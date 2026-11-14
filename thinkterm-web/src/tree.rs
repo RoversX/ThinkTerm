@@ -1022,6 +1022,7 @@ mod tests {
             window_titles: Default::default(),
             pane_labels: Default::default(),
             pane_machines: Default::default(),
+            pane_pages: Default::default(),
         };
         m.apply_panes(&list);
         let rows = m.rows(30, "default", 3);

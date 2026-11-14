@@ -5,9 +5,10 @@
   import { onChromeClick } from './chrome';
   import { handle } from './client';
   import { s, views } from './client.svelte';
-  import { loaderCircle, maximize2, minimize2, plus, squareSplitHorizontal, squareSplitVertical, squareTerminal, x } from './icons';
+  import { iconByName, loaderCircle, maximize2, minimize2, plus, puzzle, squareSplitHorizontal, squareSplitVertical, squareTerminal, x } from './icons';
 
   import { armDrag } from './drag.svelte';
+  import PluginPages from './PluginPages.svelte';
   import { iconClass } from './tabicons.svelte';
   import { mobile } from './mobile.svelte';
 
@@ -77,7 +78,7 @@
           class:current={m.current}
           data-pane={m.pane}
           title={m.title}
-        >{#if iconClass(m.icon)}<span class="ticon {iconClass(m.icon)}">{#if m.busy}<span class="spin">{@html loaderCircle}</span>{:else}<i></i>{/if}</span>{:else if m.busy}<span class="spin">{@html loaderCircle}</span>{:else}{@html squareTerminal}{/if}<span class="t">{m.title}</span><span
+        >{#if m.page}{@html iconByName(m.page) ?? puzzle}{:else if iconClass(m.icon)}<span class="ticon {iconClass(m.icon)}">{#if m.busy}<span class="spin">{@html loaderCircle}</span>{:else}<i></i>{/if}</span>{:else if m.busy}<span class="spin">{@html loaderCircle}</span>{:else}{@html squareTerminal}{/if}<span class="t">{m.title}</span><span
             class="x"
             class:danger={bar.closing && m.current}
             data-action="close-pane"
@@ -98,6 +99,8 @@
           title={bar.zoomed ? s('web-tip-unzoom') : s('web-tip-zoom')}
         >{#if bar.zoomed}{@html minimize2}{:else}{@html maximize2}{/if}</span></span></div>
   {/each}
+  <!-- A plugin's page fills its pane's room, from under the pane's bar. -->
+  <PluginPages />
   {#each handles as h, i (i)}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <span class="grip" class:across={h.across} style="left:{px(h.x)}px;top:{px(h.y)}px;{h.across ? 'width' : 'height'}:{px(h.length)}px" onpointerdown={(ev) => grab(ev, h)}></span>

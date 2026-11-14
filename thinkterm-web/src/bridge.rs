@@ -3,6 +3,7 @@
 //! changed, only that something did; it reads the views it draws.
 
 use crate::page::WebApp;
+use crate::plugin_panel::ViewPlace;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
@@ -169,30 +170,48 @@ impl Client {
         self.app.set_right_panel_shown(shown);
     }
 
-    /// How much room the page gives a plugin's panel -- or, `extended`, its
-    /// extended view -- in CSS pixels, how its text measures, and whether
-    /// there is room for an extended view: JSON `Env`. Returns an error
-    /// text or "".
-    pub fn plugin_panel_env(&self, extended: bool, env: String) -> String {
+    /// How much room the page gives a plugin's view, in CSS pixels, how its
+    /// text measures, and whether there is room for an extended view: JSON
+    /// `Env`. `place` says which view here and in what follows: `panel`,
+    /// the right panel's; `extended`, its extended view; `page:` and a
+    /// pane's id, the plugin's page in that pane's place, which is opened
+    /// by this and closed by `plugin_page_gone`. Returns an error text or
+    /// "".
+    pub fn plugin_panel_env(&self, place: String, env: String) -> String {
+        let Some(place) = ViewPlace::named(&place) else {
+            return format!("no plugin view is at {place:?}");
+        };
         match serde_json::from_str(&env) {
             Ok(env) => {
-                self.app.plugin_panel_env(extended, env);
+                self.app.plugin_panel_env(place, env);
                 String::new()
             }
             Err(err) => format!("{err}"),
         }
     }
 
-    /// The plugin panel on show, or its extended view: JSON `PanelView`, or
-    /// `null` when none is.
-    pub fn plugin_panel(&self, extended: bool) -> String {
-        json(&self.app.plugin_panel_view(extended))
+    /// Changes when any plugin's page on show would paint anew.
+    pub fn plugin_pages_revision(&self) -> f64 {
+        // Only compared: what is lost past 2^53 does not matter.
+        self.app.plugin_pages_revision() as f64
     }
 
-    /// Changes when `plugin_panel(extended)` would, so the page paints only
+    /// The page no longer shows the place of pane `pane`, where it showed
+    /// a plugin's page.
+    pub fn plugin_page_gone(&self, pane: f64) {
+        self.app.plugin_page_gone(pane as usize);
+    }
+
+    /// The plugin view on show at `place`: JSON `PanelView`, or `null` when
+    /// none is.
+    pub fn plugin_panel(&self, place: String) -> String {
+        json(&ViewPlace::named(&place).and_then(|place| self.app.plugin_panel_view(place)))
+    }
+
+    /// Changes when `plugin_panel(place)` would, so the page paints only
     /// then.
-    pub fn plugin_panel_revision(&self, extended: bool) -> f64 {
-        self.app.plugin_panel_revision(extended) as f64
+    pub fn plugin_panel_revision(&self, place: String) -> f64 {
+        ViewPlace::named(&place).map_or(0.0, |place| self.app.plugin_panel_revision(place) as f64)
     }
 
     /// Whether the plugin panel on show asks for its extended view: the
@@ -213,12 +232,12 @@ impl Client {
 
     /// The pointer over the plugin panel, or its extended view, in CSS
     /// pixels from its corner. True when it is to be painted again.
-    pub fn plugin_panel_pointer(&self, extended: bool, x: f32, y: f32) -> bool {
-        self.app.plugin_panel_pointer(extended, x, y)
+    pub fn plugin_panel_pointer(&self, place: String, x: f32, y: f32) -> bool {
+        ViewPlace::named(&place).is_some_and(|place| self.app.plugin_panel_pointer(place, x, y))
     }
 
-    pub fn plugin_panel_leave(&self, extended: bool) -> bool {
-        self.app.plugin_panel_leave(extended)
+    pub fn plugin_panel_leave(&self, place: String) -> bool {
+        ViewPlace::named(&place).is_some_and(|place| self.app.plugin_panel_leave(place))
     }
 
     /// A press in the plugin panel, or its extended view: `button` 0, 1 or
@@ -227,7 +246,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub fn plugin_panel_click(
         &self,
-        extended: bool,
+        place: String,
         x: f32,
         y: f32,
         button: u8,
@@ -244,39 +263,45 @@ impl Client {
             _ => Button::Left,
         };
         let mods = Mods { shift, ctrl, alt, cmd: meta };
-        self.app.plugin_panel_click(extended, x, y, button, count.max(1), mods)
+        ViewPlace::named(&place).is_some_and(|place| self.app.plugin_panel_click(place, x, y, button, count.max(1), mods))
     }
 
     /// The wheel over the plugin panel, or its extended view, `dy` CSS
     /// pixels down. True when something in it scrolled.
-    pub fn plugin_panel_wheel(&self, extended: bool, x: f32, y: f32, dx: f32, dy: f32) -> bool {
-        self.app.plugin_panel_wheel(extended, x, y, dx, dy)
+    pub fn plugin_panel_wheel(&self, place: String, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        ViewPlace::named(&place).is_some_and(|place| self.app.plugin_panel_wheel(place, x, y, dx, dy))
     }
 
     /// Whether the plugin panel, or its extended view, has the keyboard.
-    pub fn plugin_panel_has_keyboard(&self, extended: bool) -> bool {
-        self.app.plugin_panel_has_keyboard(extended)
+    pub fn plugin_panel_has_keyboard(&self, place: String) -> bool {
+        ViewPlace::named(&place).is_some_and(|place| self.app.plugin_panel_has_keyboard(place))
     }
 
     /// The page's field over the panel's field `id` got the keyboard.
-    pub fn plugin_panel_field_focus(&self, extended: bool, id: String) {
-        self.app.plugin_panel_field_focus(extended, &id);
+    pub fn plugin_panel_field_focus(&self, place: String, id: String) {
+        if let Some(place) = ViewPlace::named(&place) {
+            self.app.plugin_panel_field_focus(place, &id);
+        }
     }
 
     /// What the page's field over the panel's field `id` holds now: what
     /// it is to hold instead, when the panel's takes less.
-    pub fn plugin_panel_field_text(&self, extended: bool, id: String, text: String) -> Option<String> {
-        self.app.plugin_panel_field_text(extended, &id, &text)
+    pub fn plugin_panel_field_text(&self, place: String, id: String, text: String) -> Option<String> {
+        self.app.plugin_panel_field_text(ViewPlace::named(&place)?, &id, &text)
     }
 
     /// Return in the page's field over the panel's field `id`.
-    pub fn plugin_panel_field_submit(&self, extended: bool, id: String) {
-        self.app.plugin_panel_field_submit(extended, &id);
+    pub fn plugin_panel_field_submit(&self, place: String, id: String) {
+        if let Some(place) = ViewPlace::named(&place) {
+            self.app.plugin_panel_field_submit(place, &id);
+        }
     }
 
     /// The keyboard went from the panel's fields to elsewhere on the page.
-    pub fn plugin_panel_blur(&self, extended: bool) {
-        self.app.plugin_panel_blur(extended);
+    pub fn plugin_panel_blur(&self, place: String) {
+        if let Some(place) = ViewPlace::named(&place) {
+            self.app.plugin_panel_blur(place);
+        }
     }
 
     /// A key the page's field with the keyboard does not use, as
@@ -285,7 +310,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub fn plugin_panel_key(
         &self,
-        extended: bool,
+        place: String,
         key: String,
         shift: bool,
         ctrl: bool,
@@ -293,7 +318,7 @@ impl Client {
         meta: bool,
     ) -> bool {
         let mods = thinkterm_plugin_panel::Mods { shift, ctrl, alt, cmd: meta };
-        self.app.plugin_panel_key(extended, &key, mods)
+        ViewPlace::named(&place).is_some_and(|place| self.app.plugin_panel_key(place, &key, mods))
     }
 
     /// The Snippets tab: JSON `SnippetsView`.

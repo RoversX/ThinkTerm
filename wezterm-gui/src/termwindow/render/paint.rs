@@ -1497,6 +1497,12 @@ impl crate::TermWindow {
         // above reaches here, so a frame that gave up still reports what the
         // caches weighed when it did.
         self.log_render_memory_counters(passes_used, frame_complete);
+        // A page no pane painted in a whole frame is off show: behind
+        // another tab, or under another of its stack. A frame that gave up
+        // says nothing of what is on show.
+        if frame_complete {
+            self.let_go_of_plugin_pages_off_show();
+        }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
         // One paint, presented or not: retire dedicated textures nobody

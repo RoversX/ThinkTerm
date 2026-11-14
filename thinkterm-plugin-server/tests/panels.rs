@@ -15,10 +15,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 use thinkterm_plugin_channel::client::{Host, Notice, Session};
 use thinkterm_plugin_channel::registry as api;
-use thinkterm_plugin_channel::wire::{PanelEvent, PanelRequest, Raw};
+use thinkterm_plugin_channel::wire::{PageArgs, PanelEvent, PanelRequest, Raw};
 
 /// Draws "open" when a panel opens -- "extends" and the panel's number for
-/// an extended view -- or what is in the file `huge` in its data directory
+/// an extended view, "page" and what it was opened with for a page -- or
+/// what is in the file `huge` in its data directory
 /// when there is one, and then, when there is a file `ask` there, asks what
 /// is at /x, by the view's number. A click draws five frames, one after
 /// another, numbered; rows are answered with one row, and then with one
@@ -36,7 +37,12 @@ while IFS= read -r line; do
       extends=$(printf '%s' "$line" | sed -n 's/.*"extends":\([0-9]*\).*/\1/p')
       if [ -f "$THINKTERM_PLUGIN_DATA/huge" ]; then cat "$THINKTERM_PLUGIN_DATA/huge"
       elif [ -n "$extends" ]; then frame "$view" "extends $extends"
-      else frame "$view" open; fi
+      else case "$line" in
+        *'"page":{"args":{"board":"release"},"id":"0f3a9c2e5b7d1846"}'*)
+          frame "$view" "page release 0f3a9c2e5b7d1846" ;;
+        *'"page":{}'*) frame "$view" page ;;
+        *) frame "$view" open ;;
+      esac; fi
       if [ -f "$THINKTERM_PLUGIN_DATA/ask" ]; then
         printf '{"type":"ask","view":%s,"id":%s,"machine":"m1","ask":{"op":"stat","path":"/x"}}\n' "$view" "$view"
       fi ;;
@@ -98,6 +104,7 @@ fn open(session: &Session, view: u64) {
             plugin: "panel".into(),
             env: env(),
             extends: None,
+            page: None,
         },
     );
 }
@@ -110,6 +117,7 @@ fn extend(session: &Session, view: u64, panel: u64) {
             plugin: "panel".into(),
             env: env(),
             extends: Some(panel),
+            page: None,
         },
     );
 }
@@ -119,8 +127,19 @@ fn click(session: &Session, view: u64) {
     session.panel(view, PanelRequest::Input { input });
 }
 
-/// The next thing heard about panel `view`.
+/// The next thing heard about panel `view`, but that a press reached its
+/// plugin ([`heard_or_press`] for that too).
 fn heard(notices: &mpsc::Receiver<Notice>, view: u64) -> PanelEvent {
+    loop {
+        match heard_or_press(notices, view) {
+            PanelEvent::Heard => {}
+            event => return event,
+        }
+    }
+}
+
+/// The next thing heard about panel `view`.
+fn heard_or_press(notices: &mpsc::Receiver<Notice>, view: u64) -> PanelEvent {
     let notice = next_notice(
         notices,
         |notice| matches!(notice, Notice::Panel { view: of, .. } if *of == view),
@@ -143,11 +162,16 @@ fn drawn(event: PanelEvent) -> String {
         .to_string()
 }
 
-/// Nothing more is heard about panel `view` for a while.
+/// Nothing more is heard about panel `view` for a while, but that a press
+/// reached its plugin.
 fn quiet(notices: &mpsc::Receiver<Notice>, view: u64) {
     let deadline = std::time::Instant::now() + Duration::from_millis(300);
     while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
         match notices.recv_timeout(left) {
+            Ok(Notice::Panel {
+                event: PanelEvent::Heard,
+                ..
+            }) => {}
             Ok(Notice::Panel { view: of, event }) if of == view => {
                 panic!("heard {event:?}")
             }
@@ -304,6 +328,34 @@ fn a_client_is_sent_the_newest_frame_once_it_took_in_the_last() {
 }
 
 #[test]
+fn a_client_hears_that_each_press_reached_the_plugin_and_of_no_other_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_in(dir.path());
+    install_panel(&host);
+    let (session, notices) = session(&host);
+    open(&session, 1);
+    assert_eq!(drawn(heard(&notices, 1)), "open");
+    // "open" is not taken in, so no frame comes in answer: the press is
+    // heard of all the same, and before anything drawn for it.
+    click(&session, 1);
+    assert_eq!(heard_or_press(&notices, 1), PanelEvent::Heard);
+    let input = Raw::new(&json!("blur"));
+    session.panel(1, PanelRequest::Input { input });
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match notices.recv_timeout(left) {
+            Ok(Notice::Panel { view: 1, event }) => panic!("heard {event:?} for the blur"),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    session.panel(1, PanelRequest::Shown);
+    assert_eq!(drawn(heard_or_press(&notices, 1)), "5");
+    drop(session);
+    stop(&host);
+}
+
+#[test]
 fn a_frame_too_long_to_send_is_dropped_and_the_client_keeps_its_connection() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_in(dir.path());
@@ -453,6 +505,7 @@ fn a_panel_of_a_plugin_without_one_is_closed_for_good() {
             plugin: "snippets".into(),
             env: env(),
             extends: None,
+            page: None,
         },
     );
     let PanelEvent::Closed { again, reason } = heard(&notices, 3) else {
@@ -465,12 +518,118 @@ fn a_panel_of_a_plugin_without_one_is_closed_for_good() {
             plugin: "panel".into(),
             env: Raw::new(&json!({"width": "wide"})),
             extends: None,
+            page: None,
         },
     );
     let PanelEvent::Closed { again, reason } = heard(&notices, 4) else {
         panic!()
     };
     assert!(!again && reason.contains("size"), "{reason}");
+    drop(session);
+    stop(&host);
+}
+
+/// A plugin with a page and no panel: [`PANEL`], speaking the API a page
+/// needs.
+fn install_page(host: &Host) {
+    let dir = host.data_dir.join("plugins").join("pager");
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = MANIFEST
+        .replace("\"panel\"", "\"pager\"")
+        .replace("api = 2", "api = 3")
+        .replace("[panel]", "[page]");
+    std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
+    let program = dir.join("plugin.sh");
+    std::fs::write(&program, PANEL.replace("\"api\":2", "\"api\":3")).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    allow(host, "pager", &dir);
+}
+
+fn open_page(session: &Session, view: u64, plugin: &str, args: Value, extends: Option<u64>) {
+    open_page_named(session, view, plugin, "", args, extends);
+}
+
+fn open_page_named(
+    session: &Session,
+    view: u64,
+    plugin: &str,
+    id: &str,
+    args: Value,
+    extends: Option<u64>,
+) {
+    session.panel(
+        view,
+        PanelRequest::Open {
+            plugin: plugin.into(),
+            env: env(),
+            extends,
+            page: Some(PageArgs { args, id: id.into() }),
+        },
+    );
+}
+
+#[test]
+fn a_page_opens_for_a_plugin_whose_manifest_has_one_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_in(dir.path());
+    install_panel(&host);
+    install_page(&host);
+    let (session, notices) = session(&host);
+    let refused = |view| {
+        let PanelEvent::Closed { again, reason } = heard(&notices, view) else {
+            panic!()
+        };
+        assert!(!again, "{reason}");
+        reason
+    };
+
+    let listed: Vec<api::Info> = {
+        let (tx, rx) = mpsc::channel();
+        let request = serde_json::to_value(api::Request::List {
+            locale: String::new(),
+        })
+        .unwrap();
+        session.call(api::PLUGIN, request, move |answer| {
+            let _ = tx.send(answer);
+        });
+        serde_json::from_value(rx.recv().unwrap().unwrap()).unwrap()
+    };
+    let of = |id: &str| listed.iter().find(|info| info.id == id).unwrap();
+    assert_eq!(of("pager").page.as_ref().unwrap().icon, "chart-line");
+    assert!(of("pager").panel.is_none());
+    assert!(of("panel").page.is_none());
+
+    // A plugin that never said it has a page is not sent one: it would
+    // draw its panel there.
+    open_page(&session, 1, "panel", Value::Null, None);
+    assert!(refused(1).contains("no page"));
+    open_page(&session, 2, "snippets", Value::Null, None);
+    refused(2);
+
+    // Which page it is reaches the plugin with what it opens with.
+    let release = json!({"board": "release"});
+    open_page_named(&session, 3, "pager", "0f3a9c2e5b7d1846", release, None);
+    assert_eq!(drawn(heard(&notices, 3)), "page release 0f3a9c2e5b7d1846");
+    open_page(&session, 4, "pager", Value::Null, None);
+    assert_eq!(drawn(heard(&notices, 4)), "page", "two pages at once");
+
+    // And one with a page alone has no panel to show, nor a page that
+    // extends anything.
+    session.panel(
+        5,
+        PanelRequest::Open {
+            plugin: "pager".into(),
+            env: env(),
+            extends: None,
+            page: None,
+        },
+    );
+    assert!(refused(5).contains("no panel"));
+    open_page(&session, 6, "pager", Value::Null, Some(3));
+    assert!(refused(6).contains("extends no panel"));
+
+    session.panel(3, PanelRequest::Close);
+    session.panel(4, PanelRequest::Close);
     drop(session);
     stop(&host);
 }
@@ -492,6 +651,7 @@ fn what_a_plugin_asks_of_another_machine_goes_to_its_panels_client_and_back() {
                 plugin: "panel".into(),
                 env: remote_env(),
                 extends: None,
+                page: None,
             },
         )
     };

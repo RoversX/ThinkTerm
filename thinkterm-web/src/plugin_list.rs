@@ -342,6 +342,41 @@ impl PluginsModel {
             .collect()
     }
 
+    /// The name and the tab icon of plugin `id`'s page, as last heard: of a
+    /// plugin that is on, not broken, and has one.
+    pub fn page_of(&self, id: &str) -> Option<(String, String)> {
+        let plugin = self.plugins.as_ref()?.iter().find(|plugin| plugin.id == id && plugin.usable())?;
+        Some((plugin.name.clone(), plugin.page.as_ref()?.icon.clone()))
+    }
+
+    /// What the plugins that are on and not broken do when asked by name,
+    /// as last heard, in the list's order: the name each goes by
+    /// (`Action::name`), and the plugin's name, a colon and its title.
+    pub fn actions(&self) -> Vec<(String, String)> {
+        let Some(plugins) = &self.plugins else {
+            return Vec::new();
+        };
+        plugins
+            .iter()
+            .filter(|plugin| plugin.usable())
+            .flat_map(|plugin| {
+                plugin.actions.iter().map(move |action| {
+                    let name = thinkterm_plugin_channel::registry::Action::name(&plugin.id, &action.id);
+                    (name, format!("{}: {}", plugin.name, action.title))
+                })
+            })
+            .collect()
+    }
+
+    /// The plugin, and what it does, for the action named `name`, of the
+    /// plugins as last heard that are on and not broken.
+    pub fn action(&self, name: &str) -> Option<(String, thinkterm_plugin_channel::registry::Does)> {
+        let (plugin, action) = thinkterm_plugin_channel::registry::Action::named(name)?;
+        let info = self.plugins.as_ref()?.iter().find(|info| info.id == plugin && info.usable())?;
+        let does = info.actions.iter().find(|known| known.id == action)?.does.clone();
+        Some((info.id.clone(), does))
+    }
+
     /// Whether the list has been heard at all.
     pub fn known(&self) -> bool {
         self.plugins.is_some()

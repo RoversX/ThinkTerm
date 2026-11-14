@@ -13,8 +13,9 @@ use std::io::{self, Read, Write};
 /// (`registry`) and installed plugins; 3 took commands and notifications
 /// out of it; 4 added plugins' panels; 5 what a panel's plugin asks of
 /// another machine, and how long plugins run unused; 6 what is typed and
-/// pressed in a panel, and plugins that wait for the user to let them run.
-pub const PROTOCOL: u32 = 6;
+/// pressed in a panel, and plugins that wait for the user to let them run;
+/// 7 a plugin's pages.
+pub const PROTOCOL: u32 = 7;
 
 /// The largest frame either side sends or accepts, so a confused peer
 /// cannot have the other allocate without bound. A thousand scripts of
@@ -74,12 +75,16 @@ pub enum PanelRequest {
     /// if it is not running. An open under a number the client already
     /// uses replaces that panel. With `extends`, the client's number for a
     /// panel of the same plugin whose frame asked for it (`Frame::extend`),
-    /// it is that panel's extended view instead, and closes with it.
+    /// it is that panel's extended view instead, and closes with it. With
+    /// `page`, it is a page of the plugin's instead of its panel: a view in
+    /// a pane's place, which a plugin has only if its manifest says so.
     Open {
         plugin: String,
         env: Raw,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extends: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<PageArgs>,
     },
     /// Its size, fonts or theme changed: an `Env`.
     Env { env: Raw },
@@ -116,6 +121,26 @@ pub enum PanelEvent {
     /// answered with [`PanelRequest::Answer`] and the same `id`. The client
     /// does it only while the terminal is still on that machine.
     Remote { id: u64, machine: String, ask: Raw },
+    /// The host has a press the client sent (an `Input` that is a click)
+    /// and handed it to the plugin: said once for each, in the order they
+    /// came. Until it is, the client shows what was pressed as pressed --
+    /// over a slow connection, for as long as the press is on its way.
+    Heard,
+}
+
+/// A view opened as a page, which page, and what it was opened with.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageArgs {
+    /// What whoever opened the page gave it to open with -- which board,
+    /// say -- as they wrote it, or what its plugin changed that to since:
+    /// the plugin's to make sense of. Null for nothing.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub args: Value,
+    /// The page's own id, the same each time a view of it is opened --
+    /// once it was hidden a while, after a restart, on another device --
+    /// and no other page's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 /// JSON passed along unread: parsed only far enough to know where it ends,
@@ -270,6 +295,7 @@ mod tests {
                 plugin: "stocks".into(),
                 env: Raw::new(&json!({"width": 300})),
                 extends: None,
+                page: None,
             },
         };
         assert_eq!(
@@ -292,6 +318,31 @@ mod tests {
                 }
             ),
             "{extended:?}"
+        );
+        let page = ToHost::decode(
+            br#"{"panel": {"view": 3, "request": {"open": {"plugin": "board", "env": {}, "page": {"args": {"board": "release"}}}}}}"#,
+        )
+        .unwrap();
+        let ToHost::Panel {
+            request: PanelRequest::Open {
+                page: Some(opened), ..
+            },
+            ..
+        } = &page
+        else {
+            panic!("{page:?}")
+        };
+        assert_eq!(opened.args, json!({"board": "release"}));
+        let bare = PanelRequest::Open {
+            plugin: "board".into(),
+            env: Raw::new(&json!({})),
+            extends: None,
+            page: Some(PageArgs::default()),
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap()["open"]["page"],
+            json!({}),
+            "a page opened with nothing is still a page"
         );
         let shown = ToHost::Panel {
             view: 1,
@@ -332,6 +383,16 @@ mod tests {
             serde_json::to_value(&answer).unwrap(),
             json!({"panel": {"view": 4, "request": {"answer": {"id": 9, "answer": {"result": "failed", "why": "no"}}}}})
         );
+
+        let heard = FromHost::Panel {
+            view: 4,
+            event: PanelEvent::Heard,
+        };
+        assert_eq!(
+            serde_json::to_value(&heard).unwrap(),
+            json!({"panel": {"view": 4, "event": "heard"}})
+        );
+        assert_eq!(FromHost::decode(&heard.encode()).unwrap(), heard);
     }
 
     #[test]

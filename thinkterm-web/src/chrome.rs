@@ -26,9 +26,23 @@ pub struct TabView {
     /// this tab, else the tab's active pane.
     pub target: PaneId,
     pub current: bool,
+    /// For a tab whose pane on show holds a plugin's page, the icon the
+    /// page was opened with: a tab of its own is headed by it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
     /// The tab's panes, listed only for the tab on show and only when
     /// there is more than one.
     pub panes: Vec<PaneView>,
+}
+
+/// The icon heading the page pane `pane_id` holds, if it holds one: the one
+/// it was opened with, else the one a plugin without one has.
+pub fn page_icon(layout: &ListPanesResponse, pane_id: PaneId) -> Option<String> {
+    let page = layout.pane_pages.get(&pane_id)?;
+    Some(match page.icon.as_str() {
+        "" => thinkterm_plugin_panel::ICONS[0].to_string(),
+        icon => icon.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -154,6 +168,7 @@ pub fn model(
             title,
             target,
             current: is_current,
+            page: page_icon(layout, target),
             panes: pane_views,
         });
     }
@@ -226,6 +241,7 @@ mod tests {
             window_titles: Default::default(),
             pane_labels: Default::default(),
             pane_machines: Default::default(),
+            pane_pages: Default::default(),
         }
     }
 
@@ -239,6 +255,24 @@ mod tests {
         assert_eq!(tabs[1].title, "work");
         assert!(tabs[0].current && !tabs[1].current);
         assert_eq!(tabs[1].target, 21, "a click on the other tab goes to its active pane");
+    }
+
+    #[test]
+    fn a_tab_on_a_plugins_page_is_headed_by_the_pages_icon() {
+        let mut layout = layout();
+        let page = |icon: &str| thinkterm_proto::PageSpec {
+            plugin: "board".into(),
+            icon: icon.into(),
+            ..Default::default()
+        };
+        layout.pane_pages.insert(10, page("list-todo"));
+        layout.pane_pages.insert(20, page(""));
+        let tabs = model(&layout, 10, "Board", None);
+        assert_eq!(tabs[0].page.as_deref(), Some("list-todo"));
+        assert_eq!(tabs[1].page, None, "its pane on show, 21, is a terminal");
+        // Opened with no icon, a page has the one a plugin without one has.
+        assert_eq!(page_icon(&layout, 20).as_deref(), Some("puzzle"));
+        assert_eq!(page_icon(&layout, 21), None);
     }
 
     #[test]
@@ -285,6 +319,7 @@ mod tests {
             window_titles: Default::default(),
             pane_labels: Default::default(),
             pane_machines: Default::default(),
+            pane_pages: Default::default(),
         };
         assert_eq!(first_choice(&stack).map(|e| e.pane_id), Some(31));
     }

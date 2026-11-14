@@ -1,7 +1,7 @@
 // A plugin panel's text broken into lines (thinkterm-plugin-panel
-// `Text::wrap`), by the rules the desktop breaks them by
-// (plugin_panel/field.rs `wrap_line`), measured with whatever the caller
-// measures in.
+// `Text::wrap`), by the rules every client breaks them by
+// (thinkterm-plugin-panel/src/wrap.rs, which the desktop calls and this
+// follows), measured with whatever the caller measures in.
 
 // Punctuation that closes a phrase of a script written without spaces: a
 // line does not start with it.

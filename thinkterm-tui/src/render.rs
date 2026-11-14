@@ -892,9 +892,39 @@ fn painted_viewport_top(
         .max(earliest)
 }
 
+/// What a pane that holds a plugin's page shows here, where pages are not
+/// drawn: whose page it is, and where it can be seen.
+const PAGE_HINT: &str = "A plugin's page: open it in the ThinkTerm app or a browser";
+
+fn paint_page_placeholder(frame: &mut Frame<'_>, title: &str, area: Rect) {
+    fill(frame, area, " ", Style::reset());
+    // The name keeps to a row; the rest takes as many as the width needs.
+    let hint = thinkterm_plugin_panel::wrap::cells(PAGE_HINT, area.width as usize, |ch| {
+        unicode_column_width(ch.encode_utf8(&mut [0; 4]), None)
+    });
+    let title_y = area.y + area.height.saturating_sub(1 + hint.len() as u16) / 2;
+    render_center(
+        frame,
+        Rect::new(area.x, title_y, area.width, 1),
+        title,
+        chrome_bold(),
+    );
+    for (line, y) in hint.iter().zip(title_y + 1..area.bottom()) {
+        render_center(
+            frame,
+            Rect::new(area.x, y, area.width, 1),
+            line,
+            chrome_dim(),
+        );
+    }
+}
+
 fn paint_pane(frame: &mut Frame<'_>, pane: &Arc<dyn Pane>, area: Rect, ui: &UiState) {
     if area.is_empty() {
         return;
+    }
+    if pane.is_page() {
+        return paint_page_placeholder(frame, &pane.get_title(), area);
     }
     // Note that this does *not* ask the pane what changed. Asking is what makes
     // a remote pane ask the server, and the server's answer notifies the mux,
@@ -1980,6 +2010,66 @@ mod tests {
             Color::Rgb(68, 71, 90),
             "tools stay on the nav layer"
         );
+    }
+
+    #[test]
+    fn a_plugins_page_shows_as_its_name_and_where_to_see_it() {
+        let _guard = THEME_TEST_LOCK.lock().unwrap();
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(64, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                fill(frame, area, "S", chrome());
+                paint_page_placeholder(frame, "Board", area);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains('S'), "nothing of a terminal under it");
+        assert!(rendered.contains("Board"));
+        assert!(rendered.contains(PAGE_HINT));
+
+        // One row is the name's.
+        let backend = TestBackend::new(64, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| paint_page_placeholder(frame, "Board", frame.area()))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Board") && !rendered.contains(PAGE_HINT));
+
+        // Too narrow for a row, the rest takes several: all of it is there.
+        let backend = TestBackend::new(24, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| paint_page_placeholder(frame, "Board", frame.area()))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Board"));
+        for word in PAGE_HINT.split_whitespace() {
+            assert!(rendered.contains(word), "{word:?} of the hint is cut off");
+        }
     }
 
     #[test]

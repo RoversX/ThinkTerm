@@ -575,6 +575,32 @@ impl super::TermWindow {
                 }
             }
 
+            // The pane in focus holds a plugin's page: the page has what is
+            // pressed there, as the sidebar's panel has it once the user
+            // gave it the keyboard.
+            if only_key_bindings == OnlyKeyBindings::No
+                && !self.right_sidebar_has_text_focus()
+                // A view over the terminal's area is over the page too, and
+                // has what is typed.
+                && !self.content_view_foreground()
+            {
+                if let Some(page) = self.plugin_page_in_focus(pane) {
+                    let took = match self.win_key_code_to_termwiz_key_code(keycode) {
+                        Key::Code(term_key) => self.plugin_page_key(
+                            page,
+                            term_key,
+                            raw_modifiers.remove_positional_mods(),
+                        ),
+                        Key::Composed(text) => self.plugin_page_text(page, &text),
+                        _ => false,
+                    };
+                    if took {
+                        context.invalidate();
+                        return true;
+                    }
+                }
+            }
+
             if only_key_bindings == OnlyKeyBindings::No && self.content_view_foreground() {
                 use ::termwiz::input::{KeyCode as TKC, Modifiers as TMods};
                 match self.win_key_code_to_termwiz_key_code(keycode) {
@@ -674,6 +700,12 @@ impl super::TermWindow {
         // keyboard protocols can report key releases, which made the terminal
         // appear to retain focus while typing in Notes.
         if only_key_bindings == OnlyKeyBindings::No && self.right_sidebar_has_text_focus() {
+            return true;
+        }
+
+        // A page has no terminal under it: what it and the application's
+        // own keys left is nobody's, and never text for a pane.
+        if only_key_bindings == OnlyKeyBindings::No && pane.is_page() {
             return true;
         }
 

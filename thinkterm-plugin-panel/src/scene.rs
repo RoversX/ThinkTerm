@@ -43,6 +43,47 @@ pub struct Frame {
     /// the terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<u32>,
+    /// Opens a page of the plugin's ([`PageAsk`]), once for each new seq
+    /// -- and only when the frame answers a press in the view: a page is
+    /// the user's to open, by pressing what the plugin drew for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageAsk>,
+    /// A page's frame changes what the page says of itself ([`PageChange`]),
+    /// once for each new seq. A panel's asks nothing of this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_change: Option<PageChange>,
+}
+
+/// A page a view's frame asks ThinkTerm to open ([`Frame::page`]): a tab of
+/// its own, of the plugin whose view it is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageAsk {
+    pub seq: u32,
+    /// What the page is opened with: the plugin's own to make sense of
+    /// when the page's `open` hands it back. Null for nothing.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub args: serde_json::Value,
+}
+
+/// What a page's frame changes of the page it draws ([`Frame::page_change`]):
+/// each that is some, in place of what the page had. ThinkTerm keeps the
+/// page as it was changed -- it is opened with these `args` from then on,
+/// here and on other devices, and after a restart -- and its tab shows the
+/// `title` and `icon`. Size limits are a page's: a change too big for one
+/// is not made.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageChange {
+    pub seq: u32,
+    /// What the page's tab is called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The icon its tab shows, by the name the plugin's manifest gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// What the page is opened with from now on. Null is read as no
+    /// change: an empty object says it is opened with nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
 }
 
 /// A list of items, keeping the ones that read. JSON only: an item is read
@@ -142,7 +183,8 @@ pub struct Area {
 
 /// Where a click is the plugin's to hear, as a click on `id`. While the
 /// pointer is over it the player tints it with `hover`, without asking,
-/// its corners rounded by `radius`.
+/// its corners rounded by `radius`; and from a press until the plugin has
+/// the press, so that one on its way over a slow connection shows at once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hit {
     pub id: String,
@@ -496,6 +538,18 @@ impl Frame {
     /// Lets go of the keyboard: once for each new `seq`.
     pub fn release(&mut self, seq: u32) {
         self.release = Some(seq);
+    }
+
+    /// Opens a page of the plugin's with `args`, once for each new `seq`,
+    /// when this frame answers a press in the view.
+    pub fn open_page(&mut self, seq: u32, args: serde_json::Value) {
+        self.page = Some(PageAsk { seq, args });
+    }
+
+    /// Changes what the page this frame draws says of itself, once for each
+    /// new `change.seq`: in a page's frame only.
+    pub fn change_page(&mut self, change: PageChange) {
+        self.page_change = Some(change);
     }
 }
 

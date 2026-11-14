@@ -219,6 +219,38 @@ impl CommandDef {
         result
     }
 
+    /// What the plugins that can be used do when asked by name, each a
+    /// command under its plugin's name. Not for the menubar, whose menus
+    /// are ThinkTerm's own.
+    pub fn plugin_actions() -> Vec<ExpandedCommand> {
+        crate::plugins::actions()
+            .into_iter()
+            .map(|action| ExpandedCommand {
+                brief: action.title.into(),
+                doc: "".into(),
+                keys: vec![],
+                // Kept among the palette's recents by its name, which stays
+                // when ThinkTerm's language, and with it the title, changes.
+                english_brief: Some(action.name.clone().into()),
+                action: KeyAssignment::PluginAction(action.name),
+                menubar: &[],
+                icon: None,
+                accessory: None,
+            })
+            .collect()
+    }
+
+    /// What Settings › Keymap lists, by the names it lists them under:
+    /// ThinkTerm's own commands, then what the plugins do, named as the
+    /// command palette names them.
+    pub fn keymap_commands(config: &ConfigHandle) -> Vec<(String, KeyAssignment)> {
+        Self::expanded_commands(config)
+            .into_iter()
+            .chain(Self::plugin_actions())
+            .map(|command| (command.brief.to_string(), command.action))
+            .collect()
+    }
+
     pub fn actions_for_palette_and_menubar(config: &ConfigHandle) -> Vec<ExpandedCommand> {
         let mut result = Self::expanded_commands(config);
 
@@ -348,6 +380,8 @@ impl CommandDef {
                 accessory: None,
             });
         }
+
+        result.extend(Self::plugin_actions());
 
         // And sweep to pick up stuff from their key assignments
         let inputmap = InputMap::new(config);
@@ -2297,6 +2331,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         // A plugin's panel shows in the sidebar and nowhere else: not in the
         // palette, whatever key the user gave it.
         FocusPluginPanel(_) => return None,
+        // Listed with the plugins' other actions, under the name its plugin
+        // gives it; one of a plugin that is gone is not a command.
+        PluginAction(_) => return None,
         SelectTextAtMouseCursor(mode) => CommandDef {
             brief: format!(
                 "Selects text at the mouse cursor \

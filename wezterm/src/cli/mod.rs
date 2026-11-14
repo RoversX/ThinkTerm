@@ -17,6 +17,7 @@ mod kill_pane;
 mod list;
 mod list_clients;
 mod move_pane_to_new_tab;
+mod open_page;
 mod proxy;
 mod rename_workspace;
 mod restore_output;
@@ -244,6 +245,11 @@ enum CliSubCommand {
 Outputs the pane-id for the newly created pane on success"
     )]
     SplitPane(split_pane::SplitPane),
+
+    /// Open a plugin's page in a tab of its own, or in a pane's place or
+    /// beside it. Outputs the pane-id of the page's pane on success
+    #[command(name = "open-page", rename_all = "kebab")]
+    OpenPage(open_page::OpenPage),
 
     #[command(
         name = "spawn",
@@ -493,6 +499,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::Events(cmd) => cmd.run(client).await,
         CliSubCommand::GetText(cmd) => cmd.run(client, palette_pushes).await,
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::OpenPage(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::ConnectReverseProxy(cmd) => cmd.run(client).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,

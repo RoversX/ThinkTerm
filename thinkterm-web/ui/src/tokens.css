@@ -323,6 +323,12 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 /* A plugin's field: the page's own input over the canvas, as the sidebar's
    own fields look. */
 #agents .plugin, #extended .plugin { overflow: hidden; }
+/* A plugin's page, in the room of the pane it stands in the place of: over
+   the canvas, which draws nothing there, and under the pane's bar. */
+#panes .ppage { position: absolute; pointer-events: auto; overflow: hidden; background: var(--side-bg); }
+#panes .ppage .plugin { position: absolute; inset: 0; overflow: hidden; }
+#panes .ppage .plugin canvas { display: block; touch-action: none; outline: none; }
+#panes .ppage .plugin .msg { position: absolute; left: 12px; right: 12px; top: 8px; color: var(--muted); font-size: 13px; }
 /* See-through: the canvas paints the box under it, and what is drawn over it. */
 .plugin .pfield { position: absolute; box-sizing: border-box; margin: 0; background: transparent; border: 1px solid transparent; color: var(--text); font: 400 14px var(--ui); outline: none; user-select: text; -webkit-user-select: text; }
 .plugin textarea.pfield { line-height: 20px; resize: none; }

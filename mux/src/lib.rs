@@ -45,6 +45,7 @@ pub mod geometrytrace;
 pub mod kept_output;
 pub mod localpane;
 mod output_buffer;
+pub mod pagepane;
 pub mod pane;
 mod parse_watchdog;
 pub mod renderable;
@@ -136,6 +137,9 @@ pub enum MuxNotification {
         tab_id: TabId,
         title: String,
     },
+    /// What the page a pane holds says of itself changed: its title, its
+    /// icon, what it is opened with. Read the fresh one via `Pane::page`.
+    PageChanged(PaneId),
     /// A pane was labelled, relabelled or had its label taken away.
     PaneLabelChanged {
         pane_id: PaneId,
@@ -3869,6 +3873,12 @@ impl Mux {
                     CachePolicy::FetchImmediate,
                 ),
             },
+            SplitSource::Page(page) => {
+                if let Some(why) = page.refusal() {
+                    anyhow::bail!("{why}");
+                }
+                SplitSource::Page(page)
+            }
             other => other,
         };
 
@@ -3955,6 +3965,94 @@ impl Mux {
         tab.add_pane_to_stack(pane_id, Arc::clone(&pane))?;
 
         Ok(pane)
+    }
+
+    /// Opens a plugin's page as another level-2 tab in the stack `pane_id`
+    /// is in, of domain `domain`: as a rule `CurrentPaneDomain`, that
+    /// pane's, a page being the machine's its tab is on; one restored is of
+    /// the domain it was of.
+    pub async fn spawn_page_in_stack(
+        &self,
+        pane_id: PaneId,
+        domain: SpawnTabDomain,
+        page: thinkterm_proto::PageSpec,
+        size: TerminalSize,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        if let Some(why) = page.refusal() {
+            anyhow::bail!("{why}");
+        }
+        let (_, window_id, tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+        let tab = self
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("tab_id {} invalid", tab_id))?;
+        if tab.pane_index_for_pane(pane_id).is_none() {
+            anyhow::bail!("pane_id {} is not in tab {}", pane_id, tab_id);
+        }
+        let domain = self
+            .resolve_spawn_tab_domain(Some(pane_id), &domain)
+            .context("resolve_spawn_tab_domain")?;
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
+        let pane = domain
+            .spawn_page_in_stack(pane_id, size, page)
+            .await
+            .with_context(|| format!("opening a page in domain `{}`", domain.domain_name()))?;
+        tab.add_pane_to_stack(pane_id, Arc::clone(&pane))?;
+        Ok(pane)
+    }
+
+    /// Opens a plugin's page as a tab of its own: in `window_id`, or in a
+    /// new window of `workspace_for_new_window`. It is of `domain`, as a
+    /// terminal spawned there would be: with `CurrentPaneDomain`, the one
+    /// `current_pane_id` is of -- the machine the user is on.
+    pub async fn spawn_page_tab(
+        &self,
+        window_id: Option<WindowId>,
+        domain: SpawnTabDomain,
+        page: thinkterm_proto::PageSpec,
+        size: TerminalSize,
+        current_pane_id: Option<PaneId>,
+        workspace_for_new_window: String,
+    ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        if let Some(why) = page.refusal() {
+            anyhow::bail!("{why}");
+        }
+        let domain = self
+            .resolve_spawn_tab_domain(current_pane_id, &domain)
+            .context("resolve_spawn_tab_domain")?;
+
+        let window_builder;
+        let (window_id, size) = if let Some(window_id) = window_id {
+            let context = self.existing_window_spawn_context(window_id, size)?;
+            (window_id, context.size)
+        } else {
+            window_builder = self.new_empty_window(Some(workspace_for_new_window), None);
+            (*window_builder, size)
+        };
+
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
+
+        let tab = domain
+            .spawn_page(size, page, window_id, current_pane_id)
+            .await
+            .with_context(|| format!("opening a page in domain `{}`", domain.domain_name()))?;
+        let pane = tab
+            .get_active_pane()
+            .ok_or_else(|| anyhow!("missing active pane on tab!?"))?;
+
+        let mut window = self
+            .get_window_mut(window_id)
+            .ok_or_else(|| anyhow!("no such window!?"))?;
+        if let Some(idx) = window.idx_by_id(tab.tab_id()) {
+            window.save_and_then_set_active(idx);
+        }
+
+        Ok((tab, pane, window_id))
     }
 
     /// Move an existing pane into another pane stack in the same tab.

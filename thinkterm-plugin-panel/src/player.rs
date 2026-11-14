@@ -20,8 +20,8 @@
 //! fields, and give it back, but never take it.
 
 use crate::scene::{
-    Align, Area, Bounds, Color, Cursor, Field, FieldKind, Font, Frame, Hit, Item, Line, List, Rect,
-    Scroll, Size, Text,
+    Align, Area, Bounds, Color, Cursor, Field, FieldKind, Font, Frame, Hit, Item, Line, List,
+    PageChange, Rect, Scroll, Size, Text,
 };
 use crate::wire::{Button, Click, Env, Focus, Input, Key, Mods, Rows, RowsWanted, Typed};
 use serde::Serialize;
@@ -45,6 +45,11 @@ pub const FIELD_INSET: f32 = 10.0;
 pub const FIELD_INSET_LINES: f32 = 5.0;
 /// How wide a field's icon is, and the room between it and the text.
 pub const FIELD_ICON: f32 = 14.0;
+/// How many frames after a press may still be the plugin's answer to it
+/// ([`Frame::page`]): a view is sent one frame at a time, so when the user
+/// presses, one frame drawn before may be on its way and one more waiting
+/// behind it; the plugin's answer is the next.
+const PRESS_ANSWERED_WITHIN: u8 = 3;
 pub const FIELD_ICON_GAP: f32 = 6.0;
 /// A field of lines' corners; one on one line is rounded at its ends.
 pub const FIELD_RADIUS: f32 = 6.0;
@@ -299,6 +304,18 @@ pub struct Player {
     keyboard: Keyboard,
     /// The last `release` the frames said.
     release: Option<u32>,
+    /// The last page the frames asked for, by its seq; how many of the
+    /// frames to come may still answer a press sent the plugin
+    /// ([`PRESS_ANSWERED_WITHIN`] after one, none without), which a page
+    /// may be asked for in answer to; and the page asked for so, until the
+    /// client takes it.
+    page: Option<u32>,
+    pressed: u8,
+    page_asked: Option<serde_json::Value>,
+    /// The last change of its page the frames made, by its seq, and the
+    /// change made so, until the client takes it.
+    page_change: Option<u32>,
+    page_changed: Option<PageChange>,
     /// The plugin's program has not drawn since it started: the `release`
     /// of its first frame asks nothing.
     fresh: bool,
@@ -311,6 +328,11 @@ pub struct Player {
     hover: Option<Spot>,
     /// The field the pointer is over, where nothing over it answers a press.
     hover_field: Option<String>,
+    /// The hit last pressed, by its id, while the plugin has yet to hear of
+    /// a press ([`heard`](Self::heard)): tinted as one the pointer is over
+    /// is, and once more where it is. And how many presses it is to hear.
+    press: Option<String>,
+    unheard: u32,
     wanted: Vec<RowsWanted>,
 }
 
@@ -329,12 +351,19 @@ impl Player {
             field_revisions: 0,
             keyboard: Keyboard::Away,
             release: None,
+            page: None,
+            pressed: 0,
+            page_asked: None,
+            page_change: None,
+            page_changed: None,
             fresh: true,
             first_field: false,
             told: Vec::new(),
             pointer: None,
             hover: None,
             hover_field: None,
+            press: None,
+            unheard: 0,
             wanted: Vec::new(),
         }
     }
@@ -479,7 +508,58 @@ impl Player {
         self.frame = frame;
         self.shown = true;
         self.follow_keyboard(first);
+        self.follow_page(first);
+        self.follow_page_change();
         self.settle();
+    }
+
+    /// Takes note of a page the new frame asks for: one for the client to
+    /// open when its seq is new and the frame may answer a press -- one of
+    /// the few that follow it. The page of the program's first frame is
+    /// only taken note of, as its `release` is; and a frame that answers
+    /// no press asks for none, so a plugin drawing by itself opens nothing.
+    fn follow_page(&mut self, first: bool) {
+        let answers = self.pressed > 0;
+        self.pressed = self.pressed.saturating_sub(1);
+        let Some(ask) = &self.frame.page else {
+            return;
+        };
+        if self.page == Some(ask.seq) {
+            return;
+        }
+        self.page = Some(ask.seq);
+        if answers && !first {
+            self.page_asked = Some(ask.args.clone());
+            // One press opens one page.
+            self.pressed = 0;
+        }
+    }
+
+    /// The page the plugin asked to have opened, with what to open it
+    /// with: handed over once.
+    pub fn take_page_asked(&mut self) -> Option<serde_json::Value> {
+        self.page_asked.take()
+    }
+
+    /// Takes note of a change of its page the new frame makes: one for the
+    /// client to make when its seq is new. Unlike a page asked for, it is
+    /// made without a press, and from the first frame on: a page says what
+    /// it is as it is drawn, and saying it again changes nothing.
+    fn follow_page_change(&mut self) {
+        let Some(change) = &self.frame.page_change else {
+            return;
+        };
+        if self.page_change == Some(change.seq) {
+            return;
+        }
+        self.page_change = Some(change.seq);
+        self.page_changed = Some(change.clone());
+    }
+
+    /// The change of its page the plugin made, for the client to keep:
+    /// handed over once.
+    pub fn take_page_change(&mut self) -> Option<PageChange> {
+        self.page_changed.take()
     }
 
     /// Moves the keyboard as the new frame says: out of a field that went,
@@ -581,6 +661,16 @@ impl Player {
                 self.first_field = !self.shown;
                 self.set_keyboard(Keyboard::Panel);
             }
+        }
+    }
+
+    /// The view has the keyboard, and none of its fields does unless one
+    /// had it already: for a client whose fields are its own to put the
+    /// keyboard in -- a browser's inputs, pressed in or tabbed to -- when
+    /// the user puts the view's pane in focus.
+    pub fn focus_view(&mut self) {
+        if self.keyboard == Keyboard::Away {
+            self.set_keyboard(Keyboard::Panel);
         }
     }
 
@@ -820,7 +910,15 @@ impl Player {
             state.focus = None;
         }
         self.release = None;
+        self.page = None;
+        self.pressed = 0;
+        self.page_asked = None;
+        self.page_change = None;
+        self.page_changed = None;
         self.fresh = true;
+        // The new program hears none of what the last was sent.
+        self.press = None;
+        self.unheard = 0;
         self.wanted.clear();
         self.keyboard = Keyboard::Away;
         self.first_field = false;
@@ -915,14 +1013,35 @@ impl Player {
             return None;
         }
         let (hit, dx, dy) = self.hit(self.spot_at(x, y)?)?;
-        Some(Input::Click(Click {
+        let click = Click {
             id: hit.id.clone(),
             x: x - (hit.x + dx),
             y: y - (hit.y + dy),
             button,
             count,
             mods,
-        }))
+        };
+        // What the plugin draws in answer may ask for a page.
+        self.pressed = PRESS_ANSWERED_WITHIN;
+        // Shown as pressed until the plugin has it.
+        self.press = Some(click.id.clone());
+        self.unheard = self.unheard.saturating_add(1);
+        self.revision += 1;
+        Some(Input::Click(click))
+    }
+
+    /// The plugin was handed a press: one [`click`](Self::click) gave, in
+    /// the order they were given. What was pressed last stays tinted until
+    /// every press is heard -- no time at all beside the plugin, and as
+    /// long as the way there and back takes from another machine. True
+    /// when the tint went, and the panel is to be painted again.
+    pub fn heard(&mut self) -> bool {
+        self.unheard = self.unheard.saturating_sub(1);
+        if self.unheard > 0 || self.press.take().is_none() {
+            return false;
+        }
+        self.revision += 1;
+        true
     }
 
     /// What to paint, in order, leaving out what does not show.
@@ -1196,7 +1315,19 @@ impl Player {
             Item::Text(text) => Drawn::Text(text),
             Item::Line(line) => Drawn::Line(line),
             Item::Area(area) => Drawn::Area(area),
-            Item::Hit(hit) if hit.hover.is_some() && self.hover == Some(spot) => Drawn::Hover(hit),
+            Item::Hit(hit) if hit.hover.is_some() => {
+                let over = self.hover == Some(spot);
+                let pressed = self.press.as_deref() == Some(hit.id.as_str());
+                if !over && !pressed {
+                    return;
+                }
+                // Pressed under the pointer: tinted twice, so deeper.
+                if over && pressed {
+                    let what = Drawn::Hover(hit);
+                    out.push(Draw { what, dx, dy, clip });
+                }
+                Drawn::Hover(hit)
+            }
             // A field is drawn where it is in the frame, by `draw`.
             Item::Hit(_) | Item::Scroll(_) | Item::List(_) | Item::Field(_) => return,
         };
@@ -1724,6 +1855,7 @@ mod tests {
             can_extend: false,
             close: None,
             features: Vec::new(),
+            pointer: Default::default(),
         }
     }
 
@@ -2297,6 +2429,69 @@ mod tests {
     }
 
     #[test]
+    fn what_was_pressed_stays_tinted_until_the_plugin_has_every_press() {
+        let tints = |player: &Player| {
+            player
+                .draw()
+                .into_iter()
+                .filter_map(|draw| match draw.what {
+                    Drawn::Hover(hit) => Some(hit.id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let frame = || Frame {
+            items: vec![
+                hit("a", 0.0, 0.0, 300.0, 40.0),
+                hit("b", 0.0, 40.0, 300.0, 40.0),
+            ],
+            ..Frame::default()
+        };
+        let mut player = Player::new(env(300.0, 400.0));
+        player.frame(frame());
+        let before = player.revision();
+        assert!(player
+            .click(20.0, 10.0, Button::Left, 1, Mods::default())
+            .is_some());
+        assert!(player.revision() > before, "a press is a new picture");
+        assert_eq!(tints(&player), ["a", "a"], "under the pointer, and pressed");
+
+        // The pointer goes, and a frame that answers nothing comes: still
+        // on its way.
+        player.pointer_left();
+        player.frame(frame());
+        assert_eq!(tints(&player), ["a"]);
+
+        // A second press before the first is heard: the last one shows,
+        // until both are.
+        assert!(player
+            .click(20.0, 50.0, Button::Left, 1, Mods::default())
+            .is_some());
+        player.pointer_left();
+        assert_eq!(tints(&player), ["b"]);
+        assert!(!player.heard(), "one is still to be heard");
+        assert_eq!(tints(&player), ["b"]);
+        let before = player.revision();
+        assert!(player.heard());
+        assert!(player.revision() > before);
+        assert!(tints(&player).is_empty());
+        assert!(!player.heard(), "nothing was waiting");
+
+        // A program started again hears none of what the last was sent.
+        assert!(player
+            .click(20.0, 10.0, Button::Left, 1, Mods::default())
+            .is_some());
+        player.pointer_left();
+        player.restarted();
+        assert!(tints(&player).is_empty());
+        assert!(player
+            .click(20.0, 10.0, Button::Left, 1, Mods::default())
+            .is_some());
+        player.pointer_left();
+        assert!(player.heard(), "counted afresh");
+    }
+
+    #[test]
     fn a_scroll_area_scrolls_is_cut_to_itself_and_shows_its_thumb() {
         let mut player = Player::new(env(300.0, 400.0));
         let scroll = |top| Scroll {
@@ -2578,6 +2773,17 @@ mod tests {
             "never from the terminal"
         );
         assert!(player.told().is_empty());
+
+        // A client whose fields are its own to focus gives the view the
+        // keyboard and no field of it; a field that has it keeps it.
+        player.focus_view();
+        assert_eq!(player.keyboard(), &Keyboard::Panel);
+        assert_eq!(player.told(), [Input::Focus(Focus { id: None })]);
+        assert!(player.focus_field("add"));
+        player.told();
+        player.focus_view();
+        assert_eq!(player.focused_field(), Some("add"));
+        assert!(player.told().is_empty());
     }
 
     #[test]
@@ -2811,6 +3017,109 @@ mod tests {
         let lines = Field::new("n", 10.0, 0.0, 200.0, 80.0).lines().clear();
         assert!(!field_clear(&lines));
         assert_eq!(field_clear_at(&lines), None);
+    }
+
+    #[test]
+    fn a_page_change_is_handed_over_once_for_each_seq_pressed_or_not() {
+        let mut player = Player::new(env(300.0, 400.0));
+        let changing = |seq: u32, title: &str| {
+            let mut frame = Frame::default();
+            frame.change_page(PageChange {
+                seq,
+                title: Some(title.to_string()),
+                ..Default::default()
+            });
+            frame
+        };
+        // The first frame says what the page is, as any other does.
+        player.frame(changing(1, "Board"));
+        let change = player.take_page_change().expect("the first frame's change");
+        assert_eq!(change.title.as_deref(), Some("Board"));
+        assert_eq!(player.take_page_change(), None, "handed over once");
+        player.frame(changing(1, "Board"));
+        assert_eq!(player.take_page_change(), None, "the same seq changes nothing");
+        player.frame(changing(2, "Release board"));
+        assert_eq!(
+            player.take_page_change().and_then(|change| change.title),
+            Some("Release board".to_string())
+        );
+        player.frame(Frame::default());
+        assert_eq!(player.take_page_change(), None);
+        // Its program started again: what it says it is, it says anew.
+        player.restarted();
+        player.frame(changing(2, "Release board"));
+        assert!(player.take_page_change().is_some());
+    }
+
+    #[test]
+    fn a_page_is_asked_for_once_and_only_in_answer_to_a_press() {
+        let mut player = Player::new(env(300.0, 400.0));
+        let hit = |page: Option<u32>| {
+            let mut frame = Frame::default();
+            frame.items.push(Item::Hit(Hit::new("open", 0.0, 0.0, 100.0, 20.0)));
+            if let Some(seq) = page {
+                frame.open_page(seq, serde_json::json!({"board": "release"}));
+            }
+            frame
+        };
+        let press = |player: &mut Player| {
+            player
+                .click(5.0, 5.0, Button::Left, 1, Mods::default())
+                .expect("a press on the hit")
+        };
+        player.frame(hit(None));
+        // Drawn by itself: no press asked for it.
+        player.frame(hit(Some(1)));
+        assert_eq!(player.take_page_asked(), None);
+        // In answer to a press, and once.
+        press(&mut player);
+        player.frame(hit(Some(2)));
+        assert_eq!(
+            player.take_page_asked(),
+            Some(serde_json::json!({"board": "release"}))
+        );
+        assert_eq!(player.take_page_asked(), None);
+        // The same seq again asks nothing, pressed or not.
+        press(&mut player);
+        player.frame(hit(Some(2)));
+        assert_eq!(player.take_page_asked(), None);
+        // A plugin that draws by itself has a frame on its way as the user
+        // presses, and may have drawn another before it hears of the press:
+        // the one after those still answers it.
+        press(&mut player);
+        player.frame(hit(None));
+        player.frame(hit(None));
+        player.frame(hit(Some(3)));
+        assert_eq!(
+            player.take_page_asked(),
+            Some(serde_json::json!({"board": "release"}))
+        );
+        // Later than that, a frame answers no press; and the seq it showed
+        // then is spent.
+        press(&mut player);
+        for _ in 0..PRESS_ANSWERED_WITHIN {
+            player.frame(hit(None));
+        }
+        player.frame(hit(Some(4)));
+        assert_eq!(player.take_page_asked(), None);
+        press(&mut player);
+        player.frame(hit(Some(4)));
+        assert_eq!(player.take_page_asked(), None);
+        // One press opens one page.
+        press(&mut player);
+        player.frame(hit(Some(5)));
+        player.frame(hit(Some(6)));
+        assert_eq!(
+            player.take_page_asked(),
+            Some(serde_json::json!({"board": "release"}))
+        );
+        assert_eq!(player.take_page_asked(), None);
+        // A program started again counts afresh, and its first frame asks
+        // nothing.
+        press(&mut player);
+        player.restarted();
+        player.frame(hit(Some(9)));
+        assert_eq!(player.take_page_asked(), None);
     }
 
     #[test]

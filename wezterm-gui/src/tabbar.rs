@@ -260,7 +260,15 @@ fn compute_tab_title(
             if let Some(pane) = &tab.active_pane {
                 let mut title = if tab.tab_title.is_empty() {
                     if fancy {
-                        "Terminal".to_string()
+                        // A tab showing a plugin's page is called what the
+                        // page is.
+                        match mux::Mux::try_get()
+                            .and_then(|mux| mux.get_pane(pane.pane_id))
+                            .and_then(|pane| pane.page())
+                        {
+                            Some(_) => pane.title.clone(),
+                            None => "Terminal".to_string(),
+                        }
                     } else {
                         terminal_title_for_display(&pane.title).to_string()
                     }

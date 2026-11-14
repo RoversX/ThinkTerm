@@ -984,6 +984,10 @@ fn item_for_notification(n: MuxNotification) -> Option<Item> {
                 label,
             }))
         }
+        MuxNotification::PageChanged(pane_id) => {
+            let page = Mux::get().get_pane(pane_id)?.page()?;
+            write(Pdu::PageChanged(codec::PageChanged { pane_id, page }))
+        }
         MuxNotification::WindowTitleChanged { window_id, title } => {
             write(Pdu::WindowTitleChanged(codec::WindowTitleChanged {
                 window_id,

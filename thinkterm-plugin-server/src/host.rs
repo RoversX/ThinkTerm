@@ -38,8 +38,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use thinkterm_plugin_channel::registry as api;
 use thinkterm_plugin_channel::wire::{
-    frame_header, read_frame, write_frame, FromHost, PanelEvent, PanelRequest, Raw, ToHost,
-    PROTOCOL,
+    frame_header, read_frame, write_frame, FromHost, PageArgs, PanelEvent, PanelRequest, Raw,
+    ToHost, PROTOCOL,
 };
 use thinkterm_plugin_sdk::panel::{Answer, Env, Input, RowsWanted};
 use thinkterm_plugin_sdk::protocol::{FromPlugin, ToPlugin};
@@ -411,9 +411,10 @@ impl Host {
             plugin,
             env,
             extends,
+            page,
         } = request
         {
-            self.open_panel(&mut state, client, view, plugin, env, extends, &mut out);
+            self.open_panel(&mut state, client, view, plugin, env, extends, page, &mut out);
             return self.send(&mut state, out);
         }
         let Some(number) = route_of(&state.views, client, view) else {
@@ -436,10 +437,16 @@ impl Host {
                 }
             },
             PanelRequest::Input { input } => match input.read::<Input>() {
-                Ok(input) => Some(Told::Message(ToPlugin::Input {
-                    view: number,
-                    input,
-                })),
+                Ok(input) => {
+                    // The client shows a press as pressed until it hears.
+                    if matches!(input, Input::Click(_)) {
+                        out.panel(client, view, PanelEvent::Heard);
+                    }
+                    Some(Told::Message(ToPlugin::Input {
+                        view: number,
+                        input,
+                    }))
+                }
                 Err(err) => {
                     log::warn!("client {client} sent input that does not read: {err}");
                     None
@@ -502,7 +509,7 @@ impl Host {
 
     /// Opens plugin `plugin`'s panel as the client's `view`, replacing any
     /// it had under that number: the extended view of the client's panel
-    /// `extends`, with one.
+    /// `extends`, with one, and a page of the plugin's with `page`.
     #[allow(clippy::too_many_arguments)]
     fn open_panel(
         self: &Arc<Self>,
@@ -512,6 +519,7 @@ impl Host {
         plugin: String,
         env: Raw,
         extends: Option<u64>,
+        page: Option<PageArgs>,
         out: &mut Out,
     ) {
         let mut fallout = Fallout::default();
@@ -526,6 +534,11 @@ impl Host {
             }
         };
         let remote = env.remote.is_some();
+        // A page stands by itself: it is nothing's extended view.
+        if page.is_some() && extends.is_some() {
+            out.fallout(fallout);
+            return out.closed(client, view, "a page extends no panel".into(), false);
+        }
         // What an extended view extends is a panel of the same plugin that
         // the client shows, and not an extended view itself.
         let extends = match extends {
@@ -558,13 +571,17 @@ impl Host {
                     view: number,
                     env,
                     extends,
+                    page: page.clone(),
                 };
                 state
                     .registry
                     .open_panel(&plugin, index, &message, &listener, &mut fallout)
             }
             None => Err(Refusal {
-                reason: format!("there is no plugin named {plugin:?} with a panel"),
+                reason: match page {
+                    Some(_) => format!("there is no plugin named {plugin:?} with a page"),
+                    None => format!("there is no plugin named {plugin:?} with a panel"),
+                },
                 again: false,
             }),
         };

@@ -7,7 +7,8 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 use std::time::Duration;
 use thinkterm_plugin_channel::client::{Host, Session, CALL_TIMEOUT};
-use thinkterm_plugin_channel::registry::{self as api, Info, State};
+use thinkterm_plugin_channel::registry::{self as api, Does, Info, State};
+use thinkterm_plugin_panel::{At, Terminal};
 
 #[derive(Debug, Parser, Clone)]
 pub struct PluginCommand {
@@ -32,6 +33,19 @@ enum Sub {
         id: String,
         #[arg(value_name = "JSON")]
         body: String,
+    },
+    /// Do one of a plugin's actions, as the command palette and a key
+    /// bound to it do; `thinkterm plugin list` shows each plugin's
+    Do {
+        /// The plugin, by id
+        plugin: String,
+        /// The action, by its id in the plugin's manifest
+        action: String,
+        /// The pane the action is asked for at.
+        /// The default is to use the current pane based on the
+        /// environment variable WEZTERM_PANE.
+        #[arg(long)]
+        pane_id: Option<u64>,
     },
     /// Print the directory plugins are installed in
     Dir,
@@ -77,10 +91,74 @@ impl PluginCommand {
                 let answer = ask(&session, id, body, CALL_TIMEOUT)?;
                 println!("{}", serde_json::to_string_pretty(&answer)?);
             }
+            Sub::Do {
+                plugin,
+                action,
+                pane_id,
+            } => {
+                let listed = manage(&session, api::Request::List { locale: locale() })?;
+                let listed: Vec<Info> = serde_json::from_value(listed)?;
+                let info = listed
+                    .iter()
+                    .find(|info| info.id == *plugin)
+                    .ok_or_else(|| anyhow!("there is no plugin {plugin:?}"))?;
+                let found = info
+                    .actions
+                    .iter()
+                    .find(|known| known.id == *action)
+                    .ok_or_else(|| anyhow!("the plugin {plugin:?} has no action {action:?}"))?;
+                match &found.does {
+                    Does::Call(body) => {
+                        let body = at(*pane_id).added_to(body.clone());
+                        let answer = ask(&session, plugin, body, CALL_TIMEOUT)?;
+                        println!("{}", serde_json::to_string_pretty(&answer)?);
+                    }
+                    Does::Page(args) => open_page(info, args, *pane_id)?,
+                }
+            }
             Sub::Dir => unreachable!("answered above"),
         }
         Ok(())
     }
+}
+
+/// Where an action asked for here is asked for at: this directory, and the
+/// pane named, else the one this runs in.
+fn at(pane_id: Option<u64>) -> At {
+    let pane = pane_id.or_else(|| std::env::var("WEZTERM_PANE").ok()?.parse().ok());
+    At {
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|dir| dir.to_string_lossy().into_owned()),
+        remote: None,
+        terminal: pane.map(|pane| Terminal {
+            pane,
+            socket: std::env::var("WEZTERM_UNIX_SOCKET")
+                .ok()
+                .filter(|socket| !socket.is_empty()),
+        }),
+        // Asked for in a terminal: no page is in focus.
+        page: None,
+    }
+}
+
+/// Opens plugin `info`'s page with `args`, as `thinkterm cli open-page`
+/// does, which finds the ThinkTerm to open it in.
+fn open_page(info: &Info, args: &Value, pane_id: Option<u64>) -> anyhow::Result<()> {
+    let program = std::env::current_exe().context("finding this program")?;
+    let mut command = std::process::Command::new(program);
+    command
+        .args(["cli", "open-page", &info.id, "--title", &info.name])
+        .args(["--args", &args.to_string()]);
+    if let Some(page) = &info.page {
+        command.args(["--icon", &page.icon]);
+    }
+    if let Some(pane_id) = pane_id {
+        command.args(["--pane-id", &pane_id.to_string()]);
+    }
+    let status = command.status().context("running `thinkterm cli open-page`")?;
+    anyhow::ensure!(status.success(), "the page was not opened");
+    Ok(())
 }
 
 fn ask(session: &Session, plugin: &str, body: Value, wait: Duration) -> anyhow::Result<Value> {
@@ -171,6 +249,13 @@ fn print_list(listed: &[Info]) -> std::io::Result<()> {
                 out,
                 "{:id_width$}  never let run: `thinkterm plugin enable {}` lets it",
                 "", info.id
+            )?;
+        }
+        for action in &info.actions {
+            writeln!(
+                out,
+                "{:id_width$}  does {}: {}",
+                "", action.id, action.title
             )?;
         }
     }

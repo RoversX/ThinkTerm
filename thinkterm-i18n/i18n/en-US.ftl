@@ -591,6 +591,7 @@ right-snippets-unavailable = Snippets are unavailable right now
 right-plugin-starting = Starting…
 right-plugin-stopped = This panel stopped: { $reason }
 right-plugin-connect = Needs a connection to { $host }
+plugin-page-placeholder = A plugin's page. Open it in ThinkTerm on a computer, or in a browser.
 right-edit-snippet = Edit Snippet
 right-snippet = Snippet
 right-personal-vault = Personal vault

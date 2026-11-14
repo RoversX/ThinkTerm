@@ -574,6 +574,7 @@ right-snippets-unavailable = Фрагменты сейчас недоступн�
 right-plugin-starting = Запуск…
 right-plugin-stopped = Панель остановлена: { $reason }
 right-plugin-connect = Требуется подключение к { $host }
+plugin-page-placeholder = Страница плагина. Откройте её в ThinkTerm на компьютере или в браузере.
 right-edit-snippet = Изменить фрагмент
 right-snippet = Фрагмент
 right-personal-vault = Личное хранилище

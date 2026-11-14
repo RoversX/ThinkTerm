@@ -190,6 +190,9 @@ pub struct CapsuleView {
     pub current: bool,
     /// The card heading it (`tab_icons`); none until the cards arrive.
     pub icon: Option<String>,
+    /// For a pane that holds a plugin's page, the icon heading it instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
 }
 
 

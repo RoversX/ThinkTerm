@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thinkterm_plugin_channel::registry::{Background, Info, State, DIR_LIMIT};
-use thinkterm_plugin_sdk::protocol::{ToPlugin, API, PANEL_API};
+use thinkterm_plugin_sdk::protocol::{ToPlugin, API, PAGE_API, PANEL_API};
 use thinkterm_plugin_sdk::Plugin;
 
 /// Crashes within [`CRASH_WINDOW`] that mark a plugin failed.
@@ -475,6 +475,8 @@ impl Registry {
             enabled,
             state: if enabled { State::Idle } else { State::Off },
             panel: None,
+            page: None,
+            actions: Vec::new(),
             background: Background::default(),
             background_default: Background::default(),
         }
@@ -510,6 +512,8 @@ impl Registry {
                         reason: reason.clone(),
                     },
                     panel: None,
+                    page: None,
+                    actions: Vec::new(),
                     background: Background::default(),
                     background_default: Background::default(),
                 }
@@ -559,6 +563,8 @@ impl Registry {
             enabled,
             state,
             panel: manifest.panel.clone(),
+            page: manifest.page.clone(),
+            actions: manifest.actions(locale),
             background: self.background(manifest),
             background_default: manifest.background,
         }
@@ -913,10 +919,11 @@ impl Registry {
     }
 
     /// Sends the installed plugin at `index`, found answering to `id`, the
-    /// message opening a panel of it, starting its program if it is not
-    /// running -- and again if it was rebuilt. Hands back the run the panel
-    /// is open on. A program of the id still on its way out is not waited
-    /// for, as a call would: the client is to try again.
+    /// message opening a panel of it -- or a page, which it has only when
+    /// its manifest says so -- starting its program if it is not running,
+    /// and again if it was rebuilt. Hands back the run the panel is open
+    /// on. A program of the id still on its way out is not waited for, as
+    /// a call would: the client is to try again.
     pub fn open_panel(
         &mut self,
         id: &str,
@@ -936,7 +943,11 @@ impl Registry {
         let Ok(manifest) = &installed.manifest else {
             return Err(for_good(format!("there is no plugin named {id:?}")));
         };
-        if manifest.panel.is_none() {
+        let page = matches!(message, ToPlugin::Open { page: Some(_), .. });
+        if page && manifest.page.is_none() {
+            return Err(for_good(format!("{} has no page", manifest.name)));
+        }
+        if !page && manifest.panel.is_none() {
             return Err(for_good(format!("{} has no panel", manifest.name)));
         }
         if let Run::Running(process) = &installed.run {
@@ -1259,24 +1270,27 @@ impl Registry {
     }
 
     /// The run's program said it is ready, speaking plugin API `api`: any
-    /// this ThinkTerm speaks, and one that draws a panel if it has one.
+    /// this ThinkTerm speaks, and one that draws a panel if it has one, and
+    /// a page if it has that.
     pub fn ready(&mut self, id: &str, generation: u64, api: u32, fallout: &mut Fallout) {
         let Some(process) = self.process(id, generation) else {
             return;
         };
         process.ready = true;
         fallout.changed = true;
-        let has_panel = self.installed.iter().any(|installed| {
-            installed.answers_to(id)
-                && installed
-                    .manifest
-                    .as_ref()
-                    .is_ok_and(|manifest| manifest.panel.is_some())
-        });
+        let has = |what: fn(&Manifest) -> bool| {
+            self.installed.iter().any(|installed| {
+                installed.answers_to(id) && installed.manifest.as_ref().is_ok_and(what)
+            })
+        };
+        let has_panel = has(|manifest| manifest.panel.is_some());
+        let has_page = has(|manifest| manifest.page.is_some());
         let why = if !(1..=API).contains(&api) {
             format!("it speaks plugin API {api}; this ThinkTerm speaks 1 to {API}")
         } else if has_panel && api < PANEL_API {
             format!("it speaks plugin API {api}, and its panel needs {PANEL_API}")
+        } else if has_page && api < PAGE_API {
+            format!("it speaks plugin API {api}, and its page needs {PAGE_API}")
         } else {
             return;
         };

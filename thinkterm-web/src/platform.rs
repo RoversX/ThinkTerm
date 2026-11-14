@@ -180,6 +180,11 @@ pub trait Link:
 {
     /// Open the transport again to the same place with the same identity.
     fn reconnect(&self) -> LocalFuture<anyhow::Result<()>>;
+    /// Another connection to the same place with the same identity, for the
+    /// plugin host's frames alone, so that what a plugin draws and what the
+    /// terminals print do not wait behind each other. `None` where there is
+    /// no opening one: the frames then go with everything else.
+    fn beside(&self) -> LocalFuture<anyhow::Result<Option<Self>>>;
     /// Close it for good: nothing will be read or sent again.
     fn shutdown(&self);
     fn lease(&self) -> Ref<'_, Lease>;

@@ -59,12 +59,25 @@ export function search(query: string) {
 export function openPalette(only: '' | 'threads' = '') {
   palette.only = only;
   palette.open = true;
+  // What the server's plugins do is among the commands: the list is
+  // followed while the palette is open (`pluginsListed`).
+  handle.client?.plugins_want('palette', true);
   search('');
+}
+
+/** The plugin list was heard anew: what the palette found is found again,
+    with the plugins' actions as they are now. */
+export function pluginsListed() {
+  if (!palette.open) return;
+  const selected = palette.selected;
+  search(palette.query);
+  palette.selected = Math.min(selected, Math.max(0, entries().length - 1));
 }
 
 export function closePalette() {
   if (!palette.open) return;
   palette.open = false;
+  handle.client?.plugins_want('palette', false);
   palette.only = '';
   palette.query = '';
   palette.results = EMPTY;

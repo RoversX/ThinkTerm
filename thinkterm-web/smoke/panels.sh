@@ -16,11 +16,12 @@
 #     -p thinkterm-plugin-server -p thinkterm-plugin-diff
 #   NODE_PATH=<dir with node_modules/ws> thinkterm-web/smoke/panels.sh [out.png]
 #
-# Prints the JSON panels-test.js produces; exit status is the test's.
+# PROFILE=debug runs the debug build. Prints the JSON panels-test.js
+# produces; exit status is the test's.
 set -eu
 cd "$(dirname "$0")/../.."
 REPO=$PWD
-BIN=${CARGO_TARGET_DIR:-$REPO/target}/release
+BIN=${CARGO_TARGET_DIR:-$REPO/target}/${PROFILE:-release}
 PORT=18105
 OUT=${1:-/tmp/thinkterm-panels.png}
 if lsof -nP -t -i :$PORT >/dev/null 2>&1; then echo "port $PORT busy" >&2; exit 1; fi
@@ -38,6 +39,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' INT TERM
 export HOME="$T/home"; mkdir -p "$HOME"
+# Run from a ThinkTerm pane, these name the server that pane is in: the
+# command line would go there, not to the throwaway one.
+unset WEZTERM_UNIX_SOCKET WEZTERM_PANE
 export THINKTERM_NO_PRIVACY_DISCLAIM=1
 export THINKTERM_WEB_STATIC_DIR="$REPO/thinkterm-web/www"
 DATA="$HOME/Library/Application Support/ThinkTerm"
@@ -72,6 +76,8 @@ return {
 LUA
 "$BIN/thinkterm-mux-server" --config-file "$T/web.lua" --daemonize
 i=0; until curl -s -o /dev/null "http://127.0.0.1:$PORT/"; do i=$((i+1)); [ $i -lt 50 ] || { echo "server did not come up" >&2; exit 1; }; sleep 0.2; done
+# A plugin runs only once it is let: as the user turning it on does.
+"$BIN/thinkterm" plugin enable diff >/dev/null
 CLI="env HOME=$HOME THINKTERM_NO_PRIVACY_DISCLAIM=1 $BIN/thinkterm --config-file $T/web.lua cli --prefer-mux --no-auto-start"
 $CLI spawn --window-id 0 >/dev/null
 URL=$($CLI web-token mint --label panels --ttl 1h --url-only 2>/dev/null | head -1)

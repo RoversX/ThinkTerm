@@ -186,6 +186,14 @@ pub(crate) fn build_commands(
             (None, None) => {}
         }
 
+        // What plugins do comes after ThinkTerm's own, until it is used.
+        let of_plugin =
+            |command: &ExpandedCommand| matches!(command.action, KeyAssignment::PluginAction(_));
+        match of_plugin(a).cmp(&of_plugin(b)) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+
         match a.menubar.cmp(&b.menubar) {
             Ordering::Equal => a.brief.cmp(&b.brief),
             ordering => ordering,

@@ -1626,6 +1626,8 @@ fn requires_existing_frontend_access(pdu: &Pdu) -> bool {
             | Pdu::SpawnV2(_)
             | Pdu::SplitPane(_)
             | Pdu::SpawnPaneInStack(_)
+            | Pdu::SpawnPage(_)
+            | Pdu::ChangePage(_)
             | Pdu::ActivatePaneInStack(_)
             | Pdu::MovePaneToStack(_)
             | Pdu::SwapPanes(_)
@@ -1759,6 +1761,8 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::GetPaneDirection(_)
             | Pdu::AdjustPaneSize(_)
             | Pdu::SpawnPaneInStack(_)
+            | Pdu::SpawnPage(_)
+            | Pdu::ChangePage(_)
             | Pdu::ActivatePaneInStack(_)
             | Pdu::MovePaneToStack(_)
             | Pdu::SwapPanes(_)
@@ -2450,6 +2454,7 @@ impl SessionHandler {
                             let mut tab_titles = vec![];
                             let mut window_titles = HashMap::new();
                             let mut pane_machines = HashMap::new();
+                            let mut pane_pages = HashMap::new();
                             for window_id in mux.iter_windows().into_iter() {
                                 let window = mux.get_window(window_id).unwrap();
                                 window_titles.insert(window_id, window.get_title().to_string());
@@ -2467,6 +2472,12 @@ impl SessionHandler {
                                         {
                                             pane_machines.insert(pane.pane_id, machine);
                                         }
+                                        let page = mux
+                                            .get_pane(pane.pane_id)
+                                            .and_then(|pane| pane.page());
+                                        if let Some(page) = page {
+                                            pane_pages.insert(pane.pane_id, page);
+                                        }
                                     }
                                     tabs.push(tree);
                                     tab_titles.push(tab.get_title());
@@ -2482,6 +2493,7 @@ impl SessionHandler {
                                 window_titles,
                                 pane_labels,
                                 pane_machines,
+                                pane_pages,
                             }))
                         },
                         send_response,
@@ -2848,6 +2860,16 @@ impl SessionHandler {
             Pdu::SpawnPaneInStack(request) => {
                 spawn_into_main_thread(async move {
                     schedule_spawn_pane_in_stack(request, send_response);
+                })
+                .detach();
+            }
+
+            Pdu::SpawnPage(request) => {
+                spawn_into_main_thread(async move {
+                    promise::spawn::spawn(async move {
+                        send_response(spawn_page(request).await)
+                    })
+                    .detach();
                 })
                 .detach();
             }
@@ -3724,6 +3746,21 @@ impl SessionHandler {
                 })
                 .detach();
             }
+            Pdu::ChangePage(ChangePage { pane_id, edit }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            Mux::get()
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {pane_id}"))?
+                                .change_page(edit)?;
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
             Pdu::GetWorkspaceNames(GetWorkspaceNames {}) => {
                 // The desktop's namer reads its own store, which its main
                 // thread keeps.
@@ -4005,6 +4042,8 @@ impl SessionHandler {
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
+            | Pdu::SpawnPageResponse { .. }
+            | Pdu::PageChanged { .. }
             | Pdu::GetPaneRenderChangesResponse { .. }
             | Pdu::GetServerOsReleaseResponse { .. }
             | Pdu::UnitResponse { .. }
@@ -4257,6 +4296,87 @@ async fn spawn_pane_in_stack(request: SpawnPaneInStack) -> anyhow::Result<Pdu> {
         tab_id,
         window_id,
         size,
+    }))
+}
+
+/// Opens a plugin's page where the request says: a pane that runs nothing,
+/// placed as a terminal would be.
+async fn spawn_page(request: SpawnPage) -> anyhow::Result<Pdu> {
+    let mux = Mux::get();
+    // No identity, as for the spawns above: the workspace of a new window
+    // is on the wire, and none is read.
+    let SpawnPage { page, place, size } = request;
+    match place {
+        PagePlace::Tab {
+            window_id,
+            workspace,
+            pane_id,
+        } => {
+            crate::session_import::ensure_not_pending(&workspace)?;
+            let domain = config::keyassignment::SpawnTabDomain::CurrentPaneDomain;
+            let (tab, pane, window_id) = mux
+                .spawn_page_tab(window_id, domain, page, size, pane_id, workspace)
+                .await?;
+            spawned_page(&pane, tab.tab_id(), window_id, tab.get_size())
+        }
+        PagePlace::Stack { pane_id } => {
+            let (_, window_id, tab_id) = mux
+                .resolve_pane_id(pane_id)
+                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+            // It joins the stack in the base pane's place, at its size.
+            let base = mux
+                .get_pane(pane_id)
+                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+            let dims = base.get_dimensions();
+            let size = ::wezterm_term::TerminalSize {
+                rows: dims.viewport_rows,
+                cols: dims.cols,
+                pixel_width: dims.pixel_width,
+                pixel_height: dims.pixel_height,
+                dpi: dims.dpi,
+            };
+            let pane = mux
+                .spawn_page_in_stack(pane_id, SpawnTabDomain::CurrentPaneDomain, page, size)
+                .await?;
+            spawned_page(&pane, tab_id, window_id, size)
+        }
+        PagePlace::Split {
+            pane_id,
+            split_request,
+        } => {
+            let (_, window_id, tab_id) = mux
+                .resolve_pane_id(pane_id)
+                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+            let (pane, size) = mux
+                .split_pane(
+                    pane_id,
+                    split_request,
+                    SplitSource::Page(page),
+                    config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+                )
+                .await?;
+            spawned_page(&pane, tab_id, window_id, size)
+        }
+    }
+}
+
+/// What the page in `pane`, just opened, is said to be: the page as this
+/// mux keeps it, with its id and where it was opened from.
+fn spawned_page(
+    pane: &Arc<dyn Pane>,
+    tab_id: TabId,
+    window_id: mux::window::WindowId,
+    size: ::wezterm_term::TerminalSize,
+) -> anyhow::Result<Pdu> {
+    let page = pane
+        .page()
+        .ok_or_else(|| anyhow!("pane {} opened as a page holds none", pane.pane_id()))?;
+    Ok(Pdu::SpawnPageResponse(SpawnPageResponse {
+        pane_id: pane.pane_id(),
+        tab_id,
+        window_id,
+        size,
+        page,
     }))
 }
 

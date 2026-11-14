@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod domain;
 pub mod local_update;
 pub mod pane;
+pub mod plugin_link;
 pub mod remote_update;
 pub mod share;
 pub mod share_queue;

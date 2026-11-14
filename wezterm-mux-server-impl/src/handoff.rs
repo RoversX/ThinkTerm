@@ -21,6 +21,10 @@
 //! exits without touching the layout files, which the new one owns now
 //! (on macOS it stays as a process that only waits; see `hold`).
 //!
+//! A pane that holds a plugin's page has no pty to send: what it is
+//! follows the topology, and the new server makes its pane again under the
+//! same id (`HandoffPage`).
+//!
 //! Left behind: panes that hold a channel rather than a pty (ssh-domain
 //! and tmux-domain panes) and panes whose process already exited. They
 //! are pruned from the topology the new server gets, and end with the old
@@ -40,6 +44,7 @@ use std::convert::TryFrom;
 use thinkterm_proto::PaneNode;
 use mux::domain::DomainId;
 use mux::localpane::LocalPane;
+use mux::pagepane::PagePane;
 use mux::pane::{Pane, PaneId};
 use mux::tab::{Tab, TabId};
 use mux::window::{Window, WindowId};
@@ -156,6 +161,19 @@ struct HandoffPane {
     tty_name: Option<String>,
     /// varbincode of the `TerminalSnapshot`, zstd-compressed.
     snapshot: Vec<u8>,
+}
+
+/// A pane that holds a plugin's page: all there is of it. The pages go in
+/// the frame of `Topology`, after the message, and only when there are
+/// any, so the messages keep their shape and `HANDOFF_VERSION` stays: a
+/// server with no page sends what it always did, and a successor from
+/// before pages, sent a tab that names one, finds a pane that was not
+/// handed over and gives up before anything is committed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct HandoffPage {
+    pane_id: PaneId,
+    page: thinkterm_proto::PageSpec,
+    label: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -840,6 +858,7 @@ fn serve(mut stream: UnixStream, socket_path: &Path) {
 struct Capture {
     hello: Hello,
     panes: Vec<(HandoffPane, PaneObjects)>,
+    pages: Vec<HandoffPage>,
     topology: Vec<HandoffWindow>,
     paused: Vec<PausedReader>,
     connect: mux::ConnectSuspension,
@@ -914,7 +933,10 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
         expect(stream, "Ack").with_context(|| format!("pane {pane_id}"))?;
     }
 
-    write_message(stream, &HandoffMessage::Topology(clone_topology(&capture.topology)))?;
+    write_frame(
+        stream,
+        &encode_topology(clone_topology(&capture.topology), &capture.pages)?,
+    )?;
     expect(stream, "Ack").context("topology")?;
 
     // On Windows the successor binds the socket itself once this server
@@ -933,6 +955,32 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
     }
     capture.connect.keep();
     Ok(())
+}
+
+/// `Topology`, then the pages its tabs hold, in the same frame but outside
+/// the message (see `HandoffPage`).
+fn encode_topology(windows: Vec<HandoffWindow>, pages: &[HandoffPage]) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = encode_message(&HandoffMessage::Topology(windows))?;
+    if !pages.is_empty() {
+        let mut encode = varbincode::Serializer::new(&mut bytes);
+        pages
+            .serialize(&mut encode)
+            .context("encoding the pages of a handoff")?;
+    }
+    Ok(bytes)
+}
+
+/// A message, and the pages that follow a `Topology` in its frame.
+fn decode_with_pages(bytes: &[u8]) -> anyhow::Result<(HandoffMessage, Vec<HandoffPage>)> {
+    let mut rest = bytes;
+    let message = decode_message(&mut rest)?;
+    let pages = if matches!(message, HandoffMessage::Topology(_)) && !rest.is_empty() {
+        let mut decode = varbincode::Deserializer::new(&mut rest);
+        Vec::<HandoffPage>::deserialize(&mut decode).context("decoding the pages of a handoff")?
+    } else {
+        Vec::new()
+    };
+    Ok((message, pages))
 }
 
 fn clone_pane(pane: &HandoffPane) -> HandoffPane {
@@ -997,11 +1045,23 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
     let local_domain = mux.default_domain().domain_id();
     let mut paused = Vec::new();
     let mut panes = Vec::new();
+    let mut pages = Vec::new();
     let mut carried = HashSet::new();
     let mut left_behind = Vec::new();
 
     for pane in mux.iter_panes() {
         let pane_id = pane.pane_id();
+        // A page runs nothing: there is no reader to pause and no pty to
+        // send, only what it is.
+        if let Some(page) = pane.page().filter(|_| pane.domain_id() == local_domain) {
+            pages.push(HandoffPage {
+                pane_id,
+                page,
+                label: mux.pane_label(pane_id),
+            });
+            carried.insert(pane_id);
+            continue;
+        }
         let local = pane
             .downcast_ref::<LocalPane>()
             .filter(|_| pane.domain_id() == local_domain);
@@ -1087,6 +1147,7 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
             left_behind,
         },
         panes,
+        pages,
         topology,
         paused,
         connect,
@@ -1292,13 +1353,16 @@ pub fn complete(
 ) -> anyhow::Result<UnixStream> {
     let mut stream = takeover.stream;
     let mut received: Vec<Received> = Vec::new();
+    let mut pages: Vec<HandoffPage> = Vec::new();
     let mut windows: Vec<HandoffWindow> = Vec::new();
     #[cfg(unix)]
     let mut listener: Option<OwnedFd> = None;
     let started = Instant::now();
 
     loop {
-        match read_message(&mut stream)? {
+        let (message, with_it) = decode_with_pages(&read_frame(&mut stream)?)?;
+        pages.extend(with_it);
+        match message {
             HandoffMessage::Pane(pane) => {
                 let pane_id = pane.pane_id;
                 #[cfg(unix)]
@@ -1317,7 +1381,11 @@ pub fn complete(
             }
             HandoffMessage::Topology(list) => {
                 fail_at("topology")?;
-                let have: HashSet<PaneId> = received.iter().map(|r| r.pane.pane_id).collect();
+                let have: HashSet<PaneId> = received
+                    .iter()
+                    .map(|r| r.pane.pane_id)
+                    .chain(pages.iter().map(|page| page.pane_id))
+                    .collect();
                 for window in &list {
                     for tab in &window.tabs {
                         let mut wanted = Vec::new();
@@ -1345,7 +1413,7 @@ pub fn complete(
                 fail_at("commit")?;
                 #[cfg(unix)]
                 let listener = listener.ok_or_else(|| anyhow!("Commit without a listener"))?;
-                install(received, windows, local_domain)?;
+                install(received, pages, windows, local_domain)?;
                 #[cfg(unix)]
                 start_listener(listener, socket_path)?;
                 #[cfg(windows)]
@@ -1363,6 +1431,7 @@ pub fn complete(
 /// The commit: build everything and make it the mux's.
 fn install(
     received: Vec<Received>,
+    pages: Vec<HandoffPage>,
     windows: Vec<HandoffWindow>,
     local_domain: DomainId,
 ) -> anyhow::Result<()> {
@@ -1379,6 +1448,28 @@ fn install(
             .with_context(|| format!("adopting pane {pane_id}"))?;
         if let Some(label) = label {
             labels.push((pane.pane_id(), label));
+        }
+        staged.panes.push(Arc::clone(&pane));
+        by_id.insert(pane_id, pane);
+    }
+    // The pages' panes are made anew, under the ids they had and at the
+    // sizes their tabs give them: nothing of one is anywhere but here.
+    let mut sizes = HashMap::new();
+    for tab in windows.iter().flat_map(|window| &window.tabs) {
+        for entry in tab.tree.entries() {
+            sizes.insert(entry.pane_id, entry.size);
+        }
+    }
+    for HandoffPage {
+        pane_id,
+        page,
+        label,
+    } in pages
+    {
+        let size = sizes.get(&pane_id).copied().unwrap_or_default();
+        let pane: Arc<dyn Pane> = Arc::new(PagePane::new(pane_id, local_domain, size, page));
+        if let Some(label) = label {
+            labels.push((pane_id, label));
         }
         staged.panes.push(Arc::clone(&pane));
         by_id.insert(pane_id, pane);
@@ -2042,6 +2133,59 @@ mod tests {
         assert!(!wait_for_predecessor_exit(&mut ours, Some(Duration::from_millis(50))));
         drop(theirs);
         assert!(wait_for_predecessor_exit(&mut ours, Some(Duration::from_millis(50))));
+    }
+
+    #[test]
+    fn pages_follow_the_topology_and_change_nothing_when_there_are_none() {
+        let windows = || {
+            vec![HandoffWindow {
+                window_id: 1,
+                workspace: "default".to_string(),
+                title: String::new(),
+                active_tab: 0,
+                tabs: vec![HandoffTab {
+                    tab_id: 2,
+                    title: String::new(),
+                    size: TerminalSize::default(),
+                    tree: PaneNode::Leaf(entry(7)),
+                }],
+            }]
+        };
+        let plain = encode_message(&HandoffMessage::Topology(windows())).unwrap();
+        assert_eq!(
+            encode_topology(windows(), &[]).unwrap(),
+            plain,
+            "a server with no page sends what it always did"
+        );
+        let (message, pages) = decode_with_pages(&plain).unwrap();
+        assert!(matches!(message, HandoffMessage::Topology(_)) && pages.is_empty());
+
+        let page = HandoffPage {
+            pane_id: 7,
+            page: thinkterm_proto::PageSpec {
+                plugin: "board".to_string(),
+                args: "{\"board\":\"release\"}".to_string(),
+                title: "Board".to_string(),
+                icon: String::new(),
+                // All of it is handed over: ids stay what they were here.
+                id: "0f3a9c2e5b7d1846".to_string(),
+                cwd: "/home/user/project".to_string(),
+                terminal: Some(3),
+            },
+            label: Some("plan".to_string()),
+        };
+        let sent = encode_topology(windows(), std::slice::from_ref(&page)).unwrap();
+        let (message, pages) = decode_with_pages(&sent).unwrap();
+        assert!(matches!(message, HandoffMessage::Topology(list) if list.len() == 1));
+        assert_eq!(pages, vec![page]);
+        // A successor from before pages reads the message and stops there.
+        assert!(matches!(
+            decode_message(&mut &sent[..]).unwrap(),
+            HandoffMessage::Topology(_)
+        ));
+        // Nothing follows any other message.
+        let commit = encode_message(&HandoffMessage::Commit).unwrap();
+        assert!(decode_with_pages(&commit).unwrap().1.is_empty());
     }
 
     #[test]

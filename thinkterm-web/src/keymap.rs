@@ -18,6 +18,32 @@ pub struct DomKey<'a> {
     pub composing: bool,
 }
 
+/// `key` as the browser named it (`KeyboardEvent.key`), which is how a
+/// plugin says the keys it takes: [`map_key`] the other way round, for the
+/// keys a plugin can name. `None` for one with no such name.
+pub fn dom_name(key: &KeyCode) -> Option<String> {
+    let name = match key {
+        KeyCode::Char(ch) if !ch.is_control() => return Some(ch.to_string()),
+        KeyCode::Enter => "Enter",
+        KeyCode::Escape => "Escape",
+        KeyCode::Tab => "Tab",
+        KeyCode::Backspace => "Backspace",
+        KeyCode::Delete => "Delete",
+        KeyCode::Insert => "Insert",
+        KeyCode::LeftArrow => "ArrowLeft",
+        KeyCode::RightArrow => "ArrowRight",
+        KeyCode::UpArrow => "ArrowUp",
+        KeyCode::DownArrow => "ArrowDown",
+        KeyCode::Home => "Home",
+        KeyCode::End => "End",
+        KeyCode::PageUp => "PageUp",
+        KeyCode::PageDown => "PageDown",
+        KeyCode::Function(n) => return Some(format!("F{n}")),
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
 pub fn map_key(k: &DomKey<'_>) -> Option<(KeyCode, Modifiers)> {
     if k.composing {
         return None;
@@ -137,6 +163,16 @@ mod tests {
         assert_eq!(map_key(&key("F12", "F12")), Some((KeyCode::Function(12), Modifiers::NONE)));
         assert_eq!(map_key(&key("Enter", "NumpadEnter")), Some((KeyCode::Enter, Modifiers::NONE)));
         assert_eq!(map_key(&key("7", "Numpad7")), Some((KeyCode::Numpad7, Modifiers::NONE)));
+    }
+
+    #[test]
+    fn a_key_is_named_again_as_the_browser_named_it() {
+        for name in ["ArrowUp", "ArrowLeft", "PageDown", "Home", "Enter", "Escape", "Tab", "F5", " ", "j"] {
+            let (code, _) = map_key(&key(name, "")).unwrap();
+            assert_eq!(dom_name(&code).as_deref(), Some(name));
+        }
+        assert_eq!(dom_name(&KeyCode::Char('\u{3}')), None);
+        assert_eq!(dom_name(&KeyCode::Clear), None);
     }
 
     #[test]

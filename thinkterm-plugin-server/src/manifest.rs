@@ -6,14 +6,19 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use thinkterm_plugin_channel::registry::{self, Background, Panel};
-use thinkterm_plugin_sdk::protocol::{API, PANEL_API};
+use thinkterm_plugin_channel::registry::{self, Action, Background, Does, Page, Panel};
+use thinkterm_plugin_sdk::protocol::{API, PAGE_API, PANEL_API};
 
 pub const FILE: &str = "plugin.toml";
 /// The longest id: it names a directory, a switch, and every event.
 const ID_LIMIT: usize = 64;
 /// A file this long is not a manifest.
 const SIZE_LIMIT: u64 = 256 * 1024;
+/// The most actions a plugin lists: every one is a row in the command
+/// palette.
+const ACTION_LIMIT: usize = 64;
+/// What ThinkTerm adds to an action's call: where the user was.
+const AT: &str = "at";
 
 #[derive(Debug, Deserialize)]
 struct Raw {
@@ -31,9 +36,25 @@ struct Raw {
     #[serde(default)]
     panel: Option<RawPanel>,
     #[serde(default)]
+    page: Option<RawPanel>,
+    #[serde(default, rename = "action")]
+    actions: Vec<RawAction>,
+    #[serde(default)]
     locales: BTreeMap<String, RawLocale>,
 }
 
+/// An `[[action]]`: what it is called, and the one thing it does.
+#[derive(Debug, Deserialize)]
+struct RawAction {
+    id: String,
+    title: String,
+    #[serde(default)]
+    call: Option<toml::Table>,
+    #[serde(default)]
+    page: Option<toml::Table>,
+}
+
+/// A `[panel]`, and a `[page]`, which says the same of itself.
 #[derive(Debug, Default, Deserialize)]
 struct RawPanel {
     #[serde(default)]
@@ -64,6 +85,9 @@ struct RawLocale {
     name: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// Its actions' titles, by id.
+    #[serde(default)]
+    actions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +99,11 @@ pub struct Manifest {
     pub platforms: Vec<String>,
     /// The panel it adds to the right sidebar.
     pub panel: Option<Panel>,
+    /// The page it can be opened as, in a pane's place.
+    pub page: Option<Page>,
+    /// What it does when asked by name, titled as the manifest itself
+    /// titles them: [`Manifest::actions`] has them in a language.
+    actions: Vec<Action>,
     /// How long its program runs unused, unless the user chose otherwise.
     pub background: Background,
     /// The program for this system, and its arguments. None for a built-in
@@ -88,6 +117,7 @@ pub struct Manifest {
 struct Locale {
     name: Option<String>,
     description: Option<String>,
+    actions: BTreeMap<String, String>,
 }
 
 /// A plugin's name and description in one language.
@@ -113,6 +143,13 @@ fn id_rule() -> String {
 
 /// The icon a panel that names none, or one no client has, gets.
 const PANEL_ICON: &str = thinkterm_plugin_sdk::panel::ICONS[0];
+
+/// The icon a manifest names for a panel or a page, when every client has
+/// it.
+fn known_icon(icon: Option<String>) -> String {
+    icon.filter(|icon| thinkterm_plugin_sdk::panel::ICONS.contains(&icon.as_str()))
+        .unwrap_or_else(|| PANEL_ICON.to_string())
+}
 
 impl Manifest {
     /// The manifest in an installed plugin's directory.
@@ -187,12 +224,60 @@ impl Manifest {
                 return Err(format!("a [panel] needs api = {PANEL_API} or later"))
             }
             Some(panel) => Some(Panel {
-                icon: panel
-                    .icon
-                    .filter(|icon| thinkterm_plugin_sdk::panel::ICONS.contains(&icon.as_str()))
-                    .unwrap_or_else(|| PANEL_ICON.to_string()),
+                icon: known_icon(panel.icon),
             }),
         };
+        let page = match raw.page {
+            None => None,
+            Some(_) if builtin => return Err("a built-in plugin has no page".into()),
+            Some(_) if raw.api < PAGE_API => {
+                return Err(format!("a [page] needs api = {PAGE_API} or later"))
+            }
+            Some(page) => Some(Page {
+                icon: known_icon(page.icon),
+            }),
+        };
+        if !raw.actions.is_empty() && builtin {
+            return Err("a built-in plugin's actions are ThinkTerm's own".into());
+        }
+        if raw.actions.len() > ACTION_LIMIT {
+            return Err(format!("it lists more than {ACTION_LIMIT} actions"));
+        }
+        let mut actions: Vec<Action> = Vec::with_capacity(raw.actions.len());
+        for action in raw.actions {
+            let id = &action.id;
+            if !valid_id(id) {
+                return Err(format!("the action id {id:?} is not {}", id_rule()));
+            }
+            if actions.iter().any(|known| known.id == *id) {
+                return Err(format!("it lists the action {id:?} twice"));
+            }
+            if action.title.trim().is_empty() {
+                return Err(format!("the action {id:?} has no title"));
+            }
+            let does = match (action.call, action.page) {
+                (Some(call), None) if call.contains_key(AT) => {
+                    return Err(format!(
+                        "the action {id:?} calls with {AT:?}, which ThinkTerm fills in"
+                    ))
+                }
+                (Some(call), None) => Does::Call(json(call)),
+                (None, Some(_)) if page.is_none() => {
+                    return Err(format!("the action {id:?} opens a page, and there is no [page]"))
+                }
+                (None, Some(args)) => Does::Page(json(args)),
+                _ => {
+                    return Err(format!(
+                        "the action {id:?} needs one of call and page, each a table"
+                    ))
+                }
+            };
+            actions.push(Action {
+                id: action.id,
+                title: action.title,
+                does,
+            });
+        }
         let locales = raw
             .locales
             .into_iter()
@@ -200,6 +285,7 @@ impl Manifest {
                 let locale = Locale {
                     name: locale.name.filter(|name| !name.trim().is_empty()),
                     description: locale.description,
+                    actions: locale.actions,
                 };
                 (tag.to_ascii_lowercase(), locale)
             })
@@ -211,10 +297,30 @@ impl Manifest {
             description: raw.description,
             platforms,
             panel,
+            page,
+            actions,
             background,
             run,
             locales,
         })
+    }
+
+    /// Its actions, titled in `locale` where it titles them there.
+    pub fn actions(&self, locale: &str) -> Vec<Action> {
+        let found = self.locale_for(locale);
+        self.actions
+            .iter()
+            .map(|action| {
+                let title = found
+                    .and_then(|found| found.actions.get(&action.id))
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or(&action.title);
+                Action {
+                    title: title.clone(),
+                    ..action.clone()
+                }
+            })
+            .collect()
     }
 
     /// Whether it runs on this system.
@@ -277,6 +383,28 @@ impl Manifest {
             None => Err(format!("cannot find its program {program:?}")),
         }
     }
+}
+
+/// A table of the manifest as the JSON it stands for. A date, which JSON
+/// has none of, goes as the text it was written as.
+fn json(table: toml::Table) -> serde_json::Value {
+    fn one(value: toml::Value) -> serde_json::Value {
+        match value {
+            toml::Value::String(text) => text.into(),
+            toml::Value::Integer(number) => number.into(),
+            toml::Value::Float(number) => number.into(),
+            toml::Value::Boolean(flag) => flag.into(),
+            toml::Value::Datetime(when) => when.to_string().into(),
+            toml::Value::Array(items) => items.into_iter().map(one).collect(),
+            toml::Value::Table(table) => json(table),
+        }
+    }
+    serde_json::Value::Object(
+        table
+            .into_iter()
+            .map(|(key, item)| (key, one(item)))
+            .collect(),
+    )
 }
 
 fn supports(platforms: &[String]) -> bool {
@@ -392,7 +520,7 @@ mod tests {
         };
         assert!(broken("text-tools", "Text Tools").contains("is not a-z"));
         assert!(broken("text-tools", "plugins").contains("ThinkTerm's own"));
-        assert!(broken("api = 1", "api = 3").contains("newer ThinkTerm"));
+        assert!(broken("api = 1", &format!("api = {}", API + 1)).contains("newer ThinkTerm"));
         assert!(broken("api = 1", "api = 0").contains("api must be"));
         assert!(broken("version = \"0.1.0\"", "").contains("version"));
         let unreadable = broken("[run]", "[run");
@@ -426,6 +554,76 @@ mod tests {
         assert!(with_panel(1, "[panel]")
             .unwrap_err()
             .contains("needs api = 2"));
+    }
+
+    #[test]
+    fn a_page_needs_the_api_that_draws_one() {
+        let with = |api: u32, more: &str| {
+            let text = EXAMPLE.replace("api = 1", &format!("api = {api}"));
+            Manifest::parse(&format!("{text}\n{more}\n"), false)
+        };
+        let manifest = with(3, "[page]\nicon = \"list-todo\"").unwrap();
+        assert_eq!(manifest.page.unwrap().icon, "list-todo");
+        assert!(manifest.panel.is_none(), "a page needs no panel");
+        assert_eq!(with(3, "[page]").unwrap().page.unwrap().icon, PANEL_ICON);
+        let both = with(3, "[panel]\n[page]").unwrap();
+        assert!(both.panel.is_some() && both.page.is_some());
+        assert!(with(3, "").unwrap().page.is_none());
+        assert!(with(2, "[page]").unwrap_err().contains("needs api = 3"));
+        let builtin = EXAMPLE.replace("[run]", "[page]\n[run]");
+        assert!(Manifest::parse(&builtin, true).is_err());
+    }
+
+    #[test]
+    fn actions_are_listed_once_each_with_the_one_thing_they_do() {
+        let with = |more: &str| {
+            let text = EXAMPLE.replace("api = 1", "api = 3");
+            Manifest::parse(&format!("{text}\n{more}\n"), false)
+        };
+        let manifest = with(
+            "[page]\n\
+             [[action]]\nid = \"new-card\"\ntitle = \"New card\"\ncall = { op = \"new\", column = 2 }\n\
+             [[action]]\nid = \"open\"\ntitle = \"Open the board\"\npage = { board = \"release\" }\n\
+             [locales.zh-CN.actions]\nnew-card = \"新卡片\"\n",
+        )
+        .unwrap();
+        let actions = manifest.actions("en-US");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].title, "New card");
+        assert_eq!(
+            actions[0].does,
+            Does::Call(serde_json::json!({"op": "new", "column": 2}))
+        );
+        assert_eq!(
+            actions[1].does,
+            Does::Page(serde_json::json!({"board": "release"}))
+        );
+        // Titled in a language where it has the title, and as written where not.
+        let chinese = manifest.actions("zh-CN");
+        assert_eq!(chinese[0].title, "新卡片");
+        assert_eq!(chinese[1].title, "Open the board");
+        assert!(with("").unwrap().actions("en-US").is_empty());
+
+        let action = |body: &str| with(&format!("[[action]]\nid = \"a\"\ntitle = \"A\"\n{body}"));
+        assert!(action("call = {}").is_ok());
+        assert!(action("").unwrap_err().contains("one of call and page"));
+        assert!(action("call = {}\npage = {}").unwrap_err().contains("one of"));
+        assert!(action("page = {}").unwrap_err().contains("no [page]"));
+        assert!(action("call = { at = 1 }").unwrap_err().contains("fills in"));
+        assert!(action("call = \"new\"").is_err(), "a table, not a word");
+        let twice = with("[[action]]\nid = \"a\"\ntitle = \"A\"\ncall = {}\n[[action]]\nid = \"a\"\ntitle = \"B\"\ncall = {}");
+        assert!(twice.unwrap_err().contains("twice"));
+        let named = |id: &str, title: &str| {
+            with(&format!("[[action]]\nid = \"{id}\"\ntitle = \"{title}\"\ncall = {{}}"))
+        };
+        assert!(named("a.b", "A").unwrap_err().contains("action id"));
+        assert!(named("a", " ").unwrap_err().contains("no title"));
+        let many: String = (0..=ACTION_LIMIT)
+            .map(|n| format!("[[action]]\nid = \"a{n}\"\ntitle = \"A\"\ncall = {{}}\n"))
+            .collect();
+        assert!(with(&many).unwrap_err().contains("more than"));
+        let builtin = EXAMPLE.replace("[run]", "[[action]]\nid = \"a\"\ntitle = \"A\"\ncall = {}\n[run]");
+        assert!(Manifest::parse(&builtin, true).is_err());
     }
 
     #[test]

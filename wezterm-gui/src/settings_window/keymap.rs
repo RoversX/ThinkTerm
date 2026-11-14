@@ -341,6 +341,8 @@ struct KeymapView {
     /// The configuration it was built from: a reload of thinkterm.lua
     /// makes it stale, and it is built again before it is painted.
     generation: usize,
+    /// The plugin list its plugin actions are of, likewise.
+    plugins: u64,
 }
 
 impl KeymapView {
@@ -360,10 +362,7 @@ impl KeymapView {
             .into_iter()
             .map(|entry| ((entry.key, entry.mods), entry.action))
             .collect();
-        let actions: Vec<(String, KeyAssignment)> = CommandDef::expanded_commands(&config)
-            .into_iter()
-            .map(|command| (command.brief.to_string(), command.action))
-            .collect();
+        let actions = CommandDef::keymap_commands(&config);
         let names = map
             .keys
             .default
@@ -379,6 +378,7 @@ impl KeymapView {
             names,
             rendering: config.ui_key_cap_rendering,
             generation: config.generation(),
+            plugins: crate::plugins::actions_heard(),
         }
     }
 
@@ -570,6 +570,10 @@ fn action_name(actions: &[(String, KeyAssignment)], action: &KeyAssignment) -> S
     if let Some((name, _)) = actions.iter().find(|(_, known)| known == action) {
         return name.clone();
     }
+    // One of a plugin that is not there now, by the name it was bound by.
+    if let KeyAssignment::PluginAction(name) = action {
+        return name.clone();
+    }
     match crate::commands::derive_command_from_key_assignment(action) {
         Some(command) => command.brief.to_string(),
         None => {
@@ -734,15 +738,13 @@ impl SettingsWindow {
         max_width: f32,
     ) -> anyhow::Result<()> {
         // Built again when there is none, or the one there is predates a
-        // reload of thinkterm.lua: its shortcuts may have changed.
+        // reload of thinkterm.lua, whose shortcuts may have changed, or a
+        // newer list of the plugins, whose actions may have.
         let generation = config::configuration().generation();
-        if self
-            .ui
-            .keymap
-            .view
-            .as_ref()
-            .map_or(true, |view| view.generation != generation)
-        {
+        let plugins = crate::plugins::actions_heard();
+        if self.ui.keymap.view.as_ref().map_or(true, |view| {
+            view.generation != generation || view.plugins != plugins
+        }) {
             self.ui.keymap.view = Some(KeymapView::build());
         }
         let scroll = self.ui.content_scroll.offset;
@@ -2140,6 +2142,7 @@ mod tests {
             names: HashMap::new(),
             rendering: config.ui_key_cap_rendering,
             generation: config.generation(),
+            plugins: crate::plugins::actions_heard(),
         }
     }
 

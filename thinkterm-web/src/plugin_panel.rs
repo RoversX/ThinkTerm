@@ -12,13 +12,18 @@
 //! opened as the extended view of the panel's opening: the app opens it
 //! while the panel's frames ask for one.
 //!
+//! A plugin's page, in a pane's place, is a model of its own too, opened
+//! as a page with what the pane's page was opened with; the app has one for
+//! each page pane the browser page has on show ([`ViewPlace`]).
+//!
 //! The page puts a field of its own over each field the player paints,
 //! which the browser edits; what it holds, and where the keyboard goes,
 //! come back here for the player to decide what the plugin hears. A panel
 //! has the keyboard through its fields only: the page offers no key for it.
 
 use serde::Serialize;
-use thinkterm_plugin_channel::wire::{PanelEvent, PanelRequest, Raw, ToHost};
+use serde_json::Value;
+use thinkterm_plugin_channel::wire::{PageArgs, PanelEvent, PanelRequest, Raw, ToHost};
 use thinkterm_plugin_panel::{Button, Env, Frame, Mods, Painting, Player, Rows};
 
 /// How long a panel the host closed, but may serve again, waits before it
@@ -30,6 +35,28 @@ pub const ENV_EVERY_MS: f64 = 100.0;
 
 /// Frames for the host, in order.
 pub type Sends = Vec<Vec<u8>>;
+
+/// Which of the plugin views on show something is about: the right panel's,
+/// its extended view, or the page in the place of a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ViewPlace {
+    Panel,
+    Extended,
+    /// By the pane's id on the server.
+    Page(u64),
+}
+
+impl ViewPlace {
+    /// As the shell around the core names it: `panel`, `extended`, or
+    /// `page:` and the pane's id.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "panel" => Some(Self::Panel),
+            "extended" => Some(Self::Extended),
+            page => Some(Self::Page(page.strip_prefix("page:")?.parse().ok()?)),
+        }
+    }
+}
 
 /// What the page shows of the panel.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -64,6 +91,8 @@ pub struct PanelModel {
     /// For an extended view, the page's number for the opening of the
     /// panel it extends.
     extends: Option<u64>,
+    /// For a plugin's page, what it was opened with.
+    page: Option<PageArgs>,
     player: Player,
     status: Status,
     revision: u64,
@@ -91,6 +120,7 @@ impl PanelModel {
             plugin: plugin.to_string(),
             view,
             extends,
+            page: None,
             player: Player::new(env),
             status: Status::Opening,
             revision: 0,
@@ -102,6 +132,43 @@ impl PanelModel {
         };
         let open = model.open_frame();
         (model, vec![open])
+    }
+
+    /// Plugin `plugin`'s page `id`, opened with `args` -- JSON, or nothing
+    /// -- the size `env` says, as the page's view number `view` at `now`:
+    /// with the frame that opens it.
+    pub fn open_page(plugin: &str, view: u64, id: &str, args: &str, env: Env, now: f64) -> (Self, Sends) {
+        let (mut model, _) = Self::open(plugin, view, None, env, now);
+        model.page = Some(PageArgs { args: Value::Null, id: id.to_string() });
+        model.set_page_args(args);
+        let open = model.open_frame();
+        (model, vec![open])
+    }
+
+    /// Whether this is a view of plugin `plugin`'s page `id`: what tells one
+    /// page in a pane's place from another, whatever it is opened with.
+    pub fn is_page_of(&self, plugin: &str, id: &str) -> bool {
+        self.plugin == plugin && self.page.as_ref().is_some_and(|page| page.id == id)
+    }
+
+    /// What the page is opened with from now on -- JSON, or nothing -- as
+    /// its plugin changed it: the view on show stays as it is.
+    pub fn set_page_args(&mut self, args: &str) {
+        if let Some(page) = self.page.as_mut() {
+            page.args = serde_json::from_str(args).unwrap_or(Value::Null);
+        }
+    }
+
+    /// The change of its page the plugin made, for the server to keep:
+    /// handed over once.
+    pub fn take_page_change(&mut self) -> Option<thinkterm_plugin_panel::PageChange> {
+        self.player.take_page_change()
+    }
+
+    /// The page its plugin asked to have opened, in answer to a press in
+    /// this view, with what to open it with: handed over once.
+    pub fn take_page_asked(&mut self) -> Option<serde_json::Value> {
+        self.player.take_page_asked()
     }
 
     pub fn plugin(&self) -> &str {
@@ -154,6 +221,18 @@ impl PanelModel {
             Status::Again(at) => Some((at - now).max(0.0)),
             _ => None,
         }
+    }
+
+    /// One the host would not serve -- its plugin off, or not yet let run
+    /// -- is asked for again at `now`: the plugin runs, by what was heard
+    /// since. True when it was such a one.
+    pub fn serve_again(&mut self, now: f64) -> bool {
+        let stopped = matches!(self.status, Status::Stopped(_));
+        if stopped {
+            self.status = Status::Again(now);
+            self.changed();
+        }
+        stopped
     }
 
     pub fn view_json(&self) -> PanelView {
@@ -238,6 +317,9 @@ impl PanelModel {
                 Ok(rows) => self.player.rows(rows),
                 Err(err) => log::warn!("plugin panel {}: rows that do not read: {err}", self.plugin),
             },
+            PanelEvent::Heard => {
+                self.player.heard();
+            }
             PanelEvent::Closed { reason, again } => {
                 self.status = if again {
                     Status::Again(now + REOPEN_MS)
@@ -405,6 +487,25 @@ impl PanelModel {
         (taken, self.told())
     }
 
+    /// A key pressed while the page's pane is in focus and none of its
+    /// fields has the keyboard: the page has it, as the desktop's has
+    /// while its pane is in focus, and its plugin hears the keys its frame
+    /// takes.
+    pub fn page_key(&mut self, key: &str, mods: Mods) -> Sends {
+        if self.status != Status::Open {
+            return Vec::new();
+        }
+        self.player.focus_view();
+        self.player.key(key, mods);
+        self.changed();
+        self.told()
+    }
+
+    /// Whether the view has the keyboard and none of its fields does.
+    pub fn has_keyboard_itself(&self) -> bool {
+        self.player.has_keyboard() && self.player.focused_field().is_none()
+    }
+
     /// The panel is not served: the keyboard goes back, and the plugin,
     /// whose view is gone, is told nothing of it.
     fn let_go_of_keyboard(&mut self) {
@@ -446,7 +547,7 @@ impl PanelModel {
 
     fn open_frame(&self) -> Vec<u8> {
         let env = Raw::new(self.player.env());
-        self.frame(PanelRequest::Open { plugin: self.plugin.clone(), env, extends: self.extends })
+        self.frame(PanelRequest::Open { plugin: self.plugin.clone(), env, extends: self.extends, page: self.page.clone() })
     }
 
     fn frame(&self, request: PanelRequest) -> Vec<u8> {
@@ -482,6 +583,7 @@ mod tests {
             can_extend: false,
             close: None,
             features: Vec::new(),
+            pointer: Default::default(),
         }
     }
 
@@ -493,6 +595,73 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_page_opens_as_one_with_what_it_was_opened_with() {
+        let (mut page, sends) =
+            PanelModel::open_page("board", 4, "0f3a9c2e5b7d1846", "{\"board\":\"release\"}", env(), 0.0);
+        let open = &requests(&sends)[0]["open"];
+        assert_eq!(open["plugin"], "board");
+        assert_eq!(open["page"], json!({"args": {"board": "release"}, "id": "0f3a9c2e5b7d1846"}));
+        assert!(open.get("extends").is_none());
+        assert!(page.is_page_of("board", "0f3a9c2e5b7d1846"));
+        assert!(!page.is_page_of("board", "5b7d18460f3a9c2e"), "another page of the same plugin");
+        assert!(!page.is_page_of("stocks", "0f3a9c2e5b7d1846"));
+        // Its plugin changed what it opens with: opened again, with that.
+        page.set_page_args("{\"board\":\"release\",\"card\":12}");
+        let again = page.reopen(7, None, 0.0);
+        assert_eq!(requests(&again)[0]["open"]["page"]["args"], json!({"board": "release", "card": 12}));
+        assert!(page.is_page_of("board", "0f3a9c2e5b7d1846"), "the same page still");
+        // Opened with nothing, or with what is no JSON: with nothing.
+        let (bare, sends) = PanelModel::open_page("board", 5, "", "", env(), 0.0);
+        assert_eq!(requests(&sends)[0]["open"]["page"], json!({}));
+        assert!(bare.is_page_of("board", ""));
+        // A panel is no page.
+        let (panel, _) = PanelModel::open("board", 6, None, env(), 0.0);
+        assert!(!panel.is_page_of("board", ""));
+
+        assert_eq!(ViewPlace::named("panel"), Some(ViewPlace::Panel));
+        assert_eq!(ViewPlace::named("extended"), Some(ViewPlace::Extended));
+        assert_eq!(ViewPlace::named("page:12"), Some(ViewPlace::Page(12)));
+        assert_eq!(ViewPlace::named("page:"), None);
+        assert_eq!(ViewPlace::named("true"), None);
+    }
+
+    #[test]
+    fn a_page_in_focus_has_the_keyboard_and_its_plugin_the_keys_it_takes() {
+        let (mut page, _) = PanelModel::open_page("board", 1, "0f3a9c2e5b7d1846", "", env(), 0.0);
+        // Not drawn yet: nothing to take a key.
+        assert!(page.page_key("ArrowDown", Mods::default()).is_empty());
+        let frame = json!({"items": [], "keys": ["ArrowDown", " "]});
+        page.heard(PanelEvent::Frame { frame: Raw::new(&frame) }, 0.0);
+        assert!(!page.has_keyboard_itself());
+        // The first key says the page has the keyboard, in no field, and
+        // is the plugin's.
+        let heard = requests(&page.page_key("ArrowDown", Mods::default()));
+        assert_eq!(heard[0]["input"]["input"], json!({"focus": {}}), "{heard:?}");
+        assert_eq!(heard[1]["input"]["input"]["key"]["key"], "ArrowDown");
+        assert!(page.has_keyboard_itself());
+        // One it does not take goes nowhere; the next it does is sent alone.
+        assert!(page.page_key("x", Mods::default()).is_empty());
+        let heard = requests(&page.page_key(" ", Mods::default()));
+        assert_eq!(heard.len(), 1);
+        assert_eq!(heard[0]["input"]["input"]["key"]["key"], " ");
+        // The focus moved to another pane.
+        assert_eq!(requests(&page.blur())[0]["input"]["input"], json!("blur"));
+        assert!(!page.has_keyboard_itself());
+    }
+
+    #[test]
+    fn a_page_the_host_would_not_serve_is_asked_for_again_when_told_to() {
+        let (mut page, _) = PanelModel::open_page("board", 1, "0f3a9c2e5b7d1846", "", env(), 0.0);
+        assert!(!page.serve_again(5.0), "one opening is left to open");
+        page.heard(PanelEvent::Closed { reason: "the plugin is off".into(), again: false }, 1.0);
+        assert_eq!(page.view_json().state, "stopped");
+        assert_eq!(page.again_in(2.0), None, "not by itself");
+        assert!(page.serve_again(5.0));
+        assert_eq!(page.again_in(5.0), Some(0.0));
+        assert_eq!(requests(&page.reopen(2, None, 5.0))[0]["open"]["plugin"], "board");
     }
 
     #[test]

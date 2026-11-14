@@ -7,9 +7,19 @@
 //!   to, or `null`:
 //!   `thinkterm plugin call text-tools '{"op":"decode","text":"aGk="}'`.
 //! - `{"op": "uuid"}` answers with a new UUID.
+//! - Two actions (`[[action]]` in plugin.toml), which the command palette
+//!   lists and a key can be bound to: one types a new UUID in the terminal
+//!   the user is at (`At`), one opens the page.
 //! - The panel decodes what is typed in it, or the lowest line that decodes
 //!   on the screen of the terminal beside it (`View::cli`), and shows what
 //!   that decodes to in as many lines as it has room for (`Text::wrap`).
+//! - The same is a page (`[page]` in plugin.toml): a tab of its own, or a
+//!   pane beside a terminal, opened from the new tab button's menu, with
+//!   `thinkterm cli open-page text-tools`, or by the panel's own button
+//!   (`Frame::open_page`), which hands the page what is typed in the panel
+//!   to start with (`View::page`). What is typed in the page it keeps as
+//!   what it opens with (`Frame::change_page`), so it comes back with it:
+//!   after it was hidden a while, after a restart, on another device.
 
 use anyhow::{bail, Context as _};
 use base64::alphabet;
@@ -20,14 +30,16 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thinkterm_plugin_sdk::panel::{
-    feature, Align, Click, FieldText, Frame, Hit, Input, Rect, Size, Text, Token,
+    feature, Align, At, Click, FieldText, Frame, Hit, Input, PageChange, Rect, Size, Text, Token,
 };
 use thinkterm_plugin_sdk::{Cx, Emitter, Plugin, View};
 
 const PAD: f32 = 12.0;
-/// The panel's field, and its button that reads the terminal.
+/// The panel's field, its button that reads the terminal, and the one
+/// that opens the page.
 const TYPED: &str = "typed";
 const READ: &str = "read";
+const OPEN: &str = "open";
 
 struct TextTools {
     /// What each panel decodes: typed in its field, or put there from the
@@ -42,6 +54,16 @@ struct TextTools {
     turns: HashMap<u64, u64>,
     /// Draws the panels again once a line is read; none in the tests.
     emitter: Option<Emitter>,
+    /// The page each panel last asked for, by its turn among all of them,
+    /// and what to open it with: said in every frame of the panel from
+    /// then on, and opened once.
+    pages: HashMap<u64, (u32, Value)>,
+    asked: u32,
+    /// What each page's field held when its page was last changed to open
+    /// with it, by that change's turn among all of them: 0 for what it was
+    /// opened with, which needs no change.
+    kept: HashMap<u64, (u32, String)>,
+    changes: u32,
 }
 
 impl Plugin for TextTools {
@@ -57,13 +79,37 @@ impl Plugin for TextTools {
                 })
             }
             Some("uuid") => Ok(json!(uuid::Uuid::new_v4().to_string())),
-            _ => bail!("unknown op; this plugin knows \"decode\" and \"uuid\""),
+            // An action (plugin.toml): ThinkTerm adds where the user asked
+            // for it, and the UUID is typed in the terminal there.
+            Some("type-uuid") => {
+                let terminal = At::of(&body)
+                    .and_then(|at| at.terminal)
+                    .context("\"type-uuid\" is asked for at a terminal")?;
+                let uuid = uuid::Uuid::new_v4().to_string();
+                let typed = thinkterm_plugin_sdk::cli(&terminal)
+                    .args(["send-text", "--no-paste", &uuid])
+                    .output()
+                    .context("running thinkterm cli")?;
+                if !typed.status.success() {
+                    bail!("{}", String::from_utf8_lossy(&typed.stderr).trim());
+                }
+                Ok(json!(uuid))
+            }
+            _ => bail!("unknown op; this plugin knows \"decode\", \"uuid\" and \"type-uuid\""),
         }
     }
 
     fn draw(&mut self, view: &View, frame: &mut Frame) {
         let turn = self.turns.get(&view.id).copied().unwrap_or_default();
+        // A page opened with a text starts with it in its field.
+        let opened_with = match self.typed.contains_key(&view.id) {
+            true => None,
+            false => view.page.as_ref().and_then(|page| page.args["text"].as_str()),
+        };
         let typed = self.typed.entry(view.id).or_default();
+        if let Some(text) = opened_with {
+            typed.set(text);
+        }
         let mut read = self
             .read
             .lock()
@@ -76,6 +122,34 @@ impl Plugin for TextTools {
         });
         drop(read);
         draw(typed, view, frame);
+        if let Some((seq, args)) = self.pages.get(&view.id) {
+            frame.open_page(*seq, args.clone());
+        }
+        // A page opens with what was last typed in it.
+        if view.is_page() {
+            let text = typed.text().trim();
+            match self.kept.get(&view.id) {
+                None => {
+                    self.kept.insert(view.id, (0, text.to_string()));
+                }
+                Some((_, kept)) if kept != text => {
+                    self.changes += 1;
+                    self.kept.insert(view.id, (self.changes, text.to_string()));
+                }
+                Some(_) => {}
+            }
+            if let Some((seq, text)) = self.kept.get(&view.id).filter(|(seq, _)| *seq > 0) {
+                let args = match text.as_str() {
+                    "" => json!({}),
+                    text => json!({ "text": text }),
+                };
+                frame.change_page(PageChange {
+                    seq: *seq,
+                    args: Some(args),
+                    ..Default::default()
+                });
+            }
+        }
     }
 
     fn input(&mut self, view: &View, input: Input, _cx: &mut Cx) {
@@ -104,6 +178,15 @@ impl Plugin for TextTools {
                     }
                 });
             }
+            Input::Click(Click { id, .. }) if id == OPEN => {
+                let text = self.typed.get(&view.id).map_or("", |typed| typed.text());
+                let args = match text.trim() {
+                    "" => Value::Null,
+                    text => json!({ "text": text }),
+                };
+                self.asked += 1;
+                self.pages.insert(view.id, (self.asked, args));
+            }
             _ => {}
         }
     }
@@ -111,6 +194,8 @@ impl Plugin for TextTools {
     fn closed(&mut self, view: &View) {
         self.typed.remove(&view.id);
         self.turns.remove(&view.id);
+        self.pages.remove(&view.id);
+        self.kept.remove(&view.id);
         // A line read for it may be on its way still: it is dropped when it
         // comes. One that came already goes now.
         self.read
@@ -151,6 +236,18 @@ fn draw(typed: &FieldText, view: &View, frame: &mut Frame) {
         );
         let label = Text::new(PAD, y, width, tall, "Decode from the terminal");
         frame.push(label.align(Align::Center));
+        y += tall + 12.0;
+    }
+    // The panel is narrow: what is in it can be had as a page.
+    if !view.is_page() {
+        let tall = env.body.line + 10.0;
+        frame.push(
+            Hit::new(OPEN, PAD, y, width, tall)
+                .hover(Token::BgHover)
+                .radius(6.0),
+        );
+        let label = Text::new(PAD, y, width, tall, "Open as a page");
+        frame.push(label.align(Align::Center).color(Token::TextMuted));
         y += tall + 12.0;
     }
     let text = typed.text().trim();
@@ -197,6 +294,10 @@ fn main() -> std::io::Result<()> {
         read: Arc::default(),
         turns: HashMap::new(),
         emitter: Some(emitter),
+        pages: HashMap::new(),
+        asked: 0,
+        kept: HashMap::new(),
+        changes: 0,
     })
 }
 
@@ -392,7 +493,73 @@ mod tests {
             read: Arc::default(),
             turns: HashMap::new(),
             emitter: None,
+            pages: HashMap::new(),
+            asked: 0,
+            kept: HashMap::new(),
+            changes: 0,
         }
+    }
+
+    #[test]
+    fn the_panel_opens_the_page_with_what_is_typed_and_the_page_starts_with_it() {
+        let env: thinkterm_plugin_sdk::panel::Env = serde_json::from_value(json!({
+            "width": 300, "height": 500, "scale": 2, "dark": true,
+            "small": {"size": 11, "line": 15},
+            "body": {"size": 13, "line": 18},
+            "title": {"size": 15, "line": 20},
+            "mono": {"size": 12, "line": 17, "advance": 7},
+            "features": ["fields"]
+        }))
+        .unwrap();
+        let mut tools = tools();
+        let panel = View::new(1, env.clone());
+        let mut frame = Frame::default();
+        tools.draw(&panel, &mut frame);
+        assert!(frame.page.is_none(), "nothing asks for a page by itself");
+        tools.typed.entry(1).or_default().set("aGk=");
+        let press = Click {
+            id: OPEN.into(),
+            x: 1.0,
+            y: 1.0,
+            button: thinkterm_plugin_sdk::panel::Button::Left,
+            count: 1,
+            mods: Default::default(),
+        };
+        tools.input(&panel, Input::Click(press), &mut Cx::new());
+        let mut frame = Frame::default();
+        tools.draw(&panel, &mut frame);
+        let asked = frame.page.expect("the press asks for the page");
+        assert_eq!(asked.args, json!({"text": "aGk="}));
+
+        // The page it opens: no button to open another, and its field
+        // holds what it was opened with.
+        let mut page = View::new(2, env);
+        page.page = Some(thinkterm_plugin_sdk::Page {
+            id: "0f3a9c2e5b7d1846".into(),
+            args: asked.args,
+        });
+        let mut frame = Frame::default();
+        tools.draw(&page, &mut frame);
+        assert_eq!(tools.typed[&2].text(), "aGk=");
+        let drawn = serde_json::to_string(&frame).unwrap();
+        assert!(!drawn.contains("Open as a page"), "{drawn}");
+        assert!(frame.page.is_none());
+        assert!(frame.page_change.is_none(), "it opens with what it holds already");
+
+        // Typed in, it is to open with that from then on.
+        tools.typed.get_mut(&2).unwrap().set("MTcwMDAwMDAwMA==");
+        let mut frame = Frame::default();
+        tools.draw(&page, &mut frame);
+        let change = frame.page_change.expect("what is typed is kept");
+        assert_eq!(change.args, Some(json!({"text": "MTcwMDAwMDAwMA=="})));
+        let mut again = Frame::default();
+        tools.draw(&page, &mut again);
+        assert_eq!(again.page_change.map(|again| again.seq), Some(change.seq), "said once");
+        // Emptied, it opens with nothing.
+        tools.typed.get_mut(&2).unwrap().set("");
+        let mut frame = Frame::default();
+        tools.draw(&page, &mut frame);
+        assert_eq!(frame.page_change.and_then(|change| change.args), Some(json!({})));
     }
 
     #[test]

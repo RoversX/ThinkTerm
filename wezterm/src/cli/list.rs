@@ -105,7 +105,10 @@ impl ListCommand {
                             output_item.pane_id.to_string(),
                             output_item.workspace.to_string(),
                             format!("{}x{}", output_item.size.cols, output_item.size.rows),
-                            output_item.title.to_string(),
+                            match &output_item.page {
+                                Some(_) => format!("{} [page]", output_item.title),
+                                None => output_item.title.to_string(),
+                            },
                             output_item.cwd.to_string(),
                             output_item.label.clone().unwrap_or_default(),
                         ]
@@ -154,6 +157,17 @@ fn items(panes: ListPanesResponse, keep: impl Fn(PaneId) -> bool) -> Vec<CliList
                         window_title,
                         panes.pane_labels.get(&entry.pane_id).cloned(),
                     );
+                    // A plugin's page rather than a terminal: said, since
+                    // none of what is asked of a terminal is of it.
+                    if let Some(page) = panes.pane_pages.get(&entry.pane_id) {
+                        item.page = Some(CliListPage {
+                            plugin: page.plugin.clone(),
+                            args: serde_json::from_str(&page.args).ok(),
+                            id: page.id.clone(),
+                            cwd: (!page.cwd.is_empty()).then(|| page.cwd.clone()),
+                            terminal: page.terminal,
+                        });
+                    }
                     // Named by its machine and its id there.
                     if let Some(on) = panes.pane_machines.get(&entry.pane_id) {
                         item.machine = Some(on.machine.clone());
@@ -203,6 +217,24 @@ struct CliListResultPtySize {
     dpi: u32,
 }
 
+/// A plugin's page in a pane, as `list` gives it.
+#[derive(serde::Serialize)]
+struct CliListPage {
+    plugin: String,
+    /// What it opens with: what it was opened with, or what its plugin
+    /// changed that to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<serde_json::Value>,
+    /// Which page it is, to its plugin.
+    id: String,
+    /// The directory of the terminal it was opened from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    /// That terminal, by its pane's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<u64>,
+}
+
 // This will be serialized to JSON via the 'List' command.
 // As such it is intended to be a stable output format,
 // Thus we need to be careful about both the fields and their types,
@@ -217,6 +249,10 @@ struct CliListResultItem {
     /// The server the pane is on, when it is not this machine's: then
     /// `pane_id` is `MACHINE/ID`, for `--pane`.
     machine: Option<String>,
+    /// The plugin's page the pane holds in place of a terminal, for one
+    /// that does: it has no text, and takes none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<CliListPage>,
     workspace: String,
     size: CliListResultPtySize,
     title: String,
@@ -276,6 +312,7 @@ impl CliListResultItem {
             pane_id: ListedPaneId::Here(pane_id),
             label,
             machine: None,
+            page: None,
             workspace,
             size: CliListResultPtySize {
                 rows,

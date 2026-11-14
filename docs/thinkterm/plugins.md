@@ -1,14 +1,17 @@
 # Plugins
 
-**Status:** Version 2. A plugin provides data and functions: it answers
+**Status:** Version 3. A plugin provides data and functions: it answers
 calls, and tells the clients that watch it when something changed. It can
 also add a panel to the right sidebar, which it draws by hand: rectangles,
 text, lines and filled areas, the places a click reaches it, and fields to
 type in; and it can be given the keyboard (see [Panels](#panels)). The
-desktop and the browser offer the panel in the sidebar's selector, list
-the plugin in Settings › Sidebar & Plugins, and show nothing else of it;
-nothing of a plugin shows outside the sidebar. `thinkterm plugin call`
-calls one from the command line.
+desktop and the browser offer the panel in the sidebar's selector and list
+the plugin in Settings › Sidebar & Plugins. A plugin can have a page as
+well: what a panel is, drawn in a pane's place -- a tab of its own, or
+beside a terminal (see [Pages](#pages)). And it can list actions: things it
+does when asked by name, from the command palette or with a key (see
+[Actions](#actions)). A plugin shows nothing the user did not open.
+`thinkterm plugin call` calls one from the command line.
 
 A plugin you install does not run until you let it: see [New
 plugins](#new-plugins).
@@ -102,7 +105,7 @@ id = "text-tools"            # required: a-z, 0-9 and "-", at most 64 characters
 name = "Text Tools"          # required
 version = "0.1.0"            # required; shown, not compared
 description = "Decodes text, and makes UUIDs."
-api = 1                      # required: the plugin API version it speaks, 1 or 2
+api = 1                      # required: the plugin API version it speaks, 1 to 3
 
 # Optional. The systems it runs on: "macos", "linux", "windows". Default: all.
 platforms = ["macos", "linux", "windows"]
@@ -139,6 +142,39 @@ api = 2
 icon = "git-compare"
 ```
 
+A plugin with a page says so, and speaks API 3. It may have a panel as
+well, or none:
+
+```toml
+api = 3
+
+# The page it can be opened as, in a pane's place, under the plugin's name.
+# The icon, which its tab shows, is one of those a panel has.
+[page]
+icon = "list-todo"
+```
+
+A plugin lists what it does when asked by name, of any API version (see
+[Actions](#actions)):
+
+```toml
+# One [[action]] each, at most 64. The id is a-z, 0-9 and "-"; the title is
+# shown after the plugin's name. Each has one of `call` and `page`, a table.
+[[action]]
+id = "type-uuid"
+title = "Type a new UUID"
+call = { op = "type-uuid" }  # the plugin is called with this
+
+[[action]]
+id = "open"
+title = "Open as a page"
+page = {}                    # the plugin's page is opened with this; needs a [page]
+
+# Optional translations of the titles, by action id.
+[locales.zh-CN.actions]
+type-uuid = "输入一个新的 UUID"
+```
+
 The id `plugins` is reserved, and an installed plugin cannot use a built-in
 plugin's id. If two installed plugins share an id, the one whose directory
 sorts first is used, and the other is shown as invalid.
@@ -165,12 +201,19 @@ sorts first is used, and the other is shown as invalid.
   another machine reached over SSH, a plugin has ThinkTerm run programs and
   read files there. See [A terminal on another
   machine](#a-terminal-on-another-machine).
+- **A page.** A plugin whose manifest has a `[page]` can be opened in a
+  pane's place: a tab of its own, another of the tabs over a pane, or a
+  split beside a terminal. See [Pages](#pages).
+- **Actions.** A plugin whose manifest lists them is called, or has its
+  page opened, when the user asks for one by name: in the command palette,
+  with a key, from the command line. See [Actions](#actions).
 - **Running in the background.** A plugin whose manifest says so runs for as
   long as ThinkTerm does. See [How long a plugin
   runs](#how-long-a-plugin-runs).
 
-That is all. A plugin has no commands and sends no notifications: nothing of
-a plugin shows outside the sidebar.
+That is all. A plugin sends no notifications: what shows of a plugin is its
+panel in the sidebar, the pages the user opened, and the names of its
+actions where ThinkTerm lists its own commands.
 
 ## Panels
 
@@ -207,7 +250,7 @@ the rest are drawn.
 | `text`   | `x`, `y`, `w`, `h`, `text`; `color` (`text`); `font` (`ui` or `mono`); `size` (`small`, `body`, `title`: the `ui` font's); `bold`; `align` (`left`, `center`, `right`); `wrap` |
 | `line`   | `points` (x, y, x, y ...), `color`; `width` (1)                                                          |
 | `area`   | `points` (left to right), `base`, `color`; `fade` (thins to nothing at `base`): the fill under a chart   |
-| `hit`    | `id`, `x`, `y`, `w`, `h`; `hover` (a colour to tint it with while the pointer is over it); `radius` (0, the tint's corners); `cursor` (`pointer`, `arrow`) |
+| `hit`    | `id`, `x`, `y`, `w`, `h`; `hover` (a colour to tint it with while the pointer is over it, and from a press until the plugin has it); `radius` (0, the tint's corners); `cursor` (`pointer`, `arrow`) |
 | `scroll` | `id`, `x`, `y`, `w`, `h`, `height` (of what scrolls), `items` (in its own units); `top`                  |
 | `list`   | `id`, `x`, `y`, `w`, `h`, `count`, `row` (a row's height), `key`; `version` (0); `width`, `fixed` (0); `top` |
 | `field`  | `id`, `x`, `y`, `w`, `h`; `kind` (`line`, `lines`, `secret`); `value`, `seq` (0); `placeholder`; `font` (`ui` or `mono`); `max` (0: as many as a field holds); `focus`; `icon` (`search`, `plus` or `pencil`); `clear` |
@@ -351,6 +394,121 @@ Pressed, it closes the view at once, whatever the plugin does, and sends it
 
 for the plugin to stop asking: the panel is given no other extended view
 until its frames have stopped asking for one, and ask again.
+
+### Pages
+
+A page is a view like a panel -- the same frames, items, lists and fields --
+in a pane's place instead of the sidebar: a tab of its own, another of the
+tabs over a pane, or a split beside a terminal. A plugin has one when its
+manifest has a `[page]`, and speaks API 3; one that does not is never sent
+a page's `open`.
+
+ThinkTerm keeps a page as it keeps a terminal. The pane it holds the place
+of is in the tab's layout with the terminals, is moved and closed as they
+are, and comes back when the terminals do; of the page itself ThinkTerm
+keeps only which plugin's it is, its id, what it is opened with, its title
+and icon, and where it was opened from. What the page shows is the
+plugin's to keep, in its data directory: a page is opened anew, with what it
+is opened with, whenever its pane comes on show somewhere -- a window,
+another window, after a restart, and in a window when it was hidden a
+while.
+
+Its `open` says it is a page, which one, and what it is opened with:
+
+```json
+{"type":"open","view":7,"env":{"width":1100,"height":640,...},"page":{"args":{"board":"release"},"id":"0f3a9c2e5b7d1846"}}
+```
+
+`page` is there for a page and for nothing else, as `extends` is for an
+extended view. `id` is the page's own, the same in every view of it -- each
+opening has a `view` number of its own, on each device that shows it -- and
+no other page's: what the plugin keeps of a page, such as where in it the
+user was, it keeps by this. `args` is what whoever opened the page gave it,
+or what the plugin changed that to since, any JSON, the plugin's to make
+sense of, and left out when that is nothing. In the Rust SDK,
+`view.is_page()` says so and `view.page` holds the `id` and `args`.
+
+A page's `env` says where the user was when it was opened, as a panel's
+says where [the terminal beside it](#the-terminal-beside-a-panel) is: `cwd`
+is that terminal's directory then, and `terminal` is how `thinkterm cli`
+reaches it, on the machine the page's plugin runs on. They stay what they
+were while the user goes elsewhere -- a page opened from a project is that
+project's -- and are left out when the page was opened from no terminal.
+After a restart a page still has its `cwd`, and no `terminal`: the
+terminals are numbered anew.
+
+A page's frame changes what the page says of itself -- the title and icon
+of its tab, and what it is opened with from then on -- once for each new
+`seq`:
+
+```json
+{"type":"frame","view":7,"frame":{"items":[...],"page_change":{"seq":3,"title":"Release board","args":{"board":"release","card":12}}}}
+```
+
+Each of `title`, `icon` and `args` is left out to leave it as it is; `args`
+of `{}` opens the page with nothing. ThinkTerm keeps the change, so the page
+opens with it again on another device and after a restart, and every view
+of the page is told nothing of it: a plugin that shows a page in two places
+draws both. A change bigger than a page may be is not made. In the Rust SDK
+this is `frame.change_page(PageChange { seq, title, icon, args })`.
+
+A page is drawn for the room it has, which `env` says and says again when
+it changes: how it fits a narrow pane, a wide one or a phone is the plugin's
+to work out. `env` also says what the user points with, `"pointer":"touch"`
+for a finger, which is left out for a mouse: a finger never hovers, and
+wants more room to press.
+
+While a page is the pane in focus, what is typed goes to it: to the field
+with the keyboard, and to the plugin for the keys its frame takes
+(`keys`). ThinkTerm's own shortcuts still work there, and no key reaches a
+terminal. A page behind another tab, or under another of its stack, is not
+drawn and is sent nothing; its plugin's next frame waits until the page is
+looked at again.
+
+A page is a plugin's on the machine its pane is on: in a thread on a
+server, the server's plugin of that id draws it, for every window, browser
+and phone that shows the thread. The desktop reaches that plugin over a
+connection of its own to the server, beside the one the thread's terminals
+are on, so that a page drawing a lot never sits in the same queue as what
+is typed: a second one made the way the first was -- another channel of the
+SSH session, another connection to the server's socket or over TLS, another
+run of a proxy command of yours. A browser does the same: the first plugin
+it shows opens a second socket to the server, for plugins alone, which is
+closed again a while after the last of them goes off show. The plugins the
+desktop lists to open a page of, in
+the new tab button's menu and the command palette, are its own machine's:
+they are offered in a thread on this machine. The
+phone apps and the TUI draw no pages yet: there the pane shows
+the page's name, and that it can be seen on a computer or in a browser.
+
+A plugin opens its own page from a view of its own -- its panel, or
+another page -- by saying so in a frame:
+
+```json
+{"type":"frame","view":3,"frame":{"items":[...],"page":{"seq":1,"args":{"board":"release"}}}}
+```
+
+The page opens in a tab, with those `args`, once for each new `seq`, and
+only when the frame answers a press in the view: a page is the user's to
+open, by pressing what the plugin drew for it. A frame a plugin draws by
+itself opens nothing, nor does the first frame of a program that just
+started. In the Rust SDK this is `frame.open_page(seq, args)`. Asked for
+by a page, the new one is opened on that page's machine, from where that
+page was opened.
+
+A page is also opened from the menu of the new tab button -- a right click
+lists the plugins with a page -- or from the command line:
+
+```
+thinkterm cli open-page <plugin> [--args JSON] [--title TITLE] [--icon ICON]
+    [--pane-id ID | --pane NAME] [--stack | --left | --right | --top | --bottom]
+```
+
+It prints the pane's id. Without a place it opens a tab in the pane's
+window; `--stack` adds it to the tabs over the pane, and a direction puts
+it in a split beside it. `thinkterm cli list` marks a page's pane, and what
+is asked of a terminal -- `send-text`, `send-key`, `get-text` -- says a
+page is not one.
 
 ### Fields and the keyboard
 
@@ -515,6 +673,58 @@ one works. A panel that closes before its asks are answered has them fail.
 A panel beside a terminal on the plugin's own machine gets none of this:
 its plugin reaches the files itself.
 
+## Actions
+
+An action is something a plugin does when the user asks for it by name,
+without one of the plugin's views on show. Its manifest lists them
+(`[[action]]`, see [`plugin.toml`](#plugintoml)); nothing is asked of the
+program to list them, which is not started until one is asked for.
+
+On the desktop, the command palette lists the actions of the plugins that
+are on, each as the plugin's name and the action's title -- "Text Tools:
+Type a new UUID" -- and Settings › Keymap lists them with ThinkTerm's own,
+to give a key. In the configuration file an action is named by the plugin's
+id, a "." and the action's:
+
+```lua
+config.keys = {
+  { key = 'U', mods = 'CMD|SHIFT', action = wezterm.action.PluginAction 'text-tools.type-uuid' },
+}
+```
+
+A key bound to an action of a plugin that is off or gone does nothing.
+
+An action with `page` opens the plugin's page in a tab, with that table as
+the page's `args`.
+
+An action with `call` is a call like any other, answered with `ok` or
+`error`: its body is the manifest's table, with where the user was added to
+it as `at` -- the pane in focus when they asked, as [the terminal beside a
+panel](#the-terminal-beside-a-panel) is told to a panel:
+
+```json
+{"type":"call","id":12,"body":{"op":"type-uuid","at":{"cwd":"/home/user/work","terminal":{"pane":7,"socket":"…"}}}}
+```
+
+`cwd` is that terminal's directory when it runs on the plugin's machine;
+`remote` names the other machine when it does not; `terminal` is how
+`thinkterm cli` reaches the pane. Each is left out when it is not known,
+and `at` is `{}` when the user was at no pane; a manifest's own `call`
+cannot have an `at`. At a page, which is no terminal, they say where the
+page was opened from, as its `env` does, and `page` is the page's `id` when
+the page is one of the plugin's own. The answer is not shown: an action that has something
+to show opens the page, or types in the terminal. One that fails is written
+to ThinkTerm's log. In the Rust SDK, `panel::At::of(&body)` reads it and
+`thinkterm_plugin_sdk::cli(&terminal)` is `thinkterm cli` for the pane.
+
+From the command line, `thinkterm plugin do <id> <action>` does the same,
+at the pane it is run in or the one `--pane-id` names, and prints a call's
+answer; `thinkterm plugin list` shows each plugin's actions.
+
+The actions are those of the plugins on the machine ThinkTerm runs on: the
+desktop lists its own machine's, and a browser's palette the server's,
+which is where they are then done.
+
 ## The protocol
 
 ThinkTerm starts an installed plugin's program when the plugin is first
@@ -540,9 +750,9 @@ the plugin server happened to be started from says nothing about a plugin.
 A panel's environment says which terminal is beside it (see [The terminal
 beside a panel](#the-terminal-beside-a-panel)).
 
-The program's first line must be, with the API it speaks -- 1, or 2 for a
-plugin with a panel -- and no newer than `THINKTERM_PLUGIN_API`: a ThinkTerm
-takes none newer than its own. The Rust SDK says the older of its own and
+The program's first line must be, with the API it speaks -- 1, 2 or later
+for a plugin with a panel, 3 for one with a page -- and no newer than
+`THINKTERM_PLUGIN_API`: a ThinkTerm takes none newer than its own. The Rust SDK says the older of its own and
 ThinkTerm's.
 
 ```json
@@ -823,6 +1033,7 @@ thinkterm plugin enable <id>                 turn on; lets a new one run
 thinkterm plugin disable <id>
 thinkterm plugin reload [<id>]
 thinkterm plugin call <id> <json>
+thinkterm plugin do <id> <action> [--pane-id ID]   one of its actions
 thinkterm plugin dir                         where plugins are installed
 ```
 
@@ -841,7 +1052,9 @@ it. Nothing downloads or installs plugins for you.
 
 A panel never takes the keyboard: you give it, by pressing in its field
 or with your key for it, and it goes back on Escape or a press on the
-terminal. Nor can it hand what you type to the terminal: if it lets go of
+terminal. A page has it while its pane is the one in focus, which is yours
+to put elsewhere as with any pane; what it hears of your keys is what a
+panel hears. Nor can it hand what you type to the terminal: if it lets go of
 the keyboard, or stops, while you type, your keys go nowhere until you
 press Escape or click. While a panel has it, its plugin hears only the
 keys it named and what its fields hold; never a key pressed with Ctrl, Alt
@@ -849,6 +1062,11 @@ or Command, never a field's text while an input method composes it, and a
 secret field's only when you submit it. Nothing can be copied out of a secret
 field, and the clipboard reaches a plugin only as what you paste into its
 field.
+
+An action is done only when you ask for it -- you pick it in the command
+palette, press the key you gave it, or run `thinkterm plugin do` -- and
+what its plugin is then told is where you were: the pane in focus and its
+directory, which a program running as you could find out anyway.
 
 Beside a terminal on another machine, a plugin can have ThinkTerm run
 programs and read files there, as you, over ThinkTerm's own connection --
@@ -872,6 +1090,7 @@ show.
 | Crashes before `failed`                  | 3 in 60 s  |
 | Standard error logged, all plugins       | 4 MiB      |
 | Items in a frame, or a page of rows      | 20,000     |
+| Actions a plugin lists                   | 64         |
 | Rows a list keeps                        | 2,048      |
 | Characters of one text drawn             | 2,000      |
 | Numbers in one line or area              | 8,192      |

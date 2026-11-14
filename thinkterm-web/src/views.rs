@@ -394,6 +394,7 @@ mod tests {
                 label: "Terminal".into(),
                 target: 9,
                 current: true,
+                page: None,
                 panes: vec![],
             }],
             controls: Controls { following: true, fit: false, closing_tab: Some(7), clipped: Some((80, 24)) },

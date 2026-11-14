@@ -29,6 +29,7 @@
 pub mod player;
 pub mod scene;
 pub mod wire;
+pub mod wrap;
 
 /// The Lucide icons a panel can be shown by in the sidebar's selector;
 /// every client has these. A manifest naming another gets the first.
@@ -56,9 +57,9 @@ pub const FIELD_ICONS: [&str; 3] = ["search", "plus", "pencil"];
 pub use player::{Draw, Drawn, FieldIcon, FieldPart, Keyboard, Op, Painting, Player};
 pub use scene::{
     Align, Area, Bounds, Color, Cursor, Field, FieldKind, FieldText, Font, Frame, Hit, Item, Jump,
-    Line, List, Rect, Scroll, Size, Text, Token,
+    Line, List, PageAsk, PageChange, Rect, Scroll, Size, Text, Token,
 };
 pub use wire::{
-    feature, Answer, Ask, Button, Bytes, Click, CloseButton, Entry, EntryKind, Env, Focus, Input,
-    Key, Mods, MonoMetrics, Remote, Rows, RowsWanted, Terminal, TextMetrics, Typed,
+    feature, Answer, Ask, At, Button, Bytes, Click, CloseButton, Entry, EntryKind, Env, Focus, Input,
+    Key, Mods, MonoMetrics, Pointer, Remote, Rows, RowsWanted, Terminal, TextMetrics, Typed,
 };

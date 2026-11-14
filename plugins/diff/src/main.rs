@@ -945,6 +945,7 @@ mod tests {
             can_extend: false,
             close: None,
             features: Vec::new(),
+            pointer: Default::default(),
         }
     }
 

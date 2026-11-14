@@ -688,6 +688,8 @@ pub(crate) enum ContextMenuApplicationAction {
     /// The new tab menu's remote host: open it as its card's Connect does,
     /// whether or not the Remote Hosts page is open.
     OpenRemoteHost(String),
+    /// The new tab menu's plugin: open its page in a tab of its own.
+    OpenPluginPage(String),
     SetFrontendAccessMode(codec::FrontendAccessMode),
     /// Notification bell entry: jump to a thread, switching Space first when
     /// it lives elsewhere, and acknowledge its unseen work.
@@ -970,6 +972,9 @@ pub enum UIItemType {
     RightSidebarPluginPanel,
     /// The same, for the panel's extended view.
     RightSidebarPluginExtended,
+    /// The place of a pane that holds a plugin's page: the pointer and the
+    /// wheel over it go to the page's player, and never to a terminal.
+    PluginPage(PaneId),
     /// The close button at the extended view's top left, ThinkTerm's own
     /// whatever the plugin draws.
     RightSidebarPluginExtendedClose,
@@ -3570,6 +3575,14 @@ pub struct TermWindow {
     right_sidebar_snippet_listing: thinkterm_snippets::view::Listing,
     /// The plugin panel on show in this window, while one is.
     pub(crate) right_sidebar_plugin: Option<ui::plugin_panel::PluginPanel>,
+    /// The plugins' pages this window has on show, by the pane each holds
+    /// the place of (`ui::plugin_panel::page`).
+    pub(crate) plugin_pages: HashMap<PaneId, ui::plugin_panel::PluginPanel>,
+    /// The pages painted since the last sweep of those that were not.
+    pub(crate) plugin_pages_on_show: HashSet<PaneId>,
+    /// The pane whose page stands in the sidebar panel's place for the
+    /// moment (`with_plugin_page`).
+    pub(crate) plugin_page_standing: Option<PaneId>,
     /// The user's key asked for this plugin's panel to have the keyboard
     /// before the panel was open: it is given it as it opens, and holds
     /// the keyboard meanwhile.
@@ -5512,6 +5525,9 @@ impl TermWindow {
             right_sidebar_snippet_scrollbar_visible_until: None,
             right_sidebar_snippet_listing: Default::default(),
             right_sidebar_plugin: None,
+            plugin_pages: HashMap::new(),
+            plugin_pages_on_show: HashSet::new(),
+            plugin_page_standing: None,
             plugin_panel_focus_asked: None,
             plugin_panel_keys_held: false,
             plugin_field_snapshot: None,
@@ -6831,6 +6847,12 @@ impl TermWindow {
                     self.update_title_post_status();
                     self.persist_workspace_layout_after_mutation("pane label changed");
                 }
+                // Its tab shows what the page says of itself; the layout
+                // keeps what it is opened with.
+                MuxNotification::PageChanged(_) => {
+                    self.update_title_post_status();
+                    self.persist_workspace_layout_after_mutation("page changed");
+                }
                 MuxNotification::PaneAdded(pane_id) => {
                     self.push_window_config_to_pane(pane_id);
                     self.refresh_thread_work_for_pane(pane_id);
@@ -7950,7 +7972,8 @@ impl TermWindow {
                     return true;
                 }
             }
-            MuxNotification::PaneLabelChanged { pane_id, .. } => {
+            MuxNotification::PaneLabelChanged { pane_id, .. }
+            | MuxNotification::PageChanged(pane_id) => {
                 let mux = Mux::get();
                 match mux.resolve_pane_id(pane_id) {
                     Some((_domain_id, window_id, _tab_id)) if window_id == mux_window_id => {
@@ -10505,6 +10528,11 @@ impl TermWindow {
             if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
                 continue;
             }
+            // A page has no output to present and no rows to wait for: its
+            // plugin's frames ask for the paints it needs.
+            if pos.pane.is_page() {
+                continue;
+            }
             let pane_id = pos.pane.pane_id();
             let current = mux.pane_output_generation(pane_id);
             let presented = self
@@ -11862,6 +11890,29 @@ impl TermWindow {
             }
         }
 
+        // The pane holds a plugin's page. A field of the sidebar's, or a view
+        // over the terminal's area, had the clipboard first, above; here
+        // copy and paste are the page's field's, as its keys are; and what
+        // else is done to a terminal's text has nothing to be done to.
+        if pane.is_page() {
+            if let Some(page) = self.plugin_page_in_focus(pane) {
+                match assignment {
+                    CopyTo(destination) => {
+                        self.copy_from_plugin_page(page, *destination);
+                        return Ok(PerformAssignmentResult::Handled);
+                    }
+                    PasteFrom(source) => {
+                        self.paste_into_plugin_page(page, *source);
+                        return Ok(PerformAssignmentResult::Handled);
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(assignment, CopyTo(_)) || ui::plugin_panel::is_about_a_terminal(assignment) {
+                return Ok(PerformAssignmentResult::Handled);
+            }
+        }
+
         if let CopyTo(destination) = assignment {
             let text = self.selection_text(pane);
             if !text.is_empty() {
@@ -12740,6 +12791,7 @@ impl TermWindow {
                 crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
             }
             FocusPluginPanel(plugin) => self.focus_plugin_panel(plugin),
+            PluginAction(name) => self.do_plugin_action(name),
             CheckForUpdates => {
                 crate::settings_window::show_update_page_from(
                     self.mux_window_id,
@@ -13613,6 +13665,7 @@ impl Drop for TermWindow {
             }
         }
         self.close_plugin_panel();
+        self.close_plugin_pages();
         self.clear_gui_recovery_intent();
         gpu_debug(format!(
             "drop main_window backend={} size={}x{} dpi={}",

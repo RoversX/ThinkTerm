@@ -30,8 +30,10 @@
 //! the user chose for it (`FocusPluginPanel`).
 
 mod field;
+mod page;
 
 pub(crate) use field::FieldSnapshot;
+pub(crate) use page::is_about_a_terminal;
 
 use crate::plugins::{self, PanelNews};
 use crate::quad::{HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator};
@@ -58,14 +60,15 @@ use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use thinkterm_plugin_channel::registry::Does;
 use thinkterm_plugin_channel::wire::{PanelRequest, Raw};
 use thinkterm_plugin_panel::player::{
     field_clear_at, field_icon, field_radius, FIELD_ICON, FIELD_INSET,
 };
 use thinkterm_plugin_panel::{
-    feature, Align, Answer, Area, Ask, Bounds, Button, Bytes, CloseButton, Color, Cursor, Draw,
-    Drawn, Entry, EntryKind, Env, FieldPart, Font, Input, Line, Mods, MonoMetrics, Player, Rect,
-    Remote, Size, Terminal, Text, TextMetrics, Token,
+    feature, Align, Answer, Area, Ask, At, Bounds, Button, Bytes, CloseButton, Color, Cursor,
+    Draw, Drawn, Entry, EntryKind, Env, FieldPart, Font, Input, Line, Mods, MonoMetrics, Player,
+    Rect, Remote, Size, Terminal, Text, TextMetrics, Token,
 };
 use url::Url;
 use wezterm_font::LoadedFont;
@@ -115,6 +118,20 @@ pub(crate) struct PluginPanel {
     /// A field text is being selected in by dragging: in the extended view
     /// or the panel, and which.
     selecting: Option<(bool, String)>,
+    /// For a page in a pane's place rather than the panel in the sidebar
+    /// (`page`), the page as its pane last said: what it is opened with
+    /// when its view is opened again.
+    page: Option<thinkterm_proto::PageSpec>,
+    /// When a page was last painted: of those off show, the ones looked at
+    /// longest ago are let go first.
+    last_shown: Instant,
+    /// A page's: which listing of the plugins it was last looked at under
+    /// (`plugins::actions_heard`), so that one the host stopped serving is
+    /// asked for again when they change.
+    listed: u64,
+    /// A page whose pane another machine's mux keeps: the domain its pane
+    /// is of, whose machine's plugin draws it, over a link there.
+    remote: Option<DomainId>,
 }
 
 /// A view the host serves this window -- a panel, or its extended view --
@@ -142,6 +159,13 @@ struct Shown {
     editors: std::collections::HashMap<String, field::Editor>,
     /// Counts edits and caret moves, which what was recorded is painted for.
     edits: u64,
+    /// Off show for now, as a page behind another tab is: it keeps what it
+    /// shows and what was typed in it, and nothing is drawn or asked for.
+    hidden: bool,
+    /// A frame came while it was hidden, and the host was not told it was
+    /// taken in: the host holds the next back until it is, so a hidden view
+    /// hears of one frame and no more.
+    ack_owed: bool,
 }
 
 /// A machine a plugin needs ThinkTerm connected to, and the source Files
@@ -193,6 +217,8 @@ impl Shown {
             connect: None,
             editors: std::collections::HashMap::new(),
             edits: 0,
+            hidden: false,
+            ack_owed: false,
         }
     }
 
@@ -218,6 +244,33 @@ impl PluginPanel {
             && self.shown.player.extend()
             && !self.dismissed
             && !matches!(self.shown.status, Status::Stopped(_))
+    }
+
+    /// Page `page` of plugin `plugin`, as `shown`.
+    fn page(plugin: &str, page: &thinkterm_proto::PageSpec, shown: Shown) -> Self {
+        Self {
+            plugin: plugin.to_string(),
+            shown,
+            opening: 0,
+            extended: None,
+            extended_width: 0,
+            dismissed: false,
+            selecting: None,
+            page: Some(page.clone()),
+            last_shown: Instant::now(),
+            listed: plugins::actions_heard(),
+            remote: None,
+        }
+    }
+
+    /// Opens its view again, as what it is: the host closed it, or the
+    /// session that had it is gone.
+    fn reopen(&self) {
+        let env = self.shown.player.env();
+        match &self.page {
+            Some(page) => plugins::reopen_page(self.shown.view, &self.plugin, env, page),
+            None => plugins::reopen_panel(self.shown.view, &self.plugin, env),
+        }
     }
 
     /// Whether the panel or its extended view has the keyboard.
@@ -690,6 +743,10 @@ impl TermWindow {
                 extended_width,
                 dismissed: false,
                 selecting: None,
+                page: None,
+                last_shown: Instant::now(),
+                listed: plugins::actions_heard(),
+                remote: None,
             });
             return;
         };
@@ -706,7 +763,7 @@ impl TermWindow {
                 shown.env_told = now;
                 shown.env_due = false;
                 panel.opening = panel.opening.wrapping_add(1);
-                plugins::reopen_panel(shown.view, &panel.plugin, shown.player.env());
+                panel.reopen();
                 if lost {
                     self.hold_plugin_panel_keys();
                 }
@@ -883,6 +940,156 @@ impl TermWindow {
         let terminal = cli_terminal(&pane);
         self.plugin_panel_terminal = Some((pane_id, terminal.clone()));
         terminal
+    }
+
+    /// The view numbered `view`, of those this window shows: the sidebar's
+    /// panel, its extended view, or a page. What comes for a view by its
+    /// number -- from the system, or later than it was asked for -- finds
+    /// it here, wherever it is.
+    fn plugin_view_numbered(&mut self, view: u64) -> Option<&mut Shown> {
+        let of_sidebar = self.right_sidebar_plugin.as_ref().is_some_and(|panel| {
+            panel.shown.view == view
+                || panel
+                    .extended
+                    .as_ref()
+                    .is_some_and(|(extended, _)| extended.view == view)
+        });
+        if of_sidebar {
+            let panel = self.right_sidebar_plugin.as_mut()?;
+            return if panel.shown.view == view {
+                Some(&mut panel.shown)
+            } else {
+                panel.extended.as_mut().map(|(extended, _)| extended)
+            };
+        }
+        self.plugin_pages
+            .values_mut()
+            .map(|page| &mut page.shown)
+            .find(|shown| shown.view == view)
+    }
+
+    /// Does the plugin action named `name`, as a key's binding names it:
+    /// opens the plugin's page, or calls the plugin with where the user is
+    /// -- the pane in focus -- added to what its manifest says to call it
+    /// with. One that cannot be done is logged with the reason.
+    pub(crate) fn do_plugin_action(&mut self, name: &str) {
+        let (info, does) = match plugins::action(name) {
+            Ok(found) => found,
+            Err(why) => {
+                log::warn!("plugin action {name}: {why}");
+                return;
+            }
+        };
+        let body = match does {
+            Does::Page(args) => return self.open_plugin_page(&info.id, &args.to_string()),
+            Does::Call(body) => body,
+        };
+        let name = name.to_string();
+        let plugin = info.id.clone();
+        let call = move |at: At| {
+            plugins::call(&info.id, at.added_to(body), move |answer| {
+                if let Err(why) = answer {
+                    log::warn!("plugin action {name}: {why}");
+                }
+            });
+        };
+        let pane = self.get_active_pane_no_overlay();
+        let domain = pane
+            .as_ref()
+            .and_then(|pane| Mux::get().get_domain(pane.domain_id()));
+        let (Some(pane), Some(domain), Some(window)) = (pane, domain, self.window.clone()) else {
+            return call(At::default());
+        };
+        // Where the pane runs is looked at off this thread, as it is for a
+        // panel; the call follows at once.
+        promise::spawn::spawn(async move {
+            let here = promise::spawn::spawn_into_new_thread(move || Ok(runs_here(&domain)))
+                .await
+                .unwrap_or(false);
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                call(term_window.plugin_action_at(&plugin, &pane, here));
+            })));
+        })
+        .detach();
+    }
+
+    /// Where the user is for an action asked for at `pane`, which runs on
+    /// this machine or, `here` not so, on another.
+    fn plugin_action_at(&mut self, plugin: &str, pane: &Arc<dyn Pane>, here: bool) -> At {
+        if let Some(page) = pane.page() {
+            return self.plugin_action_at_page(plugin, pane, &page);
+        }
+        let directory = pane.get_current_working_dir(CachePolicy::AllowStale);
+        let (cwd, remote) = if here {
+            (directory.and_then(|url| local_path(&url)), None)
+        } else {
+            // The machine is found for the pane in focus: none is named
+            // for one the user has left meanwhile.
+            let in_focus = self
+                .get_active_pane_no_overlay()
+                .is_some_and(|now| now.pane_id() == pane.pane_id());
+            match in_focus.then(|| self.plugin_panel_remote(pane.pane_id(), pane)) {
+                Some(Beside::There(remote)) => (None, Some(remote)),
+                _ => (None, None),
+            }
+        };
+        At {
+            cwd,
+            remote,
+            terminal: cli_terminal(pane),
+            page: None,
+        }
+    }
+
+    /// Where the user is, for an action of plugin `plugin` asked for at
+    /// pane `pane`, which holds page `page`: a page is no terminal, so at
+    /// the one it was opened from, in its directory then -- and, to the
+    /// page's own plugin, at the page. A page of another machine's is that
+    /// machine's plugin's, and only where it was opened from is told.
+    fn plugin_action_at_page(
+        &mut self,
+        plugin: &str,
+        pane: &Arc<dyn Pane>,
+        page: &thinkterm_proto::PageSpec,
+    ) -> At {
+        let domain_id = pane.domain_id();
+        let cwd = (!page.cwd.is_empty()).then(|| page.cwd.clone());
+        if page::kept_here(domain_id) {
+            return At {
+                cwd,
+                remote: None,
+                terminal: page.terminal.map(|terminal| page::page_terminal(domain_id, terminal)),
+                page: (page.plugin == plugin).then(|| page.id.clone()),
+            };
+        }
+        // The terminal there is reached through this window, as the ones of
+        // that machine beside a panel are; the machine is found for the pane
+        // in focus only, as there.
+        let mux = Mux::get();
+        let mirror = page.terminal.and_then(|terminal| {
+            let domain = mux.get_domain(domain_id)?;
+            let client = domain.downcast_ref::<wezterm_client::domain::ClientDomain>()?;
+            mux.get_pane(client.remote_to_local_pane_id(terminal as PaneId)?)
+        });
+        let in_focus = self
+            .get_active_pane_no_overlay()
+            .is_some_and(|now| now.pane_id() == pane.pane_id());
+        let remote = match (cwd, in_focus) {
+            (Some(cwd), true) => self.plugin_panel_reach_of(pane.pane_id()).as_ref().ok().map(
+                |reach| Remote {
+                    host: reach.host.clone(),
+                    machine: reach.machine.clone(),
+                    cwd,
+                },
+            ),
+            _ => None,
+        };
+        At {
+            cwd: None,
+            remote,
+            terminal: mirror.as_ref().and_then(cli_terminal),
+            page: None,
+        }
     }
 
     /// Whether the panes of domain `domain_id` run on this machine: `None`
@@ -1091,20 +1298,6 @@ impl TermWindow {
         }
     }
 
-    /// The view of this window's panel numbered `view`: the panel, or its
-    /// extended view.
-    fn plugin_view_numbered(&mut self, view: u64) -> Option<&mut Shown> {
-        let panel = self.right_sidebar_plugin.as_mut()?;
-        if panel.shown.view == view {
-            return Some(&mut panel.shown);
-        }
-        panel
-            .extended
-            .as_mut()
-            .map(|(extended, _)| extended)
-            .filter(|extended| extended.view == view)
-    }
-
     /// Finds out, on a thread of its own, whether the panes of `domain`,
     /// `domain_id`, run on this machine, and paints the panel again once it
     /// knows: on Windows, telling a WSL domain from a plain one asks WSL.
@@ -1146,6 +1339,13 @@ impl TermWindow {
     }
 
     fn plugin_panel_hear(&mut self, view: u64, news: PanelNews) {
+        // About a page: heard as the panel's is, with the page in its place;
+        // what its plugin changed of the page goes to the mux.
+        if let Some(pane_id) = self.plugin_page_of_view(view) {
+            self.with_plugin_page(pane_id, |this| this.plugin_panel_hear(view, news));
+            self.follow_plugin_page_change(pane_id);
+            return;
+        }
         let news = match news {
             PanelNews::Remote { id, machine, ask } => {
                 if self.plugin_view_numbered(view).is_none() {
@@ -1173,7 +1373,7 @@ impl TermWindow {
                     shown.env_told = Instant::now();
                     shown.env_due = false;
                     panel.opening = panel.opening.wrapping_add(1);
-                    plugins::reopen_panel(view, &panel.plugin, shown.player.env());
+                    panel.reopen();
                 }
                 news => heard(shown, &panel.plugin, news),
             }
@@ -1192,6 +1392,26 @@ impl TermWindow {
         } else {
             // A view this window let go of meanwhile.
             return;
+        }
+        // A page its plugin asked for in answer to a press: opened as a
+        // tab, with what the plugin said to open it with. Asked by a page,
+        // it opens beside that page, on its machine.
+        let asked = self.right_sidebar_plugin.as_mut().and_then(|panel| {
+            let args = panel.shown.player.take_page_asked().or_else(|| {
+                let (extended, _) = panel.extended.as_mut()?;
+                extended.player.take_page_asked()
+            })?;
+            Some((panel.plugin.clone(), args))
+        });
+        if let Some((plugin, args)) = asked {
+            let args = match args {
+                serde_json::Value::Null => String::new(),
+                args => args.to_string(),
+            };
+            match self.plugin_page_standing {
+                Some(pane_id) => self.open_plugin_page_beside(pane_id, &plugin, &args),
+                None => self.open_plugin_page(&plugin, &args),
+            }
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -1810,7 +2030,7 @@ impl TermWindow {
                 .map(|(at, _)| at)
                 .chain(std::iter::once(paragraph.len()))
                 .collect();
-            for line in break_text(&chars, &xs, width) {
+            for line in thinkterm_plugin_panel::wrap::lines(&chars, &xs, width) {
                 if lines.len() == room {
                     left_over = true;
                     break 'text;
@@ -2059,47 +2279,6 @@ fn local_path(url: &Url) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
-/// Where `chars`, whose boundaries are at `xs` -- as many as it has
-/// characters, and one -- break into lines no wider than `width`: at the
-/// last place that keeps one within it, after a space or between the
-/// characters of a script written without spaces, or else where it
-/// overflows. Only between whole clusters -- a letter and its accents, an
-/// emoji's parts, which `xs` gives the cluster's start -- and a line's
-/// spaces stay at its end, hanging past the edge.
-fn break_text(chars: &[char], xs: &[f32], width: f32) -> Vec<std::ops::Range<usize>> {
-    let count = chars.len();
-    let bounds: Vec<usize> = (0..=count)
-        .filter(|&at| at == 0 || at == count || xs[at] > xs[at - 1])
-        .collect();
-    let mut lines = Vec::new();
-    let mut from = 0;
-    loop {
-        let start = bounds[from];
-        // A cluster at least, then as many more as fit.
-        let mut to = (from + 1).min(bounds.len() - 1);
-        while let Some(&next) = bounds.get(to + 1) {
-            let hangs = chars[bounds[to]..next].iter().all(|c| c.is_whitespace());
-            if !hangs && xs[next] - xs[start] > width {
-                break;
-            }
-            to += 1;
-        }
-        if bounds[to] < count {
-            if let Some(found) = (from + 1..=to)
-                .rev()
-                .find(|&at| field::breaks_before(chars, bounds[at]))
-            {
-                to = found;
-            }
-        }
-        lines.push(start..bounds[to]);
-        from = to;
-        if bounds[from] >= count {
-            return lines;
-        }
-    }
-}
-
 /// Pane `pane` as `thinkterm cli` reaches it. One the session server keeps
 /// for this machine, by its number there and the server's socket: as the
 /// programs in it reach it. Any other by its number here and the socket
@@ -2153,13 +2332,14 @@ fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, sc
             feature::KEYS.to_string(),
             feature::WRAP.to_string(),
         ],
+        pointer: Default::default(),
     }
 }
 
 /// Sends the plugin what the view's lists need next, once it is told the
 /// size they are drawn for.
 fn send_wanted(shown: &mut Shown) {
-    if shown.env_due {
+    if shown.env_due || shown.hidden {
         return;
     }
     for wanted in shown.player.wanted() {
@@ -2197,7 +2377,11 @@ fn heard(shown: &mut Shown, plugin: &str, news: PanelNews) {
         PanelNews::Frame(frame) => {
             shown.player.frame(frame);
             shown.status = Status::Open;
-            plugins::tell_panel(shown.view, PanelRequest::Shown);
+            if shown.hidden {
+                shown.ack_owed = true;
+            } else {
+                plugins::tell_panel(shown.view, PanelRequest::Shown);
+            }
             // The keyboard may have moved with it, or left with a field.
             shown.tell();
             send_wanted(shown);
@@ -2205,6 +2389,9 @@ fn heard(shown: &mut Shown, plugin: &str, news: PanelNews) {
         PanelNews::Rows(rows) => {
             shown.player.rows(rows);
             send_wanted(shown);
+        }
+        PanelNews::Heard => {
+            shown.player.heard();
         }
         PanelNews::Closed { reason, again } => {
             shown.status = if again {
@@ -2344,47 +2531,6 @@ mod tests {
         assert_eq!(host_name("user@devbox:2222"), "devbox");
         assert_eq!(host_name("[fe80::1]:22"), "fe80::1");
         assert_eq!(host_name("fe80::1"), "fe80::1");
-    }
-
-    #[test]
-    fn text_breaks_after_a_space_between_unspaced_characters_or_where_it_overflows() {
-        // A column a character, two for Chinese.
-        let lines = |text: &str, width: f32| {
-            let chars: Vec<char> = text.chars().collect();
-            let mut xs = vec![0.0];
-            for ch in &chars {
-                let wide = if (*ch as u32) >= 0x2E80 { 2.0 } else { 1.0 };
-                xs.push(xs.last().unwrap() + wide);
-            }
-            super::break_text(&chars, &xs, width)
-                .into_iter()
-                .map(|line| {
-                    chars[line]
-                        .iter()
-                        .collect::<String>()
-                        .trim_end()
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            lines("the quick brown fox", 10.0),
-            ["the quick", "brown fox"]
-        );
-        assert_eq!(
-            lines("a b c d", 3.0),
-            ["a b", "c d"],
-            "a space hangs past the edge"
-        );
-        assert_eq!(lines("abcdefghijkl", 5.0), ["abcde", "fghij", "kl"]);
-        assert_eq!(lines("中文的句子很长", 6.0), ["中文的", "句子很", "长"]);
-        assert_eq!(lines("中文。句子", 4.0), ["中", "文。", "句子"]);
-        assert_eq!(lines("", 4.0), [""]);
-
-        // A letter and its accent are one cluster: its start is theirs.
-        let chars: Vec<char> = "ab\u{301}c".chars().collect();
-        let broken = super::break_text(&chars, &[0.0, 10.0, 10.0, 20.0, 30.0], 10.0);
-        assert_eq!(broken, [0..1, 1..3, 3..4]);
     }
 
     #[test]

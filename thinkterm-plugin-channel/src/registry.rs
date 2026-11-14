@@ -104,6 +104,12 @@ pub struct Info {
     /// The panel it adds to the right sidebar, if it adds one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<Panel>,
+    /// The page it can be opened as, in a pane's place, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<Page>,
+    /// What it does when asked by name, as its manifest lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<Action>,
     /// How long it runs unused: the user's choice, else its manifest's.
     /// A built-in plugin runs inside the host, and is never started or
     /// stopped: this is its default.
@@ -121,6 +127,54 @@ pub struct Panel {
     /// A Lucide icon's name, for the selector; one a client does not have
     /// shows as a puzzle piece.
     pub icon: String,
+}
+
+/// A plugin's page: a view of it in a pane's place, a tab of its own or
+/// beside a terminal, under the plugin's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page {
+    /// A Lucide icon's name, for its tab; one a client does not have shows
+    /// as a puzzle piece.
+    pub icon: String,
+}
+
+/// Something a plugin does when the user asks for it by name -- from the
+/// command palette, with a key, with `thinkterm plugin do` -- and not from
+/// one of its own views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Action {
+    /// Its name among the plugin's actions: with the plugin's id before it
+    /// and a "." between ([`Action::name`]), its name among them all.
+    pub id: String,
+    /// What it is listed as, after the plugin's name.
+    pub title: String,
+    #[serde(flatten)]
+    pub does: Does,
+}
+
+/// What asking for an action comes to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Does {
+    /// The plugin is called with this, and with where the user was added
+    /// to it as `at`.
+    Call(serde_json::Value),
+    /// The plugin's page is opened with this.
+    Page(serde_json::Value),
+}
+
+impl Action {
+    /// The name plugin `plugin`'s action `action` goes by wherever every
+    /// plugin's are told apart: a key's binding, a command line.
+    pub fn name(plugin: &str, action: &str) -> String {
+        format!("{plugin}.{action}")
+    }
+
+    /// The plugin and the action a name is of. Neither id has a "." in it.
+    pub fn named(name: &str) -> Option<(&str, &str)> {
+        name.split_once('.')
+            .filter(|(plugin, action)| !plugin.is_empty() && !action.is_empty())
+    }
 }
 
 impl Info {
@@ -201,7 +255,7 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, to_value};
+    use serde_json::{from_value, json, to_value};
 
     #[test]
     fn requests_states_and_events_are_tagged_json() {
@@ -253,6 +307,29 @@ mod tests {
     }
 
     #[test]
+    fn an_action_reads_as_its_manifest_writes_it_and_has_one_name() {
+        let call = Action {
+            id: "new-card".into(),
+            title: "New card".into(),
+            does: Does::Call(json!({"op": "new"})),
+        };
+        let written = json!({"id": "new-card", "title": "New card", "call": {"op": "new"}});
+        assert_eq!(to_value(&call).unwrap(), written);
+        assert_eq!(from_value::<Action>(written).unwrap(), call);
+        let page: Action =
+            from_value(json!({"id": "open", "title": "Open", "page": {"board": "a"}})).unwrap();
+        assert_eq!(page.does, Does::Page(json!({"board": "a"})));
+        // A list from a host that knows no actions has none.
+        let old = json!({"id": "a", "name": "A", "enabled": true, "state": {"kind": "idle"}});
+        assert!(from_value::<Info>(old).unwrap().actions.is_empty());
+
+        assert_eq!(Action::name("board", "new-card"), "board.new-card");
+        assert_eq!(Action::named("board.new-card"), Some(("board", "new-card")));
+        assert_eq!(Action::named("board"), None);
+        assert_eq!(Action::named(".new-card"), None);
+    }
+
+    #[test]
     fn a_plugin_is_usable_while_on_and_not_broken() {
         let mut info = Info {
             id: "a".into(),
@@ -265,6 +342,8 @@ mod tests {
             enabled: true,
             state: State::Idle,
             panel: None,
+            page: None,
+            actions: Vec::new(),
             background: Background::Briefly,
             background_default: Background::Briefly,
         };

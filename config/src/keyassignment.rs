@@ -664,6 +664,9 @@ pub enum KeyAssignment {
     /// keyboard -- in its first field, if it has one. Pressed again while
     /// the panel has it, the keyboard goes back to the terminal.
     FocusPluginPanel(String),
+    /// Do one of a plugin's actions, named by the plugin's id, a "." and
+    /// the action's, as its manifest lists them: `board.new-card`.
+    PluginAction(String),
     ActivateCommandPalette,
     /// Switch this window's color scheme. `None` reverts to the configured
     /// default. Applied through the window's config_overrides, the same

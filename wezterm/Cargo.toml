@@ -53,6 +53,7 @@ termwiz-funcs.workspace = true
 termwiz.workspace = true
 textwrap.workspace  =true
 thinkterm-plugin-channel = { workspace = true, features = ["native"] }
+thinkterm-plugin-panel.workspace = true
 thinkterm-proto.workspace = true
 thinkterm-tui = { path = "../thinkterm-tui" }
 thinkterm-update.workspace = true

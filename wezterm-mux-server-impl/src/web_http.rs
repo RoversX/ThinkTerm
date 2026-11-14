@@ -27,6 +27,12 @@ pub const SUBPROTOCOL: &str = "thinkterm.v1";
 /// The page asking this server to reach another machine for it
 /// (`web_relay`): the same token, a different conversation.
 pub const RELAY_SUBPROTOCOL: &str = "thinkterm.relay.v1";
+/// A page that is already here opening a second socket, for the plugin
+/// host's frames alone (`PluginFrame`): what a plugin draws does not wait
+/// behind what the terminals print, nor the other way round. The same
+/// token, admitted and revoked with it; to the mux, one more connection,
+/// which never says who it is and so is no client in anyone's list.
+pub const PLUGINS_SUBPROTOCOL: &str = "thinkterm.plugins.v1";
 pub const TOKEN_PROTOCOL_PREFIX: &str = "tt-token.";
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -285,9 +291,29 @@ pub enum Route {
     /// Serve this file from the bundle.
     Static(PathBuf),
     /// A WebSocket upgrade carrying a token; verified by the caller.
-    /// `relay` is the page asking for another machine rather than this one.
-    Upgrade { key: String, token: String, relay: bool },
+    Upgrade { key: String, token: String, wanted: Wanted },
     Reject { status: u16, reason: &'static str },
+}
+
+/// What a socket is for, by the subprotocol it asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wanted {
+    /// This machine's mux.
+    Mux,
+    /// Another machine, reached from this one (`web_relay`).
+    Relay,
+    /// The plugin host's frames, beside a socket of the first kind.
+    Plugins,
+}
+
+impl Wanted {
+    fn subprotocol(self) -> &'static str {
+        match self {
+            Self::Mux => SUBPROTOCOL,
+            Self::Relay => RELAY_SUBPROTOCOL,
+            Self::Plugins => PLUGINS_SUBPROTOCOL,
+        }
+    }
 }
 
 fn reject(status: u16, reason: &'static str) -> Route {
@@ -336,10 +362,13 @@ pub fn route(site: &WebSite, req: &Request) -> Route {
         None => return reject(403, "Origin required"),
     }
     let protocols = req.header_list("sec-websocket-protocol");
-    let relay = !protocols.iter().any(|p| p == SUBPROTOCOL);
-    if relay && !protocols.iter().any(|p| p == RELAY_SUBPROTOCOL) {
+    let Some(wanted) = [Wanted::Mux, Wanted::Relay, Wanted::Plugins]
+        .iter()
+        .copied()
+        .find(|wanted| protocols.iter().any(|p| p == wanted.subprotocol()))
+    else {
         return reject(400, "Unknown WebSocket subprotocol");
-    }
+    };
     let mut tokens = protocols
         .iter()
         .filter_map(|p| p.strip_prefix(TOKEN_PROTOCOL_PREFIX));
@@ -347,7 +376,7 @@ pub fn route(site: &WebSite, req: &Request) -> Route {
         (Some(token), None) if !token.is_empty() => Route::Upgrade {
             key: key.to_string(),
             token: token.to_string(),
-            relay,
+            wanted,
         },
         _ => reject(401, "Web token required"),
     }
@@ -763,7 +792,7 @@ where
             )
             .await
         }
-        Route::Upgrade { key, token, relay } => {
+        Route::Upgrade { key, token, wanted } => {
             // Taken here and nowhere else: the header belongs to the
             // connection being admitted, and there is no second chance to
             // read it once the socket becomes a mux stream.
@@ -788,7 +817,7 @@ where
             // Admitted: the seat is for the unauthenticated wait only.
             drop(seat);
             let accept = accept_key(&key);
-            let protocol = if relay { RELAY_SUBPROTOCOL } else { SUBPROTOCOL };
+            let protocol = wanted.subprotocol();
             let reply = format!(
                 "HTTP/1.1 101 Switching Protocols\r\n\
                  Upgrade: websocket\r\n\
@@ -802,7 +831,7 @@ where
             }
             let _ = stream.flush().await;
             let leftover = head[head_len..].to_vec();
-            if relay {
+            if wanted == Wanted::Relay {
                 log::info!(
                     "web relay admitted on {} with token {}",
                     site.describe,
@@ -824,8 +853,14 @@ where
                 .label
                 .clone()
                 .unwrap_or_else(|| admission.token_id.clone());
+            let beside = wanted == Wanted::Plugins;
+            if beside {
+                // The page it is beside is the browser: this is not another.
+                admission.beside();
+            }
             log::info!(
-                "web client admitted on {} with token {} ({peer_label})",
+                "web {} admitted on {} with token {} ({peer_label})",
+                if beside { "plugin socket" } else { "client" },
                 site.describe,
                 admission.token_id,
             );
@@ -840,7 +875,8 @@ where
                 log::error!("web client connection ended: {err:#}");
             }
             log::info!(
-                "web client with token {} disconnected",
+                "web {} with token {} disconnected",
+                if beside { "plugin socket" } else { "client" },
                 admission.token_id
             );
             drop(admission);
@@ -1024,7 +1060,7 @@ mod tests {
             Route::Upgrade {
                 key: "dGhlIHNhbXBsZSBub25jZQ==".into(),
                 token: "abc".into(),
-                relay: false,
+                wanted: Wanted::Mux,
             }
         );
         let relay = request(
@@ -1032,7 +1068,19 @@ mod tests {
             "/ws",
             &upgrade_headers("http://localhost:8088", "thinkterm.relay.v1, tt-token.abc"),
         );
-        assert!(matches!(route(&site, &relay), Route::Upgrade { relay: true, .. }));
+        assert!(matches!(route(&site, &relay), Route::Upgrade { wanted: Wanted::Relay, .. }));
+        let plugins = request(
+            "GET",
+            "/ws",
+            &upgrade_headers("http://localhost:8088", "thinkterm.plugins.v1, tt-token.abc"),
+        );
+        assert!(matches!(route(&site, &plugins), Route::Upgrade { wanted: Wanted::Plugins, .. }));
+        let unknown = request(
+            "GET",
+            "/ws",
+            &upgrade_headers("http://localhost:8088", "thinkterm.v9, tt-token.abc"),
+        );
+        assert!(matches!(route(&site, &unknown), Route::Reject { status: 400, .. }));
         let foreign = request(
             "GET",
             "/ws",

@@ -285,6 +285,27 @@ impl PaneSummary {
 pub trait Pane: Downcast + Send + Sync {
     fn pane_id(&self) -> PaneId;
 
+    /// The plugin's page this pane holds in place of a terminal, for the
+    /// one that does (`crate::pagepane`): none of what is asked of a
+    /// terminal -- its lines, its program, its input -- means anything of
+    /// it. A terminal says none.
+    fn page(&self) -> Option<thinkterm_proto::PageSpec> {
+        None
+    }
+
+    /// Whether this pane holds a page, for those who only ask that: a
+    /// page's description is not copied out for them.
+    fn is_page(&self) -> bool {
+        self.page().is_some()
+    }
+
+    /// Changes what the page this pane holds says of itself, as its plugin
+    /// asked: the mux that keeps the pane keeps the change, and tells every
+    /// client (`MuxNotification::PageChanged`). A terminal has no page.
+    fn change_page(&self, _edit: thinkterm_proto::PageEdit) -> anyhow::Result<()> {
+        anyhow::bail!("pane {} holds no page", self.pane_id())
+    }
+
     /// Returns the 0-based cursor position relative to the top left of
     /// the visible screen
     fn get_cursor_position(&self) -> StableCursorPosition;

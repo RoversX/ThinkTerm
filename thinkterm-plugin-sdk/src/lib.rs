@@ -147,13 +147,18 @@ impl<P: Plugin + ?Sized> Plugin for Box<P> {
 
 /// A panel of the plugin on show. The same plugin can be on show in
 /// several places at once -- two windows, a browser -- each a view of its
-/// own, with its own size. A panel's extended view is a view as well.
+/// own, with its own size. A panel's extended view is a view as well, and
+/// so is a page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
     pub id: u64,
     pub env: Env,
     /// For an extended view, the panel it extends.
     pub extends: Option<u64>,
+    /// For a page -- a view in a pane's place, which a plugin has when its
+    /// manifest has a `[page]` -- which page, and what it was opened with.
+    /// `None` for a panel and for an extended view.
+    pub page: Option<Page>,
     /// For a panel, its extended view while one is on show: the panel is
     /// drawn again when it comes and when it goes.
     pub extension: Option<u64>,
@@ -163,6 +168,26 @@ pub struct View {
     pub focus: Option<Focus>,
 }
 
+/// The page a view shows ([`View::page`]).
+///
+/// A page is opened in a view each time it is looked at anew: when it is
+/// opened, when it comes back after it was hidden a while, after ThinkTerm
+/// restarts, on each device that shows it. Each view has a number of its
+/// own; the page's `id` is the same in all of them, so what the plugin
+/// keeps of a page -- where in it the user was, what they typed -- it keeps
+/// by that, and finds again. What it is opened with is kept by ThinkTerm:
+/// the plugin changes it with [`Frame::change_page`], and the page is opened
+/// with what it was changed to from then on.
+///
+/// Its [`View::env`] says where the user was when the page was opened: the
+/// terminal then in focus, and its directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+    pub id: String,
+    /// What it was opened with, or last changed to: null for nothing.
+    pub args: Value,
+}
+
 impl View {
     /// A panel of `env`'s size, numbered `id`.
     pub fn new(id: u64, env: Env) -> Self {
@@ -170,6 +195,7 @@ impl View {
             id,
             env,
             extends: None,
+            page: None,
             extension: None,
             focus: None,
         }
@@ -178,6 +204,11 @@ impl View {
     /// Whether this is a panel's extended view.
     pub fn extended(&self) -> bool {
         self.extends.is_some()
+    }
+
+    /// Whether this is a page rather than a panel in the sidebar.
+    pub fn is_page(&self) -> bool {
+        self.page.is_some()
     }
 
     /// The panel this view belongs to: itself, or the one it extends.
@@ -202,35 +233,50 @@ impl View {
     /// # }
     /// ```
     pub fn cli(&self) -> Option<std::process::Command> {
-        let terminal = self.env.terminal.as_ref()?;
-        // The one ThinkTerm ships beside the plugin host; on the PATH for
-        // a plugin started some other way.
-        let program = std::env::var_os("THINKTERM_CLI").unwrap_or_else(|| "thinkterm".into());
-        let mut command = std::process::Command::new(program);
-        command.arg("cli").arg("--no-auto-start");
-        match &terminal.socket {
-            Some(socket) => {
-                command.env("WEZTERM_UNIX_SOCKET", socket);
-            }
-            None => {
-                command
-                    .env_remove("WEZTERM_UNIX_SOCKET")
-                    .arg("--prefer-mux");
-            }
-        }
-        command
-            .env("WEZTERM_PANE", terminal.pane.to_string())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped());
-        #[cfg(windows)]
-        {
-            // A console program, which would open a window of its own.
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        Some(command)
+        self.env.terminal.as_ref().map(cli)
     }
+}
+
+/// `thinkterm cli`, as [`View::cli`] has it, for `terminal`: the one beside
+/// a view, or the one an action of the plugin's was asked for at, which
+/// ThinkTerm adds to the action's call ([`panel::At::of`]).
+///
+/// ```no_run
+/// # fn typed(body: &serde_json::Value) -> Option<()> {
+/// let at = thinkterm_plugin_sdk::panel::At::of(body)?;
+/// let mut cli = thinkterm_plugin_sdk::cli(at.terminal.as_ref()?);
+/// cli.args(["send-text", "--no-paste", "hello"]).status().ok()?;
+/// # Some(())
+/// # }
+/// ```
+pub fn cli(terminal: &panel::Terminal) -> std::process::Command {
+    // The one ThinkTerm ships beside the plugin host; on the PATH for
+    // a plugin started some other way.
+    let program = std::env::var_os("THINKTERM_CLI").unwrap_or_else(|| "thinkterm".into());
+    let mut command = std::process::Command::new(program);
+    command.arg("cli").arg("--no-auto-start");
+    match &terminal.socket {
+        Some(socket) => {
+            command.env("WEZTERM_UNIX_SOCKET", socket);
+        }
+        None => {
+            command
+                .env_remove("WEZTERM_UNIX_SOCKET")
+                .arg("--prefer-mux");
+        }
+    }
+    command
+        .env("WEZTERM_PANE", terminal.pane.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        // A console program, which would open a window of its own.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 /// What a call does besides answering, all of it sent once the answer is.
@@ -586,7 +632,12 @@ impl Runner {
                     self.dirty_all();
                 }
             }
-            ToPlugin::Open { view, env, extends } => {
+            ToPlugin::Open {
+                view,
+                env,
+                extends,
+                page,
+            } => {
                 // The panel an extended view extends knows it by.
                 if let Some(panel) = extends.and_then(|panel| self.views.get_mut(&panel)) {
                     panel.view.extension = Some(view);
@@ -595,6 +646,10 @@ impl Runner {
                 let shown = Shown {
                     view: View {
                         extends,
+                        page: page.map(|page| Page {
+                            id: page.id,
+                            args: page.args,
+                        }),
                         ..View::new(view, env)
                     },
                     last: None,

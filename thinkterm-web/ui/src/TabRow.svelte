@@ -4,7 +4,7 @@
   // right panel's toggle. What `chrome::TabStrip::render` drew.
   import { onChromeClick } from './chrome';
   import { s, views } from './client.svelte';
-  import { link2, panelLeft, panelRight, plus, squareTerminal, x } from './icons';
+  import { iconByName, link2, panelLeft, panelRight, plus, puzzle, squareTerminal, x } from './icons';
   import { closePanel, hidePanel, machines, openPanel } from './machines.svelte';
   import { iconClass } from './tabicons.svelte';
   import { openMenu } from './menu.svelte';
@@ -72,7 +72,7 @@
   <span class="strip">
   {#each tabs as tab (tab.tab)}
     <span class="tab" class:current={tab.current && !machines.panel} data-pane={tab.target} data-tab={tab.tab} title={tab.title}>
-      {#if icon}<span class="ticon {icon}"><i></i></span>{:else}{@html squareTerminal}{/if}<span class="t">{short(tab.label)}</span><span
+      {#if tab.page}{@html iconByName(tab.page) ?? puzzle}{:else if icon}<span class="ticon {icon}"><i></i></span>{:else}{@html squareTerminal}{/if}<span class="t">{short(tab.label)}</span><span
         class="x"
         class:danger={controls?.closing === tab.tab}
         data-action="close-tab"

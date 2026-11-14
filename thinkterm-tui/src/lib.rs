@@ -3124,6 +3124,10 @@ async fn report_viewport_if_changed<T: termwiz::terminal::Terminal>(
 fn poll_panes(state: &TuiState) {
     for pane in &state.layout.panes {
         if let Some(handle) = Mux::get().get_pane(pane.pane_id) {
+            // A plugin's page has no rows to ask after.
+            if handle.is_page() {
+                continue;
+            }
             let _ = handle.get_changed_since(0..0, handle.get_current_seqno());
         }
     }

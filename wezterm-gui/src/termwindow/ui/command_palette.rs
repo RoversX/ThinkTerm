@@ -1202,10 +1202,7 @@ impl crate::TermWindow {
         self.finish_inline_tab_rename(true);
         self.hover_tooltip = None;
         let root = self.build_command_palette_root();
-        let keymap_commands = CommandDef::expanded_commands(&self.config)
-            .into_iter()
-            .map(|command| (command.brief.to_string(), command.action))
-            .collect();
+        let keymap_commands = CommandDef::keymap_commands(&self.config);
         self.command_palette = Some(CommandPaletteState::new(root, keymap_commands));
         self.invalidate_window();
     }

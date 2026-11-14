@@ -6,6 +6,7 @@
 //! of an ssh session somewhere.
 
 use crate::localpane::LocalPane;
+use crate::pagepane::PagePane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::WindowId;
@@ -22,6 +23,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use thinkterm_proto::PageSpec;
 use wezterm_term::TerminalSize;
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
@@ -44,6 +46,8 @@ pub enum SplitSource {
         command_dir: Option<String>,
     },
     MovePane(PaneId),
+    /// A plugin's page, in a pane that runs nothing.
+    Page(PageSpec),
 }
 
 #[async_trait(?Send)]
@@ -106,6 +110,9 @@ pub trait Domain: Downcast + Send + Sync {
                 self.spawn_pane(split_size.second, command, command_dir)
                     .await?
             }
+            SplitSource::Page(page) => {
+                self.new_page_pane(split_size.second, page, Some(pane_id))?
+            }
             SplitSource::MovePane(_) => unreachable!("MovePane handled above"),
         };
 
@@ -119,6 +126,63 @@ pub trait Domain: Downcast + Send + Sync {
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>>;
+
+    /// The pane of a plugin's page, of this domain, opened beside pane
+    /// `beside`: a page opened anew is given its id and where the user was
+    /// here (`pagepane::opened`). A page runs nothing, so a domain whose
+    /// panes are made here has no more to do than make it; one that cannot
+    /// hold a page says why.
+    fn new_page_pane(
+        &self,
+        size: TerminalSize,
+        page: PageSpec,
+        beside: Option<PaneId>,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let page = crate::pagepane::opened(&Mux::get(), page, beside);
+        let pane: Arc<dyn Pane> = Arc::new(PagePane::new(
+            alloc_pane_id(),
+            self.domain_id(),
+            size,
+            page,
+        ));
+        Mux::get().add_pane(&pane)?;
+        Ok(pane)
+    }
+
+    /// A tab of `window` that holds a plugin's page, as `spawn` makes one
+    /// that holds a terminal, opened from pane `beside`, the one in focus.
+    /// A domain that mirrors another mux has that one make it.
+    async fn spawn_page(
+        &self,
+        size: TerminalSize,
+        page: PageSpec,
+        window: WindowId,
+        beside: Option<PaneId>,
+    ) -> anyhow::Result<Arc<Tab>> {
+        let pane = self.new_page_pane(size, page, beside)?;
+
+        let tab = Arc::new(Tab::new(&size));
+        tab.assign_pane(&pane);
+
+        let mux = Mux::get();
+        mux.add_tab_and_active_pane(&tab)?;
+        mux.add_tab_to_window(&tab, window)?;
+
+        Ok(tab)
+    }
+
+    /// The pane of a plugin's page destined for the pane stack containing
+    /// `base_pane_id`, as `spawn_pane_in_stack` spawns a terminal for one:
+    /// the caller inserts it, and a domain that mirrors another mux has
+    /// that one do both.
+    async fn spawn_page_in_stack(
+        &self,
+        base_pane_id: PaneId,
+        size: TerminalSize,
+        page: PageSpec,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        self.new_page_pane(size, page, Some(base_pane_id))
+    }
 
     /// Spawn a pane destined for the pane stack containing `base_pane_id`
     /// (a level-2 tab). The default just spawns a detached pane and leaves

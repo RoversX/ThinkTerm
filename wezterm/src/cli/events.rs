@@ -564,6 +564,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            pane_pages: HashMap::new(),
         }
     }
 

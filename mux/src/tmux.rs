@@ -377,6 +377,16 @@ impl Domain for TmuxDomain {
         anyhow::bail!("Intention: we use tmux command to do so");
     }
 
+    /// The panes here are tmux's own, and tmux knows no page.
+    fn new_page_pane(
+        &self,
+        _size: TerminalSize,
+        _page: thinkterm_proto::PageSpec,
+        _beside: Option<PaneId>,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        anyhow::bail!("a tmux window holds no plugin's page")
+    }
+
     async fn split_pane(
         &self,
         source: SplitSource,
@@ -386,6 +396,9 @@ impl Domain for TmuxDomain {
     ) -> anyhow::Result<Arc<dyn Pane>> {
         if matches!(source, SplitSource::MovePane(_)) {
             anyhow::bail!("moving an existing pane is not supported by TmuxDomain");
+        }
+        if matches!(source, SplitSource::Page(_)) {
+            anyhow::bail!("a tmux window holds no plugin's page");
         }
         let mut promise = promise::Promise::new();
         if let Some(future) = promise.get_future() {

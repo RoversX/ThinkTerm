@@ -24,6 +24,8 @@ pub const SUBPROTOCOL: &str = "thinkterm.v1";
 pub const TOKEN_PROTOCOL_PREFIX: &str = "tt-token.";
 /// Another machine, reached through the page's server (`web_relay` there).
 pub const RELAY_SUBPROTOCOL: &str = "thinkterm.relay.v1";
+/// A second socket to the page's server, for the plugin host's frames.
+pub const PLUGINS_SUBPROTOCOL: &str = "thinkterm.plugins.v1";
 
 // Allow one maximum codec payload plus its three varint header fields.
 // Independent chunk accounting bounds overhead for tiny WebSocket messages.
@@ -143,6 +145,8 @@ struct Inner {
     pub lease: RefCell<Lease>,
     url: String,
     token: String,
+    /// What the socket is for, as the server is told when it is opened.
+    protocol: &'static str,
     /// For another machine: the page's own code opens the socket and
     /// answers the relay's questions (a password, a host key), and hands
     /// it back ready to carry the mux connection. Used in place of `url`
@@ -158,17 +162,34 @@ impl WsLink {
     /// Open the socket with the token in the subprotocol list, and wait for
     /// the server to accept it.
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
-        let socket = Self::open(url, token).await?;
-        Ok(Self::around(socket, url, token, None))
+        let socket = Self::open(url, token, SUBPROTOCOL).await?;
+        Ok(Self::around(socket, url, token, SUBPROTOCOL, None))
+    }
+
+    /// A second socket to the server this one is to, for the plugin host's
+    /// frames. None for another machine: its socket is the one the relay
+    /// opened for the page, and there is no asking it for a second.
+    pub async fn beside(&self) -> Result<Option<Self>> {
+        if self.0.opener.is_some() {
+            return Ok(None);
+        }
+        let socket = Self::open(&self.0.url, &self.0.token, PLUGINS_SUBPROTOCOL).await?;
+        Ok(Some(Self::around(socket, &self.0.url, &self.0.token, PLUGINS_SUBPROTOCOL, None)))
     }
 
     /// Reach another machine through `opener`; see `Inner::opener`.
     pub async fn connect_via(opener: js_sys::Function) -> Result<Self> {
         let socket = Self::open_via(&opener).await?;
-        Ok(Self::around(socket, "", "", Some(opener)))
+        Ok(Self::around(socket, "", "", RELAY_SUBPROTOCOL, Some(opener)))
     }
 
-    fn around(socket: Rc<Socket>, url: &str, token: &str, opener: Option<js_sys::Function>) -> Self {
+    fn around(
+        socket: Rc<Socket>,
+        url: &str,
+        token: &str,
+        protocol: &'static str,
+        opener: Option<js_sys::Function>,
+    ) -> Self {
         let link = Self(Rc::new(Inner {
             socket: RefCell::new(socket),
             serials: RefCell::new(SerialTable::new()),
@@ -179,6 +200,7 @@ impl WsLink {
             lease: RefCell::new(Lease::default()),
             url: url.to_string(),
             token: token.to_string(),
+            protocol,
             opener,
         }));
         link.spawn_reader();
@@ -218,17 +240,17 @@ impl WsLink {
     }
 
     /// Open a socket and wait for the server to accept the token.
-    async fn open(url: &str, token: &str) -> Result<Rc<Socket>> {
+    async fn open(url: &str, token: &str, protocol: &'static str) -> Result<Rc<Socket>> {
         let protocols = js_sys::Array::new();
-        protocols.push(&JsValue::from_str(SUBPROTOCOL));
+        protocols.push(&JsValue::from_str(protocol));
         protocols.push(&JsValue::from_str(&format!("{TOKEN_PROTOCOL_PREFIX}{token}")));
         let ws = WebSocket::new_with_str_sequence(url, &protocols)
             .map_err(|e| anyhow!("WebSocket::new: {e:?}"))?;
         let socket = Self::adopt(ws);
         Self::opened(&socket).await?;
-        if socket.ws.protocol() != SUBPROTOCOL {
+        if socket.ws.protocol() != protocol {
             socket.retire();
-            anyhow::bail!("the server did not select the {SUBPROTOCOL} subprotocol");
+            anyhow::bail!("the server did not select the {protocol} subprotocol");
         }
         Ok(socket)
     }
@@ -359,7 +381,7 @@ impl WsLink {
     pub async fn reconnect_to(&self) -> Result<()> {
         let socket = match &self.0.opener {
             Some(opener) => Self::open_via(opener).await?,
-            None => Self::open(&self.0.url, &self.0.token).await?,
+            None => Self::open(&self.0.url, &self.0.token, self.0.protocol).await?,
         };
         // Anything still waiting was waiting on the old socket and will
         // never be answered; the new server has never heard of those
@@ -687,6 +709,11 @@ impl Link for WsLink {
     fn reconnect(&self) -> LocalFuture<Result<()>> {
         let link = self.clone();
         Box::pin(async move { link.reconnect_to().await })
+    }
+
+    fn beside(&self) -> LocalFuture<Result<Option<Self>>> {
+        let link = self.clone();
+        Box::pin(async move { WsLink::beside(&link).await })
     }
 
     fn shutdown(&self) {

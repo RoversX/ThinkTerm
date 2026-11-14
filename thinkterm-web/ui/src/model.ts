@@ -14,6 +14,8 @@ export type TabView = {
   /** The pane a click on the tab shows. */
   target: number;
   current: boolean;
+  /** For a tab on a plugin's page, the lucide icon heading it. */
+  page?: string;
   panes: PaneView[];
 };
 
@@ -33,7 +35,7 @@ export type NavRect = { pane: number; left: number; top: number; width: number; 
 
 /** `icon`: the card heading it, for what the pane runs; null with tab
     icons off. */
-export type CapsuleView = { pane: number; title: string; busy: boolean; current: boolean; icon: string | null };
+export type CapsuleView = { pane: number; title: string; busy: boolean; current: boolean; icon: string | null; /** For a pane on a plugin's page, the lucide icon heading it. */ page?: string };
 
 export type NavView = {
   rect: NavRect;

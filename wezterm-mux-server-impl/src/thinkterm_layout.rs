@@ -69,6 +69,10 @@ struct StoredTerminalSpec {
     /// replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
+    /// The plugin's page the pane held in place of a terminal: the pane
+    /// that replaces it holds the page again, and runs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page: Option<thinkterm_proto::PageSpec>,
 }
 
 #[derive(Debug)]
@@ -338,6 +342,7 @@ fn notification_changes_layout(notification: &MuxNotification) -> bool {
             | MuxNotification::TabResized(_)
             | MuxNotification::WorkspaceRenamed { .. }
             | MuxNotification::PaneLabelChanged { .. }
+            | MuxNotification::PageChanged(_)
             | MuxNotification::Empty
     )
 }
@@ -605,8 +610,9 @@ fn collect_terminal_spec(
     entry: &PaneEntry,
     terminal_specs: &mut Vec<StoredTerminalSpec>,
 ) {
-    let domain = mux
-        .get_pane(entry.pane_id)
+    let pane = mux.get_pane(entry.pane_id);
+    let domain = pane
+        .as_ref()
         .and_then(|pane| mux.get_domain(pane.domain_id()))
         .map(|domain| domain.domain_name().to_string());
     terminal_specs.push(StoredTerminalSpec {
@@ -615,6 +621,7 @@ fn collect_terminal_spec(
         domain,
         title: entry.title.clone(),
         label: mux.pane_label(entry.pane_id),
+        page: pane.and_then(|pane| pane.page()),
     });
 }
 
@@ -765,19 +772,35 @@ async fn restore_decoded_layout(
             .map(|entry| domain_for_entry(mux, entry, &specs, true))
             .unwrap_or(SpawnTabDomain::DefaultDomain);
         let command = first.and_then(|entry| kept_command(mux, workspace, entry, &domain, None));
-        let (tab, pane, window_id) = mux
-            .spawn_tab_or_window(
-                *created_window,
-                domain,
-                command,
-                cwd,
-                size,
-                None,
-                workspace.to_string(),
-                None,
-            )
-            .await
-            .context("restore ThinkTerm tab")?;
+        // A tab that began with a page begins with it again: no shell is
+        // started in a page's place.
+        let (tab, pane, window_id) = match first.and_then(|entry| page_for_entry(entry, &specs)) {
+            Some(page) => {
+                mux.spawn_page_tab(
+                    *created_window,
+                    domain,
+                    page,
+                    size,
+                    None,
+                    workspace.to_string(),
+                )
+                .await
+            }
+            None => {
+                mux.spawn_tab_or_window(
+                    *created_window,
+                    domain,
+                    command,
+                    cwd,
+                    size,
+                    None,
+                    workspace.to_string(),
+                    None,
+                )
+                .await
+            }
+        }
+        .context("restore ThinkTerm tab")?;
         *created_window = Some(window_id);
         let mut pane_map = HashMap::new();
         restore_node(
@@ -845,16 +868,23 @@ fn restore_node<'a>(
                 for entry in stack.panes.iter().skip(1) {
                     let domain = domain_for_entry(mux, entry, specs, false);
                     let command = kept_command(mux, workspace, entry, &domain, Some(base_pane_id));
-                    let pane = mux
-                        .spawn_pane_in_stack(
-                            base_pane_id,
-                            domain,
-                            command,
-                            cwd_for_entry(entry, specs, project_path),
-                            stack_size,
-                        )
-                        .await
-                        .context("restore ThinkTerm pane stack")?;
+                    let pane = match page_for_entry(entry, specs) {
+                        Some(page) => {
+                            mux.spawn_page_in_stack(base_pane_id, domain, page, stack_size)
+                                .await
+                        }
+                        None => {
+                            mux.spawn_pane_in_stack(
+                                base_pane_id,
+                                domain,
+                                command,
+                                cwd_for_entry(entry, specs, project_path),
+                                stack_size,
+                            )
+                            .await
+                        }
+                    }
+                    .context("restore ThinkTerm pane stack")?;
                     pane_map.insert(entry.pane_id, pane.pane_id());
                 }
                 if let Some(entry) = stack.panes.get(stack.active) {
@@ -881,17 +911,17 @@ fn restore_node<'a>(
                 let command = right_entry.and_then(|entry| {
                     kept_command(mux, workspace, entry, &domain, Some(base_pane_id))
                 });
+                // A page, as a terminal, is of the domain it was of.
+                let source = match right_entry.and_then(|entry| page_for_entry(entry, specs)) {
+                    Some(page) => SplitSource::Page(page),
+                    None => SplitSource::Spawn {
+                        command,
+                        command_dir: right_entry
+                            .and_then(|entry| cwd_for_entry(entry, specs, project_path)),
+                    },
+                };
                 let (right_pane, _) = mux
-                    .split_pane(
-                        base_pane_id,
-                        request,
-                        SplitSource::Spawn {
-                            command,
-                            command_dir: right_entry
-                                .and_then(|entry| cwd_for_entry(entry, specs, project_path)),
-                        },
-                        domain,
-                    )
+                    .split_pane(base_pane_id, request, source, domain)
                     .await
                     .context("restore ThinkTerm split")?;
                 restore_node(
@@ -963,6 +993,15 @@ fn active_pane_entry(node: &PaneNode) -> Option<&PaneEntry> {
             active_pane_entry(left).or_else(|| active_pane_entry(right))
         }
     }
+}
+
+/// The plugin's page the saved pane held, when it held one, as it is
+/// restored: with no terminal, whose id was another server's.
+fn page_for_entry(
+    entry: &PaneEntry,
+    specs: &HashMap<PaneId, StoredTerminalSpec>,
+) -> Option<thinkterm_proto::PageSpec> {
+    Some(specs.get(&entry.pane_id)?.page.clone()?.restored())
 }
 
 fn cwd_for_entry(
@@ -1098,6 +1137,36 @@ mod tests {
     use super::*;
     use mux::renderable::StableCursorPosition;
 
+    #[test]
+    fn a_saved_pane_says_whether_it_held_a_page() {
+        let mut layout = sample_layout("workspace-1");
+        let page = thinkterm_proto::PageSpec {
+            plugin: "board".to_string(),
+            args: "{\"board\":\"release\"}".to_string(),
+            title: "Board".to_string(),
+            id: "0f3a9c2e5b7d1846".to_string(),
+            cwd: "/home/user/project".to_string(),
+            terminal: Some(7),
+            ..Default::default()
+        };
+        let written = serde_json::to_value(&layout).unwrap();
+        assert!(
+            written["terminal_specs"][0].get("page").is_none(),
+            "a terminal's record is as it was"
+        );
+        layout.terminal_specs[0].page = Some(page.clone());
+        let written = serde_json::to_string(&layout).unwrap();
+        let read: StoredThreadLayout = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.terminal_specs[0].page.as_ref(), Some(&page));
+        let entry = pane_entry(7, TerminalSize::default(), true);
+        let specs = HashMap::from([(7, read.terminal_specs[0].clone())]);
+        // Restored with all it was but its terminal, whose id was another
+        // server's.
+        assert_eq!(page_for_entry(&entry, &specs), Some(page.clone().restored()));
+        assert_eq!(page_for_entry(&entry, &specs).unwrap().id, page.id);
+        assert_eq!(page_for_entry(&pane_entry(8, TerminalSize::default(), true), &specs), None);
+    }
+
     fn sample_layout(workspace: &str) -> StoredThreadLayout {
         StoredThreadLayout {
             workspace: workspace.to_string(),
@@ -1109,6 +1178,7 @@ mod tests {
                 domain: Some("local".to_string()),
                 title: "shell".to_string(),
                 label: None,
+                page: None,
             }],
         }
     }
@@ -1374,6 +1444,7 @@ mod tests {
             domain: Some("local".to_string()),
             title: "shell".to_string(),
             label: None,
+            page: None,
         };
         let merged = merge_workspace_snapshots(
             "workspace-1",

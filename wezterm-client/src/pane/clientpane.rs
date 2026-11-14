@@ -80,6 +80,11 @@ pub struct ClientPane {
     agent_status: Mutex<Option<thinkterm_proto::AgentStatus>>,
     foreground_program: Mutex<Option<thinkterm_proto::ForegroundProgram>>,
     kitty_relay: Mutex<Option<Arc<super::kitty::Relay>>>,
+    /// The plugin's page the pane holds on the server in place of a
+    /// terminal, as the server's listing says.
+    page: Mutex<Option<thinkterm_proto::PageSpec>>,
+    /// Where what is written to a page goes: nowhere, saying why.
+    no_terminal: Mutex<mux::pagepane::NoTerminal>,
 }
 
 impl ClientPane {
@@ -283,6 +288,8 @@ impl ClientPane {
             agent_status: Mutex::new(client.remote_agent_status(remote_pane_id)),
             foreground_program: Mutex::new(client.remote_foreground_program(remote_pane_id)),
             kitty_relay: Mutex::new(None),
+            page: Mutex::new(None),
+            no_terminal: Mutex::new(mux::pagepane::NoTerminal(String::new())),
         }
     }
 
@@ -544,6 +551,15 @@ impl ClientPane {
         self.remote_tab_id.store(remote_tab_id, Ordering::Relaxed);
     }
 
+    /// Whether the pane holds a plugin's page on the server, and which.
+    pub(crate) fn set_page(&self, page: Option<thinkterm_proto::PageSpec>) {
+        if let Some(page) = &page {
+            // In the words the server's own pane turns it away with.
+            self.no_terminal.lock().0 = page.no_terminal(self.local_pane_id);
+        }
+        *self.page.lock() = page;
+    }
+
     pub(crate) fn belongs_to_client(&self, client: &Arc<ClientInner>) -> bool {
         Arc::ptr_eq(&self.client, client)
     }
@@ -632,6 +648,13 @@ impl ClientPane {
         &self,
         size: TerminalSize,
     ) -> Option<std::time::Duration> {
+        // A page's rows are never read, so the size the server has it at is
+        // not heard of again once it is opened, and nothing shows at it: the
+        // page is drawn in the room it has here, and its place in the tab
+        // is the viewport report's to keep.
+        if self.page.lock().is_some() {
+            return None;
+        }
         let (resend, recheck_in) = self.session.server_geometry_repair(size);
         if !resend {
             return recheck_in;
@@ -796,6 +819,35 @@ impl Pane for ClientPane {
         self.local_pane_id
     }
 
+    fn page(&self) -> Option<thinkterm_proto::PageSpec> {
+        self.page.lock().clone()
+    }
+
+    fn is_page(&self) -> bool {
+        self.page.lock().is_some()
+    }
+
+    /// The server keeps the page: it is told, and tells every client what
+    /// the page is now, this one too.
+    fn change_page(&self, edit: thinkterm_proto::PageEdit) -> anyhow::Result<()> {
+        if self.page.lock().is_none() {
+            anyhow::bail!("pane {} holds no page", self.local_pane_id);
+        }
+        let client = Arc::clone(&self.client);
+        let pane_id = self.remote_pane_id;
+        promise::spawn::spawn(async move {
+            let asked = client
+                .client
+                .change_page(codec::ChangePage { pane_id, edit })
+                .await;
+            if let Err(err) = asked {
+                log::warn!("changing the page of the server's pane {pane_id}: {err:#}");
+            }
+        })
+        .detach();
+        Ok(())
+    }
+
     fn get_metadata(&self) -> Value {
         let mut map: BTreeMap<Value, Value> = BTreeMap::new();
         map.insert(
@@ -855,6 +907,11 @@ impl Pane for ClientPane {
     }
 
     fn get_title(&self) -> String {
+        // A page draws nothing here to take a title from: it is called
+        // what whoever opened it called it, or by its plugin's id.
+        if let Some(page) = self.page.lock().as_ref() {
+            return page.name().to_string();
+        }
         self.session.title()
     }
 
@@ -878,6 +935,10 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+        // Text meant for a terminal is not taken for delivered to a page.
+        if self.page.lock().is_some() {
+            anyhow::bail!("{}", self.no_terminal.lock().0);
+        }
         if self.client.remote_tab_input_is_blocked() {
             return Ok(());
         }
@@ -894,6 +955,12 @@ impl Pane for ClientPane {
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
+        if self.page.lock().is_some() {
+            return MutexGuard::map(self.no_terminal.lock(), |writer| {
+                let w: &mut dyn std::io::Write = writer;
+                w
+            });
+        }
         // Kitty-protocol and win32-input-mode keys arrive here rather than
         // through key_down, so this is where they count as input: for the
         // client list's idle time, and for the laggy-link indicator.
@@ -1052,6 +1119,11 @@ impl Pane for ClientPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        // A key pressed at a page is no terminal's, and nothing is sent
+        // for it: the client that draws the page gives it its keys.
+        if self.page.lock().is_some() {
+            return Ok(());
+        }
         if self.client.remote_tab_input_is_blocked() {
             return Ok(());
         }
@@ -1141,6 +1213,9 @@ impl Pane for ClientPane {
     }
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
+        if self.page.lock().is_some() {
+            return Ok(());
+        }
         if self.client.remote_tab_input_is_blocked() {
             return Ok(());
         }
@@ -1276,6 +1351,10 @@ impl Pane for ClientPane {
     }
 
     fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
+        // Nothing is lost with a page: what it shows is its plugin's.
+        if self.page.lock().is_some() {
+            return true;
+        }
         match reason {
             CloseReason::Window => true,
             CloseReason::Tab => false,

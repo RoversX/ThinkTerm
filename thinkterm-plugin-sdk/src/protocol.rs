@@ -9,15 +9,18 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::io::{self, BufRead, Read, Write};
-use thinkterm_plugin_channel::wire::Raw;
+use thinkterm_plugin_channel::wire::{PageArgs, Raw};
 use thinkterm_plugin_panel::{Answer, Env, Input, RowsWanted};
 
 /// The version of this protocol: a manifest's `api`, which the program's
-/// `ready` repeats. 2 added panels; a program speaking 1 still runs, and
-/// has none.
-pub const API: u32 = 2;
+/// `ready` repeats. 2 added panels and 3 pages; a program speaking 1 still
+/// runs, and has neither.
+pub const API: u32 = 3;
 /// The first version a panel is drawn in.
 pub const PANEL_API: u32 = 2;
+/// The first version a page is drawn in: a program speaking an older one
+/// is never sent a page's `open`, which it would take for a panel's.
+pub const PAGE_API: u32 = 3;
 
 /// The longest line either side sends or accepts, so that neither can make
 /// the other hold an input without bound. The same as a client's frame.
@@ -35,12 +38,16 @@ pub enum ToPlugin {
     },
     /// A panel of the plugin came on show, as `view`: to be drawn with a
     /// `frame`. With `extends`, it is the extended view of that panel,
-    /// which asked for one; it is closed before the panel is.
+    /// which asked for one; it is closed before the panel is. With `page`,
+    /// it is a page of the plugin's -- a view in a pane's place -- and what
+    /// it was opened with.
     Open {
         view: u64,
         env: Env,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extends: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<PageArgs>,
     },
     /// Its size, fonts or theme changed.
     Env { view: u64, env: Env },
@@ -216,7 +223,7 @@ mod tests {
     fn messages_are_json_tagged_by_type() {
         assert_eq!(
             to_value(FromPlugin::Ready { api: API }).unwrap(),
-            json!({"type": "ready", "api": 2})
+            json!({"type": "ready", "api": 3})
         );
         assert_eq!(
             to_value(FromPlugin::Ok {
@@ -335,6 +342,7 @@ mod tests {
             view: 2,
             env,
             extends: None,
+            page: None,
         } = open
         else {
             panic!("{open:?}")
@@ -342,10 +350,26 @@ mod tests {
         assert_eq!(env.mono.advance, 7.2);
         let extended = ToPlugin::Open {
             view: 3,
-            env,
+            env: env.clone(),
             extends: Some(2),
+            page: None,
         };
-        assert_eq!(to_value(&extended).unwrap()["extends"], 2);
+        let sent = to_value(&extended).unwrap();
+        assert_eq!(sent["extends"], 2);
+        assert!(sent.get("page").is_none(), "a panel's open is as it was");
+        let page = ToPlugin::Open {
+            view: 4,
+            env,
+            extends: None,
+            page: Some(PageArgs {
+                args: json!({"board": "release"}),
+                id: "0f3a9c2e5b7d1846".into(),
+            }),
+        };
+        assert_eq!(
+            to_value(&page).unwrap()["page"],
+            json!({"args": {"board": "release"}, "id": "0f3a9c2e5b7d1846"})
+        );
     }
 
     #[test]
@@ -357,7 +381,7 @@ mod tests {
         let mut from = wire.as_slice();
         let mut line = Vec::new();
         assert!(read_line(&mut from, &mut line).unwrap());
-        assert_eq!(line, br#"{"type":"ready","api":2}"#);
+        assert_eq!(line, br#"{"type":"ready","api":3}"#);
         assert!(read_line(&mut from, &mut line).unwrap());
         assert_eq!(line, br#"{"type":"stop"}"#);
         assert!(read_line(&mut from, &mut line).unwrap());

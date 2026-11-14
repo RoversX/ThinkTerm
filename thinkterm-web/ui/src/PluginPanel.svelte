@@ -22,7 +22,11 @@
   import { onMac } from './palette.svelte';
   import { breakLines } from './wrap';
 
-  let { extended = false }: { extended?: boolean } = $props();
+  let { extended = false, page = undefined }: { extended?: boolean; page?: number } = $props();
+  /** Which of the plugin views this is, as the wasm names them: the right
+      panel's, its extended view, or the plugin's page in the place of pane
+      `page`. */
+  const place = $derived(page !== undefined ? `page:${page}` : extended ? 'extended' : 'panel');
 
   // An extended view's close button: ThinkTerm's, at its top left, where
   // the desktop has the file preview's, whatever the plugin draws. The
@@ -419,7 +423,7 @@
     // What the panel's field takes of what the page's holds: less, it
     // holds that instead.
     const tell = () => {
-      const held = handle.client?.plugin_panel_field_text(extended, current.id, node.value);
+      const held = handle.client?.plugin_panel_field_text(place, current.id, node.value);
       if (typeof held === 'string' && held !== node.value) node.value = held;
       showClear();
     };
@@ -455,7 +459,7 @@
         !op.focused &&
         document.activeElement === node &&
         // To another of its fields, which takes it as it follows.
-        !handle.client?.plugin_panel_has_keyboard(extended)
+        !handle.client?.plugin_panel_has_keyboard(place)
       ) {
         hold();
       }
@@ -467,7 +471,7 @@
     follow(op);
     // The canvas outlines the box with the keyboard.
     const onFocus = () => {
-      handle.client?.plugin_panel_field_focus(extended, current.id);
+      handle.client?.plugin_panel_field_focus(place, current.id);
       queueMicrotask(() => refresh());
     };
     const onBlur = (ev: FocusEvent) => {
@@ -476,7 +480,7 @@
       const to = ev.relatedTarget;
       if (to instanceof HTMLElement && to.classList.contains('pfield') && host.contains(to)) return;
       if (!document.hasFocus()) return;
-      handle.client?.plugin_panel_blur(extended);
+      handle.client?.plugin_panel_blur(place);
       queueMicrotask(() => refresh());
     };
     // What a field holds is told once composed: never the half of a word
@@ -515,16 +519,16 @@
       const command = onMac() ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
       if (ev.key === 'Enter' && !ev.altKey && (current.kind === 'lines' ? command : !ev.ctrlKey && !ev.metaKey)) {
         ev.preventDefault();
-        handle.client?.plugin_panel_field_submit(extended, current.id);
+        handle.client?.plugin_panel_field_submit(place, current.id);
         return;
       }
       if (!leaves(current.kind, ev)) return;
-      const taken = handle.client?.plugin_panel_key(extended, ev.key, ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey);
+      const taken = handle.client?.plugin_panel_key(place, ev.key, ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey);
       if (!taken) return;
       ev.preventDefault();
       // The keyboard may have moved to another field, or gone back.
       refresh();
-      if (!handle.client?.plugin_panel_has_keyboard(extended) && document.activeElement === node) {
+      if (!handle.client?.plugin_panel_has_keyboard(place) && document.activeElement === node) {
         node.blur();
         focusTerminal();
       }
@@ -558,10 +562,10 @@
       since it was last painted, or `anew`, when the canvas was cleared or
       what it is painted with changed. */
   function refresh(anew = false) {
-    const revision = handle.client?.plugin_panel_revision(extended) ?? -1;
+    const revision = handle.client?.plugin_panel_revision(place) ?? -1;
     if (!anew && revision === painted) return;
     painted = revision;
-    const json = handle.client?.plugin_panel(extended);
+    const json = handle.client?.plugin_panel(place);
     const next = json ? (JSON.parse(json) as PanelView | null) : null;
     view = next;
     paint(next?.painting ?? null);
@@ -584,10 +588,12 @@
       body: TEXT.body,
       title: TEXT.title,
       mono: { ...MONO, advance },
-      can_extend: !extended && canExtend(),
+      can_extend: !extended && page === undefined && canExtend(),
       close: extended ? CLOSE : undefined,
+      // A finger never hovers, and wants more room to press.
+      pointer: matchMedia('(pointer: coarse)').matches ? 'touch' : undefined,
     };
-    const refused = handle.client?.plugin_panel_env(extended, JSON.stringify(env));
+    const refused = handle.client?.plugin_panel_env(place, JSON.stringify(env));
     if (refused) console.warn('plugin panel size: ' + refused);
   }
 
@@ -636,14 +642,14 @@
       // A mouse's wheel turns one way: with Shift, it goes across.
       if (ev.shiftKey && dx === 0) [dx, dy] = [dy, 0];
       const { x, y } = local(ev);
-      if (handle.client?.plugin_panel_wheel(extended, x, y, dx, dy)) refresh();
+      if (handle.client?.plugin_panel_wheel(place, x, y, dx, dy)) refresh();
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     // The room beside the panel changes with the terminal's width: with
     // the window's, and with either panel's.
     const room = new ResizeObserver(() => sendEnv());
     const term = document.getElementById('term');
-    if (!extended && term) room.observe(term);
+    if (!extended && page === undefined && term) room.observe(term);
     fit();
     return () => {
       stopFling();
@@ -656,7 +662,7 @@
 
   // What the plugin drew anew.
   $effect(() => {
-    void (extended ? views.extendedRevision : views.panelRevision);
+    void (page !== undefined ? views.pagesRevision : extended ? views.extendedRevision : views.panelRevision);
     refresh();
   });
 
@@ -686,7 +692,7 @@
   /** Scrolls what is under `at` (client pixels) by `dx`, `dy` of its units. */
   function scrollAt(at: { x: number; y: number }, dx: number, dy: number) {
     const box = canvas.getBoundingClientRect();
-    if (handle.client?.plugin_panel_wheel(extended, at.x - box.left, at.y - box.top, dx, dy)) refresh();
+    if (handle.client?.plugin_panel_wheel(place, at.x - box.left, at.y - box.top, dx, dy)) refresh();
   }
 
   function onPointerDown(ev: PointerEvent) {
@@ -715,7 +721,7 @@
       return;
     }
     const { x, y } = local(ev);
-    if (handle.client?.plugin_panel_pointer(extended, x, y)) refresh();
+    if (handle.client?.plugin_panel_pointer(place, x, y)) refresh();
   }
 
   function onPointerUp(ev: PointerEvent) {
@@ -741,7 +747,7 @@
 
   function onPointerLeave(ev: PointerEvent) {
     if (ev.pointerType === 'touch') return;
-    if (handle.client?.plugin_panel_leave(extended)) refresh();
+    if (handle.client?.plugin_panel_leave(place)) refresh();
   }
 
   /** The close button: the view goes at once, and its plugin hears so. */
@@ -759,13 +765,13 @@
     ev.preventDefault();
     if (document.activeElement === canvas) focusTerminal();
     const heard = handle.client?.plugin_panel_click(
-      extended, x, y, ev.button, Math.max(1, ev.detail), ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey,
+      place, x, y, ev.button, Math.max(1, ev.detail), ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey,
     );
     if (heard) refresh();
   }
 </script>
 
-<div class="plugin" class:extended bind:this={host}>
+<div class="plugin" class:extended class:page={page !== undefined} bind:this={host}>
   <!-- Focused only to hold the keyboard from the terminal (`hold`). -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <canvas

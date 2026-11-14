@@ -46,7 +46,7 @@ const plugin = `${process.env.PLUGINS_DATA}/plugins/diff/thinkterm-plugin-diff`;
   const attached = async () => /this browser has/.test(await ev("document.getElementById('status').dataset.summary || ''"));
   // What the panel, or its extended view, paints, as the wasm hands it to
   // the canvas.
-  const panel = async (extended = false) => JSON.parse((await ev(`window.thinkterm.client.plugin_panel(${extended})`)) || "null");
+  const panel = async (extended = false) => JSON.parse((await ev(`window.thinkterm.client.plugin_panel("${extended ? "extended" : "panel"}")`)) || "null");
   const beside = () => panel(true);
   const texts = (view) => (view?.painting?.ops ?? []).filter((op) => op.op === "text").map((op) => op.text);
   const textOp = (view, match) => (view?.painting?.ops ?? []).find((op) => op.op === "text" && match(op.text));

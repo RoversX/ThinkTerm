@@ -61,6 +61,28 @@ pub struct Env {
     /// never gives the panel the keyboard but through a field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// What the user points with there: a plugin sizes what is pressed for
+    /// it, and shows nothing only on a hover to a finger. A mouse from a
+    /// ThinkTerm that does not say.
+    #[serde(default, skip_serializing_if = "Pointer::is_mouse")]
+    pub pointer: Pointer,
+}
+
+/// What the user points with in a view ([`Env::pointer`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pointer {
+    /// A mouse or a trackpad: it hovers, and presses a small thing.
+    #[default]
+    Mouse,
+    /// A finger: it never hovers, and wants more room to press.
+    Touch,
+}
+
+impl Pointer {
+    fn is_mouse(&self) -> bool {
+        *self == Self::Mouse
+    }
 }
 
 /// The names of what a client can do, in [`Env::features`].
@@ -111,6 +133,46 @@ pub struct Remote {
     pub machine: String,
     /// The terminal's directory there.
     pub cwd: String,
+}
+
+/// Where the user was when they asked a plugin for one of its actions --
+/// from the command palette, with a key, with `thinkterm plugin do` -- which
+/// ThinkTerm adds to the action's call as `at`: what an [`Env`] says of the
+/// terminal beside a panel, of the pane then in focus.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct At {
+    /// Its directory, when it runs on the machine the plugin does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Where it runs, when that is another machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
+    /// The pane, as `thinkterm cli` on the plugin's machine reaches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<Terminal>,
+    /// The id of the page in focus, when that is one of the plugin's own:
+    /// the rest says where the page was opened from, as its view's `Env`
+    /// does. A page is never the terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
+}
+
+impl At {
+    /// The key it is added to a call's body under.
+    pub const KEY: &'static str = "at";
+
+    /// `body`, an action's call, with this added to it.
+    pub fn added_to(&self, mut body: serde_json::Value) -> serde_json::Value {
+        if let (Some(body), Ok(at)) = (body.as_object_mut(), serde_json::to_value(self)) {
+            body.insert(Self::KEY.to_string(), at);
+        }
+        body
+    }
+
+    /// What ThinkTerm added to the call `body`, if it did.
+    pub fn of(body: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(body.get(Self::KEY)?.clone()).ok()
+    }
 }
 
 /// What a plugin asks ThinkTerm to do on the machine the terminal beside
@@ -402,6 +464,39 @@ mod tests {
     use serde_json::{json, to_value};
 
     #[test]
+    fn where_the_user_was_goes_with_an_actions_call_as_at() {
+        let at = At {
+            cwd: Some("/home/user/work".into()),
+            remote: None,
+            terminal: Some(Terminal {
+                pane: 7,
+                socket: None,
+            }),
+            page: None,
+        };
+        let body = at.added_to(json!({"op": "new-card"}));
+        assert_eq!(
+            body,
+            json!({"op": "new-card", "at": {"cwd": "/home/user/work", "terminal": {"pane": 7}}})
+        );
+        assert_eq!(At::of(&body), Some(at.clone()));
+        assert_eq!(At::of(&json!({"op": "new-card"})), None, "a call of the plugin's own");
+        // Nowhere in particular is said too: asked for, at no terminal.
+        assert_eq!(At::default().added_to(json!({})), json!({"at": {}}));
+        // Only a table has room for it.
+        assert_eq!(at.added_to(json!("word")), json!("word"));
+        // At one of its pages: which, and where it was opened from.
+        let at_page = At {
+            page: Some("0f3a9c2e5b7d1846".into()),
+            ..at
+        };
+        assert_eq!(
+            at_page.added_to(json!({}))["at"]["page"],
+            json!("0f3a9c2e5b7d1846")
+        );
+    }
+
+    #[test]
     fn input_is_json_named_by_kind() {
         let click = Input::Click(Click {
             id: "file:2".into(),
@@ -493,6 +588,13 @@ mod tests {
             to_value(&older).unwrap().get("features").is_none(),
             "a client that does none of it says nothing"
         );
+        assert_eq!(older.pointer, Pointer::Mouse, "one that does not say");
+        assert!(to_value(&older).unwrap().get("pointer").is_none());
+        let touched = Env {
+            pointer: Pointer::Touch,
+            ..older
+        };
+        assert_eq!(to_value(&touched).unwrap()["pointer"], json!("touch"));
     }
 
     #[test]

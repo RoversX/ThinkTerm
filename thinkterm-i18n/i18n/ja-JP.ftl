@@ -576,6 +576,7 @@ right-snippets-unavailable = スニペットは現在利用できません
 right-plugin-starting = 起動しています…
 right-plugin-stopped = このパネルは停止しました：{ $reason }
 right-plugin-connect = { $host } への接続が必要です
+plugin-page-placeholder = プラグインのページです。パソコンの ThinkTerm かブラウザーで開いてください。
 right-edit-snippet = スニペットを編集
 right-snippet = スニペット
 right-personal-vault = 個人用保管庫

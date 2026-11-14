@@ -342,6 +342,11 @@ impl Link for SshLink {
         self.connect()
     }
 
+    fn beside(&self) -> LocalFuture<Result<Option<Self>>> {
+        // The one channel carries them, as it carries everything.
+        Box::pin(async { Ok(None) })
+    }
+
     fn shutdown(&self) {
         if let Some(out) = self.0.out.borrow_mut().take() {
             let _ = out.send(Out::Close);

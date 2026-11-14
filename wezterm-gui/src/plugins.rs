@@ -9,8 +9,9 @@
 //! Plugins. So are the panels plugins draw in the right sidebar: each one
 //! on show is a view, numbered here, whose frames are read on the session's
 //! thread and handed to the window showing it
-//! (`termwindow::ui::plugin_panel`). Nothing of a plugin shows outside the
-//! sidebar.
+//! (`termwindow::ui::plugin_panel`). So are the pages plugins draw in a
+//! pane's place, which are views too, and the actions their manifests list,
+//! which the command palette and the keymap name ([`actions`]).
 //!
 //! The session is let go once nothing has used it for a while. The list
 //! stays as what was last heard, and is asked for afresh on the next use:
@@ -18,20 +19,29 @@
 //! While a plugin runs always, the host itself is kept up for as long as
 //! the desktop runs, on a connection of its own (`keep_host_up`).
 //!
+//! A page whose pane is kept by another machine's mux is drawn by that
+//! machine's plugin: its view goes over a link to that machine's server
+//! (`wezterm_client::plugin_link`), a connection of its own beside the one
+//! the terminals are on, and never over the session with this machine's
+//! host. One link a machine, kept while a page of it is open.
+//!
 //! What a panel's plugin asks of the other machine its terminal runs on
 //! comes over the session too, and goes to the window showing the panel,
 //! which answers it (`plugin_panel`).
 
 use crate::termwindow::{TermWindow, TermWindowNotif};
+use mux::domain::DomainId;
 use parking_lot::{Mutex, MutexGuard};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thinkterm_plugin_channel::client::{Answer, Host, Notice, Session};
-use thinkterm_plugin_channel::registry::{self as api, Background, Info};
-use thinkterm_plugin_channel::wire::{PanelEvent, PanelRequest, Raw};
+use thinkterm_plugin_channel::registry::{self as api, Action, Background, Does, Info};
+use thinkterm_plugin_channel::wire::{FromHost, PageArgs, PanelEvent, PanelRequest, Raw, ToHost};
 use thinkterm_plugin_panel::{Ask, Env, Frame, Rows};
+use thinkterm_proto::PageSpec;
+use wezterm_client::plugin_link::{Heard, PluginLink, PluginWay};
 use window::{Window, WindowOps};
 
 /// How long the plugins may go unused before the session is let go.
@@ -50,6 +60,9 @@ struct Listing {
     /// What was last heard is out of date: something changed since, or the
     /// session that sent it is gone.
     stale: bool,
+    /// How many lists were heard: what is made from one is made again when
+    /// this has moved on.
+    times_heard: u64,
 }
 
 impl Listing {
@@ -76,6 +89,7 @@ impl Listing {
         self.asking = false;
         if let Some(plugins) = plugins {
             self.plugins = Some(plugins);
+            self.times_heard += 1;
         }
     }
 }
@@ -105,6 +119,46 @@ struct Shared {
     /// A panel was opened with no session to send it on: the panels are
     /// opened again once one connects, the first time included.
     unsent: bool,
+    /// The pages of other machines' plugins, and the links they go over.
+    remotes: Option<Remotes>,
+}
+
+impl Shared {
+    /// The views this machine's host serves, and the window showing each:
+    /// what happens to the session with it is theirs to hear, and not a
+    /// page's that another machine's host serves over a link of its own.
+    fn local_views(&self) -> HashMap<u64, Window> {
+        let remote = self.remotes.as_ref();
+        self.views
+            .iter()
+            .flatten()
+            .filter(|(view, _)| !remote.is_some_and(|remote| remote.views.contains_key(*view)))
+            .map(|(view, window)| (*view, window.clone()))
+            .collect()
+    }
+
+    /// A number for a new view `window` shows.
+    fn new_view(&mut self, window: &Window) -> u64 {
+        self.next_view += 1;
+        let view = self.next_view;
+        self.views
+            .get_or_insert_with(HashMap::new)
+            .insert(view, window.clone());
+        view
+    }
+}
+
+/// The views other machines' plugin hosts serve: pages whose panes those
+/// machines keep.
+#[derive(Default)]
+struct Remotes {
+    /// The link to each machine with such a page open, by the domain its
+    /// panes are of, and which opening of the link it is: one that ended
+    /// is told apart from the one opened after it.
+    links: HashMap<DomainId, (u64, PluginLink)>,
+    next_link: u64,
+    /// The domain each such view is of.
+    views: HashMap<u64, DomainId>,
 }
 
 /// What a window hears about the plugin panel it shows, read on the
@@ -113,6 +167,8 @@ struct Shared {
 pub enum PanelNews {
     Frame(Frame),
     Rows(Rows),
+    /// The plugin was handed a press the view sent.
+    Heard,
     /// The host no longer serves it; `again` when opening it anew may work.
     Closed {
         reason: String,
@@ -145,6 +201,7 @@ static SHARED: Mutex<Shared> = parking_lot::const_mutex(Shared {
         locale: "",
         asking: false,
         stale: true,
+        times_heard: 0,
     },
     switching: Vec::new(),
     choosing: Vec::new(),
@@ -152,6 +209,7 @@ static SHARED: Mutex<Shared> = parking_lot::const_mutex(Shared {
     views: None,
     next_view: 0,
     unsent: false,
+    remotes: None,
 });
 
 /// The shared state, marked as in use, with a session to the host. On the
@@ -252,9 +310,9 @@ fn on_notice(notice: Notice) {
                 shared.trouble = None;
                 shared.listing.stale = true;
                 let again = again || std::mem::take(&mut shared.unsent);
-                match (again, &shared.views) {
-                    (true, Some(views)) => views.clone(),
-                    _ => HashMap::new(),
+                match again {
+                    true => shared.local_views(),
+                    false => HashMap::new(),
                 }
             };
             ask_for_list();
@@ -278,7 +336,7 @@ fn on_notice(notice: Notice) {
             let views = {
                 let mut shared = SHARED.lock();
                 shared.trouble = Some(why.clone());
-                shared.views.clone().unwrap_or_default()
+                shared.local_views()
             };
             for (view, window) in views {
                 tell_panel_window(&window, view, PanelNews::Unreachable(why.clone()));
@@ -304,7 +362,8 @@ fn release_when_idle(generation: u64) {
             let idle = shared
                 .last_used
                 .map_or(true, |used| used.elapsed() >= RELEASE_AFTER);
-            let panels = shared.views.as_ref().is_some_and(|views| !views.is_empty());
+            // A page of another machine's plugin is no use of this session.
+            let panels = !shared.local_views().is_empty();
             if !idle || panels {
                 continue;
             }
@@ -327,24 +386,195 @@ fn release_when_idle(generation: u64) {
 /// of panel `extends`, with one: its number, which what the window hears
 /// about it and what it sends carry.
 pub fn open_panel(plugin: &str, env: &Env, extends: Option<u64>, window: &Window) -> u64 {
-    let view = {
-        let mut shared = SHARED.lock();
-        shared.next_view += 1;
-        let view = shared.next_view;
-        shared
-            .views
-            .get_or_insert_with(HashMap::new)
-            .insert(view, window.clone());
-        view
-    };
-    send_open(view, open_request(plugin, env, extends));
+    let view = SHARED.lock().new_view(window);
+    send_open(view, open_request(plugin, env, extends, None));
     view
 }
 
 /// Opens panel `view` again: the host closed it, or the session that had it
 /// is gone.
 pub fn reopen_panel(view: u64, plugin: &str, env: &Env) {
-    send_open(view, open_request(plugin, env, None));
+    send_open(view, open_request(plugin, env, None, None));
+}
+
+/// Shows page `page` of plugin `plugin` in `window` for `env`: its number,
+/// as for a panel.
+pub fn open_page(plugin: &str, env: &Env, page: &PageSpec, window: &Window) -> u64 {
+    let view = SHARED.lock().new_view(window);
+    send_open(view, open_request(plugin, env, None, Some(page_args(page))));
+    view
+}
+
+/// Opens page `view` again, as `reopen_panel` opens a panel.
+pub fn reopen_page(view: u64, plugin: &str, env: &Env, page: &PageSpec) {
+    send_open(view, open_request(plugin, env, None, Some(page_args(page))));
+}
+
+/// Shows a page of plugin `plugin` of another machine -- the one whose mux
+/// keeps the panes of domain `domain_id` -- in `window`, as [`open_page`]
+/// shows one of this machine's: over a link to that machine's server,
+/// opened by `way` if none is open.
+pub fn open_remote_page(
+    domain_id: DomainId,
+    way: PluginWay,
+    plugin: &str,
+    env: &Env,
+    page: &PageSpec,
+    window: &Window,
+) -> u64 {
+    let view = SHARED.lock().new_view(window);
+    reopen_remote_page(view, domain_id, way, plugin, env, page);
+    view
+}
+
+/// Opens page `view` of another machine's plugin again, over the link to
+/// its machine, opened anew by `way` when the last one ended.
+pub fn reopen_remote_page(
+    view: u64,
+    domain_id: DomainId,
+    way: PluginWay,
+    plugin: &str,
+    env: &Env,
+    page: &PageSpec,
+) {
+    let request = open_request(plugin, env, None, Some(page_args(page)));
+    let frame = ToHost::Panel { view, request }.encode();
+    let unreachable = {
+        let mut shared = SHARED.lock();
+        let Some(window) = shared.views.as_ref().and_then(|views| views.get(&view).cloned()) else {
+            // Closed meanwhile.
+            return;
+        };
+        let remotes = shared.remotes.get_or_insert_with(Remotes::default);
+        remotes.views.insert(view, domain_id);
+        let sent = match remotes.links.get(&domain_id) {
+            Some((_, link)) => link.send(frame),
+            None => {
+                remotes.next_link += 1;
+                let opening = remotes.next_link;
+                // What the link hears comes on its own threads, and waits
+                // for this lock: the link is in its place by then.
+                match PluginLink::open(way, move |heard| on_remote(domain_id, opening, heard)) {
+                    Ok(link) => {
+                        let sent = link.send(frame);
+                        remotes.links.insert(domain_id, (opening, link));
+                        sent
+                    }
+                    Err(err) => {
+                        log::warn!("starting a plugin link: {err}");
+                        false
+                    }
+                }
+            }
+        };
+        (!sent).then_some(window)
+    };
+    if let Some(window) = unreachable {
+        let why = "the way to the page's machine closed".to_string();
+        tell_panel_window(&window, view, PanelNews::Unreachable(why));
+    }
+}
+
+/// What came over the link to domain `domain_id`'s machine, the link's
+/// opening `opening`: on the link's own threads.
+fn on_remote(domain_id: DomainId, opening: u64, heard: Heard) {
+    match heard {
+        Heard::Frame(data) => match FromHost::decode(&data) {
+            // About its own pages only, over the link open now: the numbers
+            // are this machine's, and another view's is not that machine's
+            // to speak for.
+            Ok(FromHost::Panel { view, event }) => {
+                let serves = SHARED.lock().remotes.as_ref().is_some_and(|remotes| {
+                    remotes.views.get(&view) == Some(&domain_id)
+                        && remotes.links.get(&domain_id).is_some_and(|(id, _)| *id == opening)
+                });
+                if serves {
+                    heard_for_panel(view, event);
+                } else {
+                    log::warn!("domain {domain_id}'s plugin host spoke of view {view}, not its own");
+                }
+            }
+            // Its greeting, and nothing else is asked of that host here.
+            Ok(_) => {}
+            Err(err) => log::warn!("a frame from another machine's plugin host does not read: {err}"),
+        },
+        // Its pages say why, and are opened again over a new link: this
+        // one is let go, unless a newer one took its place already.
+        Heard::Ended(why) => {
+            let views: Vec<(u64, Window)> = {
+                let mut shared = SHARED.lock();
+                let shared = &mut *shared;
+                let Some(remotes) = shared.remotes.as_mut() else {
+                    return;
+                };
+                if !remotes.links.get(&domain_id).is_some_and(|(id, _)| *id == opening) {
+                    return;
+                }
+                remotes.links.remove(&domain_id);
+                let windows = shared.views.as_ref();
+                remotes
+                    .views
+                    .iter()
+                    .filter(|(_, domain)| **domain == domain_id)
+                    .filter_map(|(view, _)| Some((*view, windows?.get(view)?.clone())))
+                    .collect()
+            };
+            log::info!("the plugin link to domain {domain_id} ended: {why}");
+            for (view, window) in views {
+                tell_panel_window(&window, view, PanelNews::Unreachable(why.clone()));
+            }
+        }
+    }
+}
+
+/// Sends `request` about view `view` over the link to its machine, when
+/// the view is a page of another machine's plugin; for a view this
+/// machine's host serves, hands it back with the session to send it on.
+fn tell_remote(view: u64, request: PanelRequest) -> Option<(PanelRequest, Option<Arc<Session>>)> {
+    let shared = SHARED.lock();
+    let link = shared.remotes.as_ref().and_then(|remotes| {
+        let domain_id = remotes.views.get(&view)?;
+        Some(remotes.links.get(domain_id))
+    });
+    match link {
+        Some(link) => {
+            if let Some((_, link)) = link {
+                link.send(ToHost::Panel { view, request }.encode());
+            }
+            None
+        }
+        None => Some((request, shared.session.clone())),
+    }
+}
+
+/// View `view`, a page of another machine's plugin, went: its link goes
+/// with the last of its machine's. False for a view of this machine's.
+fn forget_remote(view: u64) -> bool {
+    let mut shared = SHARED.lock();
+    let Some(remotes) = shared.remotes.as_mut() else {
+        return false;
+    };
+    let Some(domain_id) = remotes.views.remove(&view) else {
+        return false;
+    };
+    if let Some((_, link)) = remotes.links.get(&domain_id) {
+        link.send(ToHost::Panel { view, request: PanelRequest::Close }.encode());
+    }
+    if !remotes.views.values().any(|domain| *domain == domain_id) {
+        // Dropped once what was just sent has left: the link's own thread
+        // sends what waits before it closes.
+        remotes.links.remove(&domain_id);
+    }
+    true
+}
+
+/// The page as its plugin is sent it: which, and what it is opened with --
+/// the JSON the pane holds, and nothing for what is not JSON.
+fn page_args(page: &PageSpec) -> PageArgs {
+    PageArgs {
+        args: serde_json::from_str(&page.args).unwrap_or_default(),
+        id: page.id.clone(),
+    }
 }
 
 /// Sends the open of panel `view`; with no session to send it on, the
@@ -377,16 +607,26 @@ fn send_open(view: u64, request: PanelRequest) {
     }
 }
 
-fn open_request(plugin: &str, env: &Env, extends: Option<u64>) -> PanelRequest {
+fn open_request(
+    plugin: &str,
+    env: &Env,
+    extends: Option<u64>,
+    page: Option<PageArgs>,
+) -> PanelRequest {
     PanelRequest::Open {
         plugin: plugin.to_string(),
         env: Raw::new(env),
         extends,
+        page,
     }
 }
 
-/// Tells the host about panel `view`.
+/// Tells the host about panel `view`: this machine's, or for a page of
+/// another machine's plugin, that machine's.
 pub fn tell_panel(view: u64, request: PanelRequest) {
+    let Some((request, _)) = tell_remote(view, request) else {
+        return;
+    };
     let session = in_use().session.clone();
     if let Some(session) = session {
         session.panel(view, request);
@@ -395,6 +635,7 @@ pub fn tell_panel(view: u64, request: PanelRequest) {
 
 /// Panel `view` went off show.
 pub fn close_panel(view: u64) {
+    let remote = forget_remote(view);
     let session = {
         let mut shared = SHARED.lock();
         if let Some(views) = shared.views.as_mut() {
@@ -402,6 +643,9 @@ pub fn close_panel(view: u64) {
         }
         shared.session.clone()
     };
+    if remote {
+        return;
+    }
     if let Some(session) = session {
         session.panel(view, PanelRequest::Close);
     }
@@ -417,9 +661,8 @@ fn heard_for_panel(view: u64, event: PanelEvent) {
             Ok(frame) => PanelNews::Frame(frame),
             Err(err) => {
                 log::warn!("plugin panel {view} sent a frame that does not read: {err}");
-                let session = SHARED.lock().session.clone();
-                if let Some(session) = session {
-                    session.panel(view, PanelRequest::Shown);
+                if let Some((shown, Some(session))) = tell_remote(view, PanelRequest::Shown) {
+                    session.panel(view, shown);
                 }
                 return;
             }
@@ -432,6 +675,7 @@ fn heard_for_panel(view: u64, event: PanelEvent) {
             }
         },
         PanelEvent::Closed { reason, again } => PanelNews::Closed { reason, again },
+        PanelEvent::Heard => PanelNews::Heard,
         PanelEvent::Remote { id, machine, ask } => match ask.read::<Ask>() {
             Ok(ask) => PanelNews::Remote { id, machine, ask },
             Err(err) => {
@@ -453,10 +697,12 @@ fn heard_for_panel(view: u64, event: PanelEvent) {
 
 /// Tells the plugin of panel `view` what came of what it asked, `id`.
 pub fn answer(view: u64, id: u64, answer: &thinkterm_plugin_panel::Answer) {
-    let session = SHARED.lock().session.clone();
-    if let Some(session) = session {
-        let answer = Raw::new(answer);
-        session.panel(view, PanelRequest::Answer { id, answer });
+    let request = PanelRequest::Answer {
+        id,
+        answer: Raw::new(answer),
+    };
+    if let Some((request, Some(session))) = tell_remote(view, request) {
+        session.panel(view, request);
     }
 }
 
@@ -548,6 +794,91 @@ pub fn plugins() -> Option<Vec<Info>> {
     let plugins = in_use().listing.plugins.clone();
     ask_for_list();
     plugins
+}
+
+/// One of a plugin's actions, as the command palette and the keymap list
+/// it.
+pub struct ListedAction {
+    /// What a key's binding names it by ([`Action::name`]).
+    pub name: String,
+    /// The plugin's name, a colon, and the action's title.
+    pub title: String,
+}
+
+/// The actions of the plugins that can be used, as last heard, in the
+/// list's order. Looking never starts the plugin host: until a plugin with
+/// an action has been heard of there is nothing to ask it. Once one has,
+/// the list is asked for afresh when it is out of date, for the next look.
+pub fn actions() -> Vec<ListedAction> {
+    let listed: Vec<ListedAction> = {
+        let shared = SHARED.lock();
+        let plugins = shared.listing.plugins.as_deref().unwrap_or_default();
+        plugins
+            .iter()
+            .filter(|info| info.usable())
+            .flat_map(|info| {
+                info.actions.iter().map(move |action| ListedAction {
+                    name: Action::name(&info.id, &action.id),
+                    title: format!("{}: {}", info.name, action.title),
+                })
+            })
+            .collect()
+    };
+    if !listed.is_empty() {
+        drop(in_use());
+        ask_for_list();
+    }
+    listed
+}
+
+/// The plugins that can be used and have a page, as last heard: each one's
+/// id and name, in the list's order. Like [`actions`], looking never starts
+/// the plugin host: where no plugin is installed nothing was ever heard,
+/// and there is nothing to offer.
+pub fn pages() -> Vec<(String, String)> {
+    let listed: Vec<(String, String)> = {
+        let shared = SHARED.lock();
+        let plugins = shared.listing.plugins.as_deref().unwrap_or_default();
+        plugins
+            .iter()
+            .filter(|info| info.usable() && info.page.is_some())
+            .map(|info| (info.id.clone(), info.name.clone()))
+            .collect()
+    };
+    if !listed.is_empty() {
+        drop(in_use());
+        ask_for_list();
+    }
+    listed
+}
+
+/// Which hearing of the plugin list [`actions`] is of: what lists them is
+/// made again once this has moved on.
+pub fn actions_heard() -> u64 {
+    SHARED.lock().listing.times_heard
+}
+
+/// The plugin and what it does for the action named `name`, of the plugins
+/// as last heard; or why it cannot be done.
+pub fn action(name: &str) -> Result<(Info, Does), String> {
+    let (plugin, action) =
+        Action::named(name).ok_or_else(|| format!("{name:?} does not name a plugin's action"))?;
+    let info = plugins()
+        .and_then(|all| all.into_iter().find(|info| info.id == plugin))
+        .ok_or_else(|| format!("there is no plugin {plugin:?}"))?;
+    if !info.usable() {
+        return Err(match info.state.reason() {
+            Some(reason) => format!("the plugin {plugin:?} cannot be used: {reason}"),
+            None => format!("the plugin {plugin:?} is off"),
+        });
+    }
+    let does = info
+        .actions
+        .iter()
+        .find(|known| known.id == action)
+        .map(|known| known.does.clone())
+        .ok_or_else(|| format!("the plugin {plugin:?} has no action {action:?}"))?;
+    Ok((info, does))
 }
 
 /// The switch of plugin `id` as it is to be shown: the change on its way,
@@ -768,6 +1099,7 @@ mod tests {
             locale: "",
             asking: false,
             stale: true,
+            times_heard: 0,
         };
         assert!(listing.begin("en-US"));
         assert!(!listing.begin("en-US"), "one request at a time");

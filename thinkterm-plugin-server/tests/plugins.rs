@@ -107,6 +107,39 @@ fn is_event_of(plugin: &str) -> impl Fn(&Notice) -> bool + '_ {
 }
 
 #[test]
+fn a_plugins_actions_are_listed_with_it_and_done_as_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_in(dir.path());
+    let manifest = format!(
+        "{}\n[locales.zh-CN.actions]\nshow = \"列出\"\n\n\
+         [[action]]\nid = \"show\"\ntitle = \"List them\"\ncall = {{ op = \"list\", query = \"\" }}\n",
+        snippets_copy(&host)
+    );
+    install(&host, "copy", &manifest);
+    let (session, _notices) = session(&host);
+
+    let listed = list(&session);
+    assert!(listed[0].actions.is_empty(), "a built-in plugin has none");
+    let copy = &listed[1];
+    assert_eq!(copy.actions.len(), 1);
+    assert_eq!(copy.actions[0].id, "show");
+    assert_eq!(copy.actions[0].title, "列出", "in the language asked for");
+    let api::Does::Call(body) = &copy.actions[0].does else {
+        panic!("it calls");
+    };
+    assert_eq!(*body, json!({"op": "list", "query": ""}));
+    // Doing it is the call its manifest wrote, with where the user was
+    // added: the plugin is started for it as for any call.
+    assert_eq!(copy.state, State::Idle);
+    let mut asked = body.clone();
+    asked["at"] = json!({"cwd": "/home/user", "terminal": {"pane": 3}});
+    assert_eq!(call(&session, "snippets-copy", asked), Ok(json!([])));
+    assert_eq!(info(&session, "snippets-copy").state, State::Running);
+    drop(session);
+    stop(&host);
+}
+
+#[test]
 fn an_installed_plugin_runs_as_a_program_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_in(dir.path());

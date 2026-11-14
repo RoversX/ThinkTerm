@@ -293,6 +293,10 @@ pub struct TerminalSpawnSpec {
     /// that server keeps its output under (`mux::kept_output`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_pane_id: Option<PaneId>,
+    /// The plugin's page the pane held in place of a terminal: the pane
+    /// that replaces it holds the page again, and runs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<thinkterm_proto::PageSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -1641,6 +1645,7 @@ fn store_with_session_import(
                                 title: entry.title.clone(),
                                 label: None,
                                 host_pane_id: None,
+                                page: None,
                             },
                             font_scale: None,
                         })
@@ -10537,18 +10542,36 @@ async fn materialize_layout(
             ),
             None => command,
         };
-        let (_tab, pane, win_id) = mux
-            .spawn_tab_or_window(
-                window_id,
-                domain,
-                command,
-                cwd,
-                node.root_size().unwrap_or(size),
-                None,
-                workspace_name.clone(),
-                None,
-            )
-            .await
+        let tab_size = node.root_size().unwrap_or(size);
+        // A tab that began with a page begins with it again: no shell is
+        // started in a page's place.
+        let (_tab, pane, win_id) =
+            match first_entry.and_then(|entry| page_for_entry(entry, &terminal_specs)) {
+                Some(page) => {
+                    mux.spawn_page_tab(
+                        window_id,
+                        domain,
+                        page,
+                        tab_size,
+                        None,
+                        workspace_name.clone(),
+                    )
+                    .await
+                }
+                None => {
+                    mux.spawn_tab_or_window(
+                        window_id,
+                        domain,
+                        command,
+                        cwd,
+                        tab_size,
+                        None,
+                        workspace_name.clone(),
+                        None,
+                    )
+                    .await
+                }
+            }
             .context("spawn thread tab")?;
         rollback.record(win_id);
         pane.set_config(Arc::clone(&term_config));
@@ -10630,21 +10653,22 @@ fn restore_node<'a>(
                         None,
                     )
                 });
+                // A page, as a terminal, is of the domain it was of.
+                let source = match right_entry
+                    .and_then(|entry| page_for_entry(entry, terminal_specs))
+                {
+                    Some(page) => SplitSource::Page(page),
+                    None => SplitSource::Spawn {
+                        command,
+                        command_dir: heal_fallback_cwd(
+                            right_entry
+                                .and_then(|entry| working_dir_for_entry(entry, terminal_specs)),
+                            project_root,
+                        ),
+                    },
+                };
                 let (right_pane, _size) = mux
-                    .split_pane(
-                        base_pane_id,
-                        request,
-                        SplitSource::Spawn {
-                            command,
-                            command_dir: heal_fallback_cwd(
-                                right_entry.and_then(|entry| {
-                                    working_dir_for_entry(entry, terminal_specs)
-                                }),
-                                project_root,
-                            ),
-                        },
-                        domain,
-                    )
+                    .split_pane(base_pane_id, request, source, domain)
                     .await
                     .context("restore split pane")?;
                 right_pane.set_config(Arc::clone(&term_config));
@@ -10695,16 +10719,20 @@ async fn restore_stack(
             Some(base_pane_id),
             None,
         );
-        let pane = mux
-            .spawn_pane_in_stack(
-                base_pane_id,
-                domain,
-                command,
-                heal_fallback_cwd(working_dir_for_entry(entry, terminal_specs), project_root),
-                entry.size,
-            )
-            .await
-            .context("restore pane-local tab")?;
+        let pane = match page_for_entry(entry, terminal_specs) {
+            Some(page) => mux.spawn_page_in_stack(base_pane_id, domain, page, entry.size).await,
+            None => {
+                mux.spawn_pane_in_stack(
+                    base_pane_id,
+                    domain,
+                    command,
+                    heal_fallback_cwd(working_dir_for_entry(entry, terminal_specs), project_root),
+                    entry.size,
+                )
+                .await
+            }
+        }
+        .context("restore pane-local tab")?;
         pane.set_config(Arc::clone(&term_config));
         pane_ids.push(pane.pane_id());
     }
@@ -10758,6 +10786,15 @@ fn spawns_locally(mux: &Mux, domain: &SpawnTabDomain, current: Option<PaneId>) -
 pub(crate) fn reads_kept_output(domain: &dyn mux::domain::Domain) -> bool {
     domain.downcast_ref::<mux::domain::LocalDomain>().is_some()
         || crate::local_sessions::is_host_domain_id(domain.domain_id())
+}
+
+/// The plugin's page the saved pane held, when it held one, as it is
+/// restored: with no terminal, whose id was another server's.
+fn page_for_entry(
+    entry: &PaneEntry,
+    terminal_specs: &HashMap<PaneId, TerminalSpawnSpec>,
+) -> Option<thinkterm_proto::PageSpec> {
+    Some(terminal_specs.get(&entry.pane_id)?.page.clone()?.restored())
 }
 
 /// Give `pane_id` the label the pane it stands in for had.
@@ -10884,6 +10921,7 @@ fn collect_terminal_spec<F>(
             title: entry.title.clone(),
             label: mux.pane_label(entry.pane_id),
             host_pane_id,
+            page: mux.get_pane(entry.pane_id).and_then(|pane| pane.page()),
         },
         font_scale: valid_font_scale(pane_font_scale(entry.pane_id)),
     });
@@ -18331,6 +18369,7 @@ mod kept_output_layout_tests {
                 title: format!("shell-{pane_id}"),
                 label: Some(format!("label-{pane_id}")),
                 host_pane_id: Some(90 + pane_id),
+                page: None,
             },
             font_scale: Some(1.25),
         }

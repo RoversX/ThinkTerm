@@ -335,6 +335,9 @@ impl TermWindow {
             if let Some(panel) = self.right_sidebar_plugin.as_mut() {
                 panel.selecting = None;
             }
+            for page in self.plugin_pages.values_mut() {
+                page.selecting = None;
+            }
         }
     }
 
@@ -572,7 +575,15 @@ impl TermWindow {
                 true
             }
             Act::Paste => {
-                self.paste_into_right_sidebar_from_clipboard(ClipboardPasteSource::Clipboard);
+                match self.plugin_page_standing {
+                    // A page's field: the clipboard answers once the page is
+                    // back in its own place.
+                    Some(pane_id) => {
+                        self.paste_into_plugin_page(pane_id, ClipboardPasteSource::Clipboard)
+                    }
+                    None => self
+                        .paste_into_right_sidebar_from_clipboard(ClipboardPasteSource::Clipboard),
+                }
                 true
             }
             Act::Key(Some(name)) => shown.player.key(&name, to_player),
@@ -806,20 +817,8 @@ impl TermWindow {
         else {
             return false;
         };
-        let Some(panel) = self.right_sidebar_plugin.as_mut() else {
+        let Some(shown) = self.plugin_view_numbered(view) else {
             return true;
-        };
-        let shown = if panel.shown.view == view {
-            &mut panel.shown
-        } else {
-            match panel
-                .extended
-                .as_mut()
-                .filter(|(extended, _)| extended.view == view)
-            {
-                Some((extended, _)) => extended,
-                None => return true,
-            }
         };
         let Some(id) = shown
             .player
@@ -1461,7 +1460,7 @@ fn wrap_line(
         if end < count {
             if let Some(at) = (start + 1..=end)
                 .rev()
-                .find(|at| breaks_before(&chars, *at))
+                .find(|at| thinkterm_plugin_panel::wrap::breaks_before(&chars, *at))
             {
                 end = at;
             }
@@ -1475,56 +1474,6 @@ fn wrap_line(
         });
         start = end;
     }
-}
-
-/// Whether a line may break before character `at` of `chars`: after a
-/// space, or where the characters on either side are of a script written
-/// without spaces -- but not before the punctuation that closes one.
-pub(super) fn breaks_before(chars: &[char], at: usize) -> bool {
-    let (Some(before), Some(after)) = (chars.get(at.wrapping_sub(1)), chars.get(at)) else {
-        return false;
-    };
-    if before.is_whitespace() {
-        return true;
-    }
-    let closing = matches!(
-        after,
-        '、' | '。'
-            | '，'
-            | '．'
-            | '：'
-            | '；'
-            | '！'
-            | '？'
-            | '）'
-            | '」'
-            | '』'
-            | '】'
-            | '〉'
-            | '》'
-            | '〕'
-            | 'ー'
-            | '…'
-    );
-    (unspaced(*before) || unspaced(*after)) && !after.is_whitespace() && !closing
-}
-
-/// A character of a script written without spaces between its words:
-/// Chinese, Japanese, Korean, and their punctuation.
-fn unspaced(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x2E80..=0x2FFF
-            | 0x3000..=0x303F
-            | 0x3040..=0x30FF
-            | 0x3100..=0x31FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xAC00..=0xD7AF
-            | 0xF900..=0xFAFF
-            | 0xFF00..=0xFFEF
-            | 0x20000..=0x3FFFF
-    )
 }
 
 /// The laid line the caret before character `index` shows on, and where

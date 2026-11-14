@@ -183,6 +183,19 @@ impl GetText {
             .into_iter()
             .map(|(_idx, line)| line)
             .collect();
+        // A pane that holds a plugin's page has no text, which is said
+        // rather than answered with blank lines. Only a screen with nothing
+        // on it is asked about, so a terminal's read costs what it did.
+        if lines.iter().all(|line| line.as_str().trim().is_empty()) {
+            let page = client
+                .list_panes()
+                .await
+                .ok()
+                .and_then(|mut listing| listing.pane_pages.remove(&pane_id));
+            if let Some(page) = page {
+                anyhow::bail!("{}: it has no text", page.no_terminal(pane_id));
+            }
+        }
         if self.unwrap {
             lines = unwrapped(lines);
         }

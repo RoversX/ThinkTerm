@@ -84,6 +84,9 @@ struct LiveConnection {
     connection: u64,
     token_id: String,
     kill: smol::channel::Sender<()>,
+    /// A second socket of a page that is already counted: see
+    /// `Admission::beside`.
+    beside: bool,
 }
 
 /// A short description of the browser that connected, from its User-Agent.
@@ -164,6 +167,17 @@ impl std::fmt::Debug for Admission {
             .field("token_id", &self.token_id)
             .field("label", &self.label)
             .finish()
+    }
+}
+
+impl Admission {
+    /// This connection is one a page opened beside its own: revoked with
+    /// the token like any other, but not another browser in `list`.
+    pub fn beside(&self) {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = store.live.iter_mut().find(|live| live.connection == self.connection) {
+            live.beside = true;
+        }
     }
 }
 
@@ -329,6 +343,7 @@ impl WebTokenStore {
             connection,
             token_id: token_id.clone(),
             kill,
+            beside: false,
         });
         Some(Admission {
             token_id,
@@ -385,7 +400,7 @@ impl WebTokenStore {
                 live_connections: inner
                     .live
                     .iter()
-                    .filter(|live| live.token_id == record.id)
+                    .filter(|live| live.token_id == record.id && !live.beside)
                     .count() as u32,
             })
             .collect()
@@ -555,8 +570,15 @@ mod tests {
         wrong.replace_range(0..1, if minted.token.starts_with('A') { "B" } else { "A" });
         assert!(store.verify(&wrong, None).is_none());
         assert_eq!(store.list()[0].live_connections, 1);
+        // A socket the page opens beside its own is not a second browser,
+        // and goes with the token all the same.
+        let beside = store.verify(&minted.token, None).unwrap();
+        beside.beside();
+        assert_eq!(store.list()[0].live_connections, 1);
         drop(admitted);
         assert_eq!(store.list()[0].live_connections, 0);
+        assert_eq!(store.revoke(Some(&minted.id)), 1);
+        assert!(beside.revoked.try_recv().is_ok(), "told to drop");
     }
 
     #[test]

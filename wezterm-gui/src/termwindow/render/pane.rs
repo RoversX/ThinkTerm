@@ -2071,6 +2071,10 @@ impl crate::TermWindow {
                 _ => None,
             })
             .map(|dot| (dot, surface));
+        // A plugin's page: its own icon, in the circle a terminal's has.
+        if let Some(page) = pane.as_ref().and_then(|pane| pane.page()) {
+            return self.paint_tab_page_icon(layers, &page, tab_y, tab_height);
+        }
         let icon = pane
             .as_ref()
             .map(|pane| crate::tab_icons::resolve(pane.as_ref()));
@@ -2182,6 +2186,48 @@ impl crate::TermWindow {
         if let Some(badge) = badge {
             self.paint_tab_icon_badge(layers, x, y, diameter, badge)?;
         }
+        Ok(x + diameter)
+    }
+
+    /// The icon heading the tab of a plugin's page: the one its plugin
+    /// named, in the circle the terminal's card has, so that it sits among
+    /// the terminals' as one of them. Returns where it ends.
+    pub(crate) fn paint_tab_page_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        page: &thinkterm_proto::PageSpec,
+        tab_y: usize,
+        tab_height: usize,
+    ) -> anyhow::Result<usize> {
+        let card = crate::tab_icons::resolve_window_tab();
+        let inset = self.ui_px(TAB_ICON_CIRCLE_INSET).min(tab_height / 4);
+        let diameter = tab_height.saturating_sub(inset * 2).max(1);
+        let x = inset;
+        let y = tab_y + inset;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        crate::tab_icons::draw_plate(
+            &ctx,
+            layers,
+            1,
+            x as f32,
+            y as f32,
+            diameter as f32,
+            card.circle,
+            self.chrome().is_dark(),
+        )
+        .context("page tab icon circle")?;
+        let glyph = ((diameter as f32 * TAB_ICON_GLYPH_RATIO).round() as usize).max(1);
+        let glyph_x = x + (diameter - glyph.min(diameter)) / 2;
+        let glyph_y = y + (diameter - glyph.min(diameter)) / 2;
+        self.paint_pane_nav_icon(
+            layers,
+            SvgIcon::for_panel(&page.icon),
+            glyph_x,
+            glyph_y,
+            glyph,
+            card.glyph_color.linear(),
+        )?;
         Ok(x + diameter)
     }
 
@@ -2353,8 +2399,13 @@ impl crate::TermWindow {
         if self.config.use_box_model_render {
             return self.paint_pane_box_model(pos);
         }
-
-        self.check_for_dirty_lines_and_invalidate_selection(&pos.pane);
+        // A plugin's page in the pane's place has the pane's ground and its
+        // bar, as a terminal has, and under the bar none of a terminal:
+        // no rows are asked after for it.
+        let page = pos.pane.page();
+        if page.is_none() {
+            self.check_for_dirty_lines_and_invalidate_selection(&pos.pane);
+        }
         /*
         let zone = {
             let dims = pos.pane.get_dimensions();
@@ -2554,6 +2605,9 @@ impl crate::TermWindow {
             .context("paint_pane_nav_bar")?;
         if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
             return Ok(());
+        }
+        if let Some(page) = &page {
+            return self.paint_plugin_page(pos, page, layers, pane_nav_height as f32);
         }
 
         // The Lua `enable_scroll_bar` gutter: one window-wide bar for the

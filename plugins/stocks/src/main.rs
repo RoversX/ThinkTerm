@@ -669,6 +669,7 @@ mod tests {
             can_extend: false,
             close: None,
             features: vec![feature::FIELDS.into(), feature::KEYS.into()],
+            pointer: Default::default(),
         }
     }
 

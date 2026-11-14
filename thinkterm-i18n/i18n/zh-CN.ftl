@@ -576,6 +576,7 @@ right-snippets-unavailable = 片段暂时不可用
 right-plugin-starting = 正在启动…
 right-plugin-stopped = 这个面板停了：{ $reason }
 right-plugin-connect = 需要连接到 { $host }
+plugin-page-placeholder = 这是插件的页面。请在电脑上的 ThinkTerm 或浏览器里打开。
 right-edit-snippet = 编辑片段
 right-snippet = 片段
 right-personal-vault = 个人库

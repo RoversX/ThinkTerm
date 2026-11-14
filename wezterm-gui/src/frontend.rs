@@ -336,6 +336,7 @@ impl GuiFrontEnd {
                 }
                 MuxNotification::TabTitleChanged { .. } => {}
                 MuxNotification::PaneLabelChanged { .. } => {}
+                MuxNotification::PageChanged(_) => {}
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::ClientJoined(_) | MuxNotification::ClientLeft(_) => {}
                 MuxNotification::TabResized(_) => {}

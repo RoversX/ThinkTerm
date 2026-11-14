@@ -591,6 +591,7 @@ right-snippets-unavailable = Les extraits sont indisponibles pour le moment
 right-plugin-starting = Démarrage…
 right-plugin-stopped = Ce panneau s'est arrêté : { $reason }
 right-plugin-connect = Nécessite une connexion à { $host }
+plugin-page-placeholder = Page d’une extension. Ouvrez-la dans ThinkTerm sur un ordinateur, ou dans un navigateur.
 right-edit-snippet = Modifier l’extrait
 right-snippet = Extrait
 right-personal-vault = Coffre personnel

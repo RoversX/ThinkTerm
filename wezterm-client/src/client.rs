@@ -193,6 +193,7 @@ pub struct Client {
     /// window, and stops.
     fatal_connection_error: Arc<Mutex<Option<String>>>,
     connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
+    plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
 }
 
 impl Client {
@@ -941,6 +942,30 @@ fn process_unilateral(
             .detach();
             return Ok(());
         }
+        Pdu::PageChanged(codec::PageChanged { pane_id, page }) => {
+            let pane_id = *pane_id;
+            let page = page.clone();
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let client_domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let client_domain =
+                    client_domain
+                        .downcast_ref::<ClientDomain>()
+                        .ok_or_else(|| {
+                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
+                        })?;
+                if client_domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
+
+                client_domain.process_remote_page_change(pane_id, page);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+            return Ok(());
+        }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
             promise::spawn::spawn_into_main_thread(async move {
@@ -1588,6 +1613,10 @@ struct Reconnectable {
     tls_creds: Option<GetTlsCredsResponse>,
     incoming_payload_limit: Option<usize>,
     connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
+    /// How a second connection to the server this one reaches is opened,
+    /// for plugin frames alone (`plugin_link`): as of the last connect, and
+    /// none where there is no way to open one.
+    plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
 }
 
 struct ConnectTransport {
@@ -1776,6 +1805,15 @@ struct SshStream {
     stdout: FileDescriptor,
 }
 
+/// What a program reads and what it writes, as the one stream of a
+/// connection carried through it.
+pub(crate) fn paired_stream(
+    stdin: FileDescriptor,
+    stdout: FileDescriptor,
+) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
+    Ok(Box::new(Async::new(SshStream { stdin, stdout })?))
+}
+
 unsafe impl async_io::IoSafe for SshStream {}
 
 impl std::fmt::Debug for SshStream {
@@ -1835,6 +1873,7 @@ impl Reconnectable {
             tls_creds: None,
             incoming_payload_limit: None,
             connect_transport: Arc::new(Mutex::new(None)),
+            plugin_way: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2050,11 +2089,19 @@ impl Reconnectable {
             _ => {}
         });
 
-        let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(SshStream {
-            stdin: exec.stdin,
-            stdout: exec.stdout,
-        })?);
-        self.stream.replace(stream);
+        self.stream.replace(paired_stream(exec.stdin, exec.stdout)?);
+        // Another channel of this session reaches the same server: the one
+        // just reached, so it is never started for it.
+        *self.plugin_way.lock().unwrap() = Some(crate::plugin_link::PluginWay::Ssh {
+            session: sess.clone(),
+            command: match ssh_dom.override_proxy_command.clone() {
+                Some(command) => command,
+                None => Self::remote_mux_command(
+                    &ssh_dom.remote_wezterm_path,
+                    "cli --prefer-mux --no-auto-start proxy",
+                ),
+            },
+        });
         if ssh_dom.override_proxy_command.is_none()
             && sess
                 .authentication_info()
@@ -2135,6 +2182,11 @@ impl Reconnectable {
         stream.set_write_timeout(Some(unix_dom.write_timeout))?;
         let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(stream)?);
         self.stream.replace(stream);
+        *self.plugin_way.lock().unwrap() = Some(match target {
+            UnixTarget::Socket(path) => crate::plugin_link::PluginWay::Unix { path },
+            // Another run of the command reaches the same server.
+            UnixTarget::Proxy(argv) => crate::plugin_link::PluginWay::Command { argv },
+        });
         Ok(())
     }
 
@@ -2145,15 +2197,6 @@ impl Reconnectable {
         ui: &mut ConnectionUI,
     ) -> anyhow::Result<()> {
         openssl::init();
-
-        let remote_address = &tls_client.remote_address;
-
-        let remote_host_name = remote_address.split(':').next().ok_or_else(|| {
-            anyhow!(
-                "expected mux_server_remote_address to have the form 'host:port', but have {}",
-                remote_address
-            )
-        })?;
 
         let network = match tls_client.ssh_parameters().transpose()? {
             Some(params) => {
@@ -2169,7 +2212,7 @@ impl Reconnectable {
         // we can connect using those same credentials and avoid running through
         // the SSH authentication flow.
         if let Some(Ok(_)) = tls_client.ssh_parameters() {
-            match self.try_connect(&tls_client, ui, &remote_address, remote_host_name, network) {
+            match self.try_connect(&tls_client, ui, network) {
                 Ok(stream) => {
                     self.stream.replace(stream);
                     return Ok(());
@@ -2273,7 +2316,7 @@ impl Reconnectable {
 
         let cloned_ui = ui.clone();
         let stream = cloned_ui.run_and_log_error({
-            || self.try_connect(&tls_client, ui, &remote_address, remote_host_name, network)
+            || self.try_connect(&tls_client, ui, network)
         })?;
         self.stream.replace(stream);
         Ok(())
@@ -2283,116 +2326,149 @@ impl Reconnectable {
         &mut self,
         tls_client: &TlsDomainClient,
         ui: &mut ConnectionUI,
-        remote_address: &str,
-        remote_host_name: &str,
         network: wezterm_ssh::Network,
     ) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
-        let mut connector = SslConnector::builder(SslMethod::tls())?;
-
-        let cert_file = match tls_client.pem_cert.clone() {
-            Some(cert) => cert,
-            None => self.tls_creds_cert_path()?,
+        let way = TlsWay {
+            client: tls_client.clone(),
+            creds_cert: self.tls_creds_cert_path().ok(),
+            creds_ca: self.tls_creds_ca_path().ok(),
+            network,
         };
-
-        connector
-            .set_certificate_file(&cert_file, SslFiletype::PEM)
-            .context(format!(
-                "set_certificate_file to {} for TLS client",
-                cert_file.display()
-            ))?;
-
-        if let Some(chain_file) = tls_client.pem_ca.as_ref() {
-            connector
-                .set_certificate_chain_file(&chain_file)
-                .context(format!(
-                    "set_certificate_chain_file to {} for TLS client",
-                    chain_file.display()
-                ))?;
-        }
-
-        let key_file = match tls_client.pem_private_key.clone() {
-            Some(key) => key,
-            None => self.tls_creds_cert_path()?,
-        };
-        connector
-            .set_private_key_file(&key_file, SslFiletype::PEM)
-            .context(format!(
-                "set_private_key_file to {} for TLS client",
-                key_file.display()
-            ))?;
-
-        fn load_cert(name: &Path) -> anyhow::Result<X509> {
-            let cert_bytes = std::fs::read(name)?;
-            log::trace!("loaded {}", name.display());
-            Ok(X509::from_pem(&cert_bytes)?)
-        }
-        for name in &tls_client.pem_root_certs {
-            if name.is_dir() {
-                for entry in std::fs::read_dir(name)? {
-                    if let Ok(cert) = load_cert(&entry?.path()) {
-                        connector.cert_store_mut().add_cert(cert).ok();
-                    }
-                }
-            } else {
-                connector.cert_store_mut().add_cert(load_cert(name)?)?;
-            }
-        }
-
-        if let Ok(ca_path) = self.tls_creds_ca_path() {
-            if ca_path.exists() {
-                connector.cert_store_mut().add_cert(load_cert(&ca_path)?)?;
-            }
-        }
-
-        let connector = connector.build();
-        let connector = connector
-            .configure()?
-            .verify_hostname(!tls_client.accept_invalid_hostnames);
-
-        ui.output_str(&format!("Connecting to {} using TLS\n", remote_address));
-        // A machine the SSH that bootstrapped the domain reached another way
-        // than the OS network -- through an embedded tailnet -- is reached
-        // that way here too.
-        let (host, port) = split_host_port(remote_address).context("invalid TLS remote address")?;
-        let registered = wezterm_ssh::dial_registered(network, host, port, None);
-        let stream = match registered {
-            Some(dialed) => {
-                let stream = TcpStream::from(
-                    dialed.with_context(|| format!("connecting to {}", remote_address))?,
-                );
-                // Not TCP underneath, and so no delay to turn off.
-                let _ = stream.set_nodelay(true);
-                stream
-            }
-            None => {
-                let stream = TcpStream::connect(remote_address)
-                    .with_context(|| format!("connecting to {}", remote_address))?;
-                stream.set_nodelay(true)?;
-                stream
-            }
-        };
-        stream.set_write_timeout(Some(tls_client.write_timeout))?;
-        stream.set_read_timeout(Some(tls_client.read_timeout))?;
-
-        let stream = Box::new(Async::new(AsyncSslStream::new(
-            connector
-                .connect(
-                    tls_client
-                        .expected_cn
-                        .as_deref()
-                        .unwrap_or(remote_host_name),
-                    stream,
-                )
-                .with_context(|| {
-                    format!(
-                        "SslConnector for {} with host name {}",
-                        remote_address, remote_host_name,
-                    )
-                })?,
-        ))?);
-        ui.output_str("TLS Connected!\n");
+        let stream = tls_stream(&way, &mut |said| ui.output_str(said))?;
+        // Another connection made the same way reaches the same server.
+        *self.plugin_way.lock().unwrap() = Some(crate::plugin_link::PluginWay::Tls(way));
         Ok(stream)
     }
+}
+
+/// What a TLS connection to a domain's server is made from, as of the last
+/// one made: the domain's settings, where the credentials fetched over SSH
+/// are kept for it, and the network it is on.
+#[derive(Clone, Debug)]
+pub struct TlsWay {
+    pub(crate) client: TlsDomainClient,
+    pub(crate) creds_cert: Option<PathBuf>,
+    pub(crate) creds_ca: Option<PathBuf>,
+    pub(crate) network: wezterm_ssh::Network,
+}
+
+/// A TLS connection made by `way`, telling `said` how far it got.
+pub(crate) fn tls_stream(
+    way: &TlsWay,
+    said: &mut dyn FnMut(&str),
+) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
+    let tls_client = &way.client;
+    let remote_address = &tls_client.remote_address;
+    let remote_host_name = remote_address.split(':').next().unwrap_or(remote_address);
+    let fetched = || {
+        way.creds_cert
+            .clone()
+            .ok_or_else(|| anyhow!("no place for the TLS credentials of {remote_address}"))
+    };
+    let mut connector = SslConnector::builder(SslMethod::tls())?;
+
+    let cert_file = match tls_client.pem_cert.clone() {
+        Some(cert) => cert,
+        None => fetched()?,
+    };
+
+    connector
+        .set_certificate_file(&cert_file, SslFiletype::PEM)
+        .context(format!(
+            "set_certificate_file to {} for TLS client",
+            cert_file.display()
+        ))?;
+
+    if let Some(chain_file) = tls_client.pem_ca.as_ref() {
+        connector
+            .set_certificate_chain_file(&chain_file)
+            .context(format!(
+                "set_certificate_chain_file to {} for TLS client",
+                chain_file.display()
+            ))?;
+    }
+
+    let key_file = match tls_client.pem_private_key.clone() {
+        Some(key) => key,
+        None => fetched()?,
+    };
+    connector
+        .set_private_key_file(&key_file, SslFiletype::PEM)
+        .context(format!(
+            "set_private_key_file to {} for TLS client",
+            key_file.display()
+        ))?;
+
+    fn load_cert(name: &Path) -> anyhow::Result<X509> {
+        let cert_bytes = std::fs::read(name)?;
+        log::trace!("loaded {}", name.display());
+        Ok(X509::from_pem(&cert_bytes)?)
+    }
+    for name in &tls_client.pem_root_certs {
+        if name.is_dir() {
+            for entry in std::fs::read_dir(name)? {
+                if let Ok(cert) = load_cert(&entry?.path()) {
+                    connector.cert_store_mut().add_cert(cert).ok();
+                }
+            }
+        } else {
+            connector.cert_store_mut().add_cert(load_cert(name)?)?;
+        }
+    }
+
+    if let Some(ca_path) = way.creds_ca.as_ref() {
+        if ca_path.exists() {
+            connector.cert_store_mut().add_cert(load_cert(ca_path)?)?;
+        }
+    }
+
+    let connector = connector.build();
+    let connector = connector
+        .configure()?
+        .verify_hostname(!tls_client.accept_invalid_hostnames);
+
+    said(&format!("Connecting to {} using TLS\n", remote_address));
+    // A machine the SSH that bootstrapped the domain reached another way
+    // than the OS network -- through an embedded tailnet -- is reached
+    // that way here too.
+    let (host, port) = split_host_port(remote_address).context("invalid TLS remote address")?;
+    let registered = wezterm_ssh::dial_registered(way.network, host, port, None);
+    let stream = match registered {
+        Some(dialed) => {
+            let stream =
+                TcpStream::from(dialed.with_context(|| format!("connecting to {}", remote_address))?);
+            // Not TCP underneath, and so no delay to turn off.
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        None => {
+            let stream = TcpStream::connect(remote_address)
+                .with_context(|| format!("connecting to {}", remote_address))?;
+            stream.set_nodelay(true)?;
+            stream
+        }
+    };
+    stream.set_write_timeout(Some(tls_client.write_timeout))?;
+    stream.set_read_timeout(Some(tls_client.read_timeout))?;
+
+    let stream = Box::new(Async::new(AsyncSslStream::new(
+        connector
+            .connect(
+                tls_client
+                    .expected_cn
+                    .as_deref()
+                    .unwrap_or(remote_host_name),
+                stream,
+            )
+            .with_context(|| {
+                format!(
+                    "SslConnector for {} with host name {}",
+                    remote_address, remote_host_name,
+                )
+            })?,
+    ))?);
+    said("TLS Connected!\n");
+    Ok(stream)
 }
 
 /// `host:port` or `[v6]:port`, as `remote_address` spells it.
@@ -2408,6 +2484,7 @@ fn split_host_port(address: &str) -> Option<(&str, u16)> {
 impl Client {
     fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
         let connect_transport = Arc::clone(&reconnectable.connect_transport);
+        let plugin_way = Arc::clone(&reconnectable.plugin_way);
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
@@ -2881,7 +2958,18 @@ impl Client {
             connection_generation,
             fatal_connection_error,
             connect_transport,
+            plugin_way,
         }
+    }
+
+    /// How a connection for plugin frames alone is opened to the server
+    /// this client is connected to (`plugin_link::PluginLink::open`); none
+    /// while it is not connected, or where no second way is known.
+    pub fn plugin_way(&self) -> Option<crate::plugin_link::PluginWay> {
+        if self.connection_phase() != ClientConnectionPhase::Ready {
+            return None;
+        }
+        self.plugin_way.lock().ok()?.clone()
     }
 
     pub fn verified_connect_session(&self) -> Option<VerifiedConnectSession> {
@@ -3273,6 +3361,8 @@ impl Client {
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
     rpc!(split_pane, SplitPane, SpawnResponse);
     rpc!(spawn_pane_in_stack, SpawnPaneInStack, SpawnResponse);
+    rpc!(spawn_page, SpawnPage, SpawnPageResponse);
+    rpc!(change_page, ChangePage, UnitResponse);
     rpc!(activate_pane_in_stack, ActivatePaneInStack, UnitResponse);
     rpc!(move_pane_to_stack, MovePaneToStack, UnitResponse);
     rpc!(swap_panes, SwapPanes, UnitResponse);

@@ -382,6 +382,9 @@ impl crate::TermWindow {
                 };
                 self.open_ssh_host_thread_without_connecting(host_id, &window);
             }
+            crate::termwindow::ContextMenuApplicationAction::OpenPluginPage(plugin) => {
+                self.open_plugin_page(&plugin, "");
+            }
             crate::termwindow::ContextMenuApplicationAction::EditRecordingOverlay => {
                 self.start_recording_overlay_edit();
             }

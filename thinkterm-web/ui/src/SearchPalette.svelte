@@ -4,8 +4,10 @@
   // wasm's (thinkterm-web/src/palette.rs); drawn here, walked with the
   // arrows, and closed by anything that means the page moved on.
   import { iconByName } from './icons';
-  import { closePalette, move, palette, run, search, select, selectedId, shownSections } from './palette.svelte';
+  import { closePalette, move, palette, pluginsListed, run, search, select, selectedId, shownSections } from './palette.svelte';
+  import { views } from './client.svelte';
   import { POP, ms } from './motion';
+  import { untrack } from 'svelte';
   import { fade, scale } from 'svelte/transition';
 
   const sections = $derived(shownSections());
@@ -46,6 +48,13 @@
     const id = current;
     if (!list || id === '') return;
     list.querySelector(`.pe[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+  });
+
+  // The plugins' actions are among the commands: found again when the list
+  // of plugins is heard anew while the palette is open.
+  $effect(() => {
+    void views.plugins.revision;
+    untrack(pluginsListed);
   });
 </script>
 

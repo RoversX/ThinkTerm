@@ -901,7 +901,10 @@ macro_rules! pdu {
 ///     screen (ForegroundProgram::task), for a tool such as apt or brew.
 /// 88: Task readings carry their stable rules id, so display-name overrides
 ///     cannot bypass a client's per-tool switch.
-pub const CODEC_VERSION: usize = 88;
+/// 89: A plugin's page in a pane's place (SpawnPage, SpawnPageResponse,
+///     ListPanesResponse::pane_pages), and what its plugin changes of it
+///     (ChangePage, PageChanged).
+pub const CODEC_VERSION: usize = 89;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1043,6 +1046,10 @@ pdu! {
     ShareCandidatesResponse: 141,
     GetConnectEndpoint: 142,
     GetConnectEndpointResponse: 143,
+    SpawnPage: 144,
+    SpawnPageResponse: 145,
+    ChangePage: 146,
+    PageChanged: 147,
 }
 
 /// Discovery only. This address conveys no authority to approve or export.
@@ -1353,6 +1360,83 @@ pub struct ListPanesResponse {
     /// gives them: the machine, and each one's id there.
     #[serde(default)]
     pub pane_machines: HashMap<PaneId, PaneMachine>,
+    /// The panes that hold a plugin's page in place of a terminal, and
+    /// which: a client draws those from the plugin's frames, and asks the
+    /// mux for none of their lines.
+    #[serde(default)]
+    pub pane_pages: HashMap<PaneId, thinkterm_proto::PageSpec>,
+}
+
+/// Open a plugin's page in a pane of its own, which runs nothing: the mux
+/// keeps where it is and what it was opened with, and each client draws
+/// it. Responds with SpawnPageResponse describing the new pane.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnPage {
+    pub page: thinkterm_proto::PageSpec,
+    pub place: PagePlace,
+    /// The size of the tab, for a page in a new one.
+    pub size: TerminalSize,
+}
+
+/// The pane a page was opened in, as SpawnResponse describes a terminal's,
+/// and the page as the mux keeps it: with the id it was given, and where
+/// it was opened from.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnPageResponse {
+    pub pane_id: PaneId,
+    pub tab_id: TabId,
+    pub window_id: WindowId,
+    pub size: TerminalSize,
+    pub page: thinkterm_proto::PageSpec,
+}
+
+impl SpawnPageResponse {
+    /// The new pane, as SpawnResponse describes a terminal's, and its page.
+    pub fn into_parts(self) -> (SpawnResponse, thinkterm_proto::PageSpec) {
+        let spawned = SpawnResponse {
+            pane_id: self.pane_id,
+            tab_id: self.tab_id,
+            window_id: self.window_id,
+            size: self.size,
+        };
+        (spawned, self.page)
+    }
+}
+
+/// Change what the page `pane_id` holds says of itself, as its plugin asked
+/// a client that shows it. Returns `UnitResponse`; every client then hears
+/// PageChanged.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ChangePage {
+    pub pane_id: PaneId,
+    pub edit: thinkterm_proto::PageEdit,
+}
+
+/// Unilateral to every client: what the page pane `pane_id` holds says of
+/// itself changed, and is now `page`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct PageChanged {
+    pub pane_id: PaneId,
+    pub page: thinkterm_proto::PageSpec,
+}
+
+/// Where a page is opened.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub enum PagePlace {
+    /// A tab of its own: in `window_id`, or in a new window of `workspace`.
+    /// It is of the domain `pane_id` is of, the one the user is on.
+    Tab {
+        window_id: Option<WindowId>,
+        workspace: String,
+        pane_id: Option<PaneId>,
+    },
+    /// A level-2 tab in the pane stack that contains `pane_id`.
+    Stack { pane_id: PaneId },
+    /// A split of `pane_id`.
+    Split {
+        pane_id: PaneId,
+        split_request: SplitRequest,
+    },
 }
 
 /// Where a pane of another machine is: the name the window gives the
@@ -2823,6 +2907,7 @@ mod golden {
             window_titles,
             pane_labels: HashMap::new(),
             pane_machines: Default::default(),
+            pane_pages: Default::default(),
         }
     }
 
@@ -2968,11 +3053,12 @@ mod golden {
         assert_eq!(back, command_spec());
     }
 
-    /// LIST_PANES as codec 85 writes it: the pane labels went on the end at
-    /// 81, the panes' machines after them at 85, and an empty map is one
-    /// zero byte, each after the bytes captured before.
+    /// LIST_PANES as codec 89 writes it: the pane labels went on the end at
+    /// 81, the panes' machines after them at 85, the panes' pages after
+    /// those at 89, and an empty map is one zero byte, each after the bytes
+    /// captured before.
     fn list_panes_with_labels() -> Vec<u8> {
-        [LIST_PANES, &[0, 0]].concat()
+        [LIST_PANES, &[0, 0, 0]].concat()
     }
 
     /// RENDER_CHANGES as codec 84 writes it: whether the program takes
@@ -3602,7 +3688,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 88);
+        assert_eq!(CODEC_VERSION, 89);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3672,7 +3758,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 88);
+        assert_eq!(CODEC_VERSION, 89);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3801,7 +3887,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 88);
+        assert_eq!(CODEC_VERSION, 89);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3871,6 +3957,73 @@ mod test {
                         pane_id: 3,
                     },
                 )]),
+                pane_pages: HashMap::from([(
+                    14,
+                    thinkterm_proto::PageSpec {
+                        plugin: "board".to_string(),
+                        args: "{\"board\":\"release\"}".to_string(),
+                        title: "Board".to_string(),
+                        icon: String::new(),
+                        id: "0f3a9c2e5b7d1846".to_string(),
+                        cwd: "/home/user/project".to_string(),
+                        terminal: Some(3),
+                    },
+                )]),
+            }),
+            Pdu::SpawnPage(SpawnPage {
+                page: thinkterm_proto::PageSpec {
+                    plugin: "board".to_string(),
+                    args: String::new(),
+                    title: "Board".to_string(),
+                    ..Default::default()
+                },
+                place: PagePlace::Tab {
+                    window_id: Some(2),
+                    workspace: "default".to_string(),
+                    pane_id: Some(10),
+                },
+                size: TerminalSize::default(),
+            }),
+            Pdu::SpawnPage(SpawnPage {
+                page: thinkterm_proto::PageSpec::default(),
+                place: PagePlace::Stack { pane_id: 10 },
+                size: TerminalSize::default(),
+            }),
+            Pdu::SpawnPage(SpawnPage {
+                page: thinkterm_proto::PageSpec::default(),
+                place: PagePlace::Split {
+                    pane_id: 10,
+                    split_request: SplitRequest::default(),
+                },
+                size: TerminalSize::default(),
+            }),
+            Pdu::SpawnPageResponse(SpawnPageResponse {
+                pane_id: 14,
+                tab_id: 5,
+                window_id: 2,
+                size: TerminalSize::default(),
+                page: thinkterm_proto::PageSpec {
+                    plugin: "board".to_string(),
+                    id: "0f3a9c2e5b7d1846".to_string(),
+                    terminal: Some(10),
+                    ..Default::default()
+                },
+            }),
+            Pdu::ChangePage(ChangePage {
+                pane_id: 14,
+                edit: thinkterm_proto::PageEdit {
+                    title: Some("Release board".to_string()),
+                    icon: None,
+                    args: Some("{\"card\":12}".to_string()),
+                },
+            }),
+            Pdu::PageChanged(PageChanged {
+                pane_id: 14,
+                page: thinkterm_proto::PageSpec {
+                    plugin: "board".to_string(),
+                    title: "Release board".to_string(),
+                    ..Default::default()
+                },
             }),
             Pdu::GetWorkspaceNames(GetWorkspaceNames {}),
             Pdu::GetWorkspaceNamesResponse(GetWorkspaceNamesResponse {
@@ -3907,7 +4060,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 88);
+        assert_eq!(CODEC_VERSION, 89);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

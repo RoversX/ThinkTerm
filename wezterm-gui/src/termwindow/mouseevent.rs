@@ -484,7 +484,7 @@ impl super::TermWindow {
             .unwrap_or_else(|| f32::from(amount))
     }
 
-    fn sidebar_vertical_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
+    pub(crate) fn sidebar_vertical_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
         if !matches!(event.kind, WMEK::VertWheel(_)) {
             return None;
         }
@@ -501,7 +501,7 @@ impl super::TermWindow {
         }
     }
 
-    fn sidebar_horizontal_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
+    pub(crate) fn sidebar_horizontal_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
         if !matches!(event.kind, WMEK::HorzWheel(_)) {
             return None;
         }
@@ -1804,6 +1804,13 @@ impl super::TermWindow {
                     }
                 }
             }
+            UIItemType::PluginPage(pane_id) => {
+                if self.plugin_page_pointer_left(pane_id) {
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
+            }
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
@@ -2039,6 +2046,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarAgent(_)
             | UIItemType::RightSidebarPluginPanel
             | UIItemType::RightSidebarPluginExtended
+            | UIItemType::PluginPage(_)
             | UIItemType::RightSidebarPluginExtendedClose
             | UIItemType::RightSidebarPluginConnect(_)
             | UIItemType::RightSidebarSnippetNew
@@ -4423,6 +4431,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarPluginExtended => {
                 self.mouse_event_plugin_panel(event, context, true);
             }
+            UIItemType::PluginPage(pane_id) => {
+                self.mouse_event_plugin_page(pane_id, event, context);
+            }
             UIItemType::RightSidebarPluginExtendedClose => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
@@ -5094,6 +5105,9 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarPluginExtended => {
                 self.mouse_event_plugin_panel(event, context, true);
+            }
+            UIItemType::PluginPage(pane_id) => {
+                self.mouse_event_plugin_page(pane_id, event, context);
             }
             UIItemType::RightSidebarPluginExtendedClose => {
                 context.set_cursor(Some(MouseCursor::Hand));
@@ -9245,6 +9259,31 @@ impl super::TermWindow {
         if !launch_menu.is_empty() {
             items.push(ContextMenuItem::Separator);
             items.extend(launch_menu);
+        }
+        // The plugins of this machine that have a page: each opens in a tab
+        // of its own, as a shell does -- beside a pane this machine keeps,
+        // where its plugin is the one to draw it.
+        let pages: Vec<ContextMenuItem> = if self.plugin_pages_open_here() {
+            crate::plugins::pages()
+                .into_iter()
+                .map(|(id, name)| {
+                    self.context_menu_application_item_with_icon(
+                        name,
+                        ContextMenuIcon::Application,
+                        crate::termwindow::ContextMenuApplicationAction::OpenPluginPage(id),
+                        true,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !pages.is_empty() {
+            items.push(ContextMenuItem::Separator);
+            items.push(ContextMenuItem::section_header(crate::i18n::tr(
+                "settings-section-plugins",
+            )));
+            items.extend(pages);
         }
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item(

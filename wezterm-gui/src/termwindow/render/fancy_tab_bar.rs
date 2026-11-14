@@ -1122,14 +1122,18 @@ impl crate::TermWindow {
         let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
         // The terminal card's circle, as the pane tabs draw it; the tab's
         // status keeps its own place after it.
-        let icon_right = self.paint_tab_circle_icon(
-            layers,
-            &crate::tab_icons::resolve_window_tab(),
-            tab_surface_y,
-            button_size,
-            false,
-            None,
-        )?;
+        let icon_right = match self.window_tab_page(tab_idx) {
+            // A tab that shows a plugin's page is headed by the page's icon.
+            Some(page) => self.paint_tab_page_icon(layers, &page, tab_surface_y, button_size)?,
+            None => self.paint_tab_circle_icon(
+                layers,
+                &crate::tab_icons::resolve_window_tab(),
+                tab_surface_y,
+                button_size,
+                false,
+                None,
+            )?,
+        };
 
         let close_x = self.tab_close_button_x(tab_width, button_size, icon_size);
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);

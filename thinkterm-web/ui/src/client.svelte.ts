@@ -24,6 +24,8 @@ export const views = $state({
   panelRevision: 0,
   /** The same, for the panel's extended view. */
   extendedRevision: 0,
+  /** The same, for any plugin's page in a pane's place (PluginPages). */
+  pagesRevision: 0,
   /** The panel on show asks for room beside the right panel for its
       extended view (PluginExtended). */
   panelExtended: false,
@@ -159,16 +161,17 @@ function read() {
       lastPlugins = plugins;
       views.plugins = JSON.parse(client.plugins()) as PluginsView;
     }
-    const panel = client.plugin_panel_revision(false);
+    const panel = client.plugin_panel_revision('panel');
     if (panel !== lastPanel) {
       lastPanel = panel;
       views.panelRevision = panel;
     }
-    const extended = client.plugin_panel_revision(true);
+    const extended = client.plugin_panel_revision('extended');
     if (extended !== lastExtended) {
       lastExtended = extended;
       views.extendedRevision = extended;
     }
+    views.pagesRevision = client.plugin_pages_revision();
     views.panelExtended = client.plugin_panel_extended();
     const settings = client.settings();
     if (settings !== lastSettings) {

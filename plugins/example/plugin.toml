@@ -4,7 +4,7 @@ id = "text-tools"
 name = "Text Tools"
 version = "0.1.0"
 description = "Decodes text, and makes UUIDs."
-api = 2
+api = 3
 
 [run]
 program = "thinkterm-plugin-example"
@@ -15,9 +15,30 @@ program = "thinkterm-plugin-example.exe"
 [panel]
 icon = "puzzle"
 
+# The same tool as a page: a tab of its own, or a pane beside a terminal.
+[page]
+icon = "puzzle"
+
+# What the plugin does when asked by name: from the command palette, with
+# a key bound to it in Settings › Keymap, or with
+# `thinkterm plugin do text-tools type-uuid`.
+[[action]]
+id = "type-uuid"
+title = "Type a new UUID"
+call = { op = "type-uuid" }
+
+[[action]]
+id = "open"
+title = "Open as a page"
+page = {}
+
 [locales.zh-CN]
 name = "文本工具"
 description = "解码文字，生成 UUID。"
+
+[locales.zh-CN.actions]
+type-uuid = "输入一个新的 UUID"
+open = "作为页面打开"
 
 [locales.ja-JP]
 name = "テキストツール"

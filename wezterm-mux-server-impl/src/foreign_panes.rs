@@ -85,6 +85,7 @@ fn subject(pdu: &Pdu) -> Vec<(Subject, Use)> {
         Pdu::AdjustPaneSize(req) => vec![(Pane(req.pane_id), Act)],
         Pdu::SetFocusedPane(req) => vec![(Pane(req.pane_id), Act)],
         Pdu::PaneLabelChanged(req) => vec![(Pane(req.pane_id), Act)],
+        Pdu::ChangePage(req) => vec![(Pane(req.pane_id), Act)],
         Pdu::ActivatePaneInStack(req) => vec![(Pane(req.pane_id), Act)],
         Pdu::MovePaneToNewTab(req) => vec![(Pane(req.pane_id), Act)],
         Pdu::SetPaneZoomed(req) => vec![(Pane(req.pane_id), Act)],
@@ -104,6 +105,16 @@ fn subject(pdu: &Pdu) -> Vec<(Subject, Use)> {
                 (Pane(req.pane_id), Act),
                 (Domain(req.domain.clone(), Some(req.pane_id)), Act),
             ]
+        }
+        // A page is of the domain the pane it is opened by is of.
+        Pdu::SpawnPage(req) => {
+            let current = SpawnTabDomain::CurrentPaneDomain;
+            match &req.place {
+                codec::PagePlace::Tab { pane_id, .. } => vec![(Domain(current, *pane_id), Act)],
+                codec::PagePlace::Stack { pane_id } | codec::PagePlace::Split { pane_id, .. } => {
+                    vec![(Pane(*pane_id), Act), (Domain(current, Some(*pane_id)), Act)]
+                }
+            }
         }
         Pdu::MovePaneToStack(req) => vec![
             (Pane(req.source_pane_id), Act),
@@ -284,6 +295,7 @@ pub fn hides(notification: &MuxNotification) -> bool {
         | MuxNotification::ForegroundProgramChanged(pane_id)
         | MuxNotification::AssignClipboard { pane_id, .. }
         | MuxNotification::PaneFocused(pane_id)
+        | MuxNotification::PageChanged(pane_id)
         | MuxNotification::PaneLabelChanged { pane_id, .. } => Subject::Pane(*pane_id),
         MuxNotification::TabAddedToWindow { tab_id, .. }
         | MuxNotification::TabResized(tab_id)
