@@ -540,7 +540,8 @@ pub(crate) fn connect_domain_for_ssh_host_id(host_id: &str) -> anyhow::Result<Ar
 /// client keeps the address, user and password it was built with, so one
 /// registered earlier would go on with the old ones until a restart. Only a
 /// domain doing nothing is replaced; one that is attached, attaching or
-/// retrying keeps going as it is. So is one built the way the record has it
+/// retrying keeps going as it is, but for a new password, which its next
+/// sign-in uses. So is one built the way the record has it
 /// already: the mux keeps every domain it is given, so another would only
 /// show up beside it, in the command palette for one.
 pub(crate) fn refresh_connect_domain_for_ssh_host(spec: &crate::ssh_hosts::SshHostSpec) {
@@ -551,15 +552,28 @@ pub(crate) fn refresh_connect_domain_for_ssh_host(spec: &crate::ssh_hosts::SshHo
     let Some(client) = domain.downcast_ref::<ClientDomain>() else {
         return;
     };
+    let wanted = ssh_host_client_domain_config(spec, name.clone());
     if domain.state() != mux::domain::DomainState::Detached
         || client.is_attaching()
         || client.is_attach_retrying()
     {
+        // In use, the domain is left as it is, but for the password it
+        // signs in with: a reconnect that stopped because the server
+        // refused the old one would send that one again when asked to go
+        // on, and nothing short of a detach would get the new one to it.
+        let password_alone = client.ssh_domain_config().is_some_and(|mut built| {
+            let changed = built.stored_password != wanted.stored_password;
+            built.stored_password = wanted.stored_password.clone();
+            changed && crate::ssh_hosts::same_dialing(&built, &wanted)
+        });
+        if password_alone {
+            client.set_stored_password(wanted.stored_password);
+        }
         return;
     }
-    let current = client.ssh_domain_config().is_some_and(|built| {
-        crate::ssh_hosts::same_dialing(&built, &ssh_host_client_domain_config(spec, name.clone()))
-    });
+    let current = client
+        .ssh_domain_config()
+        .is_some_and(|built| crate::ssh_hosts::same_dialing(&built, &wanted));
     if !current {
         add_ssh_host_client_domain(spec, name);
     }

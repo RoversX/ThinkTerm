@@ -76,12 +76,23 @@ impl Drop for SessionInner {
     }
 }
 
+/// What a session that ended with `err` tells whoever asked for it.
+pub(crate) fn failure_event(err: &anyhow::Error) -> SessionEvent {
+    let message = format!("{:#}", err);
+    if err
+        .chain()
+        .any(|cause| cause.is::<crate::auth::AnswerRefused>())
+    {
+        SessionEvent::AuthenticationRefused(message)
+    } else {
+        SessionEvent::Error(message)
+    }
+}
+
 impl SessionInner {
     pub fn run(&mut self) {
         if let Err(err) = self.run_impl() {
-            self.tx_event
-                .try_send(SessionEvent::Error(format!("{:#}", err)))
-                .ok();
+            self.tx_event.try_send(failure_event(&err)).ok();
         }
     }
 

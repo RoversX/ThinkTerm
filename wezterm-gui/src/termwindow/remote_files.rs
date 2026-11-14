@@ -1985,7 +1985,9 @@ impl RemoteFileConnector for SshRemoteFileConnector {
                     SessionEvent::HostVerificationFailed(failed) => {
                         return Err(format!("SSH host verification failed: {failed}"));
                     }
-                    SessionEvent::Error(err) => return Err(format!("SSH error: {err}")),
+                    SessionEvent::Error(err) | SessionEvent::AuthenticationRefused(err) => {
+                        return Err(format!("SSH error: {err}"))
+                    }
                     SessionEvent::Authenticated => {
                         let backend: Arc<dyn RemoteFileBackend> = Arc::new(SftpRemoteFileBackend {
                             sftp: session.sftp(),

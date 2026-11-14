@@ -4,6 +4,8 @@
 
 use crate::authentication::{AuthenticationBackend, AuthenticationInfo, AuthenticationMethod};
 use crate::session::{SessionEvent, SessionShutdown};
+#[cfg(feature = "libssh-rs")]
+use crate::sessioninner::failure_event;
 use crate::sessioninner::SessionInner;
 use crate::ConfigMap;
 use anyhow::Context;
@@ -32,6 +34,8 @@ enum Scenario {
     RejectedKeyThenPassword,
     PasswordThenInteractive,
     EncryptedKey,
+    RefusedPassword,
+    RefusedInteractive,
 }
 
 struct TestServer {
@@ -48,9 +52,9 @@ impl TestServer {
     fn available_methods(&self) -> MethodSet {
         use MethodKind::*;
         match (self.scenario, self.first_step) {
-            (Scenario::Interactive, _) | (Scenario::PasswordThenInteractive, true) => {
-                methods(&[KeyboardInteractive])
-            }
+            (Scenario::Interactive, _)
+            | (Scenario::RefusedInteractive, _)
+            | (Scenario::PasswordThenInteractive, true) => methods(&[KeyboardInteractive]),
             (Scenario::PublicKeyThenPassword, false)
             | (Scenario::RejectedKeyThenPassword, false)
             | (Scenario::EncryptedKey, false) => methods(&[PublicKey, Password]),
@@ -81,6 +85,12 @@ impl Handler for TestServer {
     async fn auth_password(&mut self, _: &str, password: &str) -> Result<Auth, Self::Error> {
         self.credential_attempts.fetch_add(1, Ordering::SeqCst);
         assert!(password == "example-password");
+        if self.scenario == Scenario::RefusedPassword {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
         if self.scenario == Scenario::PasswordThenInteractive {
             self.first_step = true;
             Ok(Auth::Reject {
@@ -103,6 +113,12 @@ impl Handler for TestServer {
             assert!(response
                 .next()
                 .is_some_and(|value| value.as_ref() == b"example-password"));
+            if self.scenario == Scenario::RefusedInteractive {
+                return Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                });
+            }
             Ok(Auth::Accept)
         } else {
             Ok(Auth::Partial {
@@ -488,4 +504,35 @@ async fn cancelling_key_decryption_does_not_fall_back_to_password() {
     .await;
     assert!(result.is_err());
     assert_eq!(attempts, 0);
+}
+
+#[cfg(feature = "libssh-rs")]
+#[tokio::test]
+async fn an_answer_the_server_refused_is_told_apart_from_other_failures() {
+    for scenario in [Scenario::RefusedPassword, Scenario::RefusedInteractive] {
+        let (result, attempts) =
+            exchange(AuthenticationBackend::LibSsh, scenario, true, false).await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(failure_event(&err), SessionEvent::AuthenticationRefused(_)),
+            "{:?}: {:#}",
+            scenario,
+            err
+        );
+        // The answer went to the server once, not again after its no.
+        assert_eq!(attempts, 1);
+    }
+
+    // With nobody answering, nothing was refused.
+    let (result, _) = exchange(
+        AuthenticationBackend::LibSsh,
+        Scenario::Password,
+        true,
+        true,
+    )
+    .await;
+    assert!(matches!(
+        failure_event(&result.unwrap_err()),
+        SessionEvent::Error(_)
+    ));
 }

@@ -115,7 +115,7 @@ fn main() {
                 SessionEvent::HostVerificationFailed(failed) => {
                     anyhow::bail!("{}", failed);
                 }
-                SessionEvent::Error(err) => {
+                SessionEvent::Error(err) | SessionEvent::AuthenticationRefused(err) => {
                     anyhow::bail!("{}", err);
                 }
                 SessionEvent::Authenticated => break,

@@ -332,6 +332,11 @@ pub fn is_fatal_attach_error(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<mux::ssh::AuthCancelledError>()
             .is_some()
+            // The same stored password would be refused the same way, and
+            // the server counts each time.
+            || cause
+                .downcast_ref::<mux::ssh::StoredPasswordRefused>()
+                .is_some()
             || cause
                 .downcast_ref::<crate::client::IncompatibleVersionError>()
                 .is_some()
@@ -2107,6 +2112,9 @@ pub struct ClientDomain {
     unsent_labels: Mutex<HashMap<PaneId, Option<String>>>,
     label_edits: Mutex<LabelEdits>,
     local_domain_id: DomainId,
+    /// The password kept for an ssh host, where it has been given another
+    /// since `config` was made (see `set_stored_password`).
+    stored_password: Mutex<Option<Option<String>>>,
 }
 
 async fn update_remote_workspace(
@@ -2569,6 +2577,7 @@ impl ClientDomain {
             unsent_labels: Mutex::new(HashMap::new()),
             label_edits: Mutex::new(LabelEdits::default()),
             local_domain_id,
+            stored_password: Mutex::new(None),
         }
     }
 
@@ -2601,8 +2610,24 @@ impl ClientDomain {
     /// cannot accidentally share the mux Session and stall terminal traffic.
     pub fn ssh_domain_config(&self) -> Option<SshDomain> {
         match &self.config {
-            ClientDomainConfig::Ssh(ssh) => Some(ssh.clone()),
+            ClientDomainConfig::Ssh(ssh) => {
+                let mut ssh = ssh.clone();
+                if let Some(password) = self.stored_password.lock().unwrap().clone() {
+                    ssh.stored_password = password;
+                }
+                Some(ssh)
+            }
             ClientDomainConfig::Unix(_) | ClientDomainConfig::Tls(_) => None,
+        }
+    }
+
+    /// The host was given another password while this domain is in use.
+    /// Nothing is reconnected for it: the next sign-in uses it, be that a
+    /// reconnect already waiting or a later attach.
+    pub fn set_stored_password(&self, password: Option<String>) {
+        *self.stored_password.lock().unwrap() = Some(password.clone());
+        if let Some(inner) = self.inner() {
+            inner.client.set_stored_password(password);
         }
     }
 
@@ -5065,6 +5090,10 @@ mod tests {
     fn fatal_attach_errors_do_not_retry_even_when_wrapped() {
         let fatal_errors = [
             anyhow::Error::new(mux::ssh::AuthCancelledError).context("ssh setup"),
+            anyhow::Error::new(mux::ssh::StoredPasswordRefused(
+                "password auth status: Denied".to_string(),
+            ))
+            .context("ssh setup"),
             anyhow::Error::new(crate::client::IncompatibleVersionError {
                 version: "20990101-000000-abcdef".to_string(),
                 codec_vers: 1,
@@ -6455,7 +6484,11 @@ impl ClientDomain {
         ui: ConnectionUI,
     ) -> anyhow::Result<()> {
         let domain_id = self.local_domain_id;
-        let config = self.config.clone();
+        let config = match self.ssh_domain_config() {
+            // With the password the host has now.
+            Some(ssh) => ClientDomainConfig::Ssh(ssh),
+            None => self.config.clone(),
+        };
 
         let activity = mux::activity::Activity::new();
         ui.title("ThinkTerm: Connecting...");

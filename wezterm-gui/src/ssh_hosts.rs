@@ -616,7 +616,9 @@ async fn connect_mosh_bootstrap_session(spec: &SshHostSpec) -> Result<(Session, 
             SessionEvent::HostVerificationFailed(failed) => {
                 bail!("SSH host verification failed: {}", failed);
             }
-            SessionEvent::Error(err) => bail!("SSH error: {}", err),
+            SessionEvent::Error(err) | SessionEvent::AuthenticationRefused(err) => {
+                bail!("SSH error: {}", err)
+            }
             SessionEvent::Authenticated => return Ok((session, mosh_client_host)),
         }
     }

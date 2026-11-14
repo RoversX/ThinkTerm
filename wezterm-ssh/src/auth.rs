@@ -27,6 +27,12 @@ impl AuthenticationEvent {
     }
 }
 
+/// The server asked, was answered and turned the answer down, and nothing
+/// else was left to offer it. The same answer would be turned down again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct AnswerRefused(pub(crate) String);
+
 impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
     fn agent_auth(
@@ -205,6 +211,9 @@ impl crate::sessioninner::SessionInner {
             _ => {}
         }
 
+        // Set once the server has turned down what it was told in answer
+        // to its own prompts.
+        let mut answer_refused = false;
         loop {
             let auth_methods = sess.userauth_list(None)?;
             let mut status_by_method = HashMap::new();
@@ -226,6 +235,7 @@ impl crate::sessioninner::SessionInner {
             }
 
             if auth_methods.contains(AuthMethods::INTERACTIVE) {
+                let mut answered = false;
                 loop {
                     let status = sess.userauth_keyboard_interactive(None, None)?;
                     progress.observe_libssh(AuthenticationMethod::KeyboardInteractive, status);
@@ -255,10 +265,12 @@ impl crate::sessioninner::SessionInner {
                                 .context("waiting for authentication answers from user")?;
 
                             sess.userauth_keyboard_interactive_set_answers(&answers)?;
+                            answered = true;
 
                             continue;
                         }
                         AuthStatus::Denied => {
+                            answer_refused |= answered;
                             break;
                         }
                         AuthStatus::Partial => continue,
@@ -295,15 +307,23 @@ impl crate::sessioninner::SessionInner {
                 match status {
                     AuthStatus::Success => return Ok(progress),
                     AuthStatus::Partial => continue,
+                    AuthStatus::Denied => {
+                        return Err(
+                            AnswerRefused(format!("password auth status: {:?}", status)).into()
+                        );
+                    }
                     status => anyhow::bail!("password auth status: {:?}", status),
                 }
             }
 
-            anyhow::bail!(
+            let unhandled = format!(
                 "unhandled auth case; methods={:?}, status={:?}",
-                auth_methods,
-                status_by_method
+                auth_methods, status_by_method
             );
+            if answer_refused {
+                return Err(AnswerRefused(unhandled).into());
+            }
+            anyhow::bail!(unhandled);
         }
     }
 

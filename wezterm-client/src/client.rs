@@ -194,9 +194,15 @@ pub struct Client {
     fatal_connection_error: Arc<Mutex<Option<String>>>,
     connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
     plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
+    stored_password: Arc<Mutex<Option<String>>>,
 }
 
 impl Client {
+    /// Have the next connection attempt sign in with `password`.
+    pub fn set_stored_password(&self, password: Option<String>) {
+        *self.stored_password.lock().unwrap() = password;
+    }
+
     pub fn connection_phase(&self) -> ClientConnectionPhase {
         ClientConnectionPhase::from_u8(self.connection_phase.load(Ordering::Acquire))
     }
@@ -1028,6 +1034,16 @@ fn is_auth_cancelled(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Did the server turn down the password kept for the host, with nobody
+/// asked for another? The next attempt would send the same one.
+fn is_stored_password_refused(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<mux::ssh::StoredPasswordRefused>()
+            .is_some()
+    })
+}
+
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
@@ -1617,6 +1633,9 @@ struct Reconnectable {
     /// for plugin frames alone (`plugin_link`): as of the last connect, and
     /// none where there is no way to open one.
     plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
+    /// The password kept for an ssh host, as of now: the host can be given
+    /// another while this is between tries, and the next try is to use it.
+    stored_password: Arc<Mutex<Option<String>>>,
 }
 
 struct ConnectTransport {
@@ -1867,7 +1886,12 @@ impl Write for SshStream {
 
 impl Reconnectable {
     fn new(config: ClientDomainConfig, stream: Option<Box<dyn AsyncReadAndWrite>>) -> Self {
+        let stored_password = match &config {
+            ClientDomainConfig::Ssh(ssh) => ssh.stored_password.clone(),
+            ClientDomainConfig::Unix(_) | ClientDomainConfig::Tls(_) => None,
+        };
         Self {
+            stored_password: Arc::new(Mutex::new(stored_password)),
             config,
             stream,
             tls_creds: None,
@@ -1875,6 +1899,10 @@ impl Reconnectable {
             connect_transport: Arc::new(Mutex::new(None)),
             plugin_way: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn stored_password(&self) -> Option<String> {
+        self.stored_password.lock().unwrap().clone()
     }
 
     fn tls_creds_path(&self) -> anyhow::Result<PathBuf> {
@@ -2034,8 +2062,7 @@ impl Reconnectable {
                     && thinkterm_reverse_access::protocol::display_text(source, 256) == *source
             });
 
-        let sess =
-            ssh_connect_with_ui_and_password(ssh_config, ui, ssh_dom.stored_password.clone())?;
+        let sess = ssh_connect_with_ui_and_password(ssh_config, ui, self.stored_password())?;
         // A host with no mux binary would answer the proxy only with
         // "command not found" and a closed stream. Asked first, that case is
         // told apart, and the attach can offer to install ThinkTerm. Only the
@@ -2485,6 +2512,7 @@ impl Client {
     fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
         let connect_transport = Arc::clone(&reconnectable.connect_transport);
         let plugin_way = Arc::clone(&reconnectable.plugin_way);
+        let stored_password = Arc::clone(&reconnectable.stored_password);
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
@@ -2840,6 +2868,12 @@ impl Client {
                                         // We asked and they declined; another
                                         // attempt would only ask again.
                                         suspend = Some("authentication was declined".to_string());
+                                    } else if is_stored_password_refused(&err) {
+                                        // Sending it again changes nothing
+                                        // but the server's count of failed
+                                        // sign-ins from this address.
+                                        suspend =
+                                            Some("the stored password was refused".to_string());
                                     }
                                 }
                             }
@@ -2959,6 +2993,7 @@ impl Client {
             fatal_connection_error,
             connect_transport,
             plugin_way,
+            stored_password,
         }
     }
 
@@ -3529,7 +3564,10 @@ fn outage_clock_after_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_auth_cancelled, outage_clock_after_session, split_host_port, Reconnectable};
+    use super::{
+        is_auth_cancelled, is_stored_password_refused, outage_clock_after_session, split_host_port,
+        Reconnectable,
+    };
     use crate::domain::ClientDomainConfig;
     use std::time::{Duration, Instant};
 
@@ -3665,6 +3703,33 @@ mod tests {
     }
 
     #[test]
+    fn a_password_given_later_is_the_one_the_next_sign_in_uses() {
+        let reconnectable = Reconnectable::new(
+            ClientDomainConfig::Ssh(config::SshDomain {
+                stored_password: Some("example-old".to_string()),
+                ..Default::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            reconnectable.stored_password().as_deref(),
+            Some("example-old")
+        );
+        // What `Client::set_stored_password` does, from the other end.
+        *reconnectable.stored_password.lock().unwrap() = Some("example-new".to_string());
+        assert_eq!(
+            reconnectable.stored_password().as_deref(),
+            Some("example-new")
+        );
+
+        let no_password = Reconnectable::new(
+            ClientDomainConfig::Unix(config::UnixDomain::default()),
+            None,
+        );
+        assert_eq!(no_password.stored_password(), None);
+    }
+
+    #[test]
     fn only_the_local_session_host_reconnects_over_a_unix_socket() {
         let plain = Reconnectable::new(
             ClientDomainConfig::Unix(config::UnixDomain::default()),
@@ -3701,6 +3766,25 @@ mod tests {
     fn an_ordinary_failure_is_not_auth_cancellation() {
         let err = anyhow::anyhow!("Connecting to host within 10s: timed out");
         assert!(!is_auth_cancelled(&err));
+    }
+
+    #[test]
+    fn a_refused_stored_password_survives_being_wrapped_in_context() {
+        // The reconnect loop parks on this too, rather than send the same
+        // password again.
+        let err = anyhow::Error::new(mux::ssh::StoredPasswordRefused(
+            "password auth status: Denied".to_string(),
+        ))
+        .context("ssh_connect_with_ui_and_password")
+        .context("reconnecting");
+        assert!(is_stored_password_refused(&err));
+        assert!(!is_auth_cancelled(&err));
+    }
+
+    #[test]
+    fn a_refusal_without_the_marker_is_an_ordinary_failure() {
+        let err = anyhow::anyhow!("Error: password auth status: Denied");
+        assert!(!is_stored_password_refused(&err));
     }
 
     #[test]

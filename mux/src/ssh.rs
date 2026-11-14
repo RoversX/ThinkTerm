@@ -29,12 +29,20 @@ use wezterm_ssh::{
 use wezterm_term::TerminalSize;
 
 /// The user dismissed an auth prompt instead of answering it. Distinct from a
-/// wrong password or an unreachable host: those deserve another attempt, this
+/// mistyped password or an unreachable host: those deserve another attempt, this
 /// one means "not now", so the reconnect loop parks instead of retrying (and,
 /// historically, instead of tearing the whole domain down).
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[error("Authentication was cancelled")]
 pub struct AuthCancelledError;
+
+/// The server turned down the password kept for this host, and nobody was
+/// asked for another. A further attempt would send the same one, and a
+/// server that counts failed sign-ins shuts the address out for them: so,
+/// like a dismissed prompt, this parks the reconnect loop.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("the server refused the stored password: {0}")]
+pub struct StoredPasswordRefused(pub String);
 
 #[derive(Default)]
 struct PasswordPromptHost {
@@ -85,7 +93,9 @@ const SERVER_SILENCE_LIMIT: Duration = Duration::from_secs(120);
 /// issue a second prompt (e.g. `password` then `keyboard-interactive`, or a
 /// retry), and a single-shot answer left the second one to an interactive
 /// prompt that a headless reconnect cannot serve. A wrong stored password
-/// still falls back to interactive entry after those attempts.
+/// still falls back to interactive entry after those attempts, where the
+/// server asks again; where it ends the sign-in instead, the error is
+/// [`StoredPasswordRefused`].
 pub fn ssh_connect_with_ui_and_password(
     ssh_config: wezterm_ssh::ConfigMap,
     ui: &mut ConnectionUI,
@@ -103,6 +113,10 @@ fn ssh_connect_with_silence_limit(
     let cloned_ui = ui.clone();
     cloned_ui.run_and_log_error(move || {
         let mut password_answers_left = if password.is_some() { 2usize } else { 0 };
+        // Whose answers the server has had: the stored password's, the
+        // user's, or both.
+        let mut stored_password_sent = false;
+        let mut user_was_asked = false;
         let remote_address = ssh_config
             .get("hostname")
             .expect("ssh config to always set hostname");
@@ -164,14 +178,17 @@ fn ssh_connect_with_silence_limit(
                             ui.output_str(&format!("{}\n", line));
                         }
                         let res = if prompt.echo {
+                            user_was_asked = true;
                             ui.input(editor_prompt)
                         } else if password_answers_left > 0 {
                             password_answers_left -= 1;
+                            stored_password_sent = true;
                             ui.output_str(&format!("{editor_prompt} (using stored password)\n"));
                             Ok(password
                                 .clone()
                                 .expect("password present when answers remain"))
                         } else {
+                            user_was_asked = true;
                             ui.password(editor_prompt)
                         };
                         if let Ok(line) = res {
@@ -194,11 +211,28 @@ fn ssh_connect_with_silence_limit(
                 SessionEvent::Error(err) => {
                     anyhow::bail!("Error: {}", err);
                 }
+                SessionEvent::AuthenticationRefused(err) => {
+                    return Err(refused_sign_in(err, stored_password_sent, user_was_asked));
+                }
                 SessionEvent::Authenticated => return Ok(session),
             }
         }
         bail!("unable to authenticate session");
     })
+}
+
+/// The error for a sign-in the server refused. What the user typed may be
+/// typed again, better; what is stored would only be sent again as it is.
+fn refused_sign_in(
+    message: String,
+    stored_password_sent: bool,
+    user_was_asked: bool,
+) -> anyhow::Error {
+    if stored_password_sent && !user_was_asked {
+        StoredPasswordRefused(message).into()
+    } else {
+        anyhow::anyhow!("Error: {}", message)
+    }
 }
 
 fn format_host_verification_for_terminal(failed: &HostVerificationFailed) -> Vec<Change> {
@@ -850,7 +884,7 @@ fn connect_ssh_session(
                 }
                 smol::block_on(auth.answer(answers))?;
             }
-            SessionEvent::Error(err) => {
+            SessionEvent::Error(err) | SessionEvent::AuthenticationRefused(err) => {
                 set_status(SshConnectionStatus::Failed(err.clone()));
                 shim.output_line(&format!("Error: {}", err))?;
             }
@@ -1381,6 +1415,25 @@ mod tests {
         domain.prepare_connection_attempt().unwrap();
 
         assert_eq!(domain.connection_status(), SshConnectionStatus::Connecting);
+    }
+
+    #[test]
+    fn only_a_stored_password_sent_alone_is_refused_for_good() {
+        let refused = |stored, asked| {
+            refused_sign_in("password auth status: Denied".to_string(), stored, asked)
+        };
+        assert_eq!(
+            refused(true, false).downcast_ref::<StoredPasswordRefused>(),
+            Some(&StoredPasswordRefused(
+                "password auth status: Denied".to_string()
+            ))
+        );
+        // Typed by the user, wholly or in part: they can be asked again.
+        for (stored, asked) in [(false, true), (true, true), (false, false)] {
+            let err = refused(stored, asked);
+            assert!(err.downcast_ref::<StoredPasswordRefused>().is_none());
+            assert_eq!(err.to_string(), "Error: password auth status: Denied");
+        }
     }
 
     #[test]

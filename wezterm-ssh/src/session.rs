@@ -23,6 +23,10 @@ pub enum SessionEvent {
     Authenticate(AuthenticationEvent),
     HostVerificationFailed(HostVerificationFailed),
     Error(String),
+    /// Like `Error`, for a sign-in that ended because the server turned
+    /// down an answer to one of its prompts. Giving the same answer again
+    /// ends the same way, and servers count such attempts.
+    AuthenticationRefused(String),
     Authenticated,
 }
 

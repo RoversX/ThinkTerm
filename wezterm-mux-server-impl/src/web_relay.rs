@@ -1516,6 +1516,9 @@ fn authenticate(machine: &Machine, page: &Page) -> Result<Session, Failure> {
                     ),
                 ));
             }
+            SessionEvent::AuthenticationRefused(err) => {
+                return Err(Failure::new(Reason::Auth, err));
+            }
             SessionEvent::Error(err) => {
                 let reason = if refused(&err) {
                     Reason::Auth
