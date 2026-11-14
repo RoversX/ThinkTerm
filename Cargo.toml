@@ -26,6 +26,7 @@ members = [
   "thinkterm-plugin-server",
   "plugins/diff",
   "plugins/example",
+  "plugins/showcase",
   "plugins/stocks",
   "thinkterm-session",
   "thinkterm-tab-icons",

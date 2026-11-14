@@ -1,0 +1,55 @@
+# The manifest ThinkTerm reads to find this plugin and its program.
+# docs/thinkterm/plugins.md describes every key.
+id = "showcase"
+name = "Showcase"
+version = "0.1.0"
+description = "A tour of what a plugin page can draw: charts, controls, lists, forms and motion."
+api = 3
+
+[run]
+program = "thinkterm-plugin-showcase"
+
+[run.windows]
+program = "thinkterm-plugin-showcase.exe"
+
+# A small summary in the right sidebar, with buttons that open the page.
+[panel]
+icon = "gauge"
+
+# The tour itself: a tab of its own, or a pane beside a terminal. Each
+# section gives the tab an icon of its own as it is shown.
+[page]
+icon = "gauge"
+
+# What the plugin does when asked by name: from the command palette, with
+# a key bound to it in Settings › Keymap, or with
+# `thinkterm plugin do showcase type-greeting`.
+[[action]]
+id = "open"
+title = "Open the tour"
+page = {}
+
+[[action]]
+id = "open-motion"
+title = "Open the tour on Motion"
+page = { section = "motion" }
+
+[[action]]
+id = "open-board"
+title = "Open the tour on Board"
+page = { section = "board" }
+
+[[action]]
+id = "type-greeting"
+title = "Type a greeting in the terminal"
+call = { op = "type-greeting" }
+
+[locales.zh-CN]
+name = "展示"
+description = "插件页面能画什么：图表、控件、列表、表单和动画。"
+
+[locales.zh-CN.actions]
+open = "打开导览"
+open-motion = "打开导览的动画部分"
+open-board = "打开导览的看板部分"
+type-greeting = "在终端里输入一句问候"

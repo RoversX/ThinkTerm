@@ -9550,6 +9550,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-plugin-showcase"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "thinkterm-plugin-sdk",
+]
+
+[[package]]
 name = "thinkterm-plugin-stocks"
 version = "0.1.0"
 dependencies = [
