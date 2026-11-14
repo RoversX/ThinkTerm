@@ -94,7 +94,12 @@ impl TabStop {
     }
 
     fn set_tab_stop(&mut self, col: usize) {
-        self.tabs[col] = true;
+        // An absolute move may leave the cursor one past the last column
+        // (see `set_cursor_pos`), and there is no column there to hold a
+        // stop.
+        if let Some(t) = self.tabs.get_mut(col) {
+            *t = true;
+        }
     }
 
     fn find_prev_tab_stop(&self, col: usize) -> Option<usize> {

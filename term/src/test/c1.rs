@@ -60,6 +60,21 @@ fn test_hts() {
 }
 
 #[test]
+fn test_hts_past_the_last_column() {
+    let mut term = TestTerm::new(3, 10, 0);
+    // A move to a column that is not there leaves the cursor just past
+    // the last one.
+    term.print("\x1b[99G");
+    term.assert_cursor_pos(10, 0, None, None);
+    term.print("\x1bH");
+    // No stop was made, and the ones there are as they were.
+    term.print("\r\t");
+    term.assert_cursor_pos(8, 0, None, None);
+    term.print("\t");
+    term.assert_cursor_pos(9, 0, None, None);
+}
+
+#[test]
 fn test_ri() {
     let mut term = TestTerm::new(4, 2, 0);
     term.print("a\r\nb\r\nc\r\nd.");
