@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use termwiz::image::{ImageData, ImageDataType};
 use thinkterm_render::pipeline::GpuTexture;
-use thinkterm_render::vertex::{Vertex, IS_BG_IMAGE};
+use thinkterm_render::vertex::{Vertex, IS_COLOR_EMOJI};
 
 const MAX_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TEXTURES: usize = 64;
@@ -163,6 +163,17 @@ pub(crate) fn relative_slice(view: &wezterm_term::kitty_relative::RelativeView, 
         layout.uv[1] + (layout.uv[3] - layout.uv[1]) * (clip[3] - rect[1]) / (rect[3] - rect[1]),
     ];
     Some(RelativeSlice(Slice { rect: clip.map(|v| v as f32), uv: uv.map(|v| v as f32) }))
+}
+
+/// Where one cell's part of a picture is drawn. The left and top padding are
+/// the placement's pixel offset, the same in every cell: they move the part,
+/// so neighbouring parts still meet. The right and bottom padding are what
+/// the picture leaves empty in its last column and row.
+fn cell_rect(origin: (f32, f32), cell: (f32, f32), padding: (u16, u16, u16, u16), scale: (f32, f32)) -> [f32; 4] {
+    let (left, top, right, bottom) = padding;
+    let x = origin.0 + left as f32 * scale.0;
+    let y = origin.1 + top as f32 * scale.1;
+    [x, y, x + cell.0 - right as f32 * scale.0, y + cell.1 - bottom as f32 * scale.1]
 }
 
 impl Slice {
@@ -741,16 +752,10 @@ impl Graphics {
                 if self.fragments.len() >= MAX_FRAGMENTS {
                     return Ok(());
                 }
-                let (left, top, right, bottom) = image.padding();
                 let tl = image.top_left();
                 let br = image.bottom_right();
                 let mut slice = Slice {
-                    rect: [
-                        x + left as f32 * padding_scale.0,
-                        y + top as f32 * padding_scale.1,
-                        x + cw - right as f32 * padding_scale.0,
-                        y + ch - bottom as f32 * padding_scale.1,
-                    ],
+                    rect: cell_rect((x, y), (cw, ch), image.padding(), padding_scale),
                     uv: [
                         tl.x.into_inner(),
                         tl.y.into_inner(),
@@ -979,7 +984,9 @@ impl Graphics {
                     tex: [u, v],
                     fg_color: [1.0; 4],
                     hsv: fragment.hsv,
-                    has_color: IS_BG_IMAGE,
+                    // As the desktop draws them: each pixel kept whole when
+                    // a picture is enlarged, smoothed only when it shrinks.
+                    has_color: IS_COLOR_EMOJI,
                     ..Default::default()
                 });
             }
@@ -1183,6 +1190,22 @@ mod tests {
         assert_eq!(layer(-1), 1);
         assert_eq!(layer(0), 2);
         assert_eq!(layer(i32::MAX), 2);
+    }
+
+    #[test]
+    fn a_pixel_offset_moves_each_cell_part_without_narrowing_it() {
+        // Two cells of a picture placed 3 pixels right and 2 down, the
+        // second one its last column with 7 pixels left empty.
+        let first = cell_rect((100.0, 50.0), (27.0, 58.0), (3, 2, 0, 0), (1.0, 1.0));
+        let second = cell_rect((127.0, 50.0), (27.0, 58.0), (3, 2, 7, 0), (1.0, 1.0));
+        assert_eq!(first, [103.0, 52.0, 130.0, 110.0]);
+        assert_eq!(second, [130.0, 52.0, 150.0, 110.0]);
+        let parts = [first, second].map(|rect| Slice { rect, uv: [0.0, 0.0, 1.0, 1.0] });
+        let whole = Slice { uv: [0.0, 0.0, 0.5, 1.0], ..parts[0] }
+            .joined(Slice { uv: [0.5, 0.0, 0.5 + 0.5 * 20.0 / 27.0, 1.0], ..parts[1] }, false);
+        assert_eq!(whole.map(|slice| slice.rect), Some([103.0, 52.0, 150.0, 110.0]));
+        // Shown at half the size it was placed at, the offset halves too.
+        assert_eq!(cell_rect((0.0, 0.0), (10.0, 20.0), (4, 2, 2, 0), (0.5, 0.5)), [2.0, 1.0, 11.0, 21.0]);
     }
 
     #[test]

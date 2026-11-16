@@ -37,6 +37,31 @@ pub struct TabsView {
 
 pub type NavsView = Vec<NavView>;
 
+/// The panes of the tab on show, each where the split puts it (cells of
+/// a grid `cols` by `rows`), and the one shown alone: `App::panes_view`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PanesView {
+    pub cols: usize,
+    pub rows: usize,
+    pub zoomed: Option<thinkterm_proto::PaneId>,
+    pub panes: Vec<PaneBox>,
+}
+
+/// One frame of the split: the pane in front of it, and every pane that
+/// shares it (`members`, the one in front `current`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaneBox {
+    #[serde(rename = "pane")]
+    pub pane_id: thinkterm_proto::PaneId,
+    pub left: usize,
+    pub top: usize,
+    pub cols: usize,
+    pub rows: usize,
+    /// The frame holds the focused pane.
+    pub focused: bool,
+    pub members: Vec<crate::navbar::CapsuleView>,
+}
+
 /// A passing remark (`sticky` while the page is disconnected, where it is
 /// the state rather than a remark), the desktop's takeover card, and the
 /// one-line summary probes read.
@@ -308,6 +333,8 @@ mod tests {
                 live: true,
                 selected: true,
                 deleting: false,
+                failed: false,
+                icons: Vec::new(),
             }),
             Row::Window { window_id: 3, title: "Terminal".into(), selected: false },
         ];

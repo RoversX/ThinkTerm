@@ -170,6 +170,38 @@ pub fn normalize_scroll_px(
 }
 
 /// The cell under a canvas pixel (device pixels, origin top-left).
+/// How long a wheel rests before its next move starts afresh, as the
+/// desktop counts it.
+pub const WHEEL_REST_MS: f64 = 250.0;
+
+/// The whole notches a program is sent for a wheel of `lines` rows, and
+/// the part of a row kept for the next wheel.
+///
+/// A program hears whole notches only, while a finger or a trackpad hands
+/// over a few pixels at a time: the parts are added up until they make a
+/// row, as the desktop adds them. A move after a rest counts as a whole
+/// notch at once, so the first touch is answered; turning round drops
+/// what was kept of the other way. Negative is up, as `lines` is.
+pub fn wheel_notches(kept: f64, lines: f64, rested: bool) -> (i64, f64) {
+    if !lines.is_finite() || lines == 0.0 {
+        return (0, if kept.is_finite() { kept } else { 0.0 });
+    }
+    let mut lines = lines;
+    let mut kept = if kept.is_finite() { kept } else { 0.0 };
+    if rested {
+        kept = 0.0;
+        if lines.abs() < 1.0 {
+            lines = lines.signum();
+        }
+    }
+    if kept != 0.0 && kept.signum() != lines.signum() {
+        kept = 0.0;
+    }
+    let total = lines + kept;
+    let whole = total.trunc();
+    (whole as i64, total - whole)
+}
+
 pub fn cell_at(px: f64, py: f64, cell_width: f64, cell_height: f64) -> (usize, usize) {
     let col = (px / cell_width).floor().max(0.0) as usize;
     let row = (py / cell_height).floor().max(0.0) as usize;
@@ -334,6 +366,60 @@ mod scroll_px_tests {
         assert_eq!(normalize_scroll_px(5, 3.0, -1e30, CELL, 10), (10, 0.0));
         assert_eq!(normalize_scroll_px(5, 3.0, 1e30, CELL, 10), (0, 0.0));
         assert_eq!(normalize_scroll_px(50, 0.0, 0.0, CELL, 10), (10, 0.0), "a stale row is clamped");
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+
+    /// The notches a run of wheels sends, the first one after a rest.
+    fn sent(deltas: &[f64]) -> Vec<i64> {
+        let mut kept = 0.0;
+        let mut out = Vec::new();
+        for (i, delta) in deltas.iter().enumerate() {
+            let (whole, rest) = wheel_notches(kept, *delta, i == 0);
+            kept = rest;
+            out.push(whole);
+        }
+        out
+    }
+
+    #[test]
+    fn parts_of_a_row_add_up_to_one_notch_a_row() {
+        // The first move is answered at once; after it a quarter of a row
+        // at a time is a notch every fourth move, not one each.
+        assert_eq!(sent(&[0.25; 9]), [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(sent(&[-0.25; 5]), [-1, 0, 0, 0, -1]);
+    }
+
+    #[test]
+    fn whole_rows_go_over_as_they_are() {
+        assert_eq!(sent(&[3.0, 1.0, -2.0]), [3, 1, -2]);
+        // And what is over a whole row is kept for the next.
+        assert_eq!(sent(&[2.5, 0.5]), [2, 1]);
+    }
+
+    #[test]
+    fn turning_round_drops_what_was_kept() {
+        // Three quarters of a row down, then up: the up starts from nothing.
+        assert_eq!(sent(&[1.0, 0.75, -0.5, -0.5]), [1, 0, 0, -1]);
+    }
+
+    #[test]
+    fn a_rest_starts_afresh() {
+        let (whole, kept) = wheel_notches(0.75, 0.25, true);
+        assert_eq!((whole, kept), (1, 0.0));
+        // Without the rest the same move only completes the row.
+        assert_eq!(wheel_notches(0.75, 0.25, false), (1, 0.0));
+        assert_eq!(wheel_notches(0.5, 0.25, false), (0, 0.75));
+    }
+
+    #[test]
+    fn nonsense_input_sends_nothing() {
+        assert_eq!(wheel_notches(0.5, f64::NAN, false), (0, 0.5));
+        assert_eq!(wheel_notches(0.5, 0.0, true), (0, 0.5));
+        assert_eq!(wheel_notches(f64::NAN, 1.0, false), (1, 0.0));
     }
 }
 

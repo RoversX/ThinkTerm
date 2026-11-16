@@ -13,6 +13,8 @@ use thinkterm_tab_icons::{Matcher, WireCatalog};
 pub struct TabIcons {
     /// The cards' ids, in the catalog's order: what `Matcher` indexes.
     ids: Vec<String>,
+    /// Where each stands in a thread's row (`look::row_rank`).
+    ranks: Vec<u8>,
     matcher: Matcher,
 }
 
@@ -25,8 +27,23 @@ impl TabIcons {
     pub fn new(catalog: &WireCatalog) -> Self {
         Self {
             ids: catalog.cards.iter().map(|card| card.id.clone()).collect(),
+            ranks: catalog
+                .cards
+                .iter()
+                .map(|card| thinkterm_tab_icons::look::row_rank(!card.agents.is_empty(), card.id == catalog.terminal))
+                .collect(),
             matcher: catalog.matcher(),
         }
+    }
+
+    /// Where the card `id` stands among the cards of a thread's row, as
+    /// the desktop orders them: agents first, the terminal last.
+    pub fn row_rank(&self, id: &str) -> u8 {
+        self.ids
+            .iter()
+            .position(|known| known == id)
+            .and_then(|index| self.ranks.get(index).copied())
+            .unwrap_or(1)
     }
 
     /// The card for a pane running `agent` and led by `program`.
@@ -76,6 +93,16 @@ mod tests {
         assert_eq!(icons.card(None, Some(&program("zsh"))), Some("terminal"));
         assert_eq!(icons.card(None, None), Some("terminal"));
         assert_eq!(icons.terminal(), Some("terminal"));
+    }
+
+    #[test]
+    fn a_row_s_cards_stand_as_the_desktop_s_do() {
+        let icons = TabIcons::parse(&catalog()).unwrap();
+        let mut row = vec!["terminal", "vim", "claude"];
+        row.sort_by_key(|id| icons.row_rank(id));
+        assert_eq!(row, ["claude", "vim", "terminal"]);
+        // A card from before the host's came is another program's.
+        assert_eq!(icons.row_rank("gone"), icons.row_rank("vim"));
     }
 
     #[test]

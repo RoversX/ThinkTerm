@@ -16,6 +16,37 @@ pub fn configured_palette(
     chosen.or(server).cloned().unwrap_or_default()
 }
 
+/// Whether two palettes are one scheme as it is seen: the same ground,
+/// text and sixteen colours, to the 8-bit value. A scheme read from the
+/// page's list and the same scheme as a server resolved it may differ in
+/// what a scheme does not name, and in the last bit of a float.
+pub fn same_scheme(a: &wezterm_term::color::ColorPalette, b: &wezterm_term::color::ColorPalette) -> bool {
+    let seen = |p: &wezterm_term::color::ColorPalette| {
+        let mut colors = vec![p.background.to_srgb_u8(), p.foreground.to_srgb_u8()];
+        colors.extend(p.colors.0[..16].iter().map(|c| c.to_srgb_u8()));
+        colors
+    };
+    seen(a) == seen(b)
+}
+
+/// The scheme a server's palette is when its configuration chose none: the
+/// built-in palette, or `unchosen` -- the scheme a macOS host fills in for
+/// a configuration that names none ("Apple System Colors"), which says
+/// nothing of a choice either, as the desktop reads it
+/// (`native_settings::resolve_color_scheme`).
+pub fn server_chose_none(
+    server: Option<&wezterm_term::color::ColorPalette>,
+    unchosen: Option<&wezterm_term::color::ColorPalette>,
+) -> bool {
+    match server {
+        None => true,
+        Some(server) => {
+            same_scheme(server, &wezterm_term::color::ColorPalette::default())
+                || unchosen.is_some_and(|unchosen| same_scheme(server, unchosen))
+        }
+    }
+}
+
 /// What a pane should draw now, given the base palette and the pane's own
 /// application override; `None` when nothing moved.
 pub fn recomputed_palette(
@@ -213,6 +244,23 @@ mod tests {
         let mut p = wezterm_term::color::ColorPalette::default();
         p.background = (v, v, v, 1.0).into();
         p
+    }
+
+    #[test]
+    fn a_server_chose_no_scheme_only_when_its_palette_says_so() {
+        let stock = wezterm_term::color::ColorPalette::default();
+        let filled_in = tinted(0.1);
+        assert!(server_chose_none(None, None));
+        assert!(server_chose_none(Some(&stock), None));
+        // What a macOS host fills in is no choice either.
+        assert!(server_chose_none(Some(&filled_in), Some(&filled_in)));
+        // Any other scheme is the host's own choice, kept on a light screen.
+        assert!(!server_chose_none(Some(&tinted(0.9)), Some(&filled_in)));
+        assert!(!server_chose_none(Some(&filled_in), None));
+        // Colours a scheme does not name do not tell two schemes apart.
+        let mut cursor = filled_in.clone();
+        cursor.cursor_bg = (1.0, 0.0, 0.0, 1.0).into();
+        assert!(same_scheme(&cursor, &filled_in));
     }
 
     #[test]

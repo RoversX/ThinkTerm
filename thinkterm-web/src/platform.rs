@@ -143,6 +143,14 @@ pub trait Platform: 'static {
     fn bare_lone_pane(&self) -> bool {
         false
     }
+    /// Whether a tab shows one pane at a time, whole: a screen too narrow
+    /// for a split's panes side by side (the phone app, held upright).
+    /// The pane on show is zoomed, as a person zooms one, and the others
+    /// are a tap away (`App::panes_view`, `App::zoom_to`); the panes go
+    /// without their bars.
+    fn one_pane(&self) -> bool {
+        false
+    }
     /// Whether this client's terminal is on show. A page with several
     /// machines shows one; the others keep their sessions but act on
     /// nothing a person did not ask them to.
@@ -161,6 +169,12 @@ pub trait Platform: 'static {
     /// A pane rang its bell. Nothing, unless the platform has a sound
     /// or a buzz for it.
     fn bell(&self) {}
+    /// What to say when the server turns out to be another release
+    /// (`attach::ProtocolMismatch`). None is the page's own wording; a
+    /// phone app says which side to update, and where from.
+    fn protocol_mismatch_text(&self, _mismatch: &crate::attach::ProtocolMismatch) -> Option<String> {
+        None
+    }
     /// Where the cursor cell is, in the viewport's units, so the IME's
     /// candidate window can sit by it.
     fn set_ime_anchor(&self, anchor: crate::ime::Anchor);

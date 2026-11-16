@@ -3,7 +3,7 @@
 //! render subscription.
 
 use crate::platform::Link;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use codec::Pdu;
 use crate::chrome::active_pane;
 use thinkterm_proto::layout::PaneNode;
@@ -23,6 +23,44 @@ pub async fn list_panes<L: Link>(link: &L) -> Result<codec::ListPanesResponse> {
     crate::layout::blank_implausible_tabs(&mut panes);
     Ok(panes)
 }
+
+/// The server speaks another protocol version than this client, which
+/// speaks only its own: one side is on another release. Its own type so a
+/// shell can say it in its own words (the phone apps do); shown as it is,
+/// it is the web page's wording.
+#[derive(Debug)]
+pub struct ProtocolMismatch {
+    pub ours: usize,
+    pub theirs: usize,
+    /// The server's ThinkTerm version, for the message.
+    pub server_version: String,
+}
+
+impl ProtocolMismatch {
+    fn check(version: &codec::GetCodecVersionResponse) -> Result<()> {
+        if version.codec_vers == codec::CODEC_VERSION {
+            return Ok(());
+        }
+        Err(ProtocolMismatch {
+            ours: codec::CODEC_VERSION,
+            theirs: version.codec_vers,
+            server_version: version.version_string.clone(),
+        }
+        .into())
+    }
+}
+
+impl std::fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this page speaks protocol {} but the server speaks {}; update the server or the bundle",
+            self.ours, self.theirs
+        )
+    }
+}
+
+impl std::error::Error for ProtocolMismatch {}
 
 pub struct Attached {
     pub pane_id: PaneId,
@@ -58,13 +96,7 @@ pub async fn attach<L: Link>(
         },
     )
     .await?;
-    if version.codec_vers != codec::CODEC_VERSION {
-        bail!(
-            "this page speaks protocol {} but the server speaks {}; update the server or the bundle",
-            codec::CODEC_VERSION,
-            version.codec_vers
-        );
-    }
+    ProtocolMismatch::check(&version)?;
 
     link.lease_mut().me = Some(me.clone());
     request(
@@ -188,13 +220,7 @@ pub async fn reattach<L: Link>(
         },
     )
     .await?;
-    if version.codec_vers != codec::CODEC_VERSION {
-        bail!(
-            "this page speaks protocol {} but the server speaks {}; update the server or the bundle",
-            codec::CODEC_VERSION,
-            version.codec_vers
-        );
-    }
+    ProtocolMismatch::check(&version)?;
 
     let me = link
         .lease()

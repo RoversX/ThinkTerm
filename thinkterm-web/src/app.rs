@@ -275,6 +275,8 @@ pub struct ThreadView {
     pub project_id: String,
     pub status: crate::tree::Status,
     pub dot: crate::tree::Dot,
+    /// A program in it stopped on an error (`ThreadRow::failed`).
+    pub failed: bool,
     pub live: bool,
     pub pinned: bool,
     pub unread: bool,
@@ -452,6 +454,11 @@ pub struct PaneCell<P: Platform, L: Link> {
     /// which is the only position stepped mode ever holds and the only
     /// one either end of the scrollback allows.
     pub scroll_px: f32,
+    /// The part of a row a wheel has moved without yet making a notch for
+    /// the program that has the screen, and when the wheel last moved
+    /// (`viewport::wheel_notches`).
+    pub wheel_kept: f64,
+    pub wheel_at: f64,
     pub selection: Option<Selection>,
     /// The pane's own colours (OSC 4/10/11), pushed as `SetApplicationPalette`,
     /// exactly as they arrived. `None` means the base palette shows through.
@@ -475,6 +482,8 @@ impl<P: Platform, L: Link> PaneCell<P, L> {
             session,
             scroll_from_bottom: 0,
             scroll_px: 0.0,
+            wheel_kept: 0.0,
+            wheel_at: f64::NEG_INFINITY,
             selection: None,
             application: None,
             palette: ColorPalette::default(),
@@ -542,6 +551,11 @@ pub struct Inner<P: Platform, L: Link> {
     server_palette: Option<ColorPalette>,
     /// A scheme this browser picked, which outranks the server's.
     chosen_palette: Option<ColorPalette>,
+    /// The appearance's own scheme, for a server whose configuration chose
+    /// none -- a light one on a light screen, as the desktop takes its
+    /// light default then -- and the scheme such a server's palette is
+    /// besides the built-in one (`settings::server_chose_none`).
+    fallback_palette: Option<(ColorPalette, Option<ColorPalette>)>,
     /// The background last published on the canvas as `data-bg`.
     published_bg: Option<String>,
     /// Word/line selection extends by units; the pointer is down.
@@ -567,6 +581,13 @@ pub struct Inner<P: Platform, L: Link> {
     /// otherwise is the server's word from before it heard, and is let
     /// pass, until one agrees or `ZOOM_PATIENCE_MS` is up.
     zoom_ahead: Option<(TabId, Option<PaneId>, f64)>,
+    /// The tab this client zoomed to show one pane at a time
+    /// (`Platform::one_pane`) and the pane it shows so: put back as it
+    /// was when the client leaves the tab.
+    one_pane_tab: Option<(TabId, PaneId)>,
+    /// The tab last asked to show its focused pane alone, and when: not
+    /// asked again at every listing while the server makes up its mind.
+    one_pane_asked: Option<(TabId, f64)>,
     /// A divider claim on the wire, and the step that arrived meanwhile
     /// to send when it answers: one round trip at a time, the newest
     /// position wins.
@@ -603,6 +624,13 @@ pub struct Inner<P: Platform, L: Link> {
     /// says after enough of them.
     reconnect_delay: f64,
     reconnect_pending: bool,
+    /// Bumped to drop an attempt waiting its turn (`reconnect_now`).
+    reconnect_epoch: u64,
+    /// An attempt is on the wire.
+    reconnect_running: bool,
+    /// Asked to hurry while an attempt was on the wire: if it fails, the
+    /// next one goes at once.
+    reconnect_hurry: bool,
     /// The cursor blink's phase, while `cursor_blink` is on: shown, or not.
     blink_shown: bool,
     /// The blink's tick runs once started; it does nothing while off.
@@ -835,6 +863,13 @@ impl<P: Platform, L: Link> Inner<P, L> {
     /// The base palette every pane draws from: this browser's pick, else
     /// the server's configured scheme, else the stock palette.
     pub fn configured(&self) -> ColorPalette {
+        if self.chosen_palette.is_none() {
+            if let Some((fallback, unchosen)) = &self.fallback_palette {
+                if crate::settings::server_chose_none(self.server_palette.as_ref(), unchosen.as_ref()) {
+                    return fallback.clone();
+                }
+            }
+        }
         crate::settings::configured_palette(
             self.chosen_palette.as_ref(),
             self.server_palette.as_ref(),
@@ -918,6 +953,8 @@ impl<P: Platform, L: Link> App<P, L> {
             claimed_layout: None,
             claimed_at: 0.0,
             zoom_ahead: None,
+            one_pane_tab: None,
+            one_pane_asked: None,
             divider_claim_busy: false,
             divider_claim_next: None,
             preview_epoch: 0,
@@ -934,6 +971,9 @@ impl<P: Platform, L: Link> App<P, L> {
             disconnected: None,
             reconnect_delay: RECONNECT_MIN_MS,
             reconnect_pending: false,
+            reconnect_epoch: 0,
+            reconnect_running: false,
+            reconnect_hurry: false,
             blink_shown: true,
             blink_ticking: false,
             reconnect_attempts: 0,
@@ -948,6 +988,7 @@ impl<P: Platform, L: Link> App<P, L> {
             settings: crate::settings::WebSettings::default(),
             server_palette: None,
             chosen_palette: None,
+            fallback_palette: None,
             published_bg: None,
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
@@ -1319,6 +1360,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 project_id: t.project_id.clone(),
                 status: t.status,
                 dot: t.dot,
+                failed: t.failed,
                 live: t.live,
                 pinned: t.pinned,
                 unread: t.unread,
@@ -1988,9 +2030,31 @@ impl<P: Platform, L: Link> App<P, L> {
         Self::set_status(&inner, &text);
     }
 
+    /// Try again at once, without the wait the failures before earned: the
+    /// device came back to the app, or its network changed, and what failed
+    /// then may work now. Nothing while the connection is up; with an
+    /// attempt on the wire, the next goes at once if this one fails.
+    pub fn reconnect_now(self: &Rc<Self>) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.disconnected.is_none() {
+                return;
+            }
+            if inner.reconnect_running {
+                inner.reconnect_hurry = true;
+                return;
+            }
+            // The attempt waiting its turn is dropped for this one.
+            inner.reconnect_epoch += 1;
+            inner.reconnect_pending = false;
+            inner.reconnect_delay = RECONNECT_MIN_MS;
+        }
+        self.schedule_reconnect(0.0);
+    }
+
     /// Come back and try again. `0.0` means as soon as the browser will.
     fn schedule_reconnect(self: &Rc<Self>, delay_ms: f64) {
-        {
+        let epoch = {
             let mut inner = self.inner.borrow_mut();
             if inner.reconnect_pending || inner.disconnected.is_none() {
                 return;
@@ -2007,23 +2071,38 @@ impl<P: Platform, L: Link> App<P, L> {
                 return;
             }
             inner.reconnect_pending = true;
-        }
+            inner.reconnect_epoch
+        };
         let weak = Rc::downgrade(self);
         self.platform.set_timeout(
             delay_ms.max(0.0),
             Box::new(move || {
                 // A client the page has closed does not come back.
                 let Some(app) = weak.upgrade().filter(|app| !app.retired.get()) else { return };
-                app.inner.borrow_mut().reconnect_pending = false;
+                {
+                    let mut inner = app.inner.borrow_mut();
+                    // Put aside for an attempt made sooner.
+                    if inner.reconnect_epoch != epoch {
+                        return;
+                    }
+                    inner.reconnect_pending = false;
+                }
                 let task = Rc::clone(&app).try_reconnect();
                 app.spawn(task);
             }),
         );
     }
 
+    /// One attempt, marked as on the wire while it is.
+    async fn try_reconnect(self: Rc<Self>) {
+        self.inner.borrow_mut().reconnect_running = true;
+        Rc::clone(&self).reconnect_attempt().await;
+        self.inner.borrow_mut().reconnect_running = false;
+    }
+
     /// One attempt: reopen the socket, redo the handshake on the same pane,
     /// and refetch everything on screen.
-    async fn try_reconnect(self: Rc<Self>) {
+    async fn reconnect_attempt(self: Rc<Self>) {
         let (link, pane_id, tab_id, size, nav_rows) = {
             let inner = self.inner.borrow();
             if inner.disconnected.is_none() {
@@ -2057,23 +2136,29 @@ impl<P: Platform, L: Link> App<P, L> {
                 // being asked again, and neither will one whose protocol
                 // this bundle cannot speak. Retrying either one for ever
                 // would only hide the reason.
-                let permanent = err.downcast_ref::<crate::attach::NoPanes>().is_some()
-                    || err.to_string().contains("update the server or the bundle");
+                let mismatch = err.downcast_ref::<crate::attach::ProtocolMismatch>();
+                let permanent = err.downcast_ref::<crate::attach::NoPanes>().is_some() || mismatch.is_some();
                 if permanent {
                     // Nothing will read this socket again, and the server
                     // keeps a registered client and a TCP session for as
                     // long as one is open. Hand it back.
                     link.shutdown();
                     let inner = self.inner.borrow();
-                    Self::set_status(&inner, &format!("{err:#}"));
+                    let text = mismatch
+                        .and_then(|mismatch| inner.platform.protocol_mismatch_text(mismatch))
+                        .unwrap_or_else(|| format!("{err:#}"));
+                    Self::set_status(&inner, &text);
                     log::error!("not reconnecting: {err:#}");
                     return;
                 }
                 let delay = {
                     let mut inner = self.inner.borrow_mut();
                     inner.reconnect_attempts += 1;
-                    inner.reconnect_delay =
-                        (inner.reconnect_delay * 2.0).clamp(RECONNECT_MIN_MS, RECONNECT_MAX_MS);
+                    inner.reconnect_delay = if std::mem::take(&mut inner.reconnect_hurry) {
+                        RECONNECT_MIN_MS
+                    } else {
+                        (inner.reconnect_delay * 2.0).clamp(RECONNECT_MIN_MS, RECONNECT_MAX_MS)
+                    };
                     inner.reconnect_delay
                 };
                 log::warn!("reconnect failed, retrying in {delay:.0} ms: {err:#}");
@@ -2091,6 +2176,7 @@ impl<P: Platform, L: Link> App<P, L> {
             let mut inner = self.inner.borrow_mut();
             inner.disconnected = None;
             inner.reconnect_attempts = 0;
+            inner.reconnect_hurry = false;
             // The backoff is *not* reset here. A server that accepts and
             // then drops -- one restarting in a loop, a proxy closing idle
             // sockets -- would otherwise be hammered at the minimum delay
@@ -2366,12 +2452,31 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 
     pub fn paste(&self, text: &str) {
+        let pane = self.inner.borrow().focused_pane;
+        self.paste_into(pane, text);
+    }
+
+    /// The pane typing goes to.
+    pub fn focused_pane(&self) -> PaneId {
+        self.inner.borrow().focused_pane
+    }
+
+    /// Paste into `pane`, focused or not, while it is on show here; a pane
+    /// that is not -- closed, or of another tab now -- is left alone
+    /// rather than the text landing in whichever one has the focus.
+    pub fn paste_into(&self, pane: PaneId, text: &str) {
         let mut inner = self.inner.borrow_mut();
-        if inner.disconnected.is_some() || Self::focused_is_page(&inner) || !Self::may_type(&inner) {
+        let is_page = inner
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.pane_pages.contains_key(&pane));
+        if inner.disconnected.is_some() || is_page || !Self::may_type(&inner) {
             return;
         }
         let platform = Rc::clone(&inner.platform);
-        let cell = inner.focused_mut();
+        let Some(cell) = inner.panes.get_mut(&pane) else {
+            return;
+        };
         cell.scroll_from_bottom = 0;
         cell.scroll_px = 0.0;
         let start = cell.session.paste(text);
@@ -3261,12 +3366,25 @@ impl<P: Platform, L: Link> App<P, L> {
             return false;
         }
         let smooth = inner.settings.scroll_mode.is_smooth();
+        let now = inner.platform.monotonic_ms();
         let Some(cell) = inner.panes.get_mut(&hit.pane_id) else {
             return false;
         };
         let session = Arc::clone(&cell.session);
         if session.is_alt_screen() || session.is_mouse_grabbed() {
-            let button = if lines < 0.0 { MouseButton::WheelUp(notches) } else { MouseButton::WheelDown(notches) };
+            // A program hears whole notches only. A finger or a trackpad
+            // hands over a few pixels at a time, so the parts of a row are
+            // kept until they make one, as the desktop keeps them: rounded
+            // up each time, a slow drag ran many rows ahead of the hand.
+            let rested = now - cell.wheel_at >= crate::viewport::WHEEL_REST_MS;
+            cell.wheel_at = now;
+            let (whole, kept) = crate::viewport::wheel_notches(cell.wheel_kept, lines, rested);
+            cell.wheel_kept = kept;
+            if whole == 0 {
+                return true;
+            }
+            let notches = whole.unsigned_abs() as usize;
+            let button = if whole < 0 { MouseButton::WheelUp(notches) } else { MouseButton::WheelDown(notches) };
             let dims = Self::shown_dims(&session);
             let visible = visible_rows(&dims, rows_shown, cell.scroll_from_bottom);
             let event = MouseEvent {
@@ -3524,6 +3642,10 @@ impl<P: Platform, L: Link> App<P, L> {
     /// split, when there is something to tell apart; a page on a phone
     /// keeps the bar, as the desktop does (`Platform::bare_lone_pane`).
     fn nav_rows_for(inner: &Inner<P, L>, panes: usize) -> usize {
+        if inner.platform.one_pane() {
+            // One pane at a time: there is nothing to tell apart.
+            return 0;
+        }
         if inner.platform.is_mobile()
             && (!inner.settings.pane_bars || (panes <= 1 && inner.platform.bare_lone_pane()))
         {
@@ -3561,38 +3683,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 .into_iter()
                 .zip(&layout.panes)
             {
-                let members = place
-                    .stack
-                    .iter()
-                    .map(|m| {
-                        // The page's own copy of a drawn pane's title is fresher.
-                        let raw = inner
-                            .panes
-                            .get(&m.pane_id)
-                            .map(|c| c.title.as_str())
-                            .unwrap_or(&m.title);
-                        let (title, busy) = crate::navbar::display_title(raw);
-                        let busy = busy || inner.tree.agents.get(&m.pane_id) == Some(&thinkterm_proto::AgentState::Working);
-                        // A label someone gave the pane names it, as it is
-                        // in the desktop's pane bar.
-                        let title = inner
-                            .layout
-                            .as_ref()
-                            .and_then(|layout| layout.pane_labels.get(&m.pane_id).cloned())
-                            .unwrap_or(title);
-                        crate::navbar::CapsuleView {
-                            pane_id: m.pane_id,
-                            title,
-                            busy,
-                            current: m.pane_id == place.pane_id,
-                            icon: Self::pane_icon(inner, m.pane_id),
-                            page: inner
-                                .layout
-                                .as_ref()
-                                .and_then(|layout| crate::chrome::page_icon(layout, m.pane_id)),
-                        }
-                    })
-                    .collect();
+                let members = Self::capsules(inner, place);
                 let focused = place.pane_id == inner.focused_pane;
                 views.push(crate::navbar::NavView {
                     rect,
@@ -3604,6 +3695,77 @@ impl<P: Platform, L: Link> App<P, L> {
             }
         }
         views
+    }
+
+    /// The panes sharing `place`'s frame, as a bar or a list names them.
+    fn capsules(inner: &Inner<P, L>, place: &crate::layout::PanePlacement) -> Vec<crate::navbar::CapsuleView> {
+        place
+            .stack
+            .iter()
+            .map(|m| {
+                // The page's own copy of a drawn pane's title is fresher.
+                let raw = inner
+                    .panes
+                    .get(&m.pane_id)
+                    .map(|c| c.title.as_str())
+                    .unwrap_or(&m.title);
+                let (title, busy) = crate::navbar::display_title(raw);
+                let busy = busy || inner.tree.agents.get(&m.pane_id) == Some(&thinkterm_proto::AgentState::Working);
+                // A label someone gave the pane names it, as it is
+                // in the desktop's pane bar.
+                let title = inner
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.pane_labels.get(&m.pane_id).cloned())
+                    .unwrap_or(title);
+                crate::navbar::CapsuleView {
+                    pane_id: m.pane_id,
+                    title,
+                    busy,
+                    current: m.pane_id == place.pane_id,
+                    icon: Self::pane_icon(inner, m.pane_id),
+                    page: inner
+                        .layout
+                        .as_ref()
+                        .and_then(|layout| crate::chrome::page_icon(layout, m.pane_id)),
+                }
+            })
+            .collect()
+    }
+
+    /// Every pane of the tab on show where its split puts it, drawn or
+    /// not: a client that shows one pane at a time (`Platform::one_pane`)
+    /// lists them to switch between, and draws the split as a map.
+    pub fn panes_view(&self) -> crate::views::PanesView {
+        let inner = self.inner.borrow();
+        let Some(current) = &inner.tab_layout else {
+            return crate::views::PanesView::default();
+        };
+        // The split behind a zoomed pane, at the tab's size.
+        let whole = inner
+            .layout
+            .as_ref()
+            .and_then(|listed| crate::layout::tab_containing(listed, inner.focused_pane))
+            .and_then(|node| crate::layout::with_zoom(node, current.size, 0, None));
+        let layout = whole.as_ref().unwrap_or(current);
+        crate::views::PanesView {
+            cols: layout.cols,
+            rows: layout.rows,
+            zoomed: current.zoomed,
+            panes: layout
+                .panes
+                .iter()
+                .map(|place| crate::views::PaneBox {
+                    pane_id: place.pane_id,
+                    left: place.frame.left,
+                    top: place.frame.top,
+                    cols: place.frame.cols,
+                    rows: place.frame.rows,
+                    focused: place.stack.iter().any(|m| m.pane_id == inner.focused_pane),
+                    members: Self::capsules(&inner, place),
+                })
+                .collect(),
+        }
     }
 
     /// The sidebar's rows from the model, with the pending delete shown.
@@ -3622,7 +3784,30 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Every Space with its projects and threads: the TUI's sidebar tree.
     pub fn tree_view(&self) -> crate::tree::TreeView {
         let inner = self.inner.borrow();
-        inner.tree.tree(inner.tab_id, &inner.workspace, Self::deleting(&inner))
+        let mut tree = inner.tree.tree(inner.tab_id, &inner.workspace, Self::deleting(&inner));
+        // What each thread runs, for the cards its row leads with.
+        if let Some(cards) = Self::tab_icons(&inner) {
+            let threads = tree
+                .spaces
+                .iter_mut()
+                .flat_map(|space| space.projects.iter_mut())
+                .flat_map(|project| project.threads.iter_mut());
+            for thread in threads {
+                for pane in Self::thread_panes(&inner, &thread.id) {
+                    let icon = Self::pane_icon(&inner, pane);
+                    if let Some(icon) = icon.filter(|icon| !thread.icons.contains(icon)) {
+                        thread.icons.push(icon);
+                    }
+                }
+                // As the desktop's row has them: agents first, then other
+                // programs, the terminal last, each in the order met.
+                thread.icons.sort_by_key(|icon| cards.row_rank(icon));
+                if thread.icons.is_empty() {
+                    thread.icons.extend(cards.terminal().map(str::to_string));
+                }
+            }
+        }
+        tree
     }
 
     /// Ask the server for its tree, its session view and the agents in
@@ -4308,6 +4493,14 @@ impl<P: Platform, L: Link> App<P, L> {
             self.refresh_status();
             self.request_frame();
         }
+        if tab_changed {
+            // The tab left behind goes back to its split.
+            let left = self.inner.borrow().one_pane_tab.is_some_and(|(left, _)| left != tab_id);
+            if left {
+                self.leave_one_pane();
+            }
+        }
+        self.keep_one_pane();
         // The page holds the terminal it shows: taken at this window's
         // shape as soon as a tab is on screen, and taken back by the
         // desktop only when someone interacts there.
@@ -4376,7 +4569,9 @@ impl<P: Platform, L: Link> App<P, L> {
     fn zoom_ahead(inner: &mut Inner<P, L>, pane_id: PaneId, zoom: bool) -> Option<Vec<PaneId>> {
         let current = inner.tab_layout.as_ref()?;
         let (tab_id, tab) = (current.tab_id, current.size);
-        if zoom && current.panes.len() < 2 {
+        // A lone pane has nothing to hide; a tab showing another pane
+        // alone has, and the zoom moves.
+        if zoom && current.panes.len() < 2 && current.zoomed.is_none_or(|zoomed| zoomed == pane_id) {
             return None;
         }
         let node = crate::layout::tab_containing(inner.layout.as_ref()?, pane_id)?;
@@ -4568,6 +4763,7 @@ impl<P: Platform, L: Link> App<P, L> {
             self.inner.borrow_mut().closing_tab = None;
         }
         match click {
+            Click::Pane(pane_id) if self.inner.borrow().platform.one_pane() => self.zoom_to(pane_id),
             Click::Pane(pane_id) => {
                 let hidden = self
                     .inner
@@ -4613,16 +4809,13 @@ impl<P: Platform, L: Link> App<P, L> {
                     );
                 }
             }
+            // That pane, by its id. Not by focusing it and closing the pane
+            // in focus: one not drawn here -- behind another in its stack,
+            // or another of a tab shown one pane at a time -- cannot be
+            // focused, and the one in focus would go in its place.
             Click::ClosePane(pane_id) => {
-                let (focused, following) = {
-                    let inner = self.inner.borrow();
-                    (inner.focused_pane, inner.following)
-                };
-                if pane_id != focused {
-                    self.inner.borrow_mut().closing_since = None;
-                    self.focus_pane(pane_id, following);
-                }
-                self.on_chrome_click(Click::Close);
+                self.inner.borrow_mut().closing_since = None;
+                self.act("web-act-close-pane", Pdu::KillPane(codec::KillPane { pane_id }), |_, _| {});
             }
             Click::Follow => {
                 let mut inner = self.inner.borrow_mut();
@@ -6466,6 +6659,24 @@ impl<P: Platform, L: Link> App<P, L> {
         Self::notify(&self.inner.borrow());
     }
 
+    /// The scheme to draw in when nothing was picked here and the server's
+    /// configuration chose none (`Inner::fallback_palette`), and the scheme
+    /// such a server's palette may be besides the built-in one; none to
+    /// draw the server's palette whatever it is.
+    pub fn set_fallback_palette(self: &Rc<Self>, fallback: Option<(ColorPalette, Option<ColorPalette>)>) {
+        let changed = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.fallback_palette == fallback {
+                return;
+            }
+            inner.fallback_palette = fallback;
+            inner.recompute_palettes()
+        };
+        self.repaint_palettes(&changed);
+        self.advise_palette();
+        Self::notify(&self.inner.borrow());
+    }
+
     /// The pane in use takes the scheme on the server too -- on show only:
     /// telling a host's server which pane has focus moves its desktop's tab
     /// when the desktop follows the page. A scheme chosen off show is told
@@ -6505,16 +6716,26 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// One preference changed on the page.
     pub fn set_setting(self: &Rc<Self>, key: &str, value: &str) -> Result<(), String> {
-        let (language, font, scheme) = {
+        let (language, font, scheme, redial) = {
             let mut inner = self.inner.borrow_mut();
+            let was_redialing = inner.settings.auto_reconnect;
             inner.settings.set(key, value)?;
             (
                 inner.settings.language.clone(),
                 inner.settings.font,
                 inner.settings.terminal_scheme.clone(),
+                !was_redialing && inner.settings.auto_reconnect,
             )
         };
         match key {
+            // Turned on with the connection lost: the redial it asks for
+            // starts now, not at the next network change or return.
+            "auto-reconnect" => {
+                if redial {
+                    self.reconnect_now();
+                }
+                Self::notify(&self.inner.borrow());
+            }
             "language" => self.apply_language(&language),
             "font" => self.set_font_mode(font),
             // Back to the desktop's scheme: the colours the page sends with
@@ -6991,9 +7212,187 @@ impl<P: Platform, L: Link> App<P, L> {
                 }
             }
         };
+        self.set_zoom(tab_id, pane_id, !zoomed, shown, link);
+    }
+
+    /// Show `pane_id` alone at its tab's size, whichever pane the tab
+    /// showed so before: a tap on one of `panes_view`'s where a tab shows
+    /// one pane at a time. A pane that is not the tab's on show -- another
+    /// tab's, one behind another in a stack -- is switched to as any
+    /// other, and shown alone when its tab comes (`keep_one_pane`).
+    pub fn zoom_to(self: &Rc<Self>, pane_id: PaneId) {
+        // The tab on show holds it, and in front of its stack or not.
+        let here = {
+            let inner = self.inner.borrow();
+            inner.tab_layout.as_ref().zip(inner.layout.as_ref()).and_then(|(current, listed)| {
+                let node = crate::layout::tab_containing(listed, pane_id)?;
+                let (_, tab_id) = node.window_and_tab_ids()?;
+                let whole = crate::layout::with_zoom(node, current.size, 0, None)?;
+                let front = whole.panes.iter().any(|place| place.pane_id == pane_id);
+                (tab_id == inner.tab_id).then(|| (tab_id, front, inner.link.clone()))
+            })
+        };
+        match here {
+            Some((tab_id, true, link)) => {
+                self.inner.borrow_mut().one_pane_asked = None;
+                self.set_zoom(tab_id, pane_id, true, true, link)
+            }
+            // Behind another in its stack: the server brings it to the
+            // front, then shows it alone.
+            // Not if the client left the tab, or the screen, meanwhile: that
+            // put the tab back as it was (`leave_one_pane`), and nothing
+            // would after. Nor if it has room for the split again.
+            Some((tab_id, false, link)) => self.act(
+                "web-act-activate-pane",
+                Pdu::ActivatePaneInStack(codec::ActivatePaneInStack { pane_id }),
+                move |app, _| {
+                    let still = {
+                        let inner = app.inner.borrow();
+                        inner.tab_id == tab_id && inner.platform.shown() && inner.platform.one_pane()
+                    };
+                    if still {
+                        app.set_zoom(tab_id, pane_id, true, true, link.clone());
+                    }
+                },
+            ),
+            None => self.switch_to_pane(pane_id, true),
+        }
+    }
+
+    /// The client's shape changed between one pane at a time and the
+    /// split whole (`Platform::one_pane`): the grid is laid out again,
+    /// with or without the bars, and the tab zoomed or put back.
+    pub fn one_pane_changed(self: &Rc<Self>) {
+        let on = {
+            let mut inner = self.inner.borrow_mut();
+            inner.cols = 0;
+            inner.one_pane_asked = None;
+            inner.platform.one_pane()
+        };
+        self.resize();
+        if on {
+            self.keep_one_pane();
+        } else {
+            self.leave_one_pane();
+        }
+        Self::notify(&self.inner.borrow());
+        self.request_frame();
+    }
+
+    /// Where a tab shows one pane at a time: the focused pane alone, once
+    /// a listing shows the tab on screen with its panes side by side -- at
+    /// first sight, after a split, after someone unzoomed it elsewhere.
+    fn keep_one_pane(self: &Rc<Self>) {
+        let ask = {
+            let mut inner = self.inner.borrow_mut();
+            // Asked and answered: the tab on show is zoomed, by the
+            // server's word. A split of it after, or a return to it, is
+            // shown one pane at a time at once, not once the wait is up.
+            let answered = inner.zoom_ahead.is_none()
+                && inner.one_pane_asked.is_some_and(|(asked, _)| {
+                    inner
+                        .tab_layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.tab_id == asked && layout.zoomed.is_some())
+                });
+            if answered {
+                inner.one_pane_asked = None;
+            }
+            // A tab another device holds is that device's to shape: this
+            // one shows it as it is until it is taken (`take_over_with`).
+            let wanted = inner.platform.one_pane()
+                && inner.platform.shown()
+                && inner.disconnected.is_none()
+                && inner.zoom_ahead.is_none()
+                && inner.drag_divider.is_none()
+                && !inner.link.lease().needs_claim();
+            let now = inner.platform.monotonic_ms();
+            let split = inner
+                .tab_layout
+                .as_ref()
+                .filter(|layout| wanted && layout.zoomed.is_none() && layout.panes.len() > 1)
+                .map(|layout| layout.tab_id)
+                // Asked a moment ago: the server's answer is on its way.
+                .filter(|tab_id| {
+                    !inner
+                        .one_pane_asked
+                        .is_some_and(|(asked, at)| asked == *tab_id && now - at < Self::ONE_PANE_PATIENCE_MS)
+                });
+            split.map(|tab_id| {
+                inner.one_pane_asked = Some((tab_id, now));
+                (tab_id, inner.focused_pane, inner.link.clone())
+            })
+        };
+        if let Some((tab_id, pane_id, link)) = ask {
+            self.set_zoom(tab_id, pane_id, true, true, link);
+        }
+    }
+
+    /// The tab this client zoomed to show one pane at a time and the pane
+    /// it shows so, to be put back when the client leaves it: for the App
+    /// made after this one's connection ended, on the same server, which
+    /// finds the tab zoomed and cannot tell who zoomed it.
+    pub fn one_pane_zoomed(&self) -> Option<(TabId, PaneId)> {
+        self.inner.borrow().one_pane_tab
+    }
+
+    /// That of the App before this one, on the same server
+    /// (`one_pane_zoomed`): put back by this one when it leaves the tab --
+    /// or at once, where this one does not show that tab one pane at a
+    /// time now (made off screen, attached to another tab, with room for
+    /// the split), as nothing would put it back after.
+    pub fn keep_one_pane_zoomed(self: &Rc<Self>, zoomed: (TabId, PaneId)) {
+        let here = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.one_pane_tab.is_some() {
+                return;
+            }
+            inner.one_pane_tab = Some(zoomed);
+            inner.platform.shown() && inner.platform.one_pane() && inner.tab_id == zoomed.0
+        };
+        if !here {
+            self.leave_one_pane();
+        }
+    }
+
+    /// How long a tab asked to show one pane is left to do so before it is
+    /// asked again: longer than a zoom drawn ahead waits for its listing.
+    const ONE_PANE_PATIENCE_MS: f64 = 6_000.0;
+
+    /// The tab this client zoomed to show one pane at a time goes back to
+    /// its split: the client is leaving it -- for another tab, or off
+    /// screen -- and whoever looks at it next sees it as they left it.
+    pub fn leave_one_pane(self: &Rc<Self>) {
+        let Some((tab_id, pane_id)) = self.inner.borrow_mut().one_pane_tab.take() else {
+            return;
+        };
+        // Split again for whoever looks next: when this client is back it
+        // asks anew, at once.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.one_pane_asked.is_some_and(|(asked, _)| asked == tab_id) {
+                inner.one_pane_asked = None;
+            }
+        }
+        let link = self.inner.borrow().link.clone();
+        self.spawn(async move {
+            let pdu = Pdu::SetPaneZoomed(codec::SetPaneZoomed {
+                containing_tab_id: tab_id,
+                pane_id,
+                zoomed: false,
+            });
+            if let Err(err) = thinkterm_session::host::request(&link, pdu, Ok).await {
+                log::warn!("web-act-zoom-pane: {err:#}");
+            }
+        });
+    }
+
+    /// Ask the server to zoom `pane_id` of `tab_id`, or to unzoom it,
+    /// drawing it at once when the tab is the one on show (`shown`).
+    fn set_zoom(self: &Rc<Self>, tab_id: TabId, pane_id: PaneId, zoom: bool, shown: bool, link: L) {
         // On screen at once; the server hears of it meanwhile.
         let fresh = match shown {
-            true => Self::zoom_ahead(&mut self.inner.borrow_mut(), pane_id, !zoomed),
+            true => Self::zoom_ahead(&mut self.inner.borrow_mut(), pane_id, zoom),
             false => None,
         };
         if let Some(fresh) = fresh {
@@ -7002,12 +7401,21 @@ impl<P: Platform, L: Link> App<P, L> {
             self.refresh_status();
             self.request_frame();
         }
+        {
+            // What this client zoomed for want of room is its to put back:
+            // the tab on show. Another tab's zoom, asked of it from here,
+            // is that tab's own, and the one this client keeps stays kept.
+            let mut inner = self.inner.borrow_mut();
+            if inner.platform.one_pane() && shown {
+                inner.one_pane_tab = zoom.then_some((tab_id, pane_id));
+            }
+        }
         let app = Rc::clone(self);
         self.spawn(async move {
             let pdu = Pdu::SetPaneZoomed(codec::SetPaneZoomed {
                 containing_tab_id: tab_id,
                 pane_id,
-                zoomed: !zoomed,
+                zoomed: zoom,
             });
             if let Err(err) = thinkterm_session::host::request(&link, pdu, Ok).await {
                 log::warn!("web-act-zoom-pane: {err:#}");
@@ -7162,6 +7570,8 @@ impl<P: Platform, L: Link> App<P, L> {
                 }
                 None => {}
             }
+            // The tab is this client's to shape now.
+            app.keep_one_pane();
         });
     }
 

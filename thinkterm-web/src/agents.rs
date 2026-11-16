@@ -27,6 +27,9 @@ pub struct AgentRow {
     /// For a program with no logo: the card its tab shows, which the page
     /// draws instead of the fallback, as the desktop does.
     pub card: Option<String>,
+    /// The card its tab shows, logo or not: for a client that draws the
+    /// cards and has no logos of its own (the phone).
+    pub pane_card: Option<String>,
     /// What the program said about itself (OSC 7501): what it waits for,
     /// what it is doing or why it stopped, how far it got, its sub-tasks.
     pub kind: Option<String>,
@@ -280,6 +283,7 @@ pub fn rows(
                 place,
                 icon: icon(agent_id),
                 card: if icon(agent_id) == FALLBACK_ICON { card_of(pane) } else { None },
+                pane_card: card_of(pane),
                 agent_id: agent_id.to_string(),
                 kind: report.and_then(|r| r.kind).map(kind_label),
                 said: report.and_then(|r| r.msg.clone()),
@@ -368,6 +372,7 @@ mod tests {
             place: place.into(),
             icon: icon(agent),
             card: None,
+            pane_card: None,
             kind: None,
             said: None,
             progress: None,

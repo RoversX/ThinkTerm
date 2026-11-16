@@ -751,6 +751,31 @@ mod tests {
         assert!(back.hidden.is_empty());
     }
 
+    /// A client that shows one pane at a time moves the zoom from pane to
+    /// pane, and lists the split behind it: both from a listing that has
+    /// another pane zoomed.
+    #[test]
+    fn a_zoom_moves_to_another_pane_of_a_zoomed_tab() {
+        let mut zoomed = pane(2, 80, 24, 41, 0, true);
+        zoomed.is_zoomed_pane = true;
+        let node = split(
+            SplitDirection::Horizontal,
+            size(40, 24),
+            size(39, 24),
+            PaneNode::Leaf(pane(1, 40, 24, 0, 0, false)),
+            PaneNode::Leaf(zoomed),
+        );
+        let moved = with_zoom(&node, size(80, 24), 0, Some(1)).unwrap();
+        assert_eq!(moved.zoomed, Some(1));
+        assert_eq!(moved.panes.len(), 1);
+        assert_eq!(moved.panes[0].pane_id, 1);
+        assert_eq!(moved.panes[0].frame, Rect { left: 0, top: 0, cols: 80, rows: 24 });
+        assert_eq!(moved.hidden, vec![2]);
+        let whole = with_zoom(&node, size(80, 24), 0, None).unwrap();
+        assert_eq!(whole.panes.iter().map(|p| p.pane_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(whole.panes[1].frame.left, whole.panes[0].frame.cols + 1);
+    }
+
     /// The server's tree keeps the pre-zoom sizes while a pane is zoomed;
     /// the zoomed pane's own size, resized since, is the tab's.
     #[test]

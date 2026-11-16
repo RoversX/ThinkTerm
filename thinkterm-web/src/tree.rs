@@ -11,8 +11,9 @@
 use codec::{ListPanesResponse, ThinkTermSessionState, ThinkTermSessionThread, ThinkTermTree, TreeOp};
 use std::collections::{HashMap, HashSet};
 use thinkterm_proto::{AgentState, AgentStatus, PaneId, ProgramReport, TabId, WindowId};
+use thinkterm_tab_icons::look::{self, Mark, Tone};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Idle,
     Running,
@@ -20,13 +21,40 @@ pub enum Status {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Dot {
     Active,
     Unread,
     Pinned,
     Open,
     Quiet,
+}
+
+/// The mark a thread's row ends with and what it is coloured with, as the
+/// desktop's sidebar picks them (`paint_sidebar_thread_mark`): what the
+/// thread is doing, or at rest which it is -- the one on show, one not
+/// open (`live` false), one with output nobody saw, an open one. A thread
+/// a program stopped in on an error (`ThreadRow::failed`) has its own
+/// mark instead, `failed_mark`.
+pub fn thread_mark(status: Status, dot: Dot, live: bool) -> (Mark, Tone) {
+    let current = dot == Dot::Active;
+    let mark = match status {
+        Status::Idle => Mark::Still,
+        Status::Running => Mark::Working,
+        Status::NeedsAttention => Mark::Waiting,
+        Status::Done => Mark::Finished,
+    };
+    let tone = match look::status_color(mark, current) {
+        Some(color) => Tone::Color(color),
+        None => look::still_tone(current, live, dot == Dot::Unread),
+    };
+    (mark, tone)
+}
+
+/// The mark of a thread a program in it stopped in on an error: the
+/// desktop's cross in its danger red, where any other wait is amber.
+pub fn failed_mark() -> (Mark, Tone) {
+    (Mark::Failed, Tone::Color(look::DANGER))
 }
 
 /// Serialised for the page as `{"kind": …}` rows, the shape the sidebar
@@ -65,6 +93,13 @@ pub struct ThreadRow {
     pub selected: bool,
     /// Its delete button was pressed once and waits for the press that means it.
     pub deleting: bool,
+    /// A program in it stopped on an error: its mark is `failed_mark`.
+    pub failed: bool,
+    /// The cards of what its panes run, in their order and each once, as
+    /// the desktop's row leads with them (`App::tree_view` fills them in;
+    /// a thread with no pane has the terminal's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub icons: Vec<String>,
 }
 
 /// The tree whole: `TreeModel::tree`.
@@ -334,6 +369,8 @@ impl TreeModel {
             live,
             selected: is_selected,
             deleting: deleting == Some(t.id.as_str()),
+            failed: self.has_failed(t),
+            icons: Vec::new(),
         }
     }
 
@@ -394,9 +431,20 @@ impl TreeModel {
             W::Running => Status::Running,
             _ if working => Status::Running,
             W::FinishedUnseen => Status::Done,
-            W::Idle if thread.is_unread => Status::Done,
+            // Output nobody saw is the row's own brighter dot (`Dot::Unread`),
+            // as on the desktop: a tick is for a result.
             W::Idle => Status::Idle,
         }
+    }
+
+    /// Whether a program in the thread stopped on an error, which the
+    /// desktop's sidebar marks apart from a wait (`thread_has_errored_agent`).
+    pub fn has_failed(&self, thread: &ThinkTermSessionThread) -> bool {
+        thread
+            .tabs
+            .iter()
+            .flat_map(|t| t.pane_ids.iter())
+            .any(|p| self.agents.get(p) == Some(&AgentState::Error))
     }
 
     /// The thread on show: the one holding the tab on show, else the one
@@ -971,6 +1019,22 @@ mod tests {
     }
 
     #[test]
+    fn a_row_s_mark_is_the_desktop_s() {
+        use look::{CURRENT, FINISHED, OPEN, WAITING, WORKING};
+        assert_eq!(thread_mark(Status::Running, Dot::Open, true), (Mark::Working, Tone::Color(WORKING)));
+        assert_eq!(thread_mark(Status::Running, Dot::Active, true), (Mark::Working, Tone::Color(CURRENT)));
+        assert_eq!(thread_mark(Status::NeedsAttention, Dot::Active, true), (Mark::Waiting, Tone::Color(WAITING)));
+        assert_eq!(thread_mark(Status::Done, Dot::Unread, true), (Mark::Finished, Tone::Color(FINISHED)));
+        assert_eq!(thread_mark(Status::Idle, Dot::Active, true), (Mark::Still, Tone::Color(CURRENT)));
+        assert_eq!(thread_mark(Status::Idle, Dot::Open, true), (Mark::Still, Tone::Color(OPEN)));
+        // A pinned thread is open or not, like any other.
+        assert_eq!(thread_mark(Status::Idle, Dot::Pinned, true), (Mark::Still, Tone::Color(OPEN)));
+        assert_eq!(thread_mark(Status::Idle, Dot::Pinned, false), (Mark::Still, Tone::Text(look::CLOSED_ALPHA)));
+        assert_eq!(thread_mark(Status::Idle, Dot::Unread, true), (Mark::Still, Tone::Text(look::UNREAD_ALPHA)));
+        assert_eq!(thread_mark(Status::Idle, Dot::Quiet, false), (Mark::Still, Tone::Text(look::CLOSED_ALPHA)));
+    }
+
+    #[test]
     fn status_is_the_worst_of_the_panes_and_the_server_s_word() {
         let mut m = TreeModel::default();
         let mut t = thread("a", Some("ws"), vec![(1, vec![10, 11])]);
@@ -985,9 +1049,22 @@ mod tests {
         m.agents.clear();
         t.work_status = ThinkTermSessionWorkStatus::FinishedUnseen;
         assert_eq!(m.status_of(&t), Status::Done);
+        // Unread output is the row's dot, not a result's tick.
         t.work_status = ThinkTermSessionWorkStatus::Idle;
         t.is_unread = true;
-        assert_eq!(m.status_of(&t), Status::Done);
+        assert_eq!(m.status_of(&t), Status::Idle);
+    }
+
+    #[test]
+    fn a_thread_a_program_failed_in_is_marked_apart_from_a_wait() {
+        let mut m = TreeModel::default();
+        let t = thread("a", Some("ws"), vec![(1, vec![10, 11])]);
+        m.agents.insert(10, AgentState::Blocked);
+        assert!(!m.has_failed(&t));
+        m.agents.insert(11, AgentState::Error);
+        assert!(m.has_failed(&t));
+        assert_eq!(m.status_of(&t), Status::NeedsAttention);
+        assert_eq!(failed_mark(), (Mark::Failed, Tone::Color(look::DANGER)));
     }
 
     #[test]
