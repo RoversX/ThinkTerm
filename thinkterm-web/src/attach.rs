@@ -97,6 +97,7 @@ pub async fn attach<L: Link>(
     )
     .await?;
     ProtocolMismatch::check(&version)?;
+    link.lease_mut().server_id = Some(version.server_id.clone());
 
     link.lease_mut().me = Some(me.clone());
     request(
@@ -221,6 +222,7 @@ pub async fn reattach<L: Link>(
     )
     .await?;
     ProtocolMismatch::check(&version)?;
+    link.lease_mut().server_id = Some(version.server_id.clone());
 
     let me = link
         .lease()

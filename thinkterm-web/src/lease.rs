@@ -8,6 +8,11 @@ use wezterm_term::TerminalSize;
 /// What the server has told us about who owns the tab we mirror.
 #[derive(Debug, Default, Clone)]
 pub struct Lease {
+    /// The running server attached to, as its codec version answer names
+    /// it (`server_id`): new when the server starts anew, whose pane and
+    /// tab ids are then other terminals'. Set at every attach, the
+    /// reconnects' included.
+    pub server_id: Option<String>,
     pub tab_id: Option<TabId>,
     pub me: Option<ClientId>,
     pub mode: Option<codec::FrontendAccessMode>,
@@ -247,6 +252,7 @@ mod claim_tests {
     }
     fn lease(mode: codec::FrontendAccessMode) -> Lease {
         Lease {
+            server_id: None,
             tab_id: Some(1),
             me: Some(id(1)),
             mode: Some(mode),

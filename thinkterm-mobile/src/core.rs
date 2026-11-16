@@ -278,16 +278,15 @@ struct State {
     status: String,
     composing: bool,
     /// The pane each upload under way was started from, where its path is
-    /// pasted once it lands, and the server it is on (`server_id` then): a
-    /// pane id is another terminal's once the server has started anew. An
-    /// entry goes when its upload ends.
+    /// pasted once it lands, and the server it is on (`App::server_id`
+    /// then): a pane id is another terminal's once the server has started
+    /// anew, which a reconnect of the App's own can meet. An entry goes
+    /// when its upload ends.
     upload_panes: std::collections::HashMap<u64, (thinkterm_proto::PaneId, Option<String>)>,
     /// The host each upload begun was begun on (`icons_host` then): one
     /// whose host has changed by the time its file is ready -- edited and
     /// connected to again -- is not sent to the new one.
     upload_hosts: std::collections::HashMap<u64, Option<(String, u16, String)>>,
-    /// The server the App is attached to, by its id.
-    server_id: Option<String>,
     /// The tab the App before zoomed for want of room, and the server it
     /// is on: handed to the next App on that server, which puts it back
     /// when it leaves it (`App::one_pane_zoomed`).
@@ -402,7 +401,6 @@ impl State {
             composing: false,
             upload_panes: Default::default(),
             upload_hosts: Default::default(),
-            server_id: None,
             one_pane_zoomed: None,
             settings: Vec::new(),
             palette: None,
@@ -633,7 +631,7 @@ impl State {
             }
             Cmd::UploadFor(id) => {
                 if let Some(app) = &self.app {
-                    self.upload_panes.insert(id, (app.focused_pane(), self.server_id.clone()));
+                    self.upload_panes.insert(id, (app.focused_pane(), app.server_id()));
                 }
                 self.upload_hosts.insert(id, self.icons_host.clone());
             }
@@ -641,8 +639,7 @@ impl State {
                 // The pane focused as it was begun; one begun with no App
                 // yet, the one focused now.
                 if let Some(app) = &self.app {
-                    let server = self.server_id.clone();
-                    self.upload_panes.entry(id).or_insert_with(|| (app.focused_pane(), server));
+                    self.upload_panes.entry(id).or_insert_with(|| (app.focused_pane(), app.server_id()));
                 }
                 let moved = self.upload_hosts.remove(&id).is_some_and(|begun| begun != self.icons_host);
                 if moved {
@@ -652,11 +649,12 @@ impl State {
                 }
             }
             Cmd::PasteUpload { id, text } => {
-                // Not on a server started anew since, or another: its pane
+                // Not on a server started anew since, or another -- the App
+                // may have reconnected to one by itself meanwhile: its pane
                 // ids are other terminals'. The upload says where the file
                 // went all the same.
                 if let (Some((pane, server)), Some(app)) = (self.upload_panes.remove(&id), &self.app) {
-                    if server == self.server_id {
+                    if server.is_some() && server == app.server_id() {
                         self.stats.inputs_sent += 1;
                         app.paste_into(pane, &text);
                     }
@@ -1105,7 +1103,7 @@ impl State {
         if let Some(app) = self.app.take() {
             // A tab it zoomed for want of room is the next App's to put
             // back, should that be on the same server.
-            self.one_pane_zoomed = app.one_pane_zoomed().zip(self.server_id.take()).map(|(zoomed, server)| (server, zoomed));
+            self.one_pane_zoomed = app.one_pane_zoomed().zip(app.server_id()).map(|(zoomed, server)| (server, zoomed));
             // Cut the link's hold on the App, then let every task on the
             // wire see the link gone and finish, so nothing but this
             // handle is left holding it.
@@ -1481,7 +1479,6 @@ impl State {
         if let Some((_, zoomed)) = self.one_pane_zoomed.take().filter(|(server, _)| *server == attached.server_id) {
             app.keep_one_pane_zoomed(zoomed);
         }
-        self.server_id = Some(attached.server_id.clone());
         app.fetch_tree();
         app.hide_status();
         app.refresh_layout();

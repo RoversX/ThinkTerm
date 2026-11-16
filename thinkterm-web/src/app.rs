@@ -2461,6 +2461,12 @@ impl<P: Platform, L: Link> App<P, L> {
         self.inner.borrow().focused_pane
     }
 
+    /// The running server attached to now (`Lease::server_id`): another
+    /// one after a reconnect to a server that started anew.
+    pub fn server_id(&self) -> Option<String> {
+        self.inner.borrow().link.lease().server_id.clone()
+    }
+
     /// Paste into `pane`, focused or not, while it is on show here; a pane
     /// that is not -- closed, or of another tab now -- is left alone
     /// rather than the text landing in whichever one has the focus.
