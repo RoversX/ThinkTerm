@@ -69,36 +69,30 @@ private class LicenseItem(
 
 private class LicenseList(val items: List<LicenseItem>, val texts: Map<String, String>)
 
-/// licenses.json, read once: a couple of megabytes of text, read off the
-/// main thread. None at all in a build made without android/build.sh.
-private object Licenses {
-    @Volatile private var loaded: LicenseList? = null
-
-    fun get(context: Context): LicenseList = loaded ?: synchronized(this) {
-        loaded ?: read(context).also { loaded = it }
+/// licenses.json: a couple of megabytes of text, read off the main thread
+/// each time the page opens and let go when it closes -- not kept for the
+/// rest of the app's life for a page seldom opened. None at all in a build
+/// made without android/build.sh.
+private fun readLicenses(context: Context): LicenseList {
+    val json = runCatching { context.assets.open("licenses.json").bufferedReader().use { it.readText() } }
+        .getOrNull() ?: return LicenseList(emptyList(), emptyMap())
+    val root = JSONObject(json)
+    val texts = root.getJSONObject("texts").let { all -> all.keys().asSequence().associateWith { all.getString(it) } }
+    val array = root.getJSONArray("items")
+    val items = (0 until array.length()).map { i ->
+        val item = array.getJSONObject(i)
+        fun strings(name: String) = item.optJSONArray(name)?.let { list -> (0 until list.length()).map { list.getString(it) } } ?: emptyList()
+        LicenseItem(
+            section = item.getString("section"),
+            name = item.getString("name"),
+            version = item.optString("version"),
+            license = item.optString("license"),
+            url = item.optString("url"),
+            includes = strings("includes"),
+            texts = strings("texts"),
+        )
     }
-
-    private fun read(context: Context): LicenseList {
-        val json = runCatching { context.assets.open("licenses.json").bufferedReader().use { it.readText() } }
-            .getOrNull() ?: return LicenseList(emptyList(), emptyMap())
-        val root = JSONObject(json)
-        val texts = root.getJSONObject("texts").let { all -> all.keys().asSequence().associateWith { all.getString(it) } }
-        val array = root.getJSONArray("items")
-        val items = (0 until array.length()).map { i ->
-            val item = array.getJSONObject(i)
-            fun strings(name: String) = item.optJSONArray(name)?.let { list -> (0 until list.length()).map { list.getString(it) } } ?: emptyList()
-            LicenseItem(
-                section = item.getString("section"),
-                name = item.getString("name"),
-                version = item.optString("version"),
-                license = item.optString("license"),
-                url = item.optString("url"),
-                includes = strings("includes"),
-                texts = strings("texts"),
-            )
-        }
-        return LicenseList(items, texts)
-    }
+    return LicenseList(items, texts)
 }
 
 /// The sections in the iPhone app's order, Android's own libraries before
@@ -113,7 +107,7 @@ private val SECTIONS: List<Pair<String, () -> String>> = listOf(
 @Composable
 internal fun LicensesScreen(onBack: () -> Unit) {
     val context = LocalContext.current
-    val list by produceState<LicenseList?>(null) { value = withContext(Dispatchers.IO) { Licenses.get(context) } }
+    val list by produceState<LicenseList?>(null) { value = withContext(Dispatchers.IO) { readLicenses(context) } }
     // Kept over a license's page: what was searched, and where the list was.
     var query by remember { mutableStateOf("") }
     val listState = rememberLazyListState()

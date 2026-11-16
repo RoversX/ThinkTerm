@@ -341,6 +341,7 @@ EXTRA = {
     "licenses": ["Open Source Licenses", "开源许可", "オープンソースライセンス", "Licences open source", "Open-Source-Lizenzen"],
     "licenses.assets": ["Fonts and Icons", "字体和图标", "フォントとアイコン", "Polices et icônes", "Schriften und Symbole"],
     "licenses.rust": ["Rust Libraries", "Rust 库", "Rust ライブラリ", "Bibliothèques Rust", "Rust-Bibliotheken"],
+    "licenses.android": ["Android Libraries", "Android 库", "Android ライブラリ", "Bibliothèques Android", "Android-Bibliotheken"],
     "licenses.includes": ["Includes %@", "包含 %@", "含まれるもの: %@", "Comprend %@", "Enthält %@"],
     "licenses.search": ["Search Licenses", "搜索许可", "ライセンスを検索", "Rechercher une licence", "Lizenzen durchsuchen"],
     "tn.qr": ["Or scan this with another device's camera and log in there.", "也可以用另一台设备的相机扫这个码，在那台设备上登录。", "または別のデバイスのカメラでこのコードを読み取り、そちらでログインします。", "Ou scannez ce code avec l’appareil photo d’un autre appareil et connectez-vous sur celui-ci.", "Oder scannen Sie diesen Code mit der Kamera eines anderen Geräts und melden Sie sich dort an."],
