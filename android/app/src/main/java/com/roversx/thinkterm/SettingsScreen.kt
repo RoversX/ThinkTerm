@@ -115,6 +115,7 @@ fun SettingsScreen(model: TerminalModel?, showLog: MutableState<Boolean>?, onDon
             "resize.mode" -> OptionScreen(tr("resize.mode"), resizes(), settings.resizeMode, back) { settings.resizeMode = it }
             "k.keybar" -> KeyCapsScreen(back)
             "tailscale" -> TailnetSettingsScreen(onBack = back)
+            "licenses" -> LicensesScreen(onBack = back)
             else -> SettingsSection(top, settings, model, showLog, onDone, back, push)
         }
     }
@@ -212,7 +213,7 @@ private const val ABOUT_REPO = "https://github.com/RoversX/thinkterm"
 /// About, as the desktop's About page has it: the app and its version,
 /// what it is built as and under, where it comes from, and who makes it.
 @Composable
-private fun ColumnScope.AboutContent(onDone: (() -> Unit)?) {
+private fun ColumnScope.AboutContent(onDone: (() -> Unit)?, onLicenses: () -> Unit) {
     val context = LocalContext.current
     val colors = groupedColors()
     val info = remember(context) {
@@ -280,7 +281,11 @@ private fun ColumnScope.AboutContent(onDone: (() -> Unit)?) {
     Group {
         AboutLink(tr("about.source")) { open(ABOUT_REPO) }
         AboutLink(tr("about.releasenotes")) { open("$ABOUT_REPO/releases") }
-        AboutLink(tr("about.notices")) { open("$ABOUT_REPO/blob/main/NOTICE") }
+        // In the app, as the iPhone app has them: every license it ships.
+        GroupRow(onClick = onLicenses) {
+            RowTitle(tr("licenses"))
+            RowChevron()
+        }
         AboutLink(tr("about.privacy")) { open("$ABOUT_REPO/blob/main/PRIVACY.md") }
     }
     Spacer(Modifier.height(18.dp))
@@ -406,7 +411,7 @@ private fun SettingsSection(
                     }
                 }
             }
-            "about" -> AboutContent(onDone)
+            "about" -> AboutContent(onDone) { onPush("licenses") }
         }
     }
 }

@@ -1,0 +1,77 @@
+{
+  "about": "The Java and Kotlin libraries in the release APK, by project, for Settings > About > Open Source Licenses (ios/tools/gen-licenses.py gives each its license's standard text). Every group of `gradle :app:dependencies --configuration releaseRuntimeClasspath` is under one of them; a dependency from a new project needs an entry here.",
+  "items": [
+    {
+      "name": "Android Jetpack (AndroidX)",
+      "license": "Apache-2.0",
+      "url": "https://github.com/androidx/androidx",
+      "includes": ["androidx.activity", "androidx.annotation", "androidx.arch.core", "androidx.autofill", "androidx.browser", "androidx.collection", "androidx.compose", "androidx.concurrent", "androidx.core", "androidx.customview", "androidx.documentfile", "androidx.dynamicanimation", "androidx.emoji2", "androidx.graphics", "androidx.interpolator", "androidx.legacy", "androidx.lifecycle", "androidx.loader", "androidx.localbroadcastmanager", "androidx.navigation", "androidx.print", "androidx.profileinstaller", "androidx.savedstate", "androidx.security", "androidx.startup", "androidx.tracing", "androidx.transition", "androidx.versionedparcelable", "androidx.window"]
+    },
+    {
+      "name": "Compose Multiplatform",
+      "license": "Apache-2.0",
+      "url": "https://github.com/JetBrains/compose-multiplatform",
+      "includes": ["org.jetbrains.compose", "org.jetbrains.androidx.lifecycle", "org.jetbrains.androidx.savedstate"]
+    },
+    {
+      "name": "Kotlin standard library",
+      "license": "Apache-2.0",
+      "url": "https://github.com/JetBrains/kotlin",
+      "includes": ["org.jetbrains.kotlin"]
+    },
+    {
+      "name": "kotlinx.coroutines",
+      "license": "Apache-2.0",
+      "url": "https://github.com/Kotlin/kotlinx.coroutines",
+      "includes": ["org.jetbrains.kotlinx:kotlinx-coroutines"]
+    },
+    {
+      "name": "kotlinx.serialization",
+      "license": "Apache-2.0",
+      "url": "https://github.com/Kotlin/kotlinx.serialization",
+      "includes": ["org.jetbrains.kotlinx:kotlinx-serialization"]
+    },
+    {
+      "name": "JetBrains Java Annotations",
+      "license": "Apache-2.0",
+      "url": "https://github.com/JetBrains/java-annotations",
+      "includes": ["org.jetbrains:annotations"]
+    },
+    {
+      "name": "Backdrop",
+      "license": "Apache-2.0",
+      "url": "https://github.com/Kyant0/AndroidLiquidGlass",
+      "includes": ["io.github.kyant0:backdrop", "io.github.kyant0:shapes"]
+    },
+    {
+      "name": "Java Native Access (JNA)",
+      "license": "Apache-2.0 OR LGPL-2.1-or-later",
+      "url": "https://github.com/java-native-access/jna",
+      "includes": ["net.java.dev.jna:jna"]
+    },
+    {
+      "name": "Gson",
+      "license": "Apache-2.0",
+      "url": "https://github.com/google/gson",
+      "includes": ["com.google.code.gson:gson"]
+    },
+    {
+      "name": "Tink",
+      "license": "Apache-2.0",
+      "url": "https://github.com/google/tink",
+      "includes": ["com.google.crypto.tink:tink-android"]
+    },
+    {
+      "name": "Guava ListenableFuture",
+      "license": "Apache-2.0",
+      "url": "https://github.com/google/guava",
+      "includes": ["com.google.guava:listenablefuture"]
+    },
+    {
+      "name": "JSpecify",
+      "license": "Apache-2.0",
+      "url": "https://github.com/jspecify/jspecify",
+      "includes": ["org.jspecify:jspecify"]
+    }
+  ]
+}

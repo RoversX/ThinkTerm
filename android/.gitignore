@@ -9,6 +9,7 @@ app/src/main/assets/strings.json
 app/src/main/assets/lucide/
 app/src/main/assets/brands/
 app/src/main/assets/app_icon.png
+app/src/main/assets/licenses.json
 .gradle/
 build/
 app/build/

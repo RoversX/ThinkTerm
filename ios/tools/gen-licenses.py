@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Write the licenses the iOS app shows (Settings, Open Source Licenses).
+"""Write the licenses the phone apps show (Settings, Open Source Licenses).
 
-Everything the app ships that is not ThinkTerm's own: the WezTerm code it
+Everything an app ships that is not ThinkTerm's own: the WezTerm code it
 grew from, the fonts and icons in the bundle, the Rust standard library,
-and every crate linked into the core (thinkterm-mobile, for the iPhone
+and every crate linked into the core (thinkterm-mobile, for the app's
 target, as `cargo tree` resolves it). Each with its license as its authors
 wrote it, from the crate's own files; a crate that ships none gets the
 standard text of what its manifest names. Proc-macro crates run in the
-compiler and are not in the app, so they are left out.
+compiler and are not in the app, so they are left out. The Android app's
+Java and Kotlin libraries are listed in a file of their own (EXTRA,
+android/libraries.json), each with its license's standard text.
 
-    python3 ios/tools/gen-licenses.py OUT.json [TARGET]
+    python3 ios/tools/gen-licenses.py OUT.json [TARGET [EXTRA]]
 
-Run by ios/build.sh; the output is generated, not kept in the tree. It
-holds no paths of the machine it was made on.
+Run by ios/build.sh and android/build.sh; the output is generated, not
+kept in the tree. It holds no paths of the machine it was made on.
 """
 
 import hashlib
@@ -237,6 +239,15 @@ ASSETS = [
 for name, spdx, url, bodies in ASSETS:
     items.append({"section": "assets", "name": name, "license": spdx, "url": url,
                   "texts": [texts.add(b) for b in bodies]})
+
+# The Android app's Java and Kotlin libraries, by project: none of them
+# ships a license file in the app, so each gets its license's standard
+# text.
+if len(sys.argv) > 3:
+    for entry in json.loads(read(os.path.join(ROOT, sys.argv[3])))["items"]:
+        items.append({"section": "android", "name": entry["name"], "license": entry["license"],
+                      "url": entry["url"], "includes": entry.get("includes", []),
+                      "texts": standard_texts(entry["license"], "")})
 
 # The Rust standard library, linked into the core. Its copyright file is
 # HTML; the text of it, with the markup and the blank runs taken out.

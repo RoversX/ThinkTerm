@@ -95,6 +95,10 @@ done
 # mark (filled, like the marks above) and the app's icon.
 cp assets/icon/CloseX.svg android/app/src/main/assets/brands/closex.svg
 cp assets/icon/ThinkTerm.png android/app/src/main/assets/app_icon.png
+# What Settings > About > Open Source Licenses lists, as the iPhone app's:
+# the crates linked into the core for this target, the bundle's fonts and
+# icons, and the app's Java and Kotlin libraries (android/libraries.json).
+python3 ios/tools/gen-licenses.py android/app/src/main/assets/licenses.json "$TARGET" android/libraries.json
 cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/FiraCode-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf android/app/src/main/assets/
 cp thinkterm-web/www/schemes.json ios/Resources/strings.json android/app/src/main/assets/
 # The probe sshd's throwaway key, for the emulator's "This Mac" entry:
