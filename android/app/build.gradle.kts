@@ -4,6 +4,23 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// The desktop release's version, which android/build.sh passes in
+// (-PthinktermVersion=0.5.0). The app speaks the mux codec of the release it
+// was built from and needs a server on that same codec, so a phone build
+// carries the number of the desktop and server it matches. A build without
+// it is a local one and calls itself "dev".
+val thinktermVersion = providers.gradleProperty("thinktermVersion").orNull ?: "dev"
+
+// 0.5.0 -> 50000, 1.2.3 -> 1020300: each release above the one before, with
+// the last two digits free for a phone-only fix of the same release
+// (0.5.0.1). Anything else, a timestamped test build or "dev", gets 1, which
+// every release is above.
+fun versionCodeOf(version: String): Int {
+    val parts = version.split('.').map { it.toIntOrNull() ?: return 1 }
+    if (parts.size !in 3..4 || parts.drop(1).any { it > 99 }) return 1
+    return parts[0] * 1_000_000 + parts[1] * 10_000 + parts[2] * 100 + parts.getOrElse(3) { 0 }
+}
+
 android {
     namespace = "com.roversx.thinkterm"
     compileSdk = 36
@@ -12,15 +29,24 @@ android {
         applicationId = "com.roversx.thinkterm"
         minSdk = 35
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = versionCodeOf(thinktermVersion)
+        versionName = thinktermVersion
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Most of Compose's icon set and of the libraries goes unused.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
+    }
+    // android/build.sh's Rust library. A release build makes its own copy
+    // somewhere else and names it here, so a debug build running beside it
+    // never packages the other's.
+    providers.gradleProperty("thinktermJniLibs").orNull?.let { dir ->
+        sourceSets.getByName("main").jniLibs.setSrcDirs(listOf(dir))
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
