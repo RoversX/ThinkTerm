@@ -46,8 +46,8 @@ ThinkTerm est un **terminal open source avec multiplexeur intégré, écrit en R
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="../assets/screenshots/mobile.jpeg" alt="ThinkTerm sur iPhone (Swift) et sur Android (Kotlin)" width="100%">
-      <br><strong>iPhone et Android</strong>
+      <img src="../assets/screenshots/mobile.jpeg" alt="ThinkTerm sur iOS / iPadOS (Swift) et sur Android (Kotlin)" width="100%">
+      <br><strong>iOS, iPadOS et Android</strong>
     </td>
   </tr>
 </table>

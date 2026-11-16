@@ -46,8 +46,8 @@ ThinkTerm は [WezTerm](https://github.com/wezterm/wezterm) を基盤とした�
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="../assets/screenshots/mobile.jpeg" alt="iPhone 版（Swift）と Android 版（Kotlin）の ThinkTerm" width="100%">
-      <br><strong>iPhone と Android</strong>
+      <img src="../assets/screenshots/mobile.jpeg" alt="iOS / iPadOS 版（Swift）と Android 版（Kotlin）の ThinkTerm" width="100%">
+      <br><strong>iOS・iPadOS・Android</strong>
     </td>
   </tr>
 </table>

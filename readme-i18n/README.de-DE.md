@@ -46,8 +46,8 @@ ThinkTerm ist ein **in Rust geschriebenes Open-Source-Terminal mit integriertem 
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="../assets/screenshots/mobile.jpeg" alt="ThinkTerm auf dem iPhone (Swift) und auf Android (Kotlin)" width="100%">
-      <br><strong>iPhone und Android</strong>
+      <img src="../assets/screenshots/mobile.jpeg" alt="ThinkTerm auf dem iOS / iPadOS (Swift) und auf Android (Kotlin)" width="100%">
+      <br><strong>iOS, iPadOS und Android</strong>
     </td>
   </tr>
 </table>

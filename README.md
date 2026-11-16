@@ -48,8 +48,8 @@ https://github.com/user-attachments/assets/7317e369-db86-463f-9379-a8a2ed4b602b
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="assets/screenshots/mobile.jpeg" alt="ThinkTerm on iPhone, built with Swift, and on Android, built with Kotlin" width="100%">
-      <br><strong>iPhone and Android</strong>
+      <img src="assets/screenshots/mobile.jpeg" alt="ThinkTerm on iOS / iPadOS, built with Swift, and on Android, built with Kotlin" width="100%">
+      <br><strong>iOS, iPadOS and Android</strong>
     </td>
   </tr>
 </table>
