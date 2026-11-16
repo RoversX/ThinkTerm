@@ -6,6 +6,9 @@ app/src/debug/assets/probe_key
 app/src/debug/assets/probe_user
 app/src/main/assets/schemes.json
 app/src/main/assets/strings.json
+app/src/main/assets/lucide/
+app/src/main/assets/brands/
+app/src/main/assets/app_icon.png
 .gradle/
 build/
 app/build/

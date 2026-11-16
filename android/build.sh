@@ -32,6 +32,31 @@ cargo run -q -p thinkterm-mobile --bin uniffi-bindgen -- generate \
 
 echo "== assets"
 mkdir -p android/app/src/main/assets
+# The desktop's icons (third_party/lucide, as wezterm-gui's icons.rs names
+# them), read as vectors by DesktopIcons.kt: copied here, not kept twice in
+# the tree. The same list as ios/build.sh's.
+rm -rf android/app/src/main/assets/lucide
+mkdir -p android/app/src/main/assets/lucide
+for name in app-window archive bot check hand laptop-minimal monitor-smartphone smartphone chevron-down circle-check clipboard copy lock shield-off triangle-alert chevron-left panel-left panel-right chevron-right chevrons-up-down circle-plus folder \
+  folder-open globe grid-2x2 key-round keyboard layers link-2 paperclip plus rotate-ccw search server \
+  settings square-pen x cloud laptop hard-drive monitor cpu package square-terminal power \
+  palette panels-top-left wifi info stethoscope git-branch scale arrow-up-right; do
+  [ -f "third_party/lucide/icons/$name.svg" ] && cp "third_party/lucide/icons/$name.svg" android/app/src/main/assets/lucide/
+done
+# The desktop's own "new project", which is not one of Lucide's.
+cp assets/ui/project-add.svg android/app/src/main/assets/lucide/
+# The makers' marks a tailnet's machines wear (third_party/simple-icons, as
+# the desktop's icons.rs has them), filled, not stroked. ios/build.sh's list
+# leaves out Apple's, which iOS has as a symbol of its own.
+rm -rf android/app/src/main/assets/brands
+mkdir -p android/app/src/main/assets/brands
+for name in apple android linux ubuntu debian raspberrypi fedora archlinux alpinelinux redhat centos nixos proxmox; do
+  cp "third_party/simple-icons/icons/$name.svg" android/app/src/main/assets/brands/
+done
+# About's own pictures, as the desktop's About page has them: the maker's
+# mark (filled, like the marks above) and the app's icon.
+cp assets/icon/CloseX.svg android/app/src/main/assets/brands/closex.svg
+cp assets/icon/ThinkTerm.png android/app/src/main/assets/app_icon.png
 cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/FiraCode-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf android/app/src/main/assets/
 cp thinkterm-web/www/schemes.json ios/Resources/strings.json android/app/src/main/assets/
 # The probe sshd's throwaway key, for the emulator's "This Mac" entry:

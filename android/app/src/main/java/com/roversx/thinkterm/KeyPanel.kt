@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.grid.LazyHorizontalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -32,11 +33,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -47,14 +43,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -240,24 +237,14 @@ fun KeyPanel(
             }
         }
 
-        Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color.White.copy(alpha = 0.08f)))
+        Box(Modifier.fillMaxWidth().height(0.5.dp).background(ink.copy(alpha = 0.08f)))
 
-        SingleChoiceSegmentedButtonRow(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp)
-        ) {
-            val tabs = KeyPanelTab.entries
-            tabs.forEachIndexed { index, entry ->
-                SegmentedButton(
-                    selected = tab == entry,
-                    onClick = { onTab(entry) },
-                    shape = SegmentedButtonDefaults.itemShape(index, tabs.size),
-                    icon = {},
-                    label = { Text(entry.title, fontSize = 12.sp, maxLines = 1) },
-                )
-            }
-        }
+        val tabs = KeyPanelTab.entries
+        IosSegments(
+            tabs.map { it.title },
+            tabs.indexOf(tab),
+            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+        ) { onTab(tabs[it]) }
     }
 }
 
@@ -302,13 +289,13 @@ private fun LayoutFace(model: TerminalModel, history: KeyHistory, tap: () -> Uni
                 for (cap in row) {
                     Text(
                         cap.label,
-                        color = Color.White,
+                        color = ink,
                         fontSize = 14.sp,
                         maxLines = 1,
                         modifier = Modifier
                             .weight(1f)
                             .clip(RoundedCornerShape(10.dp))
-                            .background(Color.White.copy(alpha = 0.07f))
+                            .background(ink.copy(alpha = 0.07f))
                             .clickable { KeyCaps.send(cap, model, history, tap) }
                             .padding(vertical = 12.dp),
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -332,7 +319,7 @@ private fun KeyBlock(
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(
             title.uppercase(),
-            color = Color.White.copy(alpha = 0.45f),
+            color = ink.copy(alpha = 0.45f),
             fontSize = 10.sp,
             fontWeight = FontWeight.SemiBold,
             letterSpacing = 0.6.sp,
@@ -358,13 +345,13 @@ private fun PanelKey(cap: KeyCap, modifier: Modifier, onClick: () -> Unit) {
         modifier
             .height(38.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(Color.White.copy(alpha = 0.07f))
+            .background(ink.copy(alpha = 0.07f))
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             cap.label,
-            color = Color.White,
+            color = ink,
             fontSize = 13.sp,
             fontFamily = FontFamily.Monospace,
             maxLines = 1,
@@ -397,7 +384,7 @@ private fun SnippetsFace(
                     .fillMaxWidth()
                     .height(42.dp)
                     .clip(RoundedCornerShape(11.dp))
-                    .background(Color.White.copy(alpha = 0.07f)),
+                    .background(ink.copy(alpha = 0.07f)),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Row(
@@ -416,7 +403,7 @@ private fun SnippetsFace(
                 ) {
                     Text(
                         snippet.text,
-                        color = Color.White,
+                        color = ink,
                         fontSize = 13.sp,
                         fontFamily = FontFamily.Monospace,
                         maxLines = 1,
@@ -437,7 +424,7 @@ private fun SnippetsFace(
                     Icon(
                         Icons.Filled.Tune,
                         contentDescription = tr("snip.title"),
-                        tint = Color.White.copy(alpha = 0.5f),
+                        tint = ink.copy(alpha = 0.5f),
                         modifier = Modifier.size(17.dp),
                     )
                 }
@@ -449,7 +436,7 @@ private fun SnippetsFace(
                 .fillMaxWidth()
                 .height(42.dp)
                 .clip(RoundedCornerShape(11.dp))
-                .background(Color.White.copy(alpha = 0.07f))
+                .background(ink.copy(alpha = 0.07f))
                 .clickable { draft = SnippetDraft(Snippet(text = ""), isNew = true) },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
@@ -457,12 +444,12 @@ private fun SnippetsFace(
             Icon(
                 Icons.Filled.Add,
                 contentDescription = null,
-                tint = Color.White.copy(alpha = 0.65f),
+                tint = ink.copy(alpha = 0.65f),
                 modifier = Modifier.size(18.dp),
             )
             Text(
                 tr("snip.new"),
-                color = Color.White.copy(alpha = 0.65f),
+                color = ink.copy(alpha = 0.65f),
                 fontSize = 14.sp,
                 modifier = Modifier.padding(start = 6.dp),
             )
@@ -488,24 +475,31 @@ private fun SnippetEditor(draft: SnippetDraft, store: SnippetStore, onClose: () 
         title = { Text(if (draft.isNew) tr("snip.new") else tr("snip.title")) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    label = { Text(tr("snip.command")) },
-                    textStyle = LocalTextStyle.current.copy(
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 14.sp,
-                    ),
-                    maxLines = 6,
-                    keyboardOptions = KeyboardOptions(
-                        capitalization = KeyboardCapitalization.None,
-                        autoCorrectEnabled = false,
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                val colors = groupedColors()
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(colors.fill)
+                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                ) {
+                    if (text.isEmpty()) Text(tr("snip.command"), color = colors.tertiary, fontSize = 14.sp, fontFamily = FontFamily.Monospace)
+                    BasicTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        textStyle = TextStyle(color = colors.primary, fontFamily = FontFamily.Monospace, fontSize = 14.sp),
+                        cursorBrush = SolidColor(LeadBlue),
+                        maxLines = 6,
+                        keyboardOptions = KeyboardOptions(
+                            capitalization = KeyboardCapitalization.None,
+                            autoCorrectEnabled = false,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(tr("snip.enter"), fontSize = 14.sp, modifier = Modifier.weight(1f))
-                    Switch(checked = runs, onCheckedChange = { runs = it })
+                    Text(tr("snip.enter"), fontSize = 15.sp, modifier = Modifier.weight(1f))
+                    IosSwitch(runs) { runs = it }
                 }
             }
         },
@@ -541,7 +535,7 @@ private fun HistoryFace(model: TerminalModel, history: KeyHistory, tap: () -> Un
     if (lines.isEmpty()) {
         Text(
             tr("hist.empty"),
-            color = Color.White.copy(alpha = 0.45f),
+            color = ink.copy(alpha = 0.45f),
             fontSize = 13.sp,
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().padding(top = 28.dp),
@@ -561,7 +555,7 @@ private fun HistoryFace(model: TerminalModel, history: KeyHistory, tap: () -> Un
                     .fillMaxWidth()
                     .height(42.dp)
                     .clip(RoundedCornerShape(11.dp))
-                    .background(Color.White.copy(alpha = 0.07f))
+                    .background(ink.copy(alpha = 0.07f))
                     .clickable {
                         model.text(line)
                         tap()
@@ -571,7 +565,7 @@ private fun HistoryFace(model: TerminalModel, history: KeyHistory, tap: () -> Un
             ) {
                 Text(
                     line,
-                    color = Color.White,
+                    color = ink,
                     fontSize = 13.sp,
                     fontFamily = FontFamily.Monospace,
                     maxLines = 1,
@@ -622,10 +616,10 @@ private fun Swatch(name: String, label: String, picked: Boolean, onClick: () -> 
                 .width(64.dp)
                 .height(40.dp)
                 .clip(RoundedCornerShape(10.dp))
-                .background(Schemes.background(name) ?: Color.White.copy(alpha = 0.12f))
+                .background(Schemes.background(name) ?: ink.copy(alpha = 0.12f))
                 .border(
                     width = if (picked) 2.dp else 1.dp,
-                    color = if (picked) accent else Color.White.copy(alpha = 0.18f),
+                    color = if (picked) accent else ink.copy(alpha = 0.18f),
                     shape = RoundedCornerShape(10.dp),
                 ),
             contentAlignment = Alignment.Center,
@@ -634,13 +628,13 @@ private fun Swatch(name: String, label: String, picked: Boolean, onClick: () -> 
                 Icon(
                     Icons.Filled.DesktopWindows,
                     contentDescription = null,
-                    tint = Color.White.copy(alpha = 0.8f),
+                    tint = ink.copy(alpha = 0.8f),
                     modifier = Modifier.size(18.dp),
                 )
             } else {
                 Text(
                     "Aa",
-                    color = Schemes.foreground(name) ?: Color.White,
+                    color = Schemes.foreground(name) ?: ink,
                     fontSize = 13.sp,
                     fontFamily = FontFamily.Monospace,
                 )
@@ -648,7 +642,7 @@ private fun Swatch(name: String, label: String, picked: Boolean, onClick: () -> 
         }
         Text(
             label,
-            color = if (picked) accent else Color.White.copy(alpha = 0.6f),
+            color = if (picked) accent else ink.copy(alpha = 0.6f),
             fontSize = 9.5.sp,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -670,7 +664,7 @@ private fun Chip(
         modifier
             .height(36.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(Color.White.copy(alpha = 0.07f))
+            .background(ink.copy(alpha = 0.07f))
             .clickable(onClick = onClick),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,
@@ -678,12 +672,12 @@ private fun Chip(
         Icon(
             icon,
             contentDescription = null,
-            tint = Color.White.copy(alpha = 0.75f),
+            tint = ink.copy(alpha = 0.75f),
             modifier = Modifier.size(17.dp),
         )
         Text(
             title,
-            color = Color.White.copy(alpha = 0.75f),
+            color = ink.copy(alpha = 0.75f),
             fontSize = 14.sp,
             maxLines = 1,
             modifier = Modifier.padding(start = 7.dp),

@@ -31,6 +31,8 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
 
     /// A tag of strings.json, or "system" to follow the phone's.
     var language by pref("lang", "system") { AppLanguage.tag = it }
+    /// The first run's pages were gone through (`Onboarding`).
+    var onboarded by pref("onboarded", false)
 
     // MARK: appearance
 
@@ -63,10 +65,14 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
 
     // MARK: interface
 
-    /// "one" or "two" levels of tabs: threads over tabs, or tabs alone.
-    var tabBarLevels by pref("ui.tabbar", "two")
     /// The bars over split panes; off, the rows go to the terminal.
     var paneBars by pref("ui.panebars", true)
+    /// How the sidebar shows the Spaces: "list", every Space a row that
+    /// folds, or "menu", the Space on show with the others in its menu, as
+    /// the desktop's sidebar has them.
+    var spaces by pref("ui.spaces", "list")
+    /// On a wide screen, whether the sidebar stays beside the terminal.
+    var sidebarPinned by pref("sidebar.pinned", true)
 
     // MARK: keyboard
 

@@ -2,13 +2,16 @@ package com.roversx.thinkterm
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.HapticFeedbackConstants
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.TextureView
@@ -49,8 +52,11 @@ class TerminalHostView(context: Context, private val model: TerminalModel) : Fra
         // keyboard (a tap does that itself), only keep it where it is.
         model.onFocusRequested = { if (input.keyboardShown()) input.requestFocus() }
         model.onHideKeyboard = { input.hideKeyboard() }
+        model.onShowKeyboard = { input.focusAndShowKeyboard() }
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                // The surface lent while the host was only listed goes first.
+                model.dropListSurface()
                 val s = Surface(st)
                 surface = s
                 window = NativeWindow.fromSurface(s)
@@ -150,6 +156,14 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
     /// while it is open; it is sent once, when it is committed.
     private var composing: String? = null
 
+    /// What of a word the keyboard composes in place (`composesInPlace`)
+    /// has gone to the terminal already; null while it composes none.
+    private var sent: String? = null
+
+    /// The keyboard itself is typing, through `Connection`: what it sends
+    /// does not disturb the word it is making (`lineDisturbed`).
+    private var imeSending = false
+
     /// While the overview is up the shrunken terminal is a card: any
     /// touch on it is a tap on the card, not input.
     var touchOverride: (() -> Unit)? = null
@@ -190,12 +204,15 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         isFocusable = true
         isFocusableInTouchMode = true
         isClickable = true
+        // A mouse over the terminal shows the text cursor, as the desktop's.
+        pointerIcon = PointerIcon.getSystemIcon(context, PointerIcon.TYPE_TEXT)
         model.onScreenChanged = { if (anchor != null) screen = null }
         model.onDropComposition = { dropComposition() }
         model.onImeOptionsChanged = {
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.restartInput(this)
         }
+        model.onLineDisturbed = { lineDisturbed() }
     }
 
     fun keyboardShown(): Boolean =
@@ -205,14 +222,26 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
     /// the core, whose latch would otherwise swallow every key of the
     /// next connection, and the IME starts over.
     private fun dropComposition() {
-        val open = composing != null
+        val open = composing != null || sent != null
         composing = null
+        sent = null
         model.composing = null
         model.core.setComposing(false)
         if (open) {
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.restartInput(this)
         }
+    }
+
+    /// Something other than the keyboard typed, or another pane has the
+    /// line: a word the keyboard was making in place stays on the terminal
+    /// as it is, and the keyboard starts afresh, so a correction or a
+    /// backspace of that word does not reach into what came after it.
+    private fun lineDisturbed() {
+        if (imeSending || sent == null) return
+        sent = null
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.restartInput(this)
     }
 
     fun focusAndShowKeyboard() {
@@ -234,6 +263,7 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             if (event.actionMasked == MotionEvent.ACTION_UP) it()
             return true
         }
+        if (isMouse(event)) return mouseTouch(event)
         pinch.onTouchEvent(event)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -343,9 +373,105 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         }
         val x = (downX / density).toDouble()
         val y = (downY / density).toDouble()
+        // The tap may give another pane the focus.
+        lineDisturbed()
         model.pointer("down", x, y)
         model.pointer("up", x, y)
-        focusAndShowKeyboard()
+        // With a keyboard of its own on the device the screen's has no
+        // place: the keys come from there.
+        if (hardKeyboard()) requestFocus() else focusAndShowKeyboard()
+    }
+
+    // MARK: a mouse (desktop mode, a tablet's trackpad)
+
+    /// The button held down, as the core counts them (0 left, 1 middle,
+    /// 2 right), or none.
+    private var mouseButton: Int? = null
+
+    private fun isMouse(event: MotionEvent): Boolean =
+        event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE || event.isFromSource(InputDevice.SOURCE_MOUSE)
+
+    private fun mouse(kind: String, event: MotionEvent, button: Int, held: Boolean) {
+        model.core.mouse(
+            kind,
+            (event.x / density).toDouble(),
+            (event.y / density).toDouble(),
+            button.toUByte(),
+            held,
+            event.metaState and KeyEvent.META_SHIFT_ON != 0,
+            event.metaState and KeyEvent.META_CTRL_ON != 0,
+            event.metaState and KeyEvent.META_ALT_ON != 0,
+        )
+    }
+
+    /// A mouse is the desktop's: the core takes its presses, drags and
+    /// clicks as the desktop does -- the focus, a divider, a selection by
+    /// drag or by a double or triple click, the mouse a program asked for.
+    /// The keyboard on screen stays down; a selection made offers its
+    /// copy chip where the button let go.
+    private fun mouseTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                requestFocus()
+                if (anchor != null) clearSelection()
+                model.selectionMenuAt = null
+            }
+            MotionEvent.ACTION_MOVE -> mouseButton?.let { mouse("move", event, it, true) }
+            // The release, should no button release come before it.
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> mouseButton?.let { release(event, it) }
+        }
+        return true
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (!isMouse(event)) return super.onGenericMotionEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_BUTTON_PRESS -> {
+                val button = coreButton(event.actionButton) ?: return super.onGenericMotionEvent(event)
+                mouseButton = button
+                // A press may put another pane in focus: a word the
+                // keyboard was making stays where it was typed.
+                lineDisturbed()
+                mouse("down", event, button, true)
+            }
+            MotionEvent.ACTION_BUTTON_RELEASE -> {
+                val button = coreButton(event.actionButton) ?: return super.onGenericMotionEvent(event)
+                release(event, button)
+            }
+            // A hover: no button down. The core shows what is under it to a
+            // program that follows the mouse.
+            MotionEvent.ACTION_HOVER_MOVE -> mouse("move", event, mouseButton ?: 0, false)
+            MotionEvent.ACTION_SCROLL -> {
+                // A notch up is back into the history, three rows of it, as
+                // the desktop scrolls.
+                val notches = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+                if (notches != 0f) {
+                    model.wheel((event.x / density).toDouble(), (event.y / density).toDouble(), notches * 3.0)
+                }
+            }
+            else -> return super.onGenericMotionEvent(event)
+        }
+        return true
+    }
+
+    private fun release(event: MotionEvent, button: Int) {
+        mouse("up", event, button, false)
+        mouseButton = null
+        if (button == 0 && !model.core.selectedText().isNullOrEmpty()) {
+            model.selectionMenuAt = Pair((event.x / density).toDouble(), (event.y / density).toDouble())
+        }
+    }
+
+    private fun coreButton(button: Int): Int? = when (button) {
+        MotionEvent.BUTTON_PRIMARY -> 0
+        MotionEvent.BUTTON_TERTIARY -> 1
+        MotionEvent.BUTTON_SECONDARY -> 2
+        else -> null
+    }
+
+    /// The device has a keyboard of its own, open.
+    private fun hardKeyboard(): Boolean = resources.configuration.let {
+        it.keyboard == Configuration.KEYBOARD_QWERTY && it.hardKeyboardHidden == Configuration.HARDKEYBOARDHIDDEN_NO
     }
 
     /// The finger is now at `y`: the rows between there and where it
@@ -470,6 +596,19 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         val ctrl = event.isCtrlPressed
         val alt = event.isAltPressed
         val shift = event.isShiftPressed
+        // A terminal's own copy and paste, Ctrl+C being the shell's.
+        if (ctrl && shift && !alt) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_C -> {
+                    if (!model.core.selectedText().isNullOrEmpty()) {
+                        model.copySelection()
+                        model.showCopied()
+                    }
+                    return true
+                }
+                KeyEvent.KEYCODE_V -> { model.pasteFromClipboard(); return true }
+            }
+        }
         val name = domName(keyCode)
         if (name != null) {
             model.key(name, ctrl, alt, shift)
@@ -520,29 +659,62 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
         // No suggestions and no autocorrect: a terminal wants the keys as
-        // typed, and the password variation is the one every IME honours.
+        // typed. Not the password variation, though: keyboards keep to a
+        // Latin layout there, hiding the Chinese and Japanese ones the
+        // composition below is for.
         outAttrs.inputType = EditorInfo.TYPE_CLASS_TEXT or
-            EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-            EditorInfo.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
         if (settings.incognitoKeyboard) {
             // What is typed into a shell is not the keyboard's to learn;
             // Gboard shows its incognito look for this flag.
             outAttrs.imeOptions = outAttrs.imeOptions or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
         }
+        // A keyboard starting on the view starts with no word of its own.
+        sent = null
         return Connection(this)
+    }
+
+    /// What the keyboard sends, marked as its own while it goes.
+    private inline fun fromIme(send: () -> Unit) {
+        imeSending = true
+        try {
+            send()
+        } finally {
+            imeSending = false
+        }
     }
 
     private inner class Connection(view: View) : BaseInputConnection(view, false) {
         override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
             val s = text?.toString() ?: return true
+            val inPlace = sent
+            if (inPlace != null) {
+                // The commit takes the composition's place, as on any field.
+                sent = null
+                fromIme {
+                    if (s == "\n") {
+                        sendChange(inPlace, "")
+                        model.key("Enter")
+                    } else {
+                        sendChange(inPlace, s)
+                    }
+                }
+                return true
+            }
             endComposing()
-            if (s == "\n") model.key("Enter") else if (s.isNotEmpty()) model.text(s)
+            fromIme { if (s == "\n") model.key("Enter") else if (s.isNotEmpty()) model.text(s) }
             return true
         }
 
         override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
             val s = text?.toString() ?: ""
+            val inPlace = sent
+            if (inPlace != null || (composing == null && s.isNotEmpty() && composesInPlace())) {
+                fromIme { sendChange(inPlace ?: "", s) }
+                sent = s.ifEmpty { null }
+                return true
+            }
             if (s.isEmpty()) {
                 // The IME cleared the composition (backspaced it away).
                 if (composing != null) {
@@ -559,30 +731,34 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         }
 
         override fun finishComposingText(): Boolean {
+            // Composed in place: it is on the terminal already.
+            sent = null
             val s = composing
             composing = null
             model.composing = null
             if (s != null) {
                 model.core.setComposing(false)
-                if (s.isNotEmpty()) model.text(s)
+                if (s.isNotEmpty()) fromIme { model.text(s) }
             }
             return true
         }
 
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
             // While composing the IME edits its own buffer, not the pane.
-            if (composing != null) return true
-            repeat(beforeLength) { model.key("Backspace") }
+            if (composing != null || sent != null) return true
+            fromIme { repeat(beforeLength) { model.key("Backspace") } }
             return true
         }
 
         override fun sendKeyEvent(event: KeyEvent): Boolean {
             if (event.action != KeyEvent.ACTION_DOWN) return true
-            return onKeyDown(event.keyCode, event)
+            var handled = false
+            fromIme { handled = onKeyDown(event.keyCode, event) }
+            return handled
         }
 
         override fun performEditorAction(actionCode: Int): Boolean {
-            model.key("Enter")
+            fromIme { model.key("Enter") }
             return true
         }
 
@@ -591,6 +767,35 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             composing = null
             model.composing = null
             model.core.setComposing(false)
+        }
+
+        /// Whether the keyboard on screen composes words in its own script:
+        /// Latin, Cyrillic, Greek... A keyboard that does (Samsung's,
+        /// SwiftKey's, even with suggestions off) would hold `j` or `q` back
+        /// from vim or less until a space; what it composes goes to the
+        /// terminal as it is typed instead. Chinese, Japanese and Korean
+        /// compose into other characters, and so does a keyboard that names
+        /// no language: theirs waits to be committed.
+        private fun composesInPlace(): Boolean {
+            val imm = context.getSystemService(InputMethodManager::class.java) ?: return false
+            val subtype = imm.currentInputMethodSubtype ?: return false
+            @Suppress("DEPRECATION")
+            val tag = subtype.languageTag.ifEmpty { subtype.locale }
+            if (tag.isEmpty()) return false
+            val language = tag.substringBefore('-').substringBefore('_').lowercase()
+            return language !in setOf("zh", "ja", "ko")
+        }
+
+        /// The terminal holds `from` of a composition and is to hold `to`:
+        /// what differs at the end goes as backspaces and the new end.
+        private fun sendChange(from: String, to: String) {
+            var same = 0
+            val most = minOf(from.length, to.length)
+            while (same < most && from[same] == to[same]) same++
+            // Never half a surrogate pair kept.
+            if (same > 0 && Character.isHighSurrogate(from[same - 1])) same--
+            repeat(from.codePointCount(same, from.length)) { model.key("Backspace") }
+            if (same < to.length) model.text(to.substring(same))
         }
     }
 }

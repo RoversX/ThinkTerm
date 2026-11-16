@@ -4,15 +4,18 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
+import android.view.inputmethod.EditorInfo
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -22,6 +25,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -60,19 +64,21 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.InterceptPlatformTextInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.ExperimentalComposeUiApi
-import androidx.compose.ui.platform.InterceptPlatformTextInput
-import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import android.view.inputmethod.EditorInfo
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -81,17 +87,30 @@ import com.roversx.thinkterm.core.generateSshKey
 import com.roversx.thinkterm.core.sshPublicLine
 import kotlinx.coroutines.delay
 
+/// What a host's own page has beyond the editor: the way into its
+/// terminal, and the ways to copy or remove the host.
+class HostPageActions(
+    val open: (Host) -> Unit,
+    val duplicate: () -> Unit,
+    val delete: () -> Unit,
+)
+
 /// Add or edit one host. The private key never travels back out of the
 /// encrypted preferences into a field: the editor only reports whether one
 /// is stored, and hands a new secret to `onSave` when the user supplies
 /// one. Follows ios/Sources/HostEditView.swift.
-@OptIn(ExperimentalMaterial3Api::class)
+///
+/// As a sheet it adds or edits and goes. As a host's own page (`page`),
+/// pushed from the list, it shows the host and its session first, with the
+/// way into its terminal; Save keeps an edit and stays, and `onCancel` is
+/// the way back.
 @Composable
 fun HostEditScreen(
     store: HostStore,
     host: Host,
     onSave: (Host, String, String?) -> Unit,
     onCancel: () -> Unit,
+    page: HostPageActions? = null,
 ) {
     val context = LocalContext.current
     var draft by remember { mutableStateOf(host) }
@@ -102,8 +121,14 @@ fun HostEditScreen(
     var showAdvanced by remember { mutableStateOf(false) }
     var importError by remember { mutableStateOf<String?>(null) }
     var copied by remember { mutableStateOf(false) }
-    val hasStoredSecret = remember { store.secret(host.id).isNotEmpty() }
+    var hasStoredSecret by remember { mutableStateOf(store.secret(host.id).isNotEmpty()) }
     val isExisting = remember { store.hosts.any { it.id == host.id } }
+    // The page's host as last kept, and the secrets as they were then:
+    // what Save compares the fields with.
+    var kept by remember { mutableStateOf(host) }
+    var keptSecret by remember { mutableStateOf("") }
+    var keptPassphrase by remember { mutableStateOf("") }
+    var confirmDelete by remember { mutableStateOf(false) }
 
     val keyComment = "${draft.user}@thinkterm-android"
 
@@ -144,188 +169,224 @@ fun HostEditScreen(
     val portOk = portText.isEmpty() || portText.toIntOrNull()?.let { it in 1..65535 } == true
     val canSave = draft.hostname.isNotBlank() && draft.user.isNotBlank() && portOk &&
         (isExisting || hasStoredSecret || secret.isNotEmpty())
+    val changed = !sameEdits(draft, kept) || secret != keptSecret || passphrase != keptPassphrase
 
-    Scaffold(
-        modifier = Modifier.imePadding(),
-        containerColor = MaterialTheme.colorScheme.background,
-        topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        if (draft.hostname.isBlank()) tr("newhost") else draft.display,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                },
-                navigationIcon = { TextButton(onClick = onCancel) { Text(tr("cancel")) } },
-                actions = {
-                    TextButton(
-                        onClick = { onSave(draft, secret, passphrase.ifEmpty { null }) },
-                        enabled = canSave,
-                    ) {
-                        Text(tr("save"), fontWeight = FontWeight.SemiBold)
-                    }
-                },
-            )
+    /// The edit onto the host as the store has it now: the key a
+    /// connection pinned, when it was last reached, are the store's.
+    fun edited(): Host {
+        val now = store.hosts.firstOrNull { it.id == draft.id } ?: return draft
+        return now.copy(
+            name = draft.name,
+            hostname = draft.hostname,
+            port = draft.port,
+            user = draft.user,
+            auth = draft.auth,
+            remoteCommand = draft.remoteCommand,
+            group = draft.group,
+            publicKey = draft.publicKey,
+            icon = draft.icon,
+        )
+    }
+
+    /// Save on the page: the edit goes onto the host as the store has it
+    /// now, and the page goes on with the result. A secret is handed on
+    /// only when it is new since the last keep; a new key, with the
+    /// passphrase in the field, whether that changed or not.
+    fun keep() {
+        val edited = edited()
+        val newSecret = if (secret == keptSecret) "" else secret
+        val newPassphrase = when {
+            newSecret.isNotEmpty() -> passphrase.ifEmpty { null }
+            passphrase == keptPassphrase || passphrase.isEmpty() -> null
+            else -> passphrase
+        }
+        onSave(edited, newSecret, newPassphrase)
+        val saved = store.hosts.firstOrNull { it.id == draft.id } ?: edited
+        draft = saved
+        kept = saved
+        keptSecret = secret
+        keptPassphrase = passphrase
+        if (secret.isNotEmpty()) hasStoredSecret = true
+    }
+
+    val colors = GroupedColors(MaterialTheme.colorScheme.surface.luminance() < 0.5f)
+    GroupedPage(
+        when {
+            page != null -> ""
+            draft.hostname.isBlank() -> tr("newhost")
+            else -> draft.display
         },
-    ) { inset ->
-        Column(
-            Modifier
-                .fillMaxSize()
-                .padding(inset)
-                .verticalScroll(rememberScrollState())
-                .padding(bottom = 28.dp),
-        ) {
-            EditSection(tr("f.host")) {
-                EditField(tr("f.name"), draft.name, placeholder = tr("optional")) { draft = draft.copy(name = it) }
-                EditField(
-                    tr("f.hostname"),
-                    draft.hostname,
-                    placeholder = "example.com or 10.0.0.4",
-                    keyboard = KeyboardType.Uri,
-                ) { draft = draft.copy(hostname = it.trim()) }
-                EditField(tr("f.port"), portText, placeholder = "22", keyboard = KeyboardType.Number) { typed ->
-                    portText = typed.filter { it.isDigit() }.take(5)
-                    // Out of range is kept in the field (and blocks Save)
-                    // rather than silently becoming another port.
-                    draft = draft.copy(port = portText.toIntOrNull()?.takeIf { it in 1..65535 } ?: 22)
+        onBack = if (page != null) onCancel else null,
+        leading = if (page != null) null else ({ GlassTextButton(tr("cancel"), onClick = onCancel) }),
+        trailing = {
+            if (page != null) {
+                GlassTextButton(tr("save"), bold = true, enabled = changed && canSave) { keep() }
+            } else {
+                GlassTextButton(tr("save"), bold = true, enabled = canSave) {
+                    // A key forgotten in the form goes with the save.
+                    val edited = edited().let { if (draft.knownHost == null) it.copy(knownHost = null) else it }
+                    onSave(edited, secret, passphrase.ifEmpty { null })
                 }
-                EditField(tr("f.user"), draft.user, placeholder = "root") { draft = draft.copy(user = it.trim()) }
             }
+        },
+    ) {
+        if (page != null) {
+            // The host as kept, its session and the way in.
+            HostHero(kept, page)
+        }
+        Group(tr("f.icon")) {
+            GroupRow {
+                HostIconRow(draft.icon) { draft = draft.copy(icon = it) }
+            }
+        }
 
-            EditSection(tr("f.group"), footer = tr("f.groupfoot")) {
-                EditField(tr("f.group"), draft.group, placeholder = tr("none")) { draft = draft.copy(group = it) }
-                val groups = store.groups
-                if (groups.isNotEmpty()) {
+        Group(tr("f.host")) {
+            FieldRow(tr("f.name"), draft.name, { draft = draft.copy(name = it) }, placeholder = tr("optional"))
+            FieldRow(
+                tr("f.hostname"),
+                draft.hostname,
+                { draft = draft.copy(hostname = it.trim()) },
+                placeholder = "example.com or 192.0.2.10",
+                keyboard = KeyboardType.Uri,
+            )
+            FieldRow(tr("f.port"), portText, { typed ->
+                portText = typed.filter { it.isDigit() }.take(5)
+                // Out of range is kept in the field (and blocks Save)
+                // rather than silently becoming another port.
+                draft = draft.copy(port = portText.toIntOrNull()?.takeIf { it in 1..65535 } ?: 22)
+            }, placeholder = "22", keyboard = KeyboardType.Number)
+            FieldRow(tr("f.user"), draft.user, { draft = draft.copy(user = it.trim()) }, placeholder = "root")
+        }
+
+        Group(tr("f.group"), footer = tr("f.groupfoot")) {
+            FieldRow(tr("f.group"), draft.group, { draft = draft.copy(group = it) }, placeholder = tr("none"))
+            val groups = store.groups
+            if (groups.isNotEmpty()) {
+                GroupRow {
                     Row(
-                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         for (group in groups) {
-                            FilterChip(
-                                selected = draft.group == group,
-                                onClick = { draft = draft.copy(group = if (draft.group == group) "" else group) },
-                                label = { Text(group) },
+                            val on = draft.group == group
+                            Text(
+                                group,
+                                color = if (on) Color.White else colors.primary,
+                                fontSize = 14.sp,
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (on) LeadBlue else colors.fill)
+                                    .clickable { draft = draft.copy(group = if (on) "" else group) }
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
                             )
-                        }
-                    }
-                }
-            }
-
-            EditSection(tr("f.auth")) {
-                val kinds = listOf("key" to tr("f.key"), "password" to tr("f.password"))
-                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                    kinds.forEachIndexed { index, (kind, label) ->
-                        SegmentedButton(
-                            selected = draft.auth == kind,
-                            onClick = { draft = draft.copy(auth = kind) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = kinds.size),
-                        ) {
-                            Text(label)
-                        }
-                    }
-                }
-
-                if (draft.auth == "key") {
-                    KeyStatusRow(hasNewSecret = secret.isNotEmpty(), ed25519 = draft.publicKey != null, stored = hasStoredSecret)
-                    EditActionButton(Icons.Filled.ContentPaste, tr("key.paste")) {
-                        val pasted = clipboardText(context)
-                        if (!pasted.isNullOrBlank()) loadKey(pasted)
-                    }
-                    EditActionButton(Icons.Filled.Folder, tr("key.import")) { importer.launch(arrayOf("*/*")) }
-                    EditActionButton(Icons.Filled.VpnKey, tr("key.generate")) {
-                        val pair = try {
-                            generateSshKey(keyComment)
-                        } catch (e: Throwable) {
-                            Log.w("thinkterm", "key generation failed: $e")
-                            null
-                        }
-                        if (pair != null) {
-                            secret = pair.privatePem
-                            draft = draft.copy(publicKey = pair.publicLine)
-                            copied = false
-                        }
-                    }
-                    draft.publicKey?.takeIf { it.isNotEmpty() }?.let { publicKey ->
-                        PublicKeyBlock(publicKey, copied) {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            cm?.setPrimaryClip(ClipData.newPlainText("thinkterm", publicKey))
-                            copied = true
-                        }
-                    }
-                    Disclosure(tr("key.pastetext"), showKeyText) { showKeyText = !showKeyText }
-                    if (showKeyText) {
-                        OutlinedTextField(
-                            value = secret,
-                            onValueChange = { loadKey(it) },
-                            singleLine = false,
-                            minLines = 6,
-                            textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace, fontSize = 11.sp),
-                            keyboardOptions = plainKeyboard(KeyboardType.Ascii),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                    IncognitoKeyboard {
-                        OutlinedTextField(
-                            value = passphrase,
-                            onValueChange = { passphrase = it },
-                            label = { Text(tr("key.passphrase")) },
-                            singleLine = true,
-                            visualTransformation = PasswordVisualTransformation(),
-                            keyboardOptions = plainKeyboard(KeyboardType.Password),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                } else {
-                    IncognitoKeyboard {
-                        OutlinedTextField(
-                            value = secret,
-                            onValueChange = { secret = it },
-                            label = { Text(tr("f.password")) },
-                            singleLine = true,
-                            visualTransformation = PasswordVisualTransformation(),
-                            keyboardOptions = plainKeyboard(KeyboardType.Password),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                }
-            }
-
-            EditSection(null) {
-                Disclosure(tr("f.advanced"), showAdvanced) { showAdvanced = !showAdvanced }
-                if (showAdvanced) {
-                    EditField(tr("f.remotecmd"), draft.remoteCommand, mono = true) {
-                        draft = draft.copy(remoteCommand = it)
-                    }
-                    Text(
-                        tr("f.remotecmd.foot"),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    draft.knownHost?.let { known ->
-                        Text(tr("f.hostkey"), style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            known,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 3,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        TextButton(onClick = { draft = draft.copy(knownHost = null) }) {
-                            Icon(
-                                Icons.Filled.GppBad,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.error,
-                                modifier = Modifier.size(18.dp),
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(tr("forgetkey"), color = MaterialTheme.colorScheme.error)
                         }
                     }
                 }
             }
         }
+
+        Group(tr("f.auth")) {
+            GroupRow {
+                val kinds = listOf("key" to tr("f.key"), "password" to tr("f.password"))
+                IosSegments(kinds.map { it.second }, kinds.indexOfFirst { it.first == draft.auth }.coerceAtLeast(0), Modifier.weight(1f)) {
+                    draft = draft.copy(auth = kinds[it].first)
+                }
+            }
+            if (draft.auth == "key") {
+                KeyStatusRow(hasNewSecret = secret.isNotEmpty(), ed25519 = draft.publicKey != null, stored = hasStoredSecret)
+                ActionRow("clipboard", tr("key.paste")) {
+                    val pasted = clipboardText(context)
+                    if (!pasted.isNullOrBlank()) loadKey(pasted)
+                }
+                ActionRow("folder", tr("key.import")) { importer.launch(arrayOf("*/*")) }
+                ActionRow("key-round", tr("key.generate")) {
+                    val pair = try {
+                        generateSshKey(keyComment)
+                    } catch (e: Throwable) {
+                        Log.w("thinkterm", "key generation failed: $e")
+                        null
+                    }
+                    if (pair != null) {
+                        secret = pair.privatePem
+                        draft = draft.copy(publicKey = pair.publicLine)
+                        copied = false
+                    }
+                }
+                draft.publicKey?.takeIf { it.isNotEmpty() }?.let { publicKey ->
+                    PublicKeyBlock(publicKey, copied) {
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        cm?.setPrimaryClip(ClipData.newPlainText("thinkterm", publicKey))
+                        copied = true
+                    }
+                }
+                Disclosure(tr("key.pastetext"), showKeyText) { showKeyText = !showKeyText }
+                if (showKeyText) {
+                    FieldRow("", secret, { loadKey(it) }, keyboard = KeyboardType.Ascii, monospace = true, singleLine = false, minLines = 6)
+                }
+                IncognitoKeyboard {
+                    FieldRow(tr("key.passphrase"), passphrase, { passphrase = it }, keyboard = KeyboardType.Password, secret = true)
+                }
+            } else {
+                IncognitoKeyboard {
+                    FieldRow(tr("f.password"), secret, { secret = it }, keyboard = KeyboardType.Password, secret = true)
+                }
+            }
+        }
+
+        Group(footer = if (showAdvanced) tr("f.remotecmd.foot") else null) {
+            Disclosure(tr("f.advanced"), showAdvanced) { showAdvanced = !showAdvanced }
+            if (showAdvanced) {
+                FieldRow(tr("f.remotecmd"), draft.remoteCommand, { draft = draft.copy(remoteCommand = it) }, monospace = true)
+                draft.knownHost?.let { known ->
+                    GroupRow {
+                        Column(Modifier.weight(1f).padding(vertical = 4.dp)) {
+                            Text(tr("f.hostkey"), color = colors.primary, fontSize = 16.sp)
+                            Text(
+                                known,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                color = colors.secondary,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    if (page == null) {
+                        GroupRow(onClick = { draft = draft.copy(knownHost = null) }) {
+                            DesktopIcon("shield-off", size = 18.dp, tint = colors.destructive)
+                            RowTitle(tr("forgetkey"), color = colors.destructive)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (page != null) {
+            // Copying the host, forgetting its key, deleting it: at the end.
+            Group {
+                GroupRow(onClick = page.duplicate) { RowTitle(tr("host.duplicate"), color = LeadBlue) }
+                // The key as the store has it now: a connection made from
+                // this page may have pinned one since it opened.
+                if (store.hosts.firstOrNull { it.id == draft.id }?.knownHost != null) {
+                    GroupRow(onClick = { forgetHostKey(store, draft.id) }) { RowTitle(tr("forgetkey"), color = LeadBlue) }
+                }
+                GroupRow(onClick = { confirmDelete = true }) { RowTitle(tr("host.delete"), color = colors.destructive) }
+            }
+        }
+    }
+
+    if (confirmDelete && page != null) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text(tr("host.delete.title")) },
+            text = { Text(tr("host.delete.body")) },
+            confirmButton = {
+                TextButton(onClick = { confirmDelete = false; page.delete() }) {
+                    Text(tr("host.delete.confirm", kept.display), color = colors.destructive)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text(tr("cancel")) } },
+        )
     }
 
     importError?.let { message ->
@@ -336,56 +397,6 @@ fun HostEditScreen(
             confirmButton = { TextButton(onClick = { importError = null }) { Text(tr("ok")) } },
         )
     }
-}
-
-@Composable
-private fun EditSection(title: String?, footer: String? = null, content: @Composable ColumnScope.() -> Unit) {
-    Column(
-        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        if (title != null) {
-            Text(
-                title,
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 8.dp),
-            )
-        }
-        content()
-        if (footer != null) {
-            Text(
-                footer,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@Composable
-private fun EditField(
-    label: String,
-    value: String,
-    placeholder: String? = null,
-    keyboard: KeyboardType = KeyboardType.Text,
-    mono: Boolean = false,
-    onChange: (String) -> Unit,
-) {
-    OutlinedTextField(
-        value = value,
-        onValueChange = onChange,
-        label = { Text(label) },
-        placeholder = placeholder?.let { { Text(it) } },
-        singleLine = true,
-        textStyle = if (mono) {
-            LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace, fontSize = 13.sp)
-        } else {
-            LocalTextStyle.current
-        },
-        keyboardOptions = plainKeyboard(keyboard),
-        modifier = Modifier.fillMaxWidth(),
-    )
 }
 
 /// Nothing here is prose: no capitals of its own, no autocorrect.
@@ -420,34 +431,31 @@ private fun plainKeyboard(keyboard: KeyboardType) = KeyboardOptions(
 private fun KeyStatusRow(hasNewSecret: Boolean, ed25519: Boolean, stored: Boolean) {
     val green = Color(0xFF30D158)
     val (icon, tint, text) = when {
-        hasNewSecret && ed25519 -> Triple(Icons.Filled.CheckCircle, green, tr("key.loaded.ed25519"))
-        hasNewSecret -> Triple(Icons.Filled.CheckCircle, green, tr("key.loaded"))
-        stored -> Triple(Icons.Filled.Lock, green, tr("key.stored"))
-        else -> Triple(Icons.Filled.Warning, Color(0xFFFF9F0A), tr("key.none"))
+        hasNewSecret && ed25519 -> Triple("circle-check", green, tr("key.loaded.ed25519"))
+        hasNewSecret -> Triple("circle-check", green, tr("key.loaded"))
+        stored -> Triple("lock", green, tr("key.stored"))
+        else -> Triple("triangle-alert", Color(0xFFFF9F0A), tr("key.none"))
     }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(10.dp))
-        Text(text, style = MaterialTheme.typography.bodyMedium)
+    GroupRow {
+        DesktopIcon(icon, size = 18.dp, tint = tint)
+        RowTitle(text)
     }
 }
 
+/// A row that does something, as a Form's button: the accent's words.
 @Composable
-private fun EditActionButton(icon: ImageVector, label: String, onClick: () -> Unit) {
-    OutlinedButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(10.dp))
-        Text(label, modifier = Modifier.weight(1f), textAlign = TextAlign.Start)
+private fun ActionRow(icon: String, label: String, onClick: () -> Unit) {
+    GroupRow(onClick = onClick) {
+        DesktopIcon(icon, size = 18.dp, tint = LeadBlue)
+        RowTitle(label, color = LeadBlue)
     }
 }
 
 @Composable
 private fun PublicKeyBlock(publicKey: String, copied: Boolean, onCopy: () -> Unit) {
+    val colors = groupedColors()
     Column(
-        Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
-            .padding(12.dp),
+        Modifier.fillMaxWidth().background(colors.card).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
@@ -455,38 +463,31 @@ private fun PublicKeyBlock(publicKey: String, copied: Boolean, onCopy: () -> Uni
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
             lineHeight = 15.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = colors.secondary,
             maxLines = 4,
             overflow = TextOverflow.Ellipsis,
         )
-        FilledTonalButton(onClick = onCopy) {
-            Icon(
-                if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-            )
+        Row(
+            Modifier.clip(CircleShape).background(colors.fill).clickable(onClick = onCopy).padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            DesktopIcon(if (copied) "check" else "copy", size = 16.dp, tint = LeadBlue)
             Spacer(Modifier.width(8.dp))
-            Text(if (copied) tr("copied") else tr("key.copypub"))
+            Text(if (copied) tr("copied") else tr("key.copypub"), color = LeadBlue, fontSize = 15.sp)
         }
-        Text(
-            tr("key.authorized"),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Text(tr("key.authorized"), fontSize = 13.sp, color = colors.secondary)
     }
 }
 
 @Composable
 private fun Disclosure(label: String, expanded: Boolean, onToggle: () -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onToggle).height(44.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-        Icon(
-            if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+    GroupRow(onClick = onToggle) {
+        RowTitle(label)
+        DesktopIcon(
+            "chevron-right",
+            size = 16.dp,
+            tint = groupedColors().tertiary,
+            modifier = Modifier.rotate(if (expanded) 90f else 0f),
         )
     }
 }
@@ -496,4 +497,109 @@ private fun clipboardText(context: Context): String? {
     val clip = cm.primaryClip ?: return null
     if (clip.itemCount == 0) return null
     return clip.getItemAt(0).coerceToText(context)?.toString()
+}
+
+/// What the page edits of a host alike. The rest -- the key pinned on a
+/// connection, when it was last reached -- the store keeps up to date
+/// behind the page, and is not the page's to write back.
+private fun sameEdits(a: Host, b: Host): Boolean =
+    a.name == b.name && a.hostname == b.hostname && a.port == b.port && a.user == b.user &&
+        a.auth == b.auth && a.remoteCommand == b.remoteCommand && a.group == b.group &&
+        a.publicKey == b.publicKey && a.icon == b.icon
+
+/// The desktop's host pictures, the one the host wears picked out; the
+/// first is the one a host with none chosen wears.
+@Composable
+private fun RowScope.HostIconRow(icon: String, pick: (String) -> Unit) {
+    val colors = groupedColors()
+    val chosen = icon.ifEmpty { Host.ICONS[0] }
+    Row(Modifier.weight(1f).padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        for (name in Host.ICONS) {
+            val on = name == chosen
+            Box(
+                Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(if (on) LeadBlue else colors.fill)
+                    .clickable { pick(if (name == Host.ICONS[0]) "" else name) },
+                contentAlignment = Alignment.Center,
+            ) {
+                DesktopIcon(Host.iconFile(name), size = 19.dp, tint = if (on) Color.White else colors.primary)
+            }
+        }
+    }
+}
+
+/// The top of a host's page: its picture, name and address as kept, where
+/// its session stands, and the way into its terminal.
+@Composable
+private fun HostHero(host: Host, page: HostPageActions) {
+    val colors = groupedColors()
+    val session = Sessions.existing(host.id)
+    val state = session?.let { SessionState.of(it) } ?: SessionState.NONE
+    Column(
+        Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 0.dp, bottom = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        HostTile(76.dp) { DesktopIcon(host.iconFile, size = 36.dp, tint = colors.primary) }
+        Spacer(Modifier.height(14.dp))
+        Text(host.title, color = colors.primary, fontSize = 24.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.height(3.dp))
+        Text(host.address, color = colors.secondary, fontSize = 14.sp, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.height(10.dp))
+        val (said, tint) = when (state) {
+            SessionState.CONNECTED -> tr("host.connected") to Color(0xFF34C759)
+            SessionState.CONNECTING -> tr("connecting") to Color(0xFFFF9F0A)
+            SessionState.LOST -> tr("conn.disconnected") to colors.destructive
+            SessionState.NONE -> tr("host.notconnected") to colors.secondary
+        }
+        Row(
+            Modifier.clip(CircleShape).background(tint.copy(alpha = 0.14f)).padding(horizontal = 11.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.size(8.dp).background(tint, CircleShape))
+            Spacer(Modifier.width(6.dp))
+            Text(said, color = tint, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        }
+        Spacer(Modifier.height(18.dp))
+        // Into the terminal -- opened, or connected first -- and, while
+        // there is a session, the way to end it.
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            val up = state == SessionState.CONNECTED
+            // Clear of the capsule's round ends: a word too long for its half
+            // ends in an ellipsis rather than run under them.
+            Row(
+                Modifier.weight(1f).height(50.dp).clip(CircleShape).background(LeadBlue).clickable { page.open(host) }
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                DesktopIcon(if (up) "square-terminal" else "link-2", size = 18.dp, tint = Color.White)
+                Spacer(Modifier.width(7.dp))
+                Text(
+                    tr(if (up) "host.open" else "connect"), color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
+                )
+            }
+            if (session != null && (up || state == SessionState.CONNECTING)) {
+                Row(
+                    Modifier
+                        .weight(1f)
+                        .height(50.dp)
+                        .glass(LocalGroundGlass.current, colors.dark, CircleShape)
+                        .clickable { session.disconnect() }
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                ) {
+                    DesktopIcon("power", size = 17.dp, tint = colors.primary)
+                    Spacer(Modifier.width(7.dp))
+                    Text(
+                        tr("disconnect"), color = colors.primary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
+                    )
+                }
+            }
+        }
+    }
 }

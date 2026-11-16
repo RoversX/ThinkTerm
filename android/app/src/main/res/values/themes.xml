@@ -1,6 +1,11 @@
 <resources>
-    <style name="Theme.ThinkTerm" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@android:color/black</item>
-        <item name="android:statusBarColor">@android:color/black</item>
+    <!-- The window under the first frame, in the system's lightness;
+         values-night has the dark one. -->
+    <style name="Theme.ThinkTerm" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <!-- A fresh start's sky begins on black (LaunchSky): the system's
+             launch screen is black too, without the icon. -->
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_none</item>
     </style>
 </resources>

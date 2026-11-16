@@ -3,25 +3,15 @@ package com.roversx.thinkterm
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Dns
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -37,21 +27,39 @@ class MainActivity : ComponentActivity() {
         Schemes.load(this)
         AppLanguage.tag = AppSettings.get(this).language
         val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        GlassProbe.on = debuggable && intent.getBooleanExtra("glass_probe", false)
         val store = HostStore(this)
+        // The tailnet ThinkTerm joins by itself is up before any host of it
+        // is dialled.
+        TailnetStore.init(this, store)
+        Sessions.watchNetwork(this)
+        if (debuggable && intent.getBooleanExtra("tailnet_test", false)) TailnetStore.debugJoin() else TailnetStore.apply()
+        // A fresh start opens on the starry sky; a screen made again does
+        // not. A first run with no host kept has its pages on it, and so
+        // does a debug start asked to (`replay_onboarding`), hosts or not.
+        val sky = savedInstanceState == null && !LaunchSky.played
+        val settings = AppSettings.get(this)
+        val replay = debuggable && intent.getBooleanExtra("replay_onboarding", false)
+        val firstRun = sky && (replay || !settings.onboarded && store.hosts.isEmpty())
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
-                Root(store, debuggable)
+            // The app follows the system's light or dark; the terminal's
+            // screen follows its scheme instead (TerminalChrome).
+            MaterialTheme(colorScheme = appColors(isSystemInDarkTheme()), shapes = appShapes) {
+                LaunchSkyHost(
+                    play = sky,
+                    onboard = firstRun,
+                    pages = { enter, travel -> Onboarding(store, travel) { settings.onboarded = true; enter() } },
+                ) { Root(store, debuggable) }
             }
         }
     }
 }
 
-/// The two tabs. An open host takes the whole screen, the tab bar
-/// included, the way the terminal does on iOS.
-@OptIn(ExperimentalLayoutApi::class)
+/// The threads of every host, and over them a host's terminal, the hosts
+/// or the settings, as iOS's navigation stack pushes them.
 @Composable
 private fun Root(store: HostStore, debuggable: Boolean) {
-    // Reading the tag here relabels the tabs with the rest of the app.
+    // Reading the tag here relabels the screens with the rest of the app.
     AppLanguage.tag
     // Leaving the app (Home, another app) with the setting off drops
     // every connection; coming back redials them.
@@ -67,46 +75,70 @@ private fun Root(store: HostStore, debuggable: Boolean) {
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
     }
+    var page by remember { mutableStateOf(Page.THREADS) }
     var open by remember { mutableStateOf<Host?>(null) }
-    var tab by remember { mutableIntStateOf(0) }
+    // The host whose own page is up on the hosts' screen: kept here, so the
+    // way back from its terminal comes back to it, as iOS's stack does.
+    var hostPage by remember { mutableStateOf<String?>(null) }
+    val route = open?.let { Route.OnTerminal(it) } ?: Route.OnPage(page)
 
-    val host = open
-    if (host != null) {
-        TerminalScreen(host, store) { open = null }
-        return
-    }
-
-    Scaffold(
-        modifier = Modifier.fillMaxSize(),
-        bottomBar = {
-            NavigationBar {
-                NavigationBarItem(
-                    selected = tab == 0,
-                    onClick = { tab = 0 },
-                    icon = { Icon(Icons.Default.Dns, null) },
-                    label = { Text(tr("hosts")) },
-                )
-                NavigationBarItem(
-                    selected = tab == 1,
-                    onClick = { tab = 1 },
-                    icon = { Icon(Icons.Default.Settings, null) },
-                    label = { Text(tr("settings")) },
-                )
-            }
-        },
-    ) { padding ->
-        // The bar over them spends the insets; the tabs must not again.
-        Box(
-            Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .consumeWindowInsets(padding)
-        ) {
-            if (tab == 0) {
-                HostsScreen(store, showProbe = debuggable) { open = it }
-            } else {
-                SettingsScreen(model = null, showLog = null, onDone = null)
+    // A page pushed slides in over the one it leaves, as iOS's stack does.
+    AnimatedContent(
+        targetState = route,
+        transitionSpec = { pushTransition(targetState.depth > initialState.depth) },
+        contentKey = { it.key },
+        label = "pages",
+    ) { shown ->
+        when (shown) {
+            is Route.OnTerminal -> TerminalScreen(shown.host, store) { open = null }
+            is Route.OnPage -> {
+                SystemBars(dark = isSystemInDarkTheme())
+                when (shown.page) {
+                    Page.THREADS -> ThreadsHome(
+                        store = store,
+                        debuggable = debuggable,
+                        onOpen = { open = it },
+                        onHosts = { page = Page.HOSTS },
+                        onSettings = { page = Page.SETTINGS },
+                    )
+                    Page.HOSTS -> {
+                        BackHandler { page = Page.THREADS; hostPage = null }
+                        HostsScreen(
+                            store,
+                            showProbe = false,
+                            onBack = { page = Page.THREADS; hostPage = null },
+                            hostPage = hostPage,
+                            onHostPage = { hostPage = it },
+                        ) { open = it }
+                    }
+                    Page.SETTINGS -> {
+                        BackHandler { page = Page.THREADS }
+                        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                            SettingsScreen(model = null, showLog = null, onDone = { page = Page.THREADS })
+                        }
+                    }
+                }
             }
         }
     }
 }
+
+/// Where the app is: a page of its own, or a host's terminal over it.
+/// Equal by value, so a recomposition is not a move; `key` says which
+/// screen it is, so a host edited in place is not one either.
+private sealed class Route {
+    abstract val depth: Int
+    abstract val key: String
+
+    data class OnPage(val page: Page) : Route() {
+        override val depth get() = if (page == Page.THREADS) 0 else 1
+        override val key get() = page.name
+    }
+
+    data class OnTerminal(val host: Host) : Route() {
+        override val depth get() = 2
+        override val key get() = "terminal:" + host.id
+    }
+}
+
+internal enum class Page { THREADS, HOSTS, SETTINGS }

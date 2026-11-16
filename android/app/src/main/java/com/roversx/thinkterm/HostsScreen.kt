@@ -1,53 +1,29 @@
 package com.roversx.thinkterm
 
-import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Bolt
-import androidx.compose.material.icons.filled.PowerSettingsNew
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Dns
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.GppBad
-import androidx.compose.material.icons.filled.Hardware
-import androidx.compose.material.icons.filled.Search
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.LargeTopAppBar
-import androidx.compose.material3.ListItem
-import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -57,129 +33,106 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
-/// The saved hosts, searched and grouped, plus — in a debuggable build —
-/// the entry that reaches the probe sshd on the developer's Mac. The
-/// editor takes the whole screen; system back closes it.
+/// The saved hosts, searched and grouped, each a row that opens its own
+/// page (`hostPage`, kept by the caller so the way back from its terminal
+/// comes back to it); plus -- in a debuggable build -- the entry that
+/// reaches the probe sshd on the developer's Mac. Adding a host takes the
+/// whole screen as a sheet; system back closes it.
 /// Follows ios/Sources/HostsView.swift.
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
+fun HostsScreen(
+    store: HostStore,
+    showProbe: Boolean,
+    onBack: (() -> Unit)? = null,
+    hostPage: String? = null,
+    onHostPage: (String?) -> Unit = {},
+    onOpen: (Host) -> Unit,
+) {
     val context = LocalContext.current
     val probe = remember(context, showProbe) {
         if (showProbe) Host.probe(context).takeIf { it.user.isNotEmpty() } else null
     }
-    var editing by remember { mutableStateOf<Host?>(null) }
+    var adding by remember { mutableStateOf<Host?>(null) }
     var search by remember { mutableStateOf("") }
     var pendingDelete by remember { mutableStateOf<Host?>(null) }
-
-    val target = editing
-    if (target != null) {
-        BackHandler { editing = null }
-        HostEditScreen(
-            store = store,
-            host = target,
-            onSave = { host, secret, passphrase ->
-                // A host with nothing stored needs this save to write the
-                // secret; an empty field on an edit keeps the stored one.
-                if (secret.isNotEmpty() || store.secret(host.id).isEmpty()) {
-                    store.putSecret(host.id, secret, passphrase)
-                } else if (passphrase != store.passphrase(host.id)) {
-                    // Only the passphrase changed: kept with the key it unlocks.
-                    store.putSecret(host.id, store.secret(host.id), passphrase)
-                }
-                store.upsert(host)
-                editing = null
-            },
-            onCancel = { editing = null },
-        )
-        return
+    var tailnetOpen by remember { mutableStateOf(false) }
+    // A page for a host since removed is no page.
+    val paged = hostPage?.let { id -> store.hosts.firstOrNull { it.id == id } }
+    val pushed = when {
+        paged != null -> "host:" + paged.id
+        tailnetOpen -> "tailnet"
+        else -> null
     }
 
-    val hosts = store.hosts
-    val matches = remember(hosts, search) { matchingHosts(hosts, search) }
-    val sections = remember(hosts, matches) { hostSections(hosts, matches) }
-
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
-        topBar = {
-            LargeTopAppBar(
-                title = { Text(tr("hosts")) },
-                actions = {
-                    IconButton(onClick = { editing = Host() }) {
-                        Icon(Icons.Filled.Add, contentDescription = tr("hosts.add"))
-                    }
+    // A host added comes up over the list as a sheet, and goes down again.
+    AnimatedContent(
+        targetState = adding,
+        transitionSpec = { sheetTransition(targetState != null) },
+        contentKey = { it?.id },
+        label = "host-editor",
+    ) { target ->
+        if (target != null) {
+            BackHandler { adding = null }
+            HostEditScreen(
+                store = store,
+                host = target,
+                onSave = { host, secret, passphrase ->
+                    keepHost(store, host, secret, passphrase)
+                    adding = null
                 },
+                onCancel = { adding = null },
             )
-        },
-    ) { inset ->
-        LazyColumn(
-            Modifier.fillMaxSize().padding(inset),
-            contentPadding = PaddingValues(bottom = 28.dp),
-        ) {
-            item { HostSearchField(search) { search = it } }
-
-            if (hosts.isEmpty()) {
-                item { HostsEmptyState { editing = Host() } }
-            } else if (matches.isEmpty()) {
-                item {
-                    Text(
-                        tr("hosts.nomatch.q", search),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 28.dp),
-                    )
-                }
-            } else {
-                val grouped = sections.size > 1 || sections.firstOrNull()?.title != null
-                for (section in sections) {
-                    if (grouped) {
-                        item(key = "g:" + (section.title ?: "")) {
-                            HostGroupHeader(section.title ?: tr("hosts.other"))
-                        }
+        } else {
+            // A host's page, or the tailnet's settings, pushed over the list.
+            AnimatedContent(
+                targetState = pushed,
+                transitionSpec = { pushTransition(targetState != null) },
+                label = "hosts-pushed",
+            ) { shown ->
+                when {
+                    shown == "tailnet" -> {
+                        BackHandler { tailnetOpen = false }
+                        TailnetSettingsScreen { tailnetOpen = false }
                     }
-                    items(section.hosts, key = { it.id }) { host ->
-                        HostListRow(
-                            host = host,
-                            connected = Sessions.isConnected(host.id),
-                            onDisconnect = { Sessions.close(host.id) },
-                            onOpen = { onOpen(host) },
-                            onEdit = { editing = host },
-                            onDuplicate = { store.duplicate(host, tr("host.copysuffix")) },
-                            onForgetKey = { store.forgetHostKey(host.id) },
-                            onDelete = { pendingDelete = host },
+                    shown != null && paged != null -> {
+                        BackHandler { onHostPage(null) }
+                        HostEditScreen(
+                            store = store,
+                            host = paged,
+                            onSave = { host, secret, passphrase -> keepHost(store, host, secret, passphrase) },
+                            onCancel = { onHostPage(null) },
+                            page = HostPageActions(
+                                open = onOpen,
+                                duplicate = {
+                                    store.duplicate(paged, tr("host.copysuffix"))
+                                    onHostPage(null)
+                                },
+                                delete = {
+                                    Sessions.close(paged.id)
+                                    store.remove(paged)
+                                    onHostPage(null)
+                                },
+                            ),
                         )
                     }
-                }
-            }
-
-            if (probe != null) {
-                item(key = "dev-header") { HostGroupHeader(tr("dev")) }
-                item(key = Host.PROBE_ID) {
-                    ListItem(
-                        modifier = Modifier.clickable { onOpen(probe) },
-                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                        leadingContent = { HostDisc(Icons.Filled.Hardware, Color(0xFF8E8E93)) },
-                        headlineContent = {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                if (Sessions.isConnected(Host.PROBE_ID)) {
-                                    Box(Modifier.size(8.dp).background(Color(0xFF4CAF50), CircleShape))
-                                }
-                                Text(tr("thismac"), fontWeight = FontWeight.SemiBold)
-                            }
-                        },
-                        supportingContent = {
-                            Text("probe sshd on ${probe.hostname}:${probe.port}")
-                        },
+                    else -> HostList(
+                        store, probe, search, { search = it }, onBack, onOpen,
+                        page = { onHostPage(it.id) },
+                        add = { adding = it },
+                        delete = { pendingDelete = it },
+                        openTailnet = { tailnetOpen = true },
                     )
                 }
             }
@@ -187,13 +140,14 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
     }
 
     pendingDelete?.let { host ->
+        val colors = GroupedColors(MaterialTheme.colorScheme.surface.luminance() < 0.5f)
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text(tr("host.delete.title")) },
             text = { Text(tr("host.delete.body")) },
             confirmButton = {
                 TextButton(onClick = { Sessions.close(host.id); store.remove(host); pendingDelete = null }) {
-                    Text(tr("host.delete.confirm", host.display), color = MaterialTheme.colorScheme.error)
+                    Text(tr("host.delete.confirm", host.display), color = colors.destructive)
                 }
             },
             dismissButton = {
@@ -203,181 +157,245 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
     }
 }
 
+/// Forgets a host's pinned key, in the store and in a session open on it,
+/// whose next connection would otherwise still hold the host to the old
+/// one: it asks for the key the host has now.
+internal fun forgetHostKey(store: HostStore, id: String) {
+    store.forgetHostKey(id)
+    Sessions.existing(id)?.let { model -> model.host = model.host.copy(knownHost = null) }
+}
+
+/// Keeps a host as edited or added; a session open on it takes the edit:
+/// another address, login or key is a connection made again.
+private fun keepHost(store: HostStore, host: Host, secret: String, passphrase: String?) {
+    val before = store.hosts.firstOrNull { it.id == host.id }
+    val saved = store.saveEdit(host, secret, passphrase)
+    Sessions.existing(host.id)?.let { model ->
+        model.host = saved
+        val reached = before == null || before.hostname != saved.hostname ||
+            before.port != saved.port || before.user != saved.user ||
+            before.auth != saved.auth || before.remoteCommand != saved.remoteCommand ||
+            secret.isNotEmpty() || passphrase != null
+        if (reached && model.isConnected) {
+            model.disconnect()
+            model.connect()
+        }
+    }
+}
+
+/// The hosts themselves: searched, grouped, each a row that opens its page.
 @Composable
-private fun HostSearchField(search: String, onChange: (String) -> Unit) {
-    OutlinedTextField(
-        value = search,
-        onValueChange = onChange,
-        placeholder = { Text(tr("hosts.search")) },
-        singleLine = true,
-        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-        trailingIcon = {
-            if (search.isNotEmpty()) {
-                IconButton(onClick = { onChange("") }) {
-                    Icon(Icons.Filled.Close, contentDescription = tr("cancel"))
+private fun HostList(
+    store: HostStore,
+    probe: Host?,
+    search: String,
+    onSearch: (String) -> Unit,
+    onBack: (() -> Unit)?,
+    onOpen: (Host) -> Unit,
+    page: (Host) -> Unit,
+    add: (Host) -> Unit,
+    delete: (Host) -> Unit,
+    openTailnet: () -> Unit,
+) {
+    val hosts = store.hosts
+    val matches = remember(hosts, search) { matchingHosts(hosts, search) }
+    val sections = remember(hosts, matches) { hostSections(hosts, matches) }
+    val colors = GroupedColors(MaterialTheme.colorScheme.surface.luminance() < 0.5f)
+
+    GroupedPage(
+        tr("hosts"),
+        onBack = onBack,
+        trailing = { GlassIconButton("plus", tr("newhost")) { add(Host()) } },
+    ) {
+        GlassSearchField(search, tr("hosts.search"), Modifier.padding(horizontal = 16.dp, vertical = 6.dp), onSearch)
+
+        if (hosts.isEmpty()) {
+            HostsEmptyState { add(Host()) }
+        } else if (matches.isEmpty()) {
+            Text(
+                tr("hosts.nomatch.q", search),
+                fontSize = 15.sp,
+                color = colors.secondary,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 28.dp),
+            )
+        } else {
+            val grouped = sections.size > 1 || sections.firstOrNull()?.title != null
+            for (section in sections) {
+                Group(if (grouped) section.title ?: tr("hosts.other") else null) {
+                    for (host in section.hosts) {
+                        HostListRow(
+                            host = host,
+                            session = Sessions.existing(host.id),
+                            // Disconnected, not closed: a session the list no
+                            // longer holds is one home connects again.
+                            onDisconnect = { Sessions.existing(host.id)?.disconnect() },
+                            onPage = { page(host) },
+                            onOpen = { onOpen(host) },
+                            onDuplicate = { store.duplicate(host, tr("host.copysuffix")) },
+                            onForgetKey = { forgetHostKey(store, host.id) },
+                            onDelete = { delete(host) },
+                        )
+                    }
                 }
             }
-        },
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-    )
+        }
+
+        // The tailnet ThinkTerm joined by itself, and its machines.
+        TailnetSection(store, openTailnet, open = page, add = add)
+
+        if (probe != null) {
+            Group(tr("dev")) {
+                GroupRow(onClick = { onOpen(probe) }) {
+                    HostRowContent(tr("thismac"), "probe sshd on ${probe.hostname}:${probe.port}", session = Sessions.existing(Host.PROBE_ID)) {
+                        DesktopIcon("app-window", size = 20.dp, tint = colors.primary)
+                    }
+                }
+            }
+        }
+    }
 }
 
-@Composable
-private fun HostGroupHeader(title: String) {
-    Text(
-        title,
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 18.dp, bottom = 4.dp),
-    )
-}
-
-/// One host: the disc, the name, the address, and a line with when it was
-/// last reached and how it authenticates. Long press opens the menu.
-@OptIn(ExperimentalFoundationApi::class)
+/// One host: its picture, with a dot while its session is up or on its
+/// way, its name and its address; a tap opens its page, a long press the
+/// menu.
 @Composable
 private fun HostListRow(
     host: Host,
-    connected: Boolean,
+    session: TerminalModel?,
     onDisconnect: () -> Unit,
+    onPage: () -> Unit,
     onOpen: () -> Unit,
-    onEdit: () -> Unit,
     onDuplicate: () -> Unit,
     onForgetKey: () -> Unit,
     onDelete: () -> Unit,
 ) {
+    val colors = groupedColors()
     var menu by remember { mutableStateOf(false) }
     Box {
-        ListItem(
-            modifier = Modifier.combinedClickable(onClick = onOpen, onLongClick = { menu = true }),
-            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-            leadingContent = { HostDisc(Icons.Filled.Dns, host.tint) },
-            headlineContent = {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (connected) {
-                        // Connected: the session is open behind the list.
-                        Box(Modifier.size(8.dp).background(Color(0xFF4CAF50), CircleShape))
-                    }
-                    Text(host.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
-                }
-            },
-            supportingContent = {
-                Column {
-                    Text(host.address, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier.padding(top = 3.dp),
-                    ) {
-                        Text(
-                            host.lastConnectedText,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        AuthBadge(host)
-                    }
-                }
-            },
-            trailingContent = {
-                IconButton(onClick = onEdit) {
-                    Icon(Icons.Filled.Edit, contentDescription = tr("edit"))
-                }
-            },
-        )
-        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-            DropdownMenuItem(
-                text = { Text(tr("connect")) },
-                leadingIcon = { Icon(Icons.Filled.Bolt, contentDescription = null) },
-                onClick = { menu = false; onOpen() },
-            )
-            if (connected) {
-                DropdownMenuItem(
-                    text = { Text(tr("disconnect")) },
-                    leadingIcon = { Icon(Icons.Filled.PowerSettingsNew, contentDescription = null) },
-                    onClick = { menu = false; onDisconnect() },
-                )
+        GroupRow(onClick = onPage, onLongClick = { menu = true }) {
+            HostRowContent(host.title, host.address, monospaced = true, session = session) {
+                DesktopIcon(host.iconFile, size = 21.dp, tint = colors.primary)
             }
-            DropdownMenuItem(
-                text = { Text(tr("edit")) },
-                leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
-                onClick = { menu = false; onEdit() },
-            )
-            DropdownMenuItem(
-                text = { Text(tr("duplicate")) },
-                leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
-                onClick = { menu = false; onDuplicate() },
-            )
+            RowChevron()
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text(tr("connect")) }, onClick = { menu = false; onOpen() })
+            if (session?.isConnected == true) {
+                DropdownMenuItem(text = { Text(tr("disconnect")) }, onClick = { menu = false; onDisconnect() })
+            }
+            DropdownMenuItem(text = { Text(tr("duplicate")) }, onClick = { menu = false; onDuplicate() })
             if (host.knownHost != null) {
-                DropdownMenuItem(
-                    text = { Text(tr("forgetkey")) },
-                    leadingIcon = { Icon(Icons.Filled.GppBad, contentDescription = null) },
-                    onClick = { menu = false; onForgetKey() },
-                )
+                DropdownMenuItem(text = { Text(tr("forgetkey")) }, onClick = { menu = false; onForgetKey() })
             }
             HorizontalDivider()
             DropdownMenuItem(
-                text = { Text(tr("delete"), color = MaterialTheme.colorScheme.error) },
-                leadingIcon = {
-                    Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error)
-                },
+                text = { Text(tr("delete"), color = colors.destructive) },
                 onClick = { menu = false; onDelete() },
             )
         }
     }
 }
 
-@Composable
-private fun AuthBadge(host: Host) {
-    Text(
-        if (host.auth == "key") tr("badge.key") else tr("badge.password"),
-        style = MaterialTheme.typography.labelSmall,
-        fontWeight = FontWeight.SemiBold,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier
-            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f), CircleShape)
-            .padding(horizontal = 7.dp, vertical = 2.dp),
-    )
+/// Where a host's session stands, for its dot in the list and its page.
+internal enum class SessionState {
+    /// No session, or one that never got anywhere.
+    NONE,
+    /// Dialling, attaching, or redialing by itself.
+    CONNECTING,
+    CONNECTED,
+    /// Lost, and not redialing (auto-reconnect off): the way back is a tap.
+    LOST;
+
+    /// The dot a host's picture wears: up, or on its way.
+    val dot: Color?
+        get() = when (this) {
+            CONNECTED -> Color(0xFF34C759)
+            CONNECTING -> Color(0xFFFF9F0A)
+            NONE, LOST -> null
+        }
+
+    companion object {
+        fun of(model: TerminalModel): SessionState = when {
+            model.reconnecting -> if (model.settings.autoReconnect) CONNECTING else LOST
+            model.connection.startsWith("pane ") -> CONNECTED
+            model.isConnected -> CONNECTING
+            else -> NONE
+        }
+    }
 }
 
-/// The tinted disc a row leads with; the gradient is the iOS row's.
+/// The square a host or a machine leads with: its picture on a quiet fill,
+/// and the session's dot at the corner, cut out of the row's background.
 @Composable
-private fun HostDisc(icon: ImageVector, tint: Color) {
-    Box(
-        Modifier
-            .size(40.dp)
-            .background(Brush.verticalGradient(listOf(tint, tint.copy(alpha = 0.72f))), CircleShape),
-        contentAlignment = Alignment.Center,
-    ) {
-        Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(19.dp))
+internal fun HostTile(size: Dp = 40.dp, session: TerminalModel? = null, mark: @Composable () -> Unit) {
+    val colors = groupedColors()
+    Box(Modifier.size(size)) {
+        Box(
+            Modifier.fillMaxSize().clip(RoundedCornerShape(size * 0.28f)).background(colors.fill),
+            contentAlignment = Alignment.Center,
+        ) { mark() }
+        val dot = session?.let { SessionState.of(it).dot }
+        if (dot != null) {
+            Box(
+                Modifier
+                    .align(Alignment.BottomEnd)
+                    .offset(3.dp, 3.dp)
+                    .size(12.dp)
+                    .background(colors.card, CircleShape)
+                    .padding(2.5.dp)
+                    .background(dot, CircleShape),
+            )
+        }
+    }
+}
+
+/// The shape of a row: a tile, a name, and an address under it.
+@Composable
+internal fun RowScope.HostRowContent(
+    title: String,
+    subtitle: String,
+    monospaced: Boolean = false,
+    session: TerminalModel? = null,
+    mark: @Composable () -> Unit,
+) {
+    val colors = groupedColors()
+    HostTile(session = session, mark = mark)
+    Spacer(Modifier.width(2.dp))
+    Column(Modifier.weight(1f).padding(vertical = 4.dp)) {
+        Text(title, color = colors.primary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            subtitle,
+            color = colors.secondary,
+            fontSize = 13.sp,
+            fontFamily = if (monospaced) FontFamily.Monospace else null,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
 @Composable
-private fun HostsEmptyState(add: () -> Unit) {
+internal fun HostsEmptyState(add: () -> Unit) {
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 40.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Icon(
-            Icons.Filled.Dns,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(46.dp),
-        )
+        DesktopIcon("server", size = 46.dp, tint = secondary)
         Spacer(Modifier.height(14.dp))
-        Text(tr("hosts.empty"), style = MaterialTheme.typography.titleMedium)
+        Text(tr("hosts.empty"), fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
         Spacer(Modifier.height(6.dp))
-        Text(
-            tr("hosts.empty.body"),
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-        )
+        Text(tr("hosts.empty.body"), fontSize = 15.sp, color = secondary, textAlign = TextAlign.Center)
         Spacer(Modifier.height(18.dp))
-        Button(onClick = add, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Filled.Add, contentDescription = null)
+        Row(
+            Modifier.fillMaxWidth().height(50.dp).clip(CircleShape).background(LeadBlue).clickable(onClick = add),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            DesktopIcon("plus", size = 20.dp, tint = Color.White)
             Spacer(Modifier.width(8.dp))
-            Text(tr("hosts.add"))
+            Text(tr("hosts.add"), color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -403,37 +421,3 @@ private fun hostSections(all: List<Host>, matches: List<Host>): List<HostSection
     byGroup[""]?.takeIf { it.isNotEmpty() }?.let { out.add(HostSection(null, it)) }
     return out
 }
-
-private val HOST_PALETTE = listOf(
-    Color(0xFF0A84FF), // blue
-    Color(0xFF5E5CE6), // indigo
-    Color(0xFFBF5AF2), // purple
-    Color(0xFFFF375F), // pink
-    Color(0xFFFF9F0A), // orange
-    Color(0xFF40CBE0), // teal
-    Color(0xFF30D158), // green
-    Color(0xFF64D2FF), // cyan
-)
-
-/// A stable colour per host: the djb2 hash the iOS app uses, so a host
-/// wears the same colour on both phones.
-private val Host.tint: Color
-    get() {
-        var hash = 5381UL
-        for (byte in (name + hostname + user).toByteArray()) {
-            hash = hash * 33UL + byte.toUByte().toULong()
-        }
-        return HOST_PALETTE[(hash % HOST_PALETTE.size.toULong()).toInt()]
-    }
-
-/// "13m ago", or the never-connected line. The phone's locale formats it;
-/// iOS follows the app's language, which Android has no formatter for.
-private val Host.lastConnectedText: String
-    get() {
-        val last = lastConnected ?: return tr("hosts.never")
-        return DateUtils.getRelativeTimeSpanString(
-            last,
-            System.currentTimeMillis(),
-            DateUtils.MINUTE_IN_MILLIS,
-        ).toString()
-    }

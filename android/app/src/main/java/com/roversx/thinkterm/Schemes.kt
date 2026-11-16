@@ -9,6 +9,12 @@ import org.json.JSONArray
 /// straight from the desktop's), by name. Read once, on first use.
 object Schemes {
     const val FOLLOW_DESKTOP = "desktop"
+    /// What a light interface gets when no scheme is picked, as on the
+    /// desktop (`config::MACOS_LIGHT_COLOR_SCHEME`).
+    const val LIGHT_DEFAULT = "Apple System Colors (Light)"
+    /// What a macOS host fills in when its configuration names no scheme
+    /// (`config::MACOS_DEFAULT_COLOR_SCHEME`): no choice of its own.
+    const val DARK_DEFAULT = "Apple System Colors"
 
     /// Every scheme's name, in the file's order (alphabetical).
     var names: List<String> = emptyList()

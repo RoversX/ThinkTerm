@@ -26,7 +26,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
     packaging {
         // JNA ships its own native pieces per ABI; only arm64 is built.
@@ -34,9 +33,13 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
+}
+
 dependencies {
     implementation("net.java.dev.jna:jna:5.17.0@aar")
-    implementation(platform("androidx.compose:compose-bom:2025.09.00"))
+    implementation(platform("androidx.compose:compose-bom:2026.03.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
@@ -46,4 +49,9 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.9.5")
     implementation("androidx.security:security-crypto:1.1.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    // Liquid glass over the terminal (Apache-2.0). 1.0.6 is the last
+    // release on Compose 1.10; 2.x needs Compose 1.12, AGP 9 and SDK 37.
+    implementation("io.github.kyant0:backdrop:1.0.6")
+    // The tailnet's login in the app, as iOS's Safari sheet has it.
+    implementation("androidx.browser:browser:1.8.0")
 }

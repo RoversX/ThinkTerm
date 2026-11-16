@@ -3,23 +3,36 @@ package com.roversx.thinkterm
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.res.Configuration
+import android.graphics.PixelFormat
+import android.hardware.HardwareBuffer
+import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import android.view.Choreographer
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import com.roversx.thinkterm.core.Core
 import com.roversx.thinkterm.core.Notify
+import com.roversx.thinkterm.core.ViewSet
+import java.io.File
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
+
+/// How long a list of a host's threads waits, at least, between reads of
+/// the views while the host's terminal is off screen.
+private const val LIST_REFRESH_MS = 250L
 
 /// The shell's side of the thread contract. `Notify` calls arrive on the
 /// core thread; nothing here blocks them and nothing here calls back into
@@ -55,6 +68,12 @@ class TerminalModel(
     var tree by mutableStateOf<TreeView?>(null)
         private set
     var navs by mutableStateOf<List<NavView>>(emptyList())
+        private set
+    /// The panes of the tab on show, for the switcher under the terminal.
+    var panes by mutableStateOf<PanesView?>(null)
+        private set
+    /// Every pane an agent runs in, for the right sidebar.
+    var agents by mutableStateOf<AgentsView?>(null)
         private set
     var status by mutableStateOf<StatusView?>(null)
         private set
@@ -126,6 +145,11 @@ class TerminalModel(
     /// The keyboard's options changed: the view starts its input over so
     /// the IME reads them again.
     var onImeOptionsChanged: (() -> Unit)? = null
+    /// Something other than the keyboard typed (the key bar, a paste, a
+    /// snippet), or the line is another pane's now: a word the keyboard is
+    /// making on the terminal as it goes is let go, so its next change does
+    /// not land in what came after it.
+    var onLineDisturbed: (() -> Unit)? = null
     /// The key panel is up in the keyboard's place.
     var panelOpen by mutableStateOf(false)
     /// A thread this phone was on last time it was in this host, put
@@ -133,19 +157,54 @@ class TerminalModel(
     private var restoredThread = false
     private val lastThreads = context.getSharedPreferences("thinkterm.threads", Context.MODE_PRIVATE)
     private var appliedIncognito = settings.incognitoKeyboard
+    /// The followed preferences as last applied (`followedSettings`).
+    private var appliedSettings: List<Any?> = emptyList()
     var onScreenChanged: (() -> Unit)? = null
     var onHideKeyboard: (() -> Unit)? = null
+    /// The terminal takes the keys and the keyboard comes up.
+    var onShowKeyboard: (() -> Unit)? = null
     /// A selection stands: where its copy chip goes, in dp from the
     /// terminal's origin (the head cell's top-left), or null for none.
     var selectionMenuAt by mutableStateOf<Pair<Double, Double>?>(null)
 
     val smoothScroll: Boolean get() = settings.smoothScroll
 
+    /// Whether anyone sees the terminal: its screen is up, in an app in
+    /// front. The core puts a tab zoomed for want of room back to its split
+    /// while nobody looks at it here, as iOS tells it.
+    private var onScreen = false
+    private var inFront = true
+    /// The app is in front (not in the background).
+    val isInFront: Boolean get() = inFront
+    private fun updateShown() = core.setShown(onScreen && inFront)
+
+    /// A list shows this host's threads while its terminal is off screen
+    /// (`setViewsListed`): the views are read for it, a few times a second
+    /// at most, as the core says they changed -- and not while the app is
+    /// in the background, where nobody sees the list.
+    private var listed = false
+    private val listRefreshQueued = AtomicBoolean(false)
+    private val listRefresh = Runnable {
+        listRefreshQueued.set(false)
+        if (listed && !onScreen && inFront && changePending.getAndSet(false)) refreshViews()
+    }
+
+    /// From any thread: a change the list should see is read soon.
+    private fun queueListRefresh() {
+        if (listRefreshQueued.compareAndSet(false, true)) main.postDelayed(listRefresh, LIST_REFRESH_MS)
+    }
+
+    /// The published views read last (`refreshViews`), and the connection
+    /// the core was on before the current one was asked for.
+    private var lastViews: ViewSet? = null
+    private var connectionBefore = 0uL
+
     private val frameNeeded = AtomicBoolean(false)
     private val changePending = AtomicBoolean(false)
     private val main = Handler(Looper.getMainLooper())
     private val choreographer = Choreographer.getInstance()
-    private var running = true
+    /// The frame loop runs: the terminal is on screen in an app in front.
+    private var running = false
     private var connected = false
     private val logLines = ArrayDeque<String>()
     private var toastShown: String? = null
@@ -154,7 +213,8 @@ class TerminalModel(
     private val tick = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!running) return
-            if (frameNeeded.getAndSet(false)) core.render()
+            // Nothing is drawn onto the list's stand-in surface.
+            if (!onListSurface && frameNeeded.getAndSet(false)) core.render()
             if (changePending.getAndSet(false)) refreshViews()
             choreographer.postFrameCallback(this)
         }
@@ -173,17 +233,27 @@ class TerminalModel(
 
     init {
         core = Core(Sink())
-        choreographer.postFrameCallback(tick)
-        main.postDelayed(statsTick, 500)
+        updateShown()
         applyScheme()
         applyScrollMode()
         applyTerminalPrefs()
         appliedFamily = settings.fontFamily
+        appliedSettings = followedSettings()
     }
 
+    /// The preferences the terminal follows, as one value: what the screen
+    /// watches, and what a session off screen meanwhile catches up on.
+    fun followedSettings(): List<Any?> = listOf(
+        settings.schemeName, settings.smoothScroll, settings.cursorStyle, settings.cursorBlink,
+        settings.contrast, settings.resizeMode, settings.autoReconnect, settings.paneBars, settings.fontFamily,
+        settings.incognitoKeyboard, settings.language,
+    )
+
     /// The preferences the open terminal follows: the screen calls this
-    /// when any of them changes (a snapshot read in a composable).
+    /// when any of them changes (a snapshot read in a composable), and
+    /// coming back on screen when they changed while it was away.
     fun settingsChanged() {
+        appliedSettings = followedSettings()
         applyScheme()
         applyScrollMode()
         applyTerminalPrefs()
@@ -230,25 +300,48 @@ class TerminalModel(
     /// The screen went away but the connection stays: the frame loop
     /// rests until the screen is back, and the views catch up then.
     fun leaveScreen() {
-        running = false
-        choreographer.removeFrameCallback(tick)
-        main.removeCallbacks(statsTick)
+        onScreen = false
+        updateShown()
+        updateRunning()
+        if (listed) queueListRefresh()
     }
 
     fun enterScreen() {
-        if (running) return
-        running = true
-        choreographer.postFrameCallback(tick)
-        main.postDelayed(statsTick, 500)
-        changePending.set(true)
+        onScreen = true
+        updateShown()
+        updateRunning()
+        // Changed from another screen while this one was away.
+        if (followedSettings() != appliedSettings) settingsChanged()
+    }
+
+    /// The frame loop runs while the terminal is on screen in an app in
+    /// front, and rests otherwise; the views catch up when it starts.
+    private fun updateRunning() {
+        val want = onScreen && inFront
+        if (want == running) return
+        running = want
+        if (want) {
+            choreographer.postFrameCallback(tick)
+            main.removeCallbacks(statsTick)
+            main.postDelayed(statsTick, 500)
+            changePending.set(true)
+        } else {
+            choreographer.removeFrameCallback(tick)
+            main.removeCallbacks(statsTick)
+        }
     }
 
     fun connect() {
+        pausedForBackground = false
         clearHostKeyRequest()
         val requestId = UUID.randomUUID().toString()
         activeRequestId = requestId
         requestedHost = host
         restoredThread = false
+        // A new connection's views are all new, even ones that read the
+        // same; the core may still have the last one's out until it is up.
+        lastViews = null
+        connectionBefore = core.viewsConnection()
         connected = true
         val h = host
         val secret = if (h.id == Host.PROBE_ID) probeKey() else store.secret(h.id)
@@ -306,26 +399,58 @@ class TerminalModel(
     /// Leaving the screen for good: the frame loop stops, then the core.
     fun shutdown() {
         clearHostKeyRequest()
+        dropListSurface()
+        main.removeCallbacks(pollUploads)
+        // Their copies, which nothing reads once the core is down.
+        for (upload in uploads) if (upload.ended == null) upload.file.parentFile?.deleteRecursively()
+        copier.shutdown()
         running = false
+        listed = false
         choreographer.removeFrameCallback(tick)
         main.removeCallbacks(statsTick)
+        main.removeCallbacks(listRefresh)
         core.disconnect()
         core.shutdown()
     }
 
+    /// A photo or file picker of this screen's is up: the system's own
+    /// screen over the app, not the app put away. What is picked goes up
+    /// on this connection, so the setting below does not drop it meanwhile.
+    var picking = false
+
     /// The app left the screen. The socket lives as long as the process
     /// does; with the setting off, it is dropped now and redialed on return.
     fun enteredBackground() {
-        if (!settings.keepSessionInBackground && connection.startsWith("pane ")) {
+        inFront = false
+        updateShown()
+        updateRunning()
+        if (!settings.keepSessionInBackground && !picking && connection.startsWith("pane ")) {
             disconnect()
+            pausedForBackground = true
         }
     }
 
     fun enteredForeground() {
-        if (!settings.keepSessionInBackground && connection.startsWith("disconnected")) {
+        inFront = true
+        updateShown()
+        updateRunning()
+        if (listed && !onScreen) queueListRefresh()
+        // Only what the background took down comes back: a session the
+        // user disconnected stays so.
+        if (pausedForBackground) {
+            pausedForBackground = false
             connect()
+        } else {
+            checkConnection()
         }
     }
+
+    /// What a wait or a network change cut is found out now, and what was
+    /// already down is tried again at once.
+    fun checkConnection() = core.checkConnection()
+
+    /// The background took the connection down; the foreground brings it back.
+    private var pausedForBackground = false
 
     // MARK: input
 
@@ -334,6 +459,7 @@ class TerminalModel(
         // key brought the modifier itself, so it never lingers past it.
         val stickyCtrl = takeCtrl()
         val stickyAlt = takeAlt()
+        onLineDisturbed?.invoke()
         core.key(name, ctrl || stickyCtrl, alt || stickyAlt, shift)
     }
 
@@ -344,13 +470,17 @@ class TerminalModel(
             key(text)
             return
         }
+        onLineDisturbed?.invoke()
         core.text(text)
     }
 
     fun pasteFromClipboard() {
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
         val text = cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: return
-        if (text.isNotEmpty()) core.paste(text)
+        if (text.isNotEmpty()) {
+            onLineDisturbed?.invoke()
+            core.paste(text)
+        }
     }
 
     fun copyToClipboard(text: String) {
@@ -386,10 +516,14 @@ class TerminalModel(
     // MARK: the App's chrome
 
     fun chromeClick(action: String, pane: Int? = null, tab: Int? = null) {
+        onLineDisturbed?.invoke()
         core.chromeClick(action, pane?.toUInt(), tab?.toUInt())
     }
 
-    fun sideClick(kind: String, id: String? = null, flag: Boolean? = null) = core.sideClick(kind, id, flag)
+    fun sideClick(kind: String, id: String? = null, flag: Boolean? = null) {
+        onLineDisturbed?.invoke()
+        core.sideClick(kind, id, flag)
+    }
 
     fun sideKey(key: String, value: String) = core.sideKey(key, value)
 
@@ -401,6 +535,10 @@ class TerminalModel(
     }
 
     fun setSpace(id: String) = core.setSpace(id)
+
+    /// One pane of a tab at a time, whole, where the screen has no room
+    /// for a split's panes side by side.
+    fun setOnePane(one: Boolean) = core.setOnePane(one)
 
     fun contextMenu(kind: String, id: String): List<MenuItem> = Views.menu(core.contextMenu(kind, id))
 
@@ -437,23 +575,52 @@ class TerminalModel(
     /// the core reports changes as often as output comes.
     fun refreshViews() {
         onScreenChanged?.invoke()
-        val tabs = Views.tabs(core.view("tabs"))
-        if (tabs != this.tabs) this.tabs = tabs
-        val sidebar = Views.sidebar(core.view("sidebar"))
-        if (sidebar != this.sidebar) this.sidebar = sidebar
-        val threads = Views.threads(core.view("threads"))
-        if (threads != this.threads) this.threads = threads
-        rememberThread(threads)
-        val tree = Views.tree(core.view("tree"))
-        if (tree != this.tree) this.tree = tree
-        val navs = Views.navs(core.view("navs"))
-        if (navs != this.navs) this.navs = navs
-        val status = Views.status(core.view("status"))
-        if (status != this.status) {
-            this.status = status
-            showToast(status?.toast)
+        // The views the core published, read without waiting on it; only
+        // what changed since the last read is decoded.
+        val last = lastViews
+        if (last != null && core.viewsRevision() == last.revision) return
+        val views = core.views()
+        if (views.revision == last?.revision) return
+        lastViews = views
+        if (views.tabs != last?.tabs) {
+            val tabs = Views.tabs(views.tabs)
+            if (tabs != this.tabs) this.tabs = tabs
         }
-        Views.layout(core.view("layout"))?.let { layout ->
+        if (views.sidebar != last?.sidebar) {
+            val sidebar = Views.sidebar(views.sidebar)
+            if (sidebar != this.sidebar) this.sidebar = sidebar
+        }
+        val threadsChanged = views.threads != last?.threads
+        if (threadsChanged) {
+            val threads = Views.threads(views.threads)
+            if (threads != this.threads) this.threads = threads
+        }
+        // Only this connection's threads say which one to go back to.
+        if (views.connection > connectionBefore && (threadsChanged || !restoredThread)) rememberThread(this.threads)
+        if (views.tree != last?.tree) {
+            val tree = Views.tree(views.tree)
+            if (tree != this.tree) this.tree = tree
+        }
+        if (views.navs != last?.navs) {
+            val navs = Views.navs(views.navs)
+            if (navs != this.navs) this.navs = navs
+        }
+        if (views.panes != last?.panes) {
+            val panes = Views.panes(views.panes)
+            if (panes != this.panes) this.panes = panes
+        }
+        if (views.agents != last?.agents) {
+            val agents = Views.agents(views.agents)
+            if (agents != this.agents) this.agents = agents
+        }
+        if (views.status != last?.status) {
+            val status = Views.status(views.status)
+            if (status != this.status) {
+                this.status = status
+                showToast(status?.toast)
+            }
+        }
+        if (views.layout != last?.layout) Views.layout(views.layout)?.let { layout ->
             if (layout.cellH > 0) cellHeight = layout.cellH
             if (layout.cellW > 0) cellWidth = layout.cellW
             if (layout.fontPt > 0 && layout.fontPt != fontPt) fontPt = layout.fontPt
@@ -484,17 +651,206 @@ class TerminalModel(
 
     private val expireToast = Runnable { if (toastText == toastShown) toastText = null }
 
+    // MARK: uploads
+
+    /// A file on its way to the host, or one that just got there or did
+    /// not: shown over the keys until it has said so.
+    data class Upload(
+        val id: ULong,
+        val name: String,
+        /// The app's own copy, read as it is sent and removed after.
+        val file: File,
+        val sent: ULong = 0uL,
+        val total: ULong = 0uL,
+        /// Where it is on the host, once it is.
+        val path: String? = null,
+        val error: String? = null,
+        val ended: Long? = null,
+    )
+
+    val uploads = mutableStateListOf<Upload>()
+    private val copier = Executors.newSingleThreadExecutor()
+
+    /// Leave something the phone has -- a photo, a file, the clipboard's
+    /// picture -- in the host's uploads folder and put its path on the
+    /// focused pane's command line, as the desktop does with a file dropped
+    /// on a remote terminal. `write` fills the app's own copy, off the main
+    /// thread, which the upload then reads at its own pace. The pane is the
+    /// one focused now, as it is chosen, however long the copy takes.
+    fun upload(name: String, write: (File) -> Unit) {
+        val clean = name.ifEmpty { "file" }.replace('/', '_')
+        val id = core.uploadBegin()
+        copier.execute {
+            UploadsFolder.clearOnce(context.cacheDir)
+            val folder = File(context.cacheDir, "uploads/" + UUID.randomUUID())
+            val file = File(folder, clean)
+            val made = runCatching {
+                folder.mkdirs()
+                write(file)
+                file.exists()
+            }.getOrDefault(false)
+            main.post {
+                if (!made) {
+                    folder.deleteRecursively()
+                    core.cancelUpload(id)
+                    note(tr("upload.unread", clean))
+                } else {
+                    startUpload(id, clean, file)
+                }
+            }
+        }
+    }
+
+    /// Give an upload up: the host keeps nothing of it.
+    fun cancelUpload(id: ULong) = core.cancelUpload(id)
+
+    private fun startUpload(id: ULong, name: String, file: File) {
+        core.uploadFile(id, name, file.path)
+        uploads.add(Upload(id, name, file))
+        main.removeCallbacks(pollUploads)
+        main.postDelayed(pollUploads, 150)
+    }
+
+    /// How each upload stands, as the core has it; one that is done pastes
+    /// its path and stays a moment to say so, one that failed a little
+    /// longer to say why, and one given up goes at once.
+    private val pollUploads: Runnable = object : Runnable {
+        override fun run() {
+            for (i in uploads.indices) {
+                val upload = uploads[i]
+                if (upload.ended != null) continue
+                val status = core.uploadStatus(upload.id)
+                if (status == null) {
+                    upload.file.parentFile?.deleteRecursively()
+                    uploads[i] = upload.copy(ended = SystemClock.uptimeMillis())
+                    continue
+                }
+                var next = upload.copy(sent = status.sent, total = status.total)
+                if (status.done) {
+                    next = next.copy(ended = SystemClock.uptimeMillis())
+                    upload.file.parentFile?.deleteRecursively()
+                    if (status.error.isEmpty()) {
+                        next = next.copy(path = status.path)
+                        // Into the pane it was started from, not
+                        // whichever has the focus now.
+                        onLineDisturbed?.invoke()
+                        core.pasteUpload(upload.id, status.paste)
+                    } else {
+                        next = next.copy(error = status.error)
+                    }
+                }
+                if (next != upload) uploads[i] = next
+            }
+            val now = SystemClock.uptimeMillis()
+            uploads.removeAll { u ->
+                val ended = u.ended ?: return@removeAll false
+                u.error == "cancelled" || now - ended > (if (u.error == null) 1500 else 5000)
+            }
+            if (uploads.isNotEmpty()) main.postDelayed(this, 150)
+        }
+    }
+
+    /// A passing remark of the shell's own, where the App's go.
+    fun note(text: String) {
+        main.removeCallbacks(expireToast)
+        toastText = text
+        toastShown = text
+        main.postDelayed(expireToast, 4000)
+    }
+
+    // MARK: listed with the other hosts
+
+    /// The surface lent for the list, and whether the core is on it.
+    private var listReader: ImageReader? = null
+    private var listWindow = 0L
+    private var onListSurface = false
+
+    /// The list of every host's threads shows this one's, or stopped:
+    /// while it does the core keeps the views current with the terminal
+    /// off screen, and the list reads them (`refreshViews`).
+    ///
+    /// The core attaches to the server -- and has threads to list -- only
+    /// once it has a surface to draw on, so a host listed while its
+    /// terminal is off screen is lent one of the screen's size that
+    /// nothing shows: an ImageReader that drops whatever reaches it. The
+    /// terminal's own takes its place when it comes (`dropListSurface`),
+    /// as iOS lends a layer nothing shows.
+    fun setViewsListed(listed: Boolean) {
+        this.listed = listed
+        core.setViewsListed(listed)
+        if (listed && !onScreen) {
+            changePending.set(true)
+            queueListRefresh()
+        }
+        if (listed && generation == 0uL) {
+            val metrics = context.resources.displayMetrics
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            val reader = listReader ?: ImageReader.newInstance(
+                width, height, PixelFormat.RGBA_8888, 2,
+                HardwareBuffer.USAGE_GPU_COLOR_OUTPUT or HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            ).also {
+                it.setOnImageAvailableListener({ r -> r.acquireLatestImage()?.close() }, main)
+                listReader = it
+            }
+            if (listWindow == 0L) listWindow = NativeWindow.fromSurface(reader.surface)
+            val gen = core.attachSurface(listWindow.toULong(), width.toUInt(), height.toUInt(), metrics.density.toDouble())
+            generation = gen
+            // Refused, the surface is kept for the list's next try.
+            onListSurface = gen != 0uL
+        } else if (!listed) {
+            dropListSurface()
+        }
+    }
+
+    /// The list's surface given back: the terminal's own is coming, or the
+    /// list has gone.
+    fun dropListSurface() {
+        if (onListSurface && generation != 0uL) {
+            core.detachSurface(generation)
+            generation = 0uL
+        }
+        onListSurface = false
+        if (listWindow != 0L) {
+            NativeWindow.release(listWindow)
+            listWindow = 0L
+        }
+        listReader?.close()
+        listReader = null
+    }
+
     // MARK: the preferences the App honours
 
+    /// The phone is in its light appearance.
+    private val systemLight: Boolean
+        get() = (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) != Configuration.UI_MODE_NIGHT_YES
+    /// The appearance the scheme was last chosen for.
+    private var schemeForLight: Boolean? = null
+
+    /// The phone may have gone light or dark meanwhile.
+    fun appearanceMayHaveChanged() {
+        if (schemeForLight != systemLight) applyScheme()
+    }
+
+    /// The scheme the user picked; with none picked, the host's own -- and
+    /// on a light phone the light default in place of a host's that is no
+    /// choice at all, as the desktop decides its own
+    /// (`native_settings::resolve_color_scheme`): a scheme the host's
+    /// configuration names is kept on either side.
     private fun applyScheme() {
         val name = settings.schemeName
         val json = Schemes.json(name)
+        val light = systemLight
+        schemeForLight = light
         if (name == Schemes.FOLLOW_DESKTOP || json == null) {
             core.setSetting("terminal-scheme", "\"desktop\"")
             core.setPalette(null)
+            val lightScheme = if (light) Schemes.json(Schemes.LIGHT_DEFAULT) else null
+            core.setFallbackPalette(lightScheme, lightScheme?.let { Schemes.json(Schemes.DARK_DEFAULT) })
         } else {
             core.setSetting("terminal-scheme", "\"" + name.replace("\"", "\\\"") + "\"")
             core.setPalette(json)
+            core.setFallbackPalette(null, null)
         }
     }
 
@@ -564,6 +920,8 @@ class TerminalModel(
 
         override fun onChange() {
             changePending.set(true)
+            // Off screen the frame loop rests; a list may be reading.
+            queueListRefresh()
         }
 
         override fun onClipboard(text: String) {
@@ -659,4 +1017,18 @@ object Assets {
         listOf(face, "SymbolsNerdFontMono-Regular.ttf")
             .map { java.io.File(context.filesDir, it).absolutePath }
             .filter { java.io.File(it).exists() }
+}
+
+/// The uploads folder as a process finds it holds only what one before it
+/// left, stopped in the middle of an upload: cleared once, before this
+/// one's first upload makes its own copy there.
+private object UploadsFolder {
+    private var cleared = false
+
+    @Synchronized
+    fun clearOnce(cache: File) {
+        if (cleared) return
+        File(cache, "uploads").deleteRecursively()
+        cleared = true
+    }
 }

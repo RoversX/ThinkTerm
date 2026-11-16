@@ -22,13 +22,48 @@ data class TabEntry(
 
 data class Controls(val following: Boolean, val fit: Boolean, val closing: Int?)
 
-data class TabsView(val tabs: List<TabEntry>, val controls: Controls) {
+/// `icon`: the terminal's card, which every window tab wears, as on the desktop.
+data class TabsView(val tabs: List<TabEntry>, val controls: Controls, val icon: String? = null) {
     val current: TabEntry? get() = tabs.firstOrNull { it.current }
 }
 
 data class NavRect(val pane: Int, val left: Double, val top: Double, val width: Double, val height: Double)
 
-data class CapsuleView(val pane: Int, val title: String, val busy: Boolean, val current: Boolean)
+data class CapsuleView(val pane: Int, val title: String, val busy: Boolean, val current: Boolean, val icon: String? = null)
+
+/// The panes of the tab on show, each where the split puts it, in cells of
+/// a grid `cols` by `rows`: `App::panes_view`.
+data class PanesView(val cols: Int, val rows: Int, val zoomed: Int?, val panes: List<PaneBox>)
+
+/// One frame of the split: the pane in front of it, and every pane that
+/// shares it.
+data class PaneBox(
+    val pane: Int,
+    val left: Int,
+    val top: Int,
+    val cols: Int,
+    val rows: Int,
+    val focused: Boolean,
+    val members: List<CapsuleView>,
+)
+
+/// The Agents panel: `App::agents_view`.
+data class AgentsView(val rows: List<AgentRow>, val summary: String)
+
+/// One pane an agent runs in. `state` is "working", "blocked", "error",
+/// "done", "idle" or "unknown"; `place` is "Project · Thread", or the
+/// workspace when no thread claims it.
+data class AgentRow(
+    val pane: Int,
+    val name: String,
+    val title: String,
+    val state: String,
+    val stateLabel: String,
+    val place: String,
+    val paneCard: String?,
+    val kind: String?,
+    val said: String?,
+)
 
 data class NavView(
     val rect: NavRect,
@@ -138,7 +173,14 @@ data class ThreadRow(
     val live: Boolean,
     val selected: Boolean,
     val deleting: Boolean,
-)
+    /// The cards of what it runs (`ThreadCards`); none from a core before them.
+    val icons: List<String> = emptyList(),
+    /// A program in it stopped on an error: it has a mark of its own.
+    val failed: Boolean = false,
+) {
+    /// The status word its mark is drawn for (`threadMark`).
+    val markStatus: String get() = if (failed) "Failed" else status
+}
 
 data class Editing(val kind: String, val id: String?)
 
@@ -211,7 +253,7 @@ object Views {
             fit = c?.optBoolean("fit") ?: false,
             closing = c?.takeIf { it.has("closing") && !it.isNull("closing") }?.optInt("closing"),
         )
-        return TabsView(tabs, controls)
+        return TabsView(tabs, controls, optString(root, "icon"))
     }
 
     fun navs(json: String): List<NavView> {
@@ -220,9 +262,7 @@ object Views {
             val r = n.optJSONObject("rect") ?: JSONObject()
             NavView(
                 rect = NavRect(r.optInt("pane"), r.optDouble("left"), r.optDouble("top"), r.optDouble("width"), r.optDouble("height")),
-                members = n.optJSONArray("members").map { m ->
-                    CapsuleView(m.optInt("pane"), m.optString("title"), m.optBoolean("busy"), m.optBoolean("current"))
-                },
+                members = n.optJSONArray("members").map { capsule(it) },
                 focused = n.optBoolean("focused"),
                 zoomed = n.optBoolean("zoomed"),
                 closing = n.optBoolean("closing"),
@@ -293,7 +333,61 @@ object Views {
         live = r.optBoolean("live"),
         selected = r.optBoolean("selected"),
         deleting = r.optBoolean("deleting"),
+        icons = strings(r.optJSONArray("icons")),
+        failed = r.optBoolean("failed"),
     )
+
+    fun panes(json: String): PanesView? {
+        val root = obj(json) ?: return null
+        return PanesView(
+            cols = root.optInt("cols"),
+            rows = root.optInt("rows"),
+            zoomed = root.takeIf { it.has("zoomed") && !it.isNull("zoomed") }?.optInt("zoomed"),
+            panes = root.optJSONArray("panes").map { b ->
+                PaneBox(
+                    pane = b.optInt("pane"),
+                    left = b.optInt("left"),
+                    top = b.optInt("top"),
+                    cols = b.optInt("cols"),
+                    rows = b.optInt("rows"),
+                    focused = b.optBoolean("focused"),
+                    members = b.optJSONArray("members").map { capsule(it) },
+                )
+            },
+        )
+    }
+
+    fun agents(json: String): AgentsView? {
+        val root = obj(json) ?: return null
+        return AgentsView(
+            rows = root.optJSONArray("rows").map { r ->
+                AgentRow(
+                    pane = r.optInt("pane"),
+                    name = r.optString("name"),
+                    title = r.optString("title"),
+                    state = r.optString("state"),
+                    stateLabel = r.optString("state_label"),
+                    place = r.optString("place"),
+                    paneCard = optString(r, "pane_card"),
+                    kind = optString(r, "kind"),
+                    said = optString(r, "said"),
+                )
+            },
+            summary = root.optString("summary"),
+        )
+    }
+
+    private fun capsule(m: JSONObject) = CapsuleView(
+        m.optInt("pane"), m.optString("title"), m.optBoolean("busy"), m.optBoolean("current"), optString(m, "icon"),
+    )
+
+    private fun optString(o: JSONObject, key: String): String? =
+        if (o.has(key) && !o.isNull(key)) o.optString(key) else null
+
+    private fun strings(a: JSONArray?): List<String> {
+        if (a == null) return emptyList()
+        return (0 until a.length()).mapNotNull { a.optString(it).takeIf { s -> s.isNotEmpty() } }
+    }
 
     fun previewRows(json: String): List<PreviewRow> {
         val arr = array(json) ?: return emptyList()
@@ -337,6 +431,7 @@ object Views {
                         live = r.optBoolean("live"),
                         selected = r.optBoolean("selected"),
                         deleting = r.optBoolean("deleting"),
+                        failed = r.optBoolean("failed"),
                     )
                 )
                 "archived" -> SideRow.Archived(r.optInt("count"), r.optBoolean("open"), r.optString("label"))

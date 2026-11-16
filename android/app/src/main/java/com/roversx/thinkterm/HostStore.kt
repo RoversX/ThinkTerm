@@ -33,17 +33,38 @@ data class Host(
     val publicKey: String? = null,
     /// Unix milliseconds of the last connection that reached a pane.
     val lastConnected: Long? = null,
+    /// The picture the host wears, by the desktop's name for it
+    /// (`Host.ICONS`); empty is the server.
+    val icon: String = "",
 ) {
     val display: String get() = if (name.isNotEmpty()) name else "$user@$hostname:$port"
     /// The headline of a row: `display` would repeat the address below it
     /// when the host has no name.
     val title: String get() = name.ifEmpty { hostname }
     val address: String get() = "$user@$hostname" + if (port == 22) "" else ":$port"
+    val iconFile: String get() = iconFile(icon)
 
     /// The dev-only entry that reaches the Mac's probe sshd. 10.0.2.2 is
     /// the emulator's route to the host's loopback.
     companion object {
         const val PROBE_ID = "probe"
+
+        /// The desktop's host icons (thinkterm-core's `HostIcon`), in the
+        /// order its picker offers them; a host with none chosen wears the
+        /// first.
+        val ICONS = listOf("server", "cloud", "globe", "laptop", "mac-mini", "desktop", "chip", "container")
+
+        /// The desktop's picture for an icon, as its hosts page draws it.
+        fun iconFile(icon: String): String = when (icon) {
+            "cloud" -> "cloud"
+            "globe" -> "globe"
+            "laptop" -> "laptop"
+            "mac-mini" -> "hard-drive"
+            "desktop" -> "monitor"
+            "chip" -> "cpu"
+            "container" -> "package"
+            else -> "server"
+        }
 
         fun probe(context: Context) = Host(
             id = PROBE_ID,
@@ -91,6 +112,21 @@ class HostStore(context: Context) {
         save()
     }
 
+    /// What the host editor hands back, kept, and the host as stored. A
+    /// secret typed in replaces the stored one, with the passphrase that
+    /// goes with it. With none typed the stored secret stays, and so does
+    /// its passphrase unless a new one was typed: the field starts empty,
+    /// so an empty one (null) is no change.
+    fun saveEdit(host: Host, secret: String, passphrase: String?): Host {
+        if (secret.isNotEmpty() || secret(host.id).isEmpty()) {
+            putSecret(host.id, secret, passphrase)
+        } else if (passphrase != null) {
+            putSecret(host.id, secret(host.id), passphrase)
+        }
+        upsert(host)
+        return hosts.firstOrNull { it.id == host.id } ?: host
+    }
+
     fun remove(host: Host) {
         hosts = hosts.filter { it.id != host.id }
         secrets.edit().remove(host.id).remove(host.id + ".passphrase").apply()
@@ -110,6 +146,14 @@ class HostStore(context: Context) {
         if (at < 0 || hosts[at].knownHost == null) return
         hosts = hosts.toMutableList().also { it[at] = it[at].copy(knownHost = null) }
         save()
+    }
+
+    /// A secret of the app's own (the tailnet's keys), kept beside the
+    /// hosts' in the encrypted preferences.
+    fun appSecret(key: String): String? = secrets.getString(key, null)?.takeIf { it.isNotEmpty() }
+
+    fun putAppSecret(key: String, value: String?) {
+        secrets.edit().apply { if (value.isNullOrEmpty()) remove(key) else putString(key, value) }.apply()
     }
 
     /// The groups in use, for the editor's suggestions.
@@ -160,6 +204,7 @@ class HostStore(context: Context) {
                     .put("group", h.group)
                     .put("publicKey", h.publicKey ?: JSONObject.NULL)
                     .put("lastConnected", h.lastConnected ?: JSONObject.NULL)
+                    .put("icon", h.icon)
             )
         }
         prefs.edit().putString(KEY, arr.toString()).apply()
@@ -183,6 +228,7 @@ class HostStore(context: Context) {
                     group = o.optString("group"),
                     publicKey = o.stringOrNull("publicKey"),
                     lastConnected = if (o.isNull("lastConnected")) null else o.optLong("lastConnected"),
+                    icon = o.optString("icon"),
                 )
             }
         } catch (e: Throwable) {
