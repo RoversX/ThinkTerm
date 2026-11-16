@@ -31,10 +31,7 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                     let window_id = sud.window_id;
                     state.keyboard_window_id.borrow_mut().replace(window_id);
                     if let Some(text_input) = &state.text_input {
-                        if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                            input.enable();
-                            input.commit();
-                        }
+                        text_input.enable_for_keyboard(keyboard);
                         text_input.advise_surface(surface, keyboard);
                     }
                 } else {
@@ -44,13 +41,23 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
             WlKeyboardEvent::Leave { serial, .. } => {
                 *state.last_serial.borrow_mut() = *serial;
                 if let Some(text_input) = &state.text_input {
-                    if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                        input.disable();
-                        input.commit();
-                    }
+                    text_input.disable_for_keyboard(keyboard);
                 }
             }
-            WlKeyboardEvent::Key { serial, .. } | WlKeyboardEvent::Modifiers { serial, .. } => {
+            WlKeyboardEvent::Key { serial, .. } => {
+                *state.last_serial.borrow_mut() = *serial;
+                // A key press proves the surface has keyboard focus, so it is
+                // the one moment we know an input method can be asked for. If
+                // the enable was lost (a focus change raced it, or the
+                // compositor dropped the state after a leave), re-ask now; it
+                // costs one round trip and makes the very next keystroke,
+                // including the rest of a ctrl+space chord, reach the input
+                // method instead of the terminal.
+                if let Some(text_input) = &state.text_input {
+                    text_input.enable_for_keyboard(keyboard);
+                }
+            }
+            WlKeyboardEvent::Modifiers { serial, .. } => {
                 *state.last_serial.borrow_mut() = *serial;
             }
             WlKeyboardEvent::RepeatInfo { rate, delay } => {

@@ -37,6 +37,9 @@ struct Inner {
     keyboard_to_seat: HashMap<ObjectId, ObjectId>,
     surface_to_keyboard: HashMap<ObjectId, ObjectId>,
     pending_state: HashMap<ObjectId, PendingState>,
+    /// The text input objects we asked the compositor to enable. A key press
+    /// repairs this if a focus change or a compositor quirk dropped it.
+    enabled: HashMap<ObjectId, bool>,
 }
 
 impl TextInputState {
@@ -49,6 +52,41 @@ impl TextInputState {
             text_input_manager,
             inner: Mutex::new(Inner::default()),
         })
+    }
+
+    /// Whether we last asked the compositor to enable text input for this
+    /// object. The compositor owns the real state; this is only what we sent,
+    /// kept so a key press can tell a lost enable from a healthy one.
+    pub(super) fn set_enabled(&self, input: &ZwpTextInputV3, enabled: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        let current = inner.enabled.get(&input.id()).copied().unwrap_or(false);
+        if current == enabled {
+            return;
+        }
+        inner.enabled.insert(input.id(), enabled);
+        if enabled {
+            input.enable();
+        } else {
+            input.disable();
+        }
+        input.commit();
+        log::debug!(
+            "wayland: text input {} {:?}",
+            if enabled { "enabled" } else { "disabled" },
+            input.id()
+        );
+    }
+
+    pub(super) fn enable_for_keyboard(&self, keyboard: &WlKeyboard) {
+        if let Some(input) = self.get_text_input_for_keyboard(keyboard) {
+            self.set_enabled(&input, true);
+        }
+    }
+
+    pub(super) fn disable_for_keyboard(&self, keyboard: &WlKeyboard) {
+        if let Some(input) = self.get_text_input_for_keyboard(keyboard) {
+            self.set_enabled(&input, false);
+        }
     }
 
     pub fn get_text_input_for_keyboard(&self, keyboard: &WlKeyboard) -> Option<ZwpTextInputV3> {
@@ -120,6 +158,7 @@ impl Inner {
         for input in self.input_by_seat.values() {
             input.disable();
             input.commit();
+            self.enabled.insert(input.id(), false);
         }
     }
 }
@@ -164,6 +203,23 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
         };
 
         match event {
+            // The compositor's own focus signal for text input. Asking the
+            // input method in when the surface gains that focus is the
+            // protocol's pattern; the keyboard's focus event already does it,
+            // but that path silently does nothing when our keyboard -> seat
+            // mapping is not in place yet, and the input method then stays in
+            // the inactive (English) layout until the window is left and
+            // re-entered.
+            TextInputEvent::Enter { .. } => {
+                if let Some(text_input) = state.text_input.as_ref() {
+                    text_input.set_enabled(input, true);
+                }
+            }
+            TextInputEvent::Leave { .. } => {
+                if let Some(text_input) = state.text_input.as_ref() {
+                    text_input.set_enabled(input, false);
+                }
+            }
             TextInputEvent::PreeditString {
                 text,
                 cursor_begin: _,
