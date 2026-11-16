@@ -132,6 +132,9 @@ pub use config::Config;
 pub use error::{Error, InternalErrorKind};
 #[doc(inline)]
 pub use ts_control::Node as NodeInfo;
+// ThinkTerm (sign-in state): added. What `Device::registration_error` says of a machine control
+// has not let in.
+pub use ts_runtime::control_runner::NOT_LET_IN as REGISTRATION_NOT_LET_IN;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
 use ts_runtime::Spawn;
 

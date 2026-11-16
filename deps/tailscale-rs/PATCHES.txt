@@ -73,10 +73,25 @@ sign-in state (tailscale, ts_runtime)
     Device::current_auth_state, current_self_node and registration_error answer at once with
     where signing in stands; 0.6.1's questions wait until it is done. When control turns the
     device away, the control runner stays in a Failed state that says why, instead of
-    stopping with the reason only in the log.
+    stopping with the reason only in the log. What it says of a machine control knows and
+    has not let in -- one waiting for an admin's approval, as a rule -- is a constant
+    (ts_runtime's control_runner::NOT_LET_IN, tailscale::REGISTRATION_NOT_LET_IN), so that
+    whoever shows the device can tell that wait from an error.
     Used by: the Tailscale panel's status, login link and error message.
     Drop when: upstream offers status queries that do not wait, and reports a refused
     registration.
+
+sign-in retry (ts_runtime)
+    A registration that fails is asked again after a while, as tailscaled does, instead of
+    the control runner staying failed until the device is made anew: a sign-in follow-up
+    whose long poll was cut (the network, an app put away while its user signs in) is asked
+    again with the same address, and anew after two cuts in a row; a device control has not
+    let in asks again every 10 seconds, so it gets in soon after an admin approves it; any
+    other failure after 2 seconds, doubling up to 30. A try after a network or HTTP failure
+    goes on a new connection from the dialer.
+    Used by: thinkterm-tailnet-engine (a node waiting for approval is not stuck; a failed
+    sign-in shows as still connecting).
+    Drop when: upstream retries registration by itself.
 
 shutdown (tailscale)
     Device::stop stops a device that is still shared: gracefully within a timeout, else

@@ -1,4 +1,5 @@
 use core::net::{Ipv4Addr, Ipv6Addr};
+use core::time::Duration;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -43,9 +44,10 @@ enum RegState {
     AuthRequired(url::Url),
     Registered(HttpConn),
     // ThinkTerm (sign-in state): added.
-    /// Control turned the device away, for the reason given. The runner does not try again;
-    /// it stays to say why (see `current_registration_error`) rather than stopping, which would
-    /// leave every question to it unanswered and the reason only in the log.
+    /// The registration failed, or control turned the device away, for the reason given. The
+    /// runner stays to say why (see `current_registration_error`) rather than stopping, which
+    /// would leave every question to it unanswered and the reason only in the log; the
+    /// registration is asked again after a while (sign-in retry, `register_again`).
     Failed(String),
 }
 
@@ -105,21 +107,31 @@ impl kameo::Actor for ControlRunner {
 
                 async move {
                     let mut followup = None;
+                    // ThinkTerm (sign-in retry): the connection the next try goes on, the wait
+                    // before it, and how many follow-ups in a row were cut short.
+                    let mut client = client;
+                    let mut wait = REGISTER_RETRY_FIRST;
+                    let mut cut = 0;
 
                     loop {
                         let result = ts_control::register(
                             &params.config,
                             &params.config.server_url,
                             params.auth_key.as_deref(),
-                            followup,
+                            // ThinkTerm (sign-in retry): kept for a follow-up asked again.
+                            followup.clone(),
                             &params.env.keys,
                             &client,
                         )
                         .await;
 
-                        if let Err(RegistrationError::MachineNotAuthorized(Some(u))) = result {
+                        if let Err(RegistrationError::MachineNotAuthorized(Some(u))) = &result {
+                            let u = u.clone();
                             tracing::warn!(auth_url = %u, "machine not authorized");
                             followup = Some(u.clone());
+                            // ThinkTerm (sign-in retry): a sign-in under way starts afresh.
+                            wait = REGISTER_RETRY_FIRST;
+                            cut = 0;
 
                             let Some(aref) = aref.upgrade() else {
                                 // if the control runner is dead, we should die shortly, no reason
@@ -134,12 +146,53 @@ impl kameo::Actor for ControlRunner {
                             continue;
                         }
 
+                        // ThinkTerm (sign-in retry): a follow-up cut short -- its long poll
+                        // closed under it, by the network or the app put away while its user
+                        // signs in -- is asked again with the same address, the sign-in page
+                        // still open on it, the device still shown as signing in; cut twice in
+                        // a row, the sign-in is asked anew, which gives a new address while it
+                        // is not done. A device control has not let in is no cut.
+                        if let Err(e) = &result
+                            && followup.is_some()
+                            && *e != RegistrationError::MachineNotAuthorized(None)
+                        {
+                            tracing::warn!(error = %e, "sign-in follow-up cut short; asking again");
+                            cut += 1;
+                            if cut >= 2 {
+                                followup = None;
+                                cut = 0;
+                            }
+                            tokio::time::sleep(wait).await;
+                            wait = (wait * 2).min(REGISTER_RETRY_MAX);
+                            client = redial(&params, client).await;
+                            continue;
+                        }
+
                         let Some(aref) = aref.upgrade() else {
                             return;
                         };
-                        drop(aref.tell(RegisterResult(result.map(|_| client))).await);
-
-                        break;
+                        // ThinkTerm (sign-in retry): a registration that failed is told (the
+                        // runner's Failed state, which says why) and asked again after a while,
+                        // as tailscaled does, rather than given up: a control server out of
+                        // reach for a moment, a device waiting for an admin's approval, each
+                        // gets in once it can, without a new runner.
+                        let again = register_again(result.as_ref().err(), wait);
+                        let refreshed = matches!(
+                            result,
+                            Err(RegistrationError::NetworkError | RegistrationError::Internal(_))
+                        );
+                        drop(aref.tell(RegisterResult(result.map(|_| client.clone()))).await);
+                        drop(aref);
+                        let Some(again) = again else {
+                            break;
+                        };
+                        followup = None;
+                        tokio::time::sleep(again).await;
+                        wait = (wait * 2).min(REGISTER_RETRY_MAX);
+                        // On a new connection where the last may be what failed.
+                        if refreshed {
+                            client = redial(&params, client).await;
+                        }
                     }
                 }
             }
@@ -422,15 +475,61 @@ impl Message<RegisterResult> for ControlRunner {
     }
 }
 
+// ThinkTerm (sign-in retry): added.
+/// The wait before a failed registration is asked again, the first time; it doubles with each
+/// failure in a row, up to `REGISTER_RETRY_MAX`.
+const REGISTER_RETRY_FIRST: Duration = Duration::from_secs(2);
+const REGISTER_RETRY_MAX: Duration = Duration::from_secs(30);
+/// How often a device control knows and has not let in asks again: it gets in about this long
+/// after an admin approves it, or its auth key is put right.
+const REGISTER_APPROVAL_POLL: Duration = Duration::from_secs(10);
+
+// ThinkTerm (sign-in retry): added.
+/// When a registration that ended in `failed` (none: it got through) is asked again: never for
+/// one that got through; a device control has not let in at a steady pace; any other failure
+/// after `wait`.
+fn register_again(failed: Option<&RegistrationError>, wait: Duration) -> Option<Duration> {
+    match failed? {
+        RegistrationError::MachineNotAuthorized(None) => Some(REGISTER_APPROVAL_POLL),
+        _ => Some(wait),
+    }
+}
+
+// ThinkTerm (sign-in retry): added.
+/// A new connection to control from the dialer, for a registration asked again; `old` when
+/// none can be had, the try after going on it.
+async fn redial(params: &Params, old: HttpConn) -> HttpConn {
+    match params
+        .env
+        .ask::<DialerActor, _>(
+            None,
+            DialNext {
+                url: params.config.server_url.clone(),
+            },
+            true,
+        )
+        .await
+    {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            tracing::warn!(error = %e, "no new connection to control for a registration retry");
+            old
+        }
+    }
+}
+
+// ThinkTerm (sign-in state): added.
+/// What a registration says when control knows the machine and has not let it in, with no
+/// address to sign in at: it waits for an admin of the tailnet to approve it, or the auth key
+/// it came with is wrong, used up or expired. Whoever shows the device tells it by this.
+pub const NOT_LET_IN: &str = "the control server has not let this machine in: it waits for \
+                              an admin's approval, or its auth key is wrong, used up or expired";
+
 // ThinkTerm (sign-in state): added.
 /// What a failed registration says to whoever looks at the device.
 fn registration_failure(err: &RegistrationError) -> String {
     match err {
-        RegistrationError::MachineNotAuthorized(None) => {
-            "the control server turned this machine away: the auth key may be wrong, used up or \
-             expired"
-                .to_string()
-        }
+        RegistrationError::MachineNotAuthorized(None) => NOT_LET_IN.to_string(),
         RegistrationError::NetworkError => {
             "the control server could not be reached while signing in".to_string()
         }
@@ -580,7 +679,27 @@ impl DialerActor {
 mod tests {
     use ts_control::RegistrationError;
 
-    use super::registration_failure;
+    use super::{
+        REGISTER_APPROVAL_POLL, REGISTER_RETRY_FIRST, register_again, registration_failure,
+    };
+
+    #[test]
+    fn a_failed_registration_is_asked_again() {
+        // Through: not again.
+        assert_eq!(register_again(None, REGISTER_RETRY_FIRST), None);
+        // Waiting for an admin: at a steady pace, so it gets in soon after.
+        let refused = RegistrationError::MachineNotAuthorized(None);
+        assert_eq!(
+            register_again(Some(&refused), core::time::Duration::from_secs(30)),
+            Some(REGISTER_APPROVAL_POLL)
+        );
+        // Anything else: after the wait the caller doubles.
+        let unreachable = RegistrationError::NetworkError;
+        assert_eq!(
+            register_again(Some(&unreachable), core::time::Duration::from_secs(8)),
+            Some(core::time::Duration::from_secs(8))
+        );
+    }
 
     #[test]
     fn a_sign_in_turned_away_says_why() {
