@@ -44,6 +44,12 @@ ThinkTerm ist ein **in Rust geschriebenes Open-Source-Terminal mit integriertem 
       <br><strong>Spaces</strong>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="../assets/screenshots/mobile.jpeg" alt="ThinkTerm auf dem iPhone (Swift) und auf Android (Kotlin)" width="100%">
+      <br><strong>iPhone und Android</strong>
+    </td>
+  </tr>
 </table>
 
 ## Leistung

@@ -44,6 +44,12 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
       <br><strong>空间切换</strong>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="../assets/screenshots/mobile.jpeg" alt="iPhone 版（Swift）和 Android 版（Kotlin）的 ThinkTerm" width="100%">
+      <br><strong>iPhone 和 Android</strong>
+    </td>
+  </tr>
 </table>
 
 ## 性能
