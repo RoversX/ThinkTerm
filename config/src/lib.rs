@@ -284,12 +284,17 @@ pub fn dynamic_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
-pub fn build_default_schemes() -> HashMap<String, Palette> {
-    let mut color_schemes = HashMap::new();
-    for (scheme_name, data) in scheme_data::SCHEMES
+/// Every colour scheme built in, by name with its TOML: upstream's, then
+/// the ones ThinkTerm ships itself.
+pub fn builtin_schemes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    scheme_data::SCHEMES
         .iter()
         .chain(thinkterm_schemes::SCHEMES.iter())
-    {
+}
+
+pub fn build_default_schemes() -> HashMap<String, Palette> {
+    let mut color_schemes = HashMap::new();
+    for (scheme_name, data) in builtin_schemes() {
         let scheme_name = scheme_name.to_string();
         let scheme = ColorSchemeFile::from_toml_str(data).unwrap();
         color_schemes.insert(scheme_name, scheme.colors.clone());

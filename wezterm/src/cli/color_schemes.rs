@@ -54,13 +54,18 @@ fn resolve(name: &str, toml: &str) -> anyhow::Result<Scheme> {
 
 impl ColorSchemesCommand {
     pub fn run(&self) -> anyhow::Result<()> {
-        let mut schemes = Vec::with_capacity(config::scheme_data::SCHEMES.len());
-        for (name, toml) in config::scheme_data::SCHEMES.iter() {
+        let mut schemes = Vec::with_capacity(config::scheme_data::SCHEMES.len() + 1);
+        // ThinkTerm's own among them: the light half of the default is
+        // what a light interface gets, on a page and a phone as here.
+        for (name, toml) in config::builtin_schemes() {
             match resolve(name, toml) {
                 Ok(scheme) => schemes.push(scheme),
                 Err(err) => log::warn!("color scheme {name:?} did not parse: {err:#}"),
             }
         }
+        // By name, as upstream's already are: a picker lists them in
+        // this order.
+        schemes.sort_by_key(|scheme| scheme.name.to_lowercase());
         self.print(&schemes).map_err(crate::stdout_error)
     }
 
