@@ -35,6 +35,12 @@ APP_TEMPLATE = {
 }
 ARCHIVES = (".zip", ".tar.gz", ".tar.xz", ".tgz", ".dmg", ".apk", ".aab", ".ipa", ".deb", ".rpm", ".appimage", ".msi", ".exe")
 HOME = re.compile(rb"(?:/(?:Users|home)/|[A-Za-z]:[\\/]+Users[\\/]+)([A-Za-z_\x80-\xff][A-Za-z0-9_.\x80-\xff-]*)")
+# The same path as tools write it into a file or folder name, its slashes
+# turned into dashes: /Users/<name>/src as -Users-<name>-src (coding agents
+# name their project folders so), C:\Users\<name> as C--Users-<name>. The
+# name ends at the next dash, which is where the path went on. Not after a
+# letter, digit or dash, so words like nav-home-link and --home-dir pass.
+DASHED_HOME = re.compile(rb"(?<![A-Za-z0-9_.-])(?:[A-Za-z]-)?-(?:Users|home)-([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)")
 # Match actual multiline key material, not the header strings used by SSH code.
 PRIVATE_KEY = re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?:\r?\n|\\n)(?:(?:Proc-Type:|DEK-Info:)[^\r\n]+\r?\n)*[\r\n]*(?:[A-Za-z0-9+/=]{32,})(?:\r?\n|\\n)")
 TOKENS = re.compile(rb"(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk-(?:proj-|ant-)[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16})")
@@ -126,8 +132,8 @@ def content_issues(path, data, personal=None):
     issues = set()
     if b"PRIVATE KEY-----" in data and PRIVATE_KEY.search(data):
         issues.add("private-key: remove key material")
-    if any(marker in data for marker in (b"/Users/", b"/home/", b"Users\\", b"Users/")):
-        for match in HOME.finditer(data):
+    if any(marker in data for marker in (b"/Users/", b"/home/", b"Users\\", b"Users/", b"-Users-", b"-home-")):
+        for match in [*HOME.finditer(data), *DASHED_HOME.finditer(data)]:
             user = match[1].lower()
             if user in SAMPLE_USERS:
                 continue

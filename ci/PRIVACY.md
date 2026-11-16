@@ -22,7 +22,8 @@ python3 ci/check-privacy.py --tree HEAD
 ```
 
 Checks cover multiline private keys, selected credential token formats,
-embedded CI credentials, literal home directories, literal SSH IPv4 endpoints,
+embedded CI credentials, literal home directories (also in the dashed form a
+folder named after a path has, `-Users-<name>-src`), literal SSH IPv4 endpoints,
 local credential filenames, generated mobile build output, and release archives
 or app bundles. Use `alice`/`example` and documentation IPs such as `192.0.2.10`
 for fixtures. Existing public upstream examples and specific packaging template

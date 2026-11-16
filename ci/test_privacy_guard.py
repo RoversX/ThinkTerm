@@ -52,6 +52,18 @@ class Rules(unittest.TestCase):
             self.assertTrue(GUARD.content_issues("example.rs", data))
         self.assertFalse(GUARD.content_issues("example.rs", b"/Users/alice/project /home/example/app"))
 
+    def test_home_paths_written_with_dashes(self):
+        # A folder named after a path, as coding agents name theirs.
+        person = b"synthetic-person"
+        for data in (
+            b"/tmp/agent/-Users-" + person + b"-src-app/notes",
+            b'"C--Users-' + person + b'-work"',
+            b"-home-" + person + b"-project",
+        ):
+            self.assertTrue(GUARD.content_issues("example.rs", data), data)
+        for data in (b"/tmp/-Users-alice-project", b"-home-example-app", b"nav-home-link", b"smart-home-hub", b"--home-dir", b"Manage-Users-Page"):
+            self.assertFalse(GUARD.content_issues("example.rs", data), data)
+
     def test_keys_and_runtime_header_strings(self):
         header = b"-----BEGIN " + b"OPENSSH PRIVATE KEY-----"
         self.assertTrue(GUARD.content_issues("key.txt", header + b"\n" + b"A" * 64 + b"\n"))
