@@ -3,8 +3,8 @@ Patches to the vendored tailscale-rs crates
 
 What is here
 ------------
-The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp_core and ts_derp --
-are copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
+The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp_core, ts_derp and
+ts_netmon -- are copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
 ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at them
 ([patch.crates-io]) and keeps them out of the workspace (exclude). Every other tailscale-rs
 crate (ts_keys, ts_tunnel, ...) still comes from crates.io, held at the same version by
@@ -22,18 +22,40 @@ below:
 
 The whole difference from upstream, at any time, against a fresh copy of 0.6.1:
 
-    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp; do
+    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp ts_netmon; do
         curl -sL "https://static.crates.io/crates/$c/$c-0.6.1.crate" | tar xz -C /tmp
         diff -ru "/tmp/$c-0.6.1" "deps/tailscale-rs/$c"
     done
 
 Upstream files this copy does not carry (README.md, examples, tests, Cargo.lock,
 Cargo.toml.orig, .cargo_vcs_info.json) show up as "Only in", and so do the LICENSE and
-PATENTS that ts_runtime, ts_control, ts_netstack_smoltcp_core and ts_derp got from the
-tailscale crate, as they ship without them. All of that is expected.
+PATENTS that ts_runtime, ts_control, ts_netstack_smoltcp_core, ts_derp and ts_netmon got
+from the tailscale crate, as they ship without them. All of that is expected.
 
 The changes
 -----------
+ios (ts_netmon)
+    The network monitor's macOS code is for every Apple system: each `target_os = "macos"`
+    in the crate's sources and its Cargo.toml is `target_vendor = "apple"`, and nothing
+    else is changed. iOS has the same route socket and sysctl dumps; 0.6.1 has a monitor
+    for macOS, Linux and Windows only, so the library does not build for a phone.
+    Redoing it on a new version, from a fresh copy of the crate:
+        grep -rl 'target_os = "macos"' src Cargo.toml | xargs sed -i '' \
+            's/target_os = "macos"/target_vendor = "apple"/g'
+    Used by: the phone app, which holds a node of its own (thinkterm-mobile's tailnet.rs).
+    Drop when: upstream's monitor builds for iOS.
+
+android (ts_netmon)
+    `PlatformMon` is re-exported only where the crate has one (Windows, Linux, Apple); 0.6.1
+    re-exports it everywhere, so the crate does not build for Android, which Rust counts as
+    a system of its own rather than Linux. There `platform_mon()` is None, as upstream
+    already has it for systems with no monitor, and the runtime runs without one: no
+    local-network endpoints are offered and a change of network is not seen, while DERP
+    and the STUN-found address carry the connections. The Linux monitor is not borrowed
+    for Android: it binds NETLINK_ROUTE, which apps targeting Android 11 and up may not.
+    Used by: the phone app on Android (thinkterm-mobile's tailnet.rs).
+    Drop when: upstream builds for Android, or a monitor for it is written.
+
 peer list (tailscale, ts_runtime)
     Device::peers lists every peer in the tailnet; 0.6.1 only looks one up by name or
     address. The peer tracker also answers at once when a netmap shows the tailnet has no

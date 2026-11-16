@@ -10765,8 +10765,6 @@ dependencies = [
 [[package]]
 name = "ts_netmon"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9db3f993efce5c30bd72dda4d9b2036945aa13ef160b2626d77b2f6adaf47fea"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",

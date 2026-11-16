@@ -480,3 +480,6 @@ ts_control = {path="deps/tailscale-rs/ts_control", version="0.6.1"}
 # the dial and the frame's parse), and so that a connection gone quiet is
 # noticed rather than waited on for good.
 ts_derp = {path="deps/tailscale-rs/ts_derp", version="0.6.1"}
+# Vendored so that the library builds for iOS: 0.6.1 watches the network on
+# macOS, Linux and Windows only, and iOS has what the macOS monitor uses.
+ts_netmon = {path="deps/tailscale-rs/ts_netmon", version="0.6.1"}
