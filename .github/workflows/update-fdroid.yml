@@ -1,0 +1,43 @@
+# Once a release is published -- from the web UI, which is what creates its
+# tag -- asks the F-Droid repository to rebuild. That repository's own
+# workflow downloads the APKs from the releases and signs its index: only
+# the tag is sent, and only for its log.
+# Needs the FDROID_TOKEN secret, a token that may run the fdroid repository's
+# Actions.
+name: Update F-Droid repository
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  update-fdroid:
+    # A prerelease is not what F-Droid should offer as an update.
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask the F-Droid repository to update
+        env:
+          FDROID_TOKEN: ${{ secrets.FDROID_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # A warning, shown on the run's page: a release published without
+          # it leaves phones on the old version with every check green.
+          if [[ -z "${FDROID_TOKEN}" ]]; then
+            echo "::warning::FDROID_TOKEN is not configured; the F-Droid repository was not asked to update."
+            exit 0
+          fi
+
+          jq -nc --arg tag "$TAG" '{ref: "main", inputs: {tag: $tag}}' \
+            | curl -fsS -X POST \
+                -H "Authorization: Bearer ${FDROID_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${OWNER}/fdroid/actions/workflows/update.yml/dispatches" \
+                --data @-

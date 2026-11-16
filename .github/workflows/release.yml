@@ -680,9 +680,138 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # The phone app ships with every release, never on its own: it speaks the
+  # mux codec of the commit it was built from and connects only to servers
+  # on that same codec, so each release builds it from the same commit as
+  # the servers and gives it their version. It has no deselect box for the
+  # same reason.
+  android:
+    name: android arm64
+    needs: [prepare, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The app signing key is this environment's secret, as the macOS
+    # certificate is: a run only reaches it once it is approved.
+    environment: release
+
+    env:
+      TAG_NAME: ${{ needs.prepare.outputs.version }}
+      # The one android/build.sh was last checked with; build.sh itself
+      # takes whichever NDK is newest on a developer's machine.
+      ANDROID_NDK_VERSION: 29.0.14206865
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        run: bash ci/check-submodules.sh
+
+      # A release that would ship without the app stops here, a minute in.
+      # A test build without the key goes on and leaves the APK unsigned.
+      - name: Check signing credentials
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -eu
+          if [ -z "$ANDROID_KEYSTORE" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            if [ "$PUBLISH" = true ]; then
+              echo "::error::the ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD secrets are not both set"
+              exit 1
+            fi
+            echo "::warning::no Android signing key; this build's APK is unsigned"
+          fi
+
+      # See the macos job: the version comes from .tag, not from git.
+      - name: Stamp version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: echo "$RELEASE_TAG" > .tag
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: android-arm64
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # The bindings generator is built for the runner itself.
+      - name: Install system deps
+        run: env CI=yes PATH=$PATH ./get-deps
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Install Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The Gradle android/gradle-dist holds on a developer's machine.
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: 8.14.3
+
+      - name: Install the NDK
+        run: |
+          set -eu
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses >/dev/null
+          "$sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      # The colour schemes the app lists come from the browser bundle.
+      - name: Fetch the browser bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-bundle
+          path: thinkterm-web/www
+
+      # The version reaches the script through env, as in the macos job.
+      - name: Build
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          THINKTERM_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          THINKTERM_ANDROID_KEY_ALIAS: thinkterm
+        run: |
+          set -eu
+          if [ -n "$ANDROID_KEYSTORE" ]; then
+            ( umask 077; printf '%s' "$ANDROID_KEYSTORE" | base64 -d > "$RUNNER_TEMP/android.p12" )
+            export THINKTERM_ANDROID_KEYSTORE="$RUNNER_TEMP/android.p12"
+          fi
+          android/build.sh release "$TAG_NAME"
+          rm -f "$RUNNER_TEMP/android.p12"
+          out=android/app/build/outputs/apk/release
+          if [ -f "$out/ThinkTerm-android-arm64-$TAG_NAME.apk" ]; then
+            mv "$out/ThinkTerm-android-arm64-$TAG_NAME.apk" .
+          else
+            mv "$out/app-release-unsigned.apk" "ThinkTerm-android-arm64-$TAG_NAME-unsigned.apk"
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-arm64
+          path: ThinkTerm-android-arm64-*.apk
+          if-no-files-found: error
+          retention-days: 3
+
   publish:
     name: publish
-    needs: [prepare, macos, windows, linux]
+    needs: [prepare, macos, windows, linux, android]
     # Runs even when some platforms were deselected (those jobs report as
     # skipped), but never after a real failure -- half a release is worse than
     # none.
