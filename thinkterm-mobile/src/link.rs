@@ -135,6 +135,36 @@ impl SshLink {
         self.0.open.get()
     }
 
+    /// Leave this device's file at `path` on the host as `name`, on a
+    /// channel beside the protocol's; the network thread says how it goes
+    /// (`Net::UploadProgress`) and how it ended (`Net::Uploaded`) for
+    /// `id`. False when there is no connection to send it on.
+    pub fn upload(&self, id: u64, name: String, path: String) -> bool {
+        let out = self.0.out.borrow();
+        match out.as_ref().filter(|_| self.0.open.get()) {
+            Some(out) => out.send(Out::Upload { id, name, path }).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Give upload `id` up.
+    pub fn cancel_upload(&self, id: u64) {
+        if let Some(out) = self.0.out.borrow().as_ref() {
+            let _ = out.send(Out::CancelUpload(id));
+        }
+    }
+
+    /// See whether the open connection still carries anything; one that
+    /// does not closes as it would have on its own, only now.
+    pub fn probe(&self) {
+        if !self.0.open.get() {
+            return;
+        }
+        if let Some(out) = self.0.out.borrow().as_ref() {
+            let _ = out.send(Out::Probe);
+        }
+    }
+
     /// Bytes from the wire. Decodes every whole PDU in them, answers
     /// requests and hands pushes on; a partial PDU waits for more.
     pub fn feed(&self, bytes: &[u8]) -> Result<()> {

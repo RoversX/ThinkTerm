@@ -47,6 +47,8 @@ pub struct MobilePlatform {
     backing: Cell<(u32, u32)>,
     /// The shell has this connection's terminal on screen, in front.
     shown: Cell<bool>,
+    /// The shell shows one pane at a time (`Platform::one_pane`).
+    one_pane: Cell<bool>,
 }
 
 impl MobilePlatform {
@@ -74,12 +76,18 @@ impl MobilePlatform {
             rng: Cell::new(seed),
             backing: Cell::new((0, 0)),
             shown: Cell::new(true),
+            one_pane: Cell::new(false),
         }
     }
 
     /// Returns whether it changed.
     pub fn set_shown(&self, shown: bool) -> bool {
         self.shown.replace(shown) != shown
+    }
+
+    /// Returns whether it changed.
+    pub fn set_one_pane(&self, one: bool) -> bool {
+        self.one_pane.replace(one) != one
     }
 
     /// The surface's size in device pixels and its scale, from the shell.
@@ -180,6 +188,12 @@ impl Platform for MobilePlatform {
         72.0
     }
 
+    /// A reconnect that finds the host on another release says it as the
+    /// first connection does: which side to update.
+    fn protocol_mismatch_text(&self, mismatch: &thinkterm_web::attach::ProtocolMismatch) -> Option<String> {
+        Some(crate::core::mismatch_text(mismatch))
+    }
+
     fn spawn(&self, fut: LocalFuture<()>) {
         if let Err(err) = self.spawner.spawn_local(fut) {
             log::error!("the core executor refused a task: {err}");
@@ -244,6 +258,10 @@ impl Platform for MobilePlatform {
 
     fn bare_lone_pane(&self) -> bool {
         true
+    }
+
+    fn one_pane(&self) -> bool {
+        self.one_pane.get()
     }
 
     fn shown(&self) -> bool {

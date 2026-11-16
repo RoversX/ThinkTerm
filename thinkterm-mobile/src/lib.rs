@@ -20,7 +20,9 @@ mod icons;
 mod link;
 pub mod painter;
 mod platform;
+mod qr;
 mod ssh;
+mod tailnet;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -163,6 +165,10 @@ pub struct ViewSet {
     pub tree: String,
     pub sidebar: String,
     pub navs: String,
+    /// The panes of the tab on show (`App::panes_view`).
+    pub panes: String,
+    /// The Agents panel (`App::agents_view`).
+    pub agents: String,
     pub status: String,
     pub layout: String,
 }
@@ -178,6 +184,8 @@ impl Default for ViewSet {
             tree: null(),
             sidebar: null(),
             navs: null(),
+            panes: null(),
+            agents: null(),
             status: null(),
             layout: null(),
         }
@@ -196,6 +204,100 @@ pub struct TabIcon {
     pub mask: Vec<u8>,
 }
 
+/// Something drawn for the shell to show as it is: `width` by `height`
+/// pixels, four bytes each, red first, the colours already multiplied by
+/// how opaque they are.
+#[derive(uniffi::Record)]
+pub struct Picture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// The icons of what a thread's panes run, as its row leads with them on
+/// the desktop: the first card and at its corner the second, or a disc
+/// for how many more there are.
+#[derive(uniffi::Record)]
+pub struct CardsPicture {
+    pub picture: Picture,
+    /// How far in from the picture's edges the icons' own box starts, in
+    /// pixels: the room their shadows fall in.
+    pub inset: u32,
+    /// The box's width in pixels, the room a row keeps for its icons
+    /// however many there are; it is as high as the first icon.
+    pub slot: u32,
+    /// The programs past the first, when a disc stands for them: the
+    /// shell writes the number on it.
+    pub count: Option<CardsCount>,
+}
+
+/// The disc in a `CardsPicture`: its corner in the picture and how wide
+/// it is, in pixels.
+#[derive(uniffi::Record)]
+pub struct CardsCount {
+    pub more: u32,
+    pub x: f32,
+    pub y: f32,
+    pub diameter: f32,
+}
+
+/// A thread's mark as the desktop's sidebar draws it: one picture for a
+/// mark at rest, and for one that moves a picture for each step of its
+/// turn, the one on show being `(now / step_ms) % frames` by the wall
+/// clock, so that every mark steps together. Each is `side` pixels square
+/// with the mark in its middle, as a `Picture`'s pixels are.
+#[derive(uniffi::Record)]
+pub struct MarkPictures {
+    pub side: u32,
+    pub frames: Vec<Vec<u8>>,
+    pub step_ms: u32,
+}
+
+/// The mark of a thread whose row says `status` and `dot` (a `ThreadRow`'s,
+/// as the sidebar's rows spell them) and whether it is `live`, `size`
+/// pixels across; `status` "Failed" for a row that says `failed`, which
+/// has a mark of its own. `dark` is the appearance of what it is shown on,
+/// whose text a mark at rest may be coloured as. None for words no row
+/// says.
+#[uniffi::export]
+pub fn thread_mark(status: String, dot: String, live: bool, size: u32, dark: bool) -> Option<MarkPictures> {
+    use thinkterm_tab_icons::look;
+    let word = |word: String| serde_json::Value::String(word);
+    let (mark, tone) = if status == "Failed" {
+        thinkterm_web::tree::failed_mark()
+    } else {
+        let status = serde_json::from_value(word(status)).ok()?;
+        let dot = serde_json::from_value(word(dot)).ok()?;
+        thinkterm_web::tree::thread_mark(status, dot, live)
+    };
+    let (color, alpha) = match tone {
+        look::Tone::Color(color) => (look::status_srgb(color, dark), 1.0),
+        look::Tone::Text(alpha) if dark => (thinkterm_tab_icons::WHITE, alpha),
+        look::Tone::Text(alpha) => (thinkterm_tab_icons::Rgb(0, 0, 0), alpha),
+    };
+    let size = (size as f32).clamp(1.0, icons::MAX_PICTURE / look::TICK_SCALE);
+    let side = look::mark_side(size) as u32;
+    let steps = if mark == look::Mark::Working { look::MARK_STEPS } else { 1 };
+    let frames = (0..steps)
+        .map(|step| icons::picture(&look::mark_svg(mark, Some(step), size, color, alpha), side, side))
+        .collect::<Option<Vec<_>>>()?;
+    Some(MarkPictures { side, frames, step_ms: look::MARK_STEP_MS as u32 })
+}
+
+/// How an upload stands (`Core::upload_status`): how much of it has gone,
+/// and once it is `done` where the file is on the host and that path as a
+/// shell reads it, a space after it -- what the desktop pastes for a file
+/// dropped on a remote terminal -- or why there is none.
+#[derive(uniffi::Record, Clone, Default)]
+pub struct UploadStatus {
+    pub sent: u64,
+    pub total: u64,
+    pub done: bool,
+    pub path: String,
+    pub paste: String,
+    pub error: String,
+}
+
 /// What the core thread last published for the shell to read. The lock
 /// is held only to copy in or out, never while anything is made.
 pub(crate) struct Published {
@@ -205,6 +307,9 @@ pub(crate) struct Published {
     /// a count of their own: output changes them and no view.
     pub screen: String,
     pub screen_revision: u64,
+    /// The uploads under way and those done whose end the shell has yet
+    /// to read (`Core::upload_status`, which forgets them), by id.
+    pub uploads: std::collections::HashMap<u64, UploadStatus>,
 }
 
 impl Default for Published {
@@ -213,6 +318,7 @@ impl Default for Published {
             views: ViewSet::default(),
             screen: "null".into(),
             screen_revision: 0,
+            uploads: Default::default(),
         }
     }
 }
@@ -479,6 +585,32 @@ impl Core {
         })
     }
 
+    /// The cards `ids` (a thread row's `icons`, or one tab's `icon`) as one
+    /// picture, the first `diameter` pixels across, lit and shadowed as the
+    /// desktop's are (`thinkterm_tab_icons::look`); `scale` is how many
+    /// pixels a point is and `dark` the appearance of what they are shown
+    /// on. With `glyphs` false the circles are bare, for a spinner. Ids
+    /// there is no card for are left out; none for none left. Drawn on the
+    /// caller's thread, and kept by the shell as `tab_icon`'s are.
+    pub fn cards_picture(&self, ids: Vec<String>, diameter: u32, scale: f32, dark: bool, glyphs: bool) -> Option<CardsPicture> {
+        use thinkterm_tab_icons::look;
+        let cards: Vec<_> = ids.iter().filter_map(|id| self.icons.card(id)).collect();
+        let diameter = (diameter as f32).clamp(1.0, icons::MAX_SIZE as f32);
+        let drawn = look::cards_svg(&cards.iter().collect::<Vec<_>>(), diameter, scale.clamp(1.0, 4.0), dark, glyphs)?;
+        let (width, height) = (drawn.width as u32, drawn.height as u32);
+        Some(CardsPicture {
+            picture: Picture { width, height, rgba: icons::picture(&drawn.svg, width, height)? },
+            inset: drawn.inset as u32,
+            slot: drawn.slot as u32,
+            count: drawn.count.map(|count| CardsCount {
+                more: count.more as u32,
+                x: count.x,
+                y: count.y,
+                diameter: count.diameter,
+            }),
+        })
+    }
+
     /// Counts the changes to the cards `tab_icon` draws: each connection
     /// brings its host's. What a shell drew before a change is stale.
     pub fn tab_icons_revision(&self) -> u64 {
@@ -505,6 +637,93 @@ impl Core {
     /// another device and marks no result as seen.
     pub fn set_shown(&self, shown: bool) {
         let _ = self.tx.send(core::Cmd::SetShown(shown));
+    }
+
+    /// An upload's id, for `upload_file`, `upload_status` and
+    /// `cancel_upload`: asked as a file is chosen, before it is made ready
+    /// to go (copied, loaded), which can take a while. Its path goes, once
+    /// it is through, into the pane focused now -- not whichever has the
+    /// focus by the time the file is ready. One whose file could not be
+    /// made ready is given up (`cancel_upload`).
+    pub fn upload_begin(&self) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let _ = self.tx.send(core::Cmd::UploadFor(id));
+        id
+    }
+
+    /// Leave this device's file at `path` on the host as `name`, in the
+    /// folder the desktop puts what is dropped on a remote terminal
+    /// (`~/ThinkTerm_Uploads`) and under another name where that one is
+    /// taken, over the connection's own ssh session beside the terminal:
+    /// upload `id` (`upload_begin`). The file is read as it goes and may
+    /// be any size; it must stay where it is until the upload is done.
+    /// Returns at once.
+    pub fn upload_file(&self, id: u64, name: String, path: String) {
+        let total = std::fs::metadata(&path).map(|file| file.len()).unwrap_or(0);
+        if let Ok(mut published) = self.published.lock() {
+            published.uploads.insert(id, UploadStatus { total, ..Default::default() });
+        }
+        if self.tx.send(core::Cmd::Upload { id, name, path }).is_err() {
+            if let Ok(mut published) = self.published.lock() {
+                published.uploads.remove(&id);
+            }
+        }
+    }
+
+    /// How upload `id` stands; none for one there is no word of. One
+    /// that is done is forgotten once this has said so.
+    pub fn upload_status(&self, id: u64) -> Option<UploadStatus> {
+        let mut published = self.published.lock().ok()?;
+        let mut status = published.uploads.get(&id)?.clone();
+        if status.done {
+            published.uploads.remove(&id);
+            if status.error.is_empty() {
+                match shlex::try_quote(&status.path) {
+                    Ok(quoted) => status.paste = format!("{quoted} "),
+                    Err(_) => status.error = "the host named the file oddly".into(),
+                }
+            }
+        }
+        Some(status)
+    }
+
+    /// Give upload `id` up: nothing of it is kept on the host. Also for
+    /// one begun whose file could not be made ready.
+    pub fn cancel_upload(&self, id: u64) {
+        let _ = self.tx.send(core::Cmd::CancelUpload(id));
+    }
+
+    /// The device came back to the app, or its network changed: a
+    /// connection that went with the wait is found out now (within a few
+    /// seconds) rather than when its keep-alives give up, and one already
+    /// down is tried again at once rather than after the wait its failures
+    /// earned.
+    pub fn check_connection(&self) {
+        let _ = self.tx.send(core::Cmd::CheckConnection);
+    }
+
+    /// Paste a finished upload's `paste` (`UploadStatus`) into the pane the
+    /// upload was started from -- not whichever has the focus now -- if
+    /// that pane is still on show; otherwise nothing is pasted.
+    pub fn paste_upload(&self, id: u64, text: String) {
+        let _ = self.tx.send(core::Cmd::PasteUpload { id, text });
+    }
+
+    /// Whether the shell shows one pane of a tab at a time, whole, for
+    /// want of room for a split's panes side by side: the pane on show is
+    /// zoomed and the others are listed in `ViewSet::panes`, a "pane"
+    /// click on one showing it instead. Off, the split is drawn whole,
+    /// each pane under its bar.
+    pub fn set_one_pane(&self, one: bool) {
+        let _ = self.tx.send(core::Cmd::OnePane(one));
+    }
+
+    /// Whether the shell shows this connection's views -- its threads, in
+    /// a list with other hosts' -- while its terminal is off screen: they
+    /// are kept current for it, which `set_shown(false)` alone stops.
+    pub fn set_views_listed(&self, listed: bool) {
+        let _ = self.tx.send(core::Cmd::ListViews(listed));
     }
 
     /// One of the App's views as JSON: "tabs", "threads", "tree",
@@ -574,6 +793,27 @@ impl Core {
         let _ = self.tx.send(core::Cmd::Pointer { kind, x, y });
     }
 
+    /// A mouse on the terminal, in points, as the desktop takes one: "down",
+    /// "move" or "up" of `button` (0 left, 1 middle, 2 right), `held`
+    /// whether a button is down -- a move with none is a hover -- and the
+    /// modifiers held. A press focuses the pane under it; a drag selects,
+    /// a double or triple press a word or a line; a program that asked for
+    /// the mouse gets it, unless Shift holds it back for the selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mouse(&self, kind: String, x: f64, y: f64, button: u8, held: bool, shift: bool, ctrl: bool, alt: bool) {
+        let mut mods = wezterm_term::KeyModifiers::NONE;
+        if shift {
+            mods |= wezterm_term::KeyModifiers::SHIFT;
+        }
+        if ctrl {
+            mods |= wezterm_term::KeyModifiers::CTRL;
+        }
+        if alt {
+            mods |= wezterm_term::KeyModifiers::ALT;
+        }
+        let _ = self.tx.send(core::Cmd::Mouse { kind, x, y, button, held, mods });
+    }
+
     /// Scroll at a point by `lines`; positive is back into history.
     pub fn wheel(&self, x: f64, y: f64, lines: f64) {
         let _ = self.tx.send(core::Cmd::Wheel { x, y, lines });
@@ -597,6 +837,17 @@ impl Core {
     /// none to follow the host's own scheme. Kept like a setting.
     pub fn set_palette(&self, scheme: Option<String>) {
         let _ = self.tx.send(core::Cmd::SetPalette(scheme));
+    }
+
+    /// While following the host's scheme (`set_palette(None)`): the scheme
+    /// to draw in instead when the host's configuration chose none -- the
+    /// light default on a light screen, as the desktop does -- and
+    /// `unchosen`, the scheme a host fills in when its configuration names
+    /// none ("Apple System Colors"), which is no choice either. Both as
+    /// `set_palette` takes them; none to draw the host's scheme whatever it
+    /// is. Kept like a setting.
+    pub fn set_fallback_palette(&self, scheme: Option<String>, unchosen: Option<String>) {
+        let _ = self.tx.send(core::Cmd::SetFallbackPalette { scheme, unchosen });
     }
 
     /// Scale the focused pane's font by a tenth per step; 0 resets.

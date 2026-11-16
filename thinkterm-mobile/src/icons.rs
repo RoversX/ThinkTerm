@@ -1,5 +1,8 @@
-//! The cards heading tabs and pane capsules (`thinkterm_tab_icons`), with
-//! each glyph drawn into a coverage mask the shell tints, as the desktop's
+//! The cards heading tabs and pane capsules (`thinkterm_tab_icons`), and
+//! the pictures the shell shows of them and of a thread's mark: how they
+//! look is said once for every client (`thinkterm_tab_icons::look`), and
+//! drawn here into pixels, so the shell draws nothing of its own. A glyph
+//! on its own is still a coverage mask the shell tints, as the desktop's
 //! atlas does. The built-in cards are alike on every machine; a machine's
 //! restyled and imported ones live in its desktop's settings, which the
 //! network thread reads over the connection's own ssh session (`ssh`), as
@@ -220,9 +223,80 @@ fn draw(svg: &str, size: u32) -> Option<Vec<u8>> {
     Some(pixmap.data().chunks_exact(4).map(|pixel| pixel[3]).collect())
 }
 
+/// `svg` drawn as it is, `width` by `height` pixels: four bytes a pixel,
+/// red first, the colours already multiplied by how opaque they are. None
+/// for one that does not draw.
+pub fn picture(svg: &str, width: u32, height: u32) -> Option<Vec<u8>> {
+    // A card's glyph is a host's own SVG; see `mask`.
+    std::panic::catch_unwind(|| paint(svg, width, height)).ok().flatten()
+}
+
+fn paint(svg: &str, width: u32, height: u32) -> Option<Vec<u8>> {
+    let mut options = resvg::usvg::Options::default();
+    options.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &options).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    Some(pixmap.take())
+}
+
+/// The largest picture of a row's icons or of a mark, in pixels a side.
+pub const MAX_PICTURE: f32 = 1024.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_s_icons_and_a_mark_draw_as_the_look_says() {
+        use thinkterm_tab_icons::look;
+        let catalog = catalog();
+        let terminal = catalog.cards.iter().find(|card| card.id == catalog.terminal).unwrap();
+        let cards = look::cards_svg(&[terminal], 40.0, 2.0, true, true).unwrap();
+        let (width, height) = (cards.width as u32, cards.height as u32);
+        let pixels = picture(&cards.svg, width, height).expect("a picture");
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+        let at = |x: f32, y: f32| {
+            let i = ((y as u32 * width + x as u32) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let circle = thinkterm_tab_icons::Rgb::parse(&terminal.circle).unwrap();
+        // Just inside the rim at the top the fill is at its lightest, and
+        // at the foot at its darkest; both are whole.
+        let top = at(cards.inset + 20.0, cards.inset + 4.0);
+        let foot = at(cards.inset + 20.0, cards.inset + 35.0);
+        let near = |pixel: [u8; 4], color: thinkterm_tab_icons::Rgb| {
+            pixel[3] == 255
+                && (pixel[0] as i32 - color.0 as i32).abs() <= 6
+                && (pixel[1] as i32 - color.1 as i32).abs() <= 6
+                && (pixel[2] as i32 - color.2 as i32).abs() <= 6
+        };
+        assert!(near(top, look::lighten(circle, look::PLATE.fill_top_lighten)), "{top:?}");
+        assert!(near(foot, look::darken(circle, look::PLATE.fill_bottom_darken)), "{foot:?}");
+        // The glyph is on it, in its own colour, and the shadow under it:
+        // some of it below the circle, none above.
+        let glyph = thinkterm_tab_icons::Rgb::parse(&terminal.glyph).unwrap();
+        let on_glyph = (0..40).flat_map(|y| (0..40).map(move |x| (x, y))).any(|(x, y)| {
+            let pixel = at(cards.inset + x as f32, cards.inset + y as f32);
+            pixel[..3] == [glyph.0, glyph.1, glyph.2]
+        });
+        assert!(on_glyph, "the glyph is drawn in the card's glyph colour");
+        let below = at(cards.inset + 20.0, cards.inset + 44.0)[3];
+        assert!(below > 0 && below < 255, "{below}");
+        assert_eq!(at(cards.inset + 20.0, 0.0)[3], 0);
+
+        // A working mark: nine pixels, the run's head whole and the rest
+        // fainter; a finished one a tick in the same square.
+        let color = look::srgb(look::WORKING);
+        let side = look::mark_side(20.0) as u32;
+        let mark = picture(&look::mark_svg(look::Mark::Working, Some(0), 20.0, color, 1.0), side, side).unwrap();
+        let alphas: Vec<u8> = mark.chunks_exact(4).map(|pixel| pixel[3]).collect();
+        assert!(alphas.contains(&255) && alphas.contains(&0));
+        assert!(alphas.iter().any(|&a| (40..=50).contains(&a)), "an unlit pixel is 0.18 there");
+        let tick = picture(&look::mark_svg(look::Mark::Finished, None, 20.0, look::srgb(look::FINISHED), 1.0), side, side).unwrap();
+        assert!(tick.chunks_exact(4).any(|pixel| pixel[3] > 200), "the tick is drawn");
+        assert!(tick.chunks_exact(4).any(|pixel| pixel[3] == 0));
+    }
 
     #[test]
     fn the_built_in_cards_carry_their_glyphs() {

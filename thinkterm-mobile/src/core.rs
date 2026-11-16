@@ -28,7 +28,7 @@ use thinkterm_font_core::FontShaper as _;
 use thinkterm_font_web::{Face, FontSet};
 use thinkterm_render::pipeline::GpuTexture;
 use thinkterm_web::app::{build_session, grid_for, App, PaneCell, Setup};
-use thinkterm_web::attach::{attach, Attached};
+use thinkterm_web::attach::{attach, Attached, ProtocolMismatch};
 use thinkterm_web::glyphs::GlyphCache;
 use thinkterm_web::gpu::Gpu;
 use thinkterm_web::host::AppHost;
@@ -99,6 +99,24 @@ pub enum Cmd {
         name: String,
         reply: Sender<String>,
     },
+    /// Upload `id` is begun: its path goes into the pane focused now.
+    UploadFor(u64),
+    /// A file of this device's for the host's uploads folder; how it
+    /// goes is kept in `Published::uploads` under `id`.
+    Upload {
+        id: u64,
+        name: String,
+        path: String,
+    },
+    CancelUpload(u64),
+    /// `Core::check_connection`.
+    CheckConnection,
+    /// Upload `id` is done: its path goes into the pane it was started
+    /// from, if that one is still on show.
+    PasteUpload {
+        id: u64,
+        text: String,
+    },
     ChromeClick {
         action: String,
         pane: Option<u32>,
@@ -128,6 +146,15 @@ pub enum Cmd {
         kind: String,
         x: f64,
         y: f64,
+    },
+    /// A mouse's, which hovers, has buttons of its own and modifiers held.
+    Mouse {
+        kind: String,
+        x: f64,
+        y: f64,
+        button: u8,
+        held: bool,
+        mods: KeyModifiers,
     },
     Wheel {
         x: f64,
@@ -163,10 +190,20 @@ pub enum Cmd {
         value: String,
     },
     SetPalette(Option<String>),
+    /// `Core::set_fallback_palette`.
+    SetFallbackPalette {
+        scheme: Option<String>,
+        unchosen: Option<String>,
+    },
     SetShown(bool),
+    /// The shell shows one pane of a tab at a time, or the split whole.
+    OnePane(bool),
     /// The shell read `Core::views` for the first time.
     ViewsRead,
     WantScreen(bool),
+    /// The shell shows the views though the terminal is off screen: a list
+    /// of this host's threads among other hosts'.
+    ListViews(bool),
     TextBetween {
         anchor: (usize, usize),
         head: (usize, usize),
@@ -240,10 +277,29 @@ struct State {
     conn: Conn,
     status: String,
     composing: bool,
+    /// The pane each upload under way was started from, where its path is
+    /// pasted once it lands, and the server it is on (`server_id` then): a
+    /// pane id is another terminal's once the server has started anew. An
+    /// entry goes when its upload ends.
+    upload_panes: std::collections::HashMap<u64, (thinkterm_proto::PaneId, Option<String>)>,
+    /// The host each upload begun was begun on (`icons_host` then): one
+    /// whose host has changed by the time its file is ready -- edited and
+    /// connected to again -- is not sent to the new one.
+    upload_hosts: std::collections::HashMap<u64, Option<(String, u16, String)>>,
+    /// The server the App is attached to, by its id.
+    server_id: Option<String>,
+    /// The tab the App before zoomed for want of room, and the server it
+    /// is on: handed to the next App on that server, which puts it back
+    /// when it leaves it (`App::one_pane_zoomed`).
+    one_pane_zoomed: Option<(String, (thinkterm_proto::TabId, thinkterm_proto::PaneId))>,
     /// The shell's preferences, applied to each App as it is made.
     settings: Vec<(String, String)>,
     /// The chosen scheme's colours as JSON, applied to every App made.
     palette: Option<String>,
+    /// The scheme for a host that chose none, and the one such a host's
+    /// palette may be besides the built-in (`Cmd::SetFallbackPalette`),
+    /// as JSON; applied to every App made.
+    fallback: Option<(String, Option<String>)>,
     /// A scheme was chosen while the terminal was off screen or the link
     /// down, when the App tells the server nothing of it: told when it is
     /// shown again over a link that is up (`tell_palette`).
@@ -256,6 +312,9 @@ struct State {
     views_dirty: Rc<Cell<bool>>,
     /// The shell's text input reads the rows: keep them current.
     screen_wanted: bool,
+    /// The views are on show without the terminal (`Cmd::ListViews`): they
+    /// are made off screen too.
+    views_listed: bool,
     /// The tab icon cards on show, shared with the shell's thread, which
     /// draws them: the built-in ones, then the host's (`Net::TabIcons`).
     icons: Arc<icons::Shown>,
@@ -341,13 +400,19 @@ impl State {
             conn: Conn::Idle,
             status: String::new(),
             composing: false,
+            upload_panes: Default::default(),
+            upload_hosts: Default::default(),
+            server_id: None,
+            one_pane_zoomed: None,
             settings: Vec::new(),
             palette: None,
+            fallback: None,
             palette_untold: false,
             published,
             views_read,
             views_dirty: Rc::new(Cell::new(true)),
             screen_wanted: false,
+            views_listed: false,
             icons,
             icons_host: None,
             screen_dirty: false,
@@ -368,7 +433,7 @@ impl State {
             wait = wait.min(due.saturating_duration_since(now));
         }
         let owed = self.views_dirty.get() || (self.screen_dirty && self.screen_wanted);
-        if owed && self.platform.shown() {
+        if owed && (self.platform.shown() || (self.views_listed && self.views_dirty.get())) {
             wait = wait.min((self.views_made + VIEWS_EVERY).saturating_duration_since(now));
         }
         wait
@@ -380,13 +445,14 @@ impl State {
     /// every frame. Called between commands, never from inside the App,
     /// whose state the views borrow.
     fn publish_views(&mut self) {
-        if !self.platform.shown() {
+        if !self.platform.shown() && !self.views_listed {
             // Nobody looks at a terminal off screen (the app in the back,
-            // the hosts in front): what changed is made once it is back.
+            // another host's in front): what changed is made once it is
+            // back. A list of its threads is looked at, and kept current.
             return;
         }
         let views_dirty = self.views_dirty.get();
-        if !self.screen_wanted {
+        if !self.screen_wanted || !self.platform.shown() {
             // Rows nobody reads are not made at each paint.
             self.screen_dirty = false;
         }
@@ -402,7 +468,7 @@ impl State {
         self.views_made = now;
         let views = (views_dirty && self.views_read.load(Ordering::Relaxed)).then(|| self.view_set());
         // A change of view (another pane focused) changes the rows too.
-        let rows = self.screen_wanted.then(|| self.screen_json());
+        let rows = (self.screen_wanted && self.platform.shown()).then(|| self.screen_json());
         let fresh = std::mem::take(&mut self.screen_fresh);
         if let Ok(mut published) = self.published.lock() {
             if let Some(mut views) = views {
@@ -432,6 +498,8 @@ impl State {
             tree: self.view("tree"),
             sidebar: self.view("sidebar"),
             navs: self.view("navs"),
+            panes: self.view("panes"),
+            agents: self.view("agents"),
             status: self.view("status"),
             layout: self.view("layout"),
         }
@@ -563,6 +631,53 @@ impl State {
             Cmd::View { name, reply } => {
                 let _ = reply.send(self.view(&name));
             }
+            Cmd::UploadFor(id) => {
+                if let Some(app) = &self.app {
+                    self.upload_panes.insert(id, (app.focused_pane(), self.server_id.clone()));
+                }
+                self.upload_hosts.insert(id, self.icons_host.clone());
+            }
+            Cmd::Upload { id, name, path } => {
+                // The pane focused as it was begun; one begun with no App
+                // yet, the one focused now.
+                if let Some(app) = &self.app {
+                    let server = self.server_id.clone();
+                    self.upload_panes.entry(id).or_insert_with(|| (app.focused_pane(), server));
+                }
+                let moved = self.upload_hosts.remove(&id).is_some_and(|begun| begun != self.icons_host);
+                if moved {
+                    self.upload_ended(id, Err("the host changed".into()));
+                } else if !self.link.as_ref().is_some_and(|link| link.upload(id, name, path)) {
+                    self.upload_ended(id, Err("not connected".into()));
+                }
+            }
+            Cmd::PasteUpload { id, text } => {
+                // Not on a server started anew since, or another: its pane
+                // ids are other terminals'. The upload says where the file
+                // went all the same.
+                if let (Some((pane, server)), Some(app)) = (self.upload_panes.remove(&id), &self.app) {
+                    if server == self.server_id {
+                        self.stats.inputs_sent += 1;
+                        app.paste_into(pane, &text);
+                    }
+                }
+            }
+            Cmd::CheckConnection => {
+                if let Some(link) = &self.link {
+                    link.probe();
+                }
+                if let Some(app) = self.app.clone() {
+                    app.reconnect_now();
+                }
+            }
+            Cmd::CancelUpload(id) => {
+                // Its pane too, for one begun whose file never came.
+                self.upload_panes.remove(&id);
+                self.upload_hosts.remove(&id);
+                if let Some(link) = &self.link {
+                    link.cancel_upload(id);
+                }
+            }
             Cmd::ChromeClick { action, pane, tab } => {
                 if let Some(app) = self.app.clone() {
                     let click = thinkterm_web::commands::chrome_click(
@@ -636,6 +751,16 @@ impl State {
                         },
                         what,
                     );
+                }
+            }
+            Cmd::Mouse { kind, x, y, button, held, mods } => {
+                if let Some(app) = self.app.clone() {
+                    let what = match kind.as_str() {
+                        "down" => thinkterm_web::app::Pointer::Down,
+                        "move" => thinkterm_web::app::Pointer::Move,
+                        _ => thinkterm_web::app::Pointer::Up,
+                    };
+                    app.pointer(&PointerInput { x, y, button, buttons_down: held, mods }, what);
                 }
             }
             Cmd::Wheel { x, y, lines } => {
@@ -731,6 +856,15 @@ impl State {
                     }
                 }
             }
+            Cmd::SetFallbackPalette { scheme, unchosen } => {
+                self.fallback = scheme.map(|scheme| (scheme, unchosen));
+                if let Some(app) = self.app.clone() {
+                    Self::apply_fallback(&app, &self.notify, self.fallback.as_ref());
+                    if !self.palette_tellable() {
+                        self.palette_untold = true;
+                    }
+                }
+            }
             Cmd::SetShown(shown) => {
                 if !self.platform.set_shown(shown) {
                     return;
@@ -745,10 +879,29 @@ impl State {
                         app.resize();
                         app.refresh_layout();
                         self.tell_palette(&app);
+                    } else {
+                        // A tab zoomed for want of room goes back to its
+                        // split while nobody looks at it here.
+                        app.leave_one_pane();
                     }
                 }
             }
+            Cmd::OnePane(one) => {
+                if self.platform.set_one_pane(one) {
+                    if let Some(app) = self.app.clone() {
+                        app.one_pane_changed();
+                    }
+                    self.views_dirty.set(true);
+                }
+            }
             Cmd::ViewsRead => self.views_dirty.set(true),
+            Cmd::ListViews(listed) => {
+                self.views_listed = listed;
+                // What changed while nobody looked is made now.
+                if listed {
+                    self.views_dirty.set(true);
+                }
+            }
             Cmd::WantScreen(wanted) => {
                 self.screen_wanted = wanted;
                 // Made at once rather than at the next paint, and sent even
@@ -789,6 +942,29 @@ impl State {
         app.set_terminal_palette(palette);
     }
 
+    fn apply_fallback(
+        app: &Rc<App<MobilePlatform, SshLink>>,
+        notify: &Arc<dyn Notify>,
+        fallback: Option<&(String, Option<String>)>,
+    ) {
+        let read = |json: &str| {
+            thinkterm_web::settings::SchemeColors::parse(json)
+                .and_then(|colors| colors.to_palette())
+                .map_err(|err| notify.on_log(format!("scheme: {err}")))
+                .ok()
+        };
+        let fallback = match fallback {
+            None => None,
+            Some((scheme, unchosen)) => {
+                let Some(scheme) = read(scheme) else {
+                    return;
+                };
+                Some((scheme, unchosen.as_deref().and_then(read)))
+            }
+        };
+        app.set_fallback_palette(fallback);
+    }
+
     fn view(&self, name: &str) -> String {
         let Some(app) = &self.app else {
             return "null".into();
@@ -799,10 +975,42 @@ impl State {
             "tree" => json(&app.tree_view()),
             "sidebar" => json(&app.sidebar_view()),
             "navs" => json(&app.navs_view()),
+            "panes" => json(&app.panes_view()),
+            "agents" => json(&app.agents_view()),
             "status" => json(&app.status_view()),
             "layout" => app.layout_view(),
             "strings" => json(&thinkterm_web::views::strings()),
             _ => "null".into(),
+        }
+    }
+
+    /// Upload `id` is over: where it is on the host, or why it is not,
+    /// for the shell to read (`Core::upload_status`).
+    fn upload_ended(&mut self, id: u64, result: Result<String, String>) {
+        self.upload_hosts.remove(&id);
+        if result.is_err() {
+            self.upload_panes.remove(&id);
+        }
+        if let Ok(mut published) = self.published.lock() {
+            if let Some(upload) = published.uploads.get_mut(&id) {
+                upload.done = true;
+                match result {
+                    Ok(path) => upload.path = path,
+                    Err(error) => upload.error = error,
+                }
+            }
+        }
+    }
+
+    /// Every upload not yet over ends, for `reason`.
+    fn end_unfinished_uploads(&mut self, reason: &str) {
+        let unfinished: Vec<u64> = self
+            .published
+            .lock()
+            .map(|published| published.uploads.iter().filter(|(_, upload)| !upload.done).map(|(id, _)| *id).collect())
+            .unwrap_or_default();
+        for id in unfinished {
+            self.upload_ended(id, Err(reason.to_string()));
         }
     }
 
@@ -884,6 +1092,9 @@ impl State {
     /// surface, if lent, is dropped: the shell re-attaches it by calling
     /// `attach_surface` again, which is what it does on any change anyway.
     fn disconnect(&mut self) {
+        // What was on its way goes with the connection: its word that it
+        // ended would come from the old link, and be dropped below.
+        self.end_unfinished_uploads("disconnected");
         // Invalidate queued completions even if no new connection follows,
         // or the next connect fails before it can create its link.
         self.link_serial += 1;
@@ -892,6 +1103,9 @@ impl State {
             link.shutdown();
         }
         if let Some(app) = self.app.take() {
+            // A tab it zoomed for want of room is the next App's to put
+            // back, should that be on the same server.
+            self.one_pane_zoomed = app.one_pane_zoomed().zip(self.server_id.take()).map(|(zoomed, server)| (server, zoomed));
             // Cut the link's hold on the App, then let every task on the
             // wire see the link gone and finish, so nothing but this
             // handle is left holding it.
@@ -1005,7 +1219,17 @@ impl State {
                 .on_log(format!("remote command exited with {code}")),
             Net::TabIcons(Ok(cards)) => self.show_icons(cards),
             Net::TabIcons(Err(err)) => self.notify.on_log(format!("tab icons: {err}")),
+            Net::UploadProgress { id, sent, total } => {
+                if let Ok(mut published) = self.published.lock() {
+                    if let Some(upload) = published.uploads.get_mut(&id) {
+                        (upload.sent, upload.total) = (sent, total);
+                    }
+                }
+            }
+            Net::Uploaded { id, result } => self.upload_ended(id, result),
             Net::Closed(reason) => {
+                // What was on its way went with the connection.
+                self.end_unfinished_uploads(&reason);
                 if self.app.is_none() {
                     self.conn = Conn::Disconnected(reason.clone());
                     self.set_status(&format!("disconnected: {reason}"));
@@ -1091,9 +1315,12 @@ impl State {
         let serial = self.link_serial;
         self.attaching = true;
         let spawned = self.pool.spawner().spawn_local(async move {
-            let outcome = attach(&link, size, 0, me)
-                .await
-                .map_err(|e| format!("{e:#}"));
+            let outcome = attach(&link, size, 0, me).await.map_err(|e| {
+                match e.downcast_ref::<ProtocolMismatch>() {
+                    Some(mismatch) => mismatch_text(mismatch),
+                    None => format!("{e:#}"),
+                }
+            });
             let _ = tx.send(Cmd::Attached { serial, outcome });
         });
         if let Err(err) = spawned {
@@ -1240,13 +1467,21 @@ impl State {
         if let Some(scheme) = self.palette.clone() {
             Self::apply_palette(&app, &self.notify, Some(&scheme));
         }
+        if self.fallback.is_some() {
+            Self::apply_fallback(&app, &self.notify, self.fallback.as_ref());
+        }
         // Made off screen, it told the server no scheme it was given. A new
         // connection holds no scheme of before to undo: the desktop's is
         // its own already.
-        self.palette_untold = self.palette.is_some() && !self.platform.shown();
+        self.palette_untold = (self.palette.is_some() || self.fallback.is_some()) && !self.platform.shown();
         if let Err(err) = app.set_tab_icons(&self.icons.json()) {
             self.notify.on_log(format!("tab icons: {err}"));
         }
+        // The tab the App before zoomed for want of room, on this server.
+        if let Some((_, zoomed)) = self.one_pane_zoomed.take().filter(|(server, _)| *server == attached.server_id) {
+            app.keep_one_pane_zoomed(zoomed);
+        }
+        self.server_id = Some(attached.server_id.clone());
         app.fetch_tree();
         app.hide_status();
         app.refresh_layout();
@@ -1503,6 +1738,27 @@ fn json<T: serde::Serialize>(value: &T) -> String {
 }
 
 
+/// What the phone says when the host's ThinkTerm is another release, on
+/// the first connection and on a reconnect (`MobilePlatform`). The two
+/// speak one protocol version only, so one of them has to move to the
+/// other's release; the numbers only go up, so they say which. An iPhone
+/// gets the app from TestFlight.
+pub(crate) fn mismatch_text(mismatch: &ProtocolMismatch) -> String {
+    let host = &mismatch.server_version;
+    if mismatch.theirs > mismatch.ours {
+        let update = if cfg!(target_os = "ios") {
+            "Update the app in TestFlight to the same release"
+        } else {
+            "Update the app to the same release"
+        };
+        format!("the host runs a newer ThinkTerm ({host}) than this app. {update}.")
+    } else {
+        format!(
+            "the host runs an older ThinkTerm ({host}) than this app. Update ThinkTerm on the host to the app's release."
+        )
+    }
+}
+
 /// Two numbers from the install's id (FNV-1a over it, twice), for the
 /// client identity's epoch and id fields.
 fn stable_identity(device_id: &str) -> (u64, usize) {
@@ -1559,6 +1815,26 @@ mod tests {
     }
 
     #[test]
+    fn a_protocol_mismatch_says_which_side_to_update() {
+        let mismatch = |theirs| ProtocolMismatch {
+            ours: 89,
+            theirs,
+            server_version: "0.5.2".into(),
+        };
+        let newer = mismatch_text(&mismatch(90));
+        assert!(newer.contains("newer ThinkTerm (0.5.2)"), "{newer}");
+        assert!(newer.contains("Update the app"), "{newer}");
+        let older = mismatch_text(&mismatch(88));
+        assert!(older.contains("older ThinkTerm (0.5.2)"), "{older}");
+        assert!(older.contains("on the host"), "{older}");
+
+        // Through anyhow, as the handshake returns it.
+        let err: anyhow::Error = mismatch(90).into();
+        let err = err.context("attach");
+        assert!(err.downcast_ref::<ProtocolMismatch>().is_some());
+    }
+
+    #[test]
     fn views_go_out_once_a_frame_and_only_after_a_change() {
         let changes = Arc::default();
         let mut state = state_with(&changes, true);
@@ -1597,6 +1873,32 @@ mod tests {
         assert_eq!(state.wait(Instant::now()), Duration::ZERO, "owed once it is back");
         state.publish_views();
         assert_eq!(state.published.lock().unwrap().views.revision, 1, "made once it is back");
+    }
+
+    #[test]
+    fn a_list_of_its_threads_keeps_the_views_current_off_screen() {
+        let changes = Arc::default();
+        let mut state = state_with(&changes, true);
+        state.platform.set_shown(false);
+        state.views_dirty.set(false);
+        state.handle(Cmd::ListViews(true));
+        assert!(state.views_dirty.get(), "what changed unseen is made as the list comes up");
+        state.views_made = Instant::now() - VIEWS_EVERY;
+        assert_eq!(state.wait(Instant::now()), Duration::ZERO);
+        state.publish_views();
+        assert_eq!(state.published.lock().unwrap().views.revision, 1, "made with the terminal off screen");
+        // The rows are the terminal's: none are made for a list.
+        state.screen_wanted = true;
+        state.screen_dirty = true;
+        state.publish_views();
+        assert!(!state.screen_dirty);
+        assert_eq!(state.published.lock().unwrap().screen_revision, 0);
+
+        state.handle(Cmd::ListViews(false));
+        state.views_dirty.set(true);
+        state.views_made = Instant::now() - VIEWS_EVERY;
+        state.publish_views();
+        assert_eq!(state.published.lock().unwrap().views.revision, 1, "and wait again once the list is gone");
     }
 
     #[test]

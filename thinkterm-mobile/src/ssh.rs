@@ -51,6 +51,19 @@ pub struct SshParams {
 
 pub enum Out {
     Bytes(Vec<u8>),
+    /// A file of this device's to leave on the host, beside the protocol
+    /// (`upload`): read as it is sent, never held whole.
+    Upload {
+        id: u64,
+        name: String,
+        path: String,
+    },
+    /// Give upload `id` up: what reached the host of it is removed there.
+    CancelUpload(u64),
+    /// See whether the connection still carries anything (`PROBE_WAIT`):
+    /// one that does not is ended at once, rather than when the
+    /// keep-alives have gone unanswered long enough.
+    Probe,
     Close,
 }
 
@@ -67,6 +80,17 @@ pub enum Net {
     Exit(u32),
     /// The host's tab icon cards, read beside the protocol, or why not.
     TabIcons(Result<WireCatalog, String>),
+    /// How much of upload `id` has gone, of how much.
+    UploadProgress {
+        id: u64,
+        sent: u64,
+        total: u64,
+    },
+    /// Where upload `id` landed on the host, or why it did not.
+    Uploaded {
+        id: u64,
+        result: Result<String, String>,
+    },
     Closed(String),
 }
 
@@ -194,6 +218,215 @@ async fn output(session: &client::Handle<HostKeyCheck>, command: String, limit: 
     read.map(|()| out)
 }
 
+/// Where the desktop leaves what is dropped on a remote terminal, under
+/// the login's home (`native_settings::DEFAULT_REMOTE_DROP_DESTINATION`).
+const UPLOADS: &str = "ThinkTerm_Uploads";
+
+/// The line the upload's answer is on: whatever a profile says comes
+/// before it.
+const UPLOADED: &str = "thinkterm-upload ";
+
+/// The longest an upload may take, all told: a large file over a slow
+/// line. One that hangs is given up by whoever watches its progress.
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(6 * 3600);
+
+/// A name for a file on the host: its last component, nothing a shell or
+/// a listing would trip on, and never none.
+pub fn upload_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean: String = last.chars().filter(|c| !c.is_control()).collect();
+    let clean = clean.trim().trim_start_matches('.').to_string();
+    match clean.is_empty() {
+        true => "file".to_string(),
+        false => clean,
+    }
+}
+
+/// Leaves what it reads in the uploads folder under `$1` -- or under
+/// that name with ` (1)`, ` (2)`... before its extension where one is
+/// there already, the desktop's collision names -- and prints where. It
+/// is written beside its place first and moved there only once all `$2`
+/// bytes of it have come: an upload given up, or cut off with its
+/// connection, leaves nothing behind. The name is claimed by creating it
+/// (`set -C`, which fails on one that is there), so two uploads of one
+/// name ending together never both take it. `/bin/sh` runs it, whatever
+/// the login shell is.
+fn upload_command(name: &str, size: u64) -> String {
+    format!(
+        r#"/bin/sh -c 'd="$HOME/{UPLOADS}"; mkdir -p "$d" || exit 1; n=$1; t="$d/.thinkterm-upload.$$"; cat > "$t" || {{ rm -f "$t"; exit 1; }}; if [ "$(wc -c < "$t" | tr -d " ")" != "$2" ]; then rm -f "$t"; exit 1; fi; b=${{n%.*}}; e=${{n##*.}}; if [ "$b" = "$n" ]; then e=; else e=.$e; fi; p="$d/$n"; i=1; while :; do if [ ! -e "$p" ] && [ ! -L "$p" ]; then (set -C; : > "$p") 2>/dev/null && break; [ -e "$p" ] || [ -L "$p" ] || {{ rm -f "$t"; exit 1; }}; fi; p="$d/$b ($i)$e"; i=$((i+1)); done; mv -f "$t" "$p" || {{ rm -f "$t" "$p"; exit 1; }}; printf "\n{UPLOADED}%s\n" "$p"' sh {} {size}"#,
+        shell_quote(name)
+    )
+}
+
+/// Where the upload's answer says the file is.
+fn uploaded_path(out: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(UPLOADED))
+        .filter(|path| path.starts_with('/'))
+        .map(str::to_string)
+}
+
+/// How much of a file goes in one message: small enough that an upload
+/// given up stops soon and its progress moves smoothly.
+const UPLOAD_CHUNK: usize = 32 * 1024;
+
+/// The most of the host's own words an upload keeps: its answer is the
+/// last line, and whatever a login profile prints comes before it.
+const UPLOAD_SAID: usize = 64 * 1024;
+
+/// How long a connection has to show it still carries anything when asked
+/// (`Out::Probe`): long enough for a slow line, short of what a person
+/// waits before they kill the app.
+const PROBE_WAIT: Duration = Duration::from_secs(5);
+
+/// A probe's channel is asked for behind whatever the session has queued,
+/// and uploads queue a lot: on a slow line its answer comes long after
+/// `PROBE_WAIT`. While an upload is under way and the host took more of
+/// one in this recently -- counted from the probe's asking, so a phone that
+/// slept with the connection dead is not fooled by what moved before --
+/// the probe waits on. A host says it took more by widening the upload's
+/// window, half the window at a time (a megabyte, for OpenSSH): long
+/// enough for the first such step of three uploads started together on a
+/// line of a megabit a second, and no longer, for a connection that died.
+const UPLOAD_STILL: Duration = Duration::from_secs(30);
+
+/// How many uploads go at once; the rest wait their turn. Each is a
+/// channel of the session's, and a host allows only so many (OpenSSH's
+/// `MaxSessions` is 10, the terminal's own among them).
+const UPLOADS_AT_ONCE: usize = 3;
+
+/// Resolves once `cancel` says the upload was given up; never, if nobody
+/// is left to say so.
+async fn given_up(cancel: &tokio::sync::watch::Receiver<bool>) {
+    let mut cancel = cancel.clone();
+    if cancel.wait_for(|given_up| *given_up).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Leave the file at `path` on the host as `name`, on a channel of its
+/// own beside the protocol's, and say where it is. It is read as it goes;
+/// `progress` hears how much has gone, `took` each time the host says it
+/// took more in, and `cancel` set ends it -- at once, wherever the upload
+/// is, and a file that had already landed is removed again.
+async fn upload(
+    session: &client::Handle<HostKeyCheck>,
+    name: &str,
+    path: &str,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+    progress: &dyn Fn(u64, u64),
+    took: &dyn Fn(),
+) -> Result<String> {
+    use std::io::Read as _;
+    let cancelled = || *cancel.borrow();
+    let mut file = std::fs::File::open(path).context("opening the file")?;
+    let total = file.metadata().context("reading the file's size")?.len();
+    let channel = bounded("opening a channel", session.channel_open_session()).await?;
+    let command = upload_command(&upload_name(name), total);
+    let send = async {
+        bounded("exec", channel.exec(true, command)).await?;
+        // As the protocol's channel: the writer waits for the remote's
+        // window, which grows only as the reader takes messages in.
+        let (mut reader, writer) = channel.split();
+        let write = async {
+            let mut chunk = vec![0u8; UPLOAD_CHUNK];
+            let mut sent = 0u64;
+            progress(0, total);
+            loop {
+                anyhow::ensure!(!cancelled(), "cancelled");
+                let read = file.read(&mut chunk).context("reading the file")?;
+                if read == 0 {
+                    break;
+                }
+                // A write may wait long for the host's window on a slow
+                // line; giving up does not wait with it.
+                tokio::select! {
+                    biased;
+                    () = given_up(cancel) => anyhow::bail!("cancelled"),
+                    written = writer.data(&chunk[..read]) => written.context("writing the file")?,
+                }
+                sent += read as u64;
+                progress(sent, total);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        // Its end is said whether it went whole or not: the host counts
+        // what came and keeps nothing of a file that came short.
+        let write = async {
+            let written = write.await;
+            let _ = writer.eof().await;
+            written
+        };
+        // Once given up, the host has a while to clear away what came and
+        // say so; a host that does not is left to its channel's close.
+        let gave_up = async {
+            given_up(cancel).await;
+            tokio::time::sleep(STEP).await;
+        };
+        let read = async {
+            tokio::pin!(gave_up);
+            let (mut out, mut err, mut status) = (Vec::new(), String::new(), None);
+            loop {
+                let msg = tokio::select! {
+                    msg = reader.wait() => msg,
+                    () = &mut gave_up => break,
+                };
+                match msg {
+                    Some(ChannelMsg::Data { data }) => {
+                        // Read to the end whatever comes: a channel nobody
+                        // reads fills, and a full one stalls the session's
+                        // every channel, the terminal's too. Only the last
+                        // of it is kept; the answer is its last line.
+                        out.extend_from_slice(&data);
+                        if out.len() > UPLOAD_SAID {
+                            out.drain(..out.len() - UPLOAD_SAID);
+                        }
+                    }
+                    Some(ChannelMsg::ExtendedData { data, .. }) => err = String::from_utf8_lossy(&data).to_string(),
+                    Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                    // The host took more of the file in: the connection
+                    // carries, however slowly.
+                    Some(ChannelMsg::WindowAdjusted { .. }) => took(),
+                    Some(ChannelMsg::Close) | None => break,
+                    Some(_) => {}
+                }
+            }
+            match uploaded_path(&out) {
+                Some(path) if status.unwrap_or(0) == 0 => Ok(path),
+                _ => {
+                    let said = err.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+                    match said.is_empty() {
+                        true => Err(anyhow!("the host did not take the file")),
+                        false => Err(anyhow!("{said}")),
+                    }
+                }
+            }
+        };
+        let (written, read) = tokio::join!(write, read);
+        if cancelled() {
+            let _ = writer.close().await;
+            // Given up after the last of it went: the host may have put
+            // the file in its place already, and it is taken away again.
+            if let Ok(landed) = &read {
+                let _ = output(session, format!("rm -f -- {}", shell_quote(landed)), UPLOAD_SAID).await;
+            }
+            anyhow::bail!("cancelled");
+        }
+        // Why the sending stopped is the reason, before what the host
+        // made of a file that came short.
+        match (written, read) {
+            (Err(err), _) => Err(err),
+            (Ok(()), read) => read,
+        }
+    };
+    match tokio::time::timeout(UPLOAD_DEADLINE, send).await {
+        Ok(sent) => sent,
+        Err(_) => Err(anyhow!("no end in {} s", UPLOAD_DEADLINE.as_secs())),
+    }
+}
+
 /// The host desktop's tab icon cards, as its server gives a page them
 /// (`icons`): its settings, then the glyphs it imported that they name.
 async fn tab_icons(session: &client::Handle<HostKeyCheck>) -> Result<WireCatalog> {
@@ -276,11 +509,15 @@ async fn run(
         known: params.known_host.clone(),
         seen: Arc::clone(&seen),
     };
-    let dial = tokio::time::timeout(
-        STEP,
-        client::connect(config, (params.host.as_str(), params.port), handler),
-    )
-    .await
+    // A machine of the tailnet the app has joined is reached through the
+    // app's own node; every other host by the system's network.
+    let dial = match crate::tailnet::dial(&params.host, params.port).await {
+        Some(Ok(stream)) => tokio::time::timeout(STEP, client::connect_stream(config, stream, handler)).await,
+        Some(Err(err)) => return Err(err.context("reaching the machine through the tailnet")),
+        None => {
+            tokio::time::timeout(STEP, client::connect(config, (params.host.as_str(), params.port), handler)).await
+        }
+    }
     .context("connecting timed out")?;
     if dial.is_err() && params.known_host.is_none() {
         if let Some(fingerprint) = seen.lock().unwrap().clone() {
@@ -343,6 +580,8 @@ async fn run(
     // on a full inbound queue. So the writer runs apart from the reader,
     // and a stalled write never stops the reading.
     let (mut reader, writer) = channel.split();
+    // Files go on channels of their own, opened here where the session is.
+    let (upload_tx, mut upload_rx) = unbounded_channel::<Out>();
     let mut sender = tokio::spawn(async move {
         while let Some(out) = out_rx.recv().await {
             match out {
@@ -350,6 +589,9 @@ async fn run(
                     .data(&bytes[..])
                     .await
                     .context("writing to the channel")?,
+                beside @ (Out::Upload { .. } | Out::CancelUpload(_) | Out::Probe) => {
+                    let _ = upload_tx.send(beside);
+                }
                 Out::Close => break,
             }
         }
@@ -365,11 +607,109 @@ async fn run(
     let cards = tab_icons(&session);
     tokio::pin!(cards);
     let mut cards_read = false;
+    // How many uploads are under way, and when the host last took more of
+    // one in: a probe stuck behind their data is no sign of a dead
+    // connection while they go on moving (`UPLOAD_STILL`).
+    let going = std::cell::Cell::new(0usize);
+    let moved = std::cell::Cell::new(None::<std::time::Instant>);
+    // Uploads under way, each on its channel while the terminal goes on,
+    // and those waiting their turn.
+    let mut uploads = futures::stream::FuturesUnordered::new();
+    let mut waiting: std::collections::VecDeque<(u64, String, String)> = Default::default();
+    // Each one's word that it was given up, until it ends.
+    let mut cancels: std::collections::HashMap<u64, tokio::sync::watch::Sender<bool>> = Default::default();
+    // A look at whether the connection still carries anything: a channel
+    // opened and closed again, which needs the host's answer.
+    let mut probes = futures::stream::FuturesUnordered::new();
+    let start = |id: u64, name: String, path: String, cancels: &mut std::collections::HashMap<u64, tokio::sync::watch::Sender<bool>>| {
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        cancels.insert(id, cancel_tx);
+        let (session, moved) = (&session, &moved);
+        async move {
+            // Told at each hundredth, not at each message.
+            let last = std::cell::Cell::new(u64::MAX);
+            let progress = |sent: u64, total: u64| {
+                let step = if total == 0 { 100 } else { sent * 100 / total };
+                if last.replace(step) != step {
+                    deliver(Net::UploadProgress { id, sent, total });
+                }
+            };
+            let took = || moved.set(Some(std::time::Instant::now()));
+            let result = upload(session, &name, &path, &cancel, &progress, &took).await;
+            (id, result.map_err(|err| format!("{err:#}")))
+        }
+    };
     loop {
         tokio::select! {
             read = &mut cards, if !cards_read => {
                 cards_read = true;
                 deliver(Net::TabIcons(read.map_err(|err| format!("{err:#}"))));
+            }
+            Some(asked) = upload_rx.recv() => match asked {
+                Out::Upload { id, name, path } => {
+                    if uploads.len() < UPLOADS_AT_ONCE {
+                        uploads.push(start(id, name, path, &mut cancels));
+                        going.set(uploads.len());
+                    } else {
+                        waiting.push_back((id, name, path));
+                    }
+                }
+                Out::Probe => {
+                    if probes.is_empty() {
+                        let (session, going, moved) = (&session, &going, &moved);
+                        probes.push(async move {
+                            let asked = std::time::Instant::now();
+                            let open = session.channel_open_session();
+                            tokio::pin!(open);
+                            loop {
+                                match tokio::time::timeout(PROBE_WAIT, &mut open).await {
+                                    Ok(Ok(channel)) => {
+                                        let _ = channel.close().await;
+                                        return true;
+                                    }
+                                    // Turned down -- the host allows only so
+                                    // many channels -- but answered: the
+                                    // connection carries.
+                                    Ok(Err(russh::Error::ChannelOpenFailure(_))) => return true,
+                                    Ok(Err(_)) => return false,
+                                    // No answer yet: behind uploads that go
+                                    // on moving, it is waited for.
+                                    Err(_) => {
+                                        let since = moved.get().map_or(asked, |at| at.max(asked));
+                                        if going.get() == 0 || since.elapsed() >= UPLOAD_STILL {
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                Out::CancelUpload(id) => {
+                    if let Some(at) = waiting.iter().position(|(waiting, ..)| *waiting == id) {
+                        waiting.remove(at);
+                        deliver(Net::Uploaded { id, result: Err("cancelled".into()) });
+                    } else if let Some(cancel) = cancels.get(&id) {
+                        let _ = cancel.send(true);
+                    }
+                }
+                _ => {}
+            },
+            Some(alive) = futures::StreamExt::next(&mut probes), if !probes.is_empty() => {
+                if !alive {
+                    // Gone without a word, as a connection is that a
+                    // network change or a long sleep cut off.
+                    sender.abort();
+                    return Ok("the connection dropped".into());
+                }
+            }
+            Some((id, result)) = futures::StreamExt::next(&mut uploads), if !uploads.is_empty() => {
+                cancels.remove(&id);
+                deliver(Net::Uploaded { id, result });
+                if let Some((id, name, path)) = waiting.pop_front() {
+                    uploads.push(start(id, name, path, &mut cancels));
+                }
+                going.set(uploads.len());
             }
             sent = &mut sender => {
                 let _ = session
@@ -395,6 +735,12 @@ async fn run(
                     deliver(Net::Exit(exit_status))
                 }
                 Some(ChannelMsg::Eof) => {}
+                // The session itself ended under the channel, with no
+                // word from the host: the connection was cut.
+                None if exit.is_none() => {
+                    sender.abort();
+                    return Ok("the connection dropped".into());
+                }
                 Some(ChannelMsg::Close) | None => {
                     sender.abort();
                     let mut reason = String::from("the remote command ended");
@@ -505,6 +851,113 @@ mod host_key_tests {
             );
             server.abort();
             let _ = server.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn an_upload_s_name_is_safe_to_leave_on_a_host() {
+        assert_eq!(upload_name("Pasted 2026-01-02 at 03.04.05.png"), "Pasted 2026-01-02 at 03.04.05.png");
+        assert_eq!(upload_name("/private/var/tmp/a b.txt"), "a b.txt");
+        assert_eq!(upload_name("..\\..\\evil"), "evil");
+        assert_eq!(upload_name(".hidden"), "hidden");
+        assert_eq!(upload_name("line\nbreak"), "linebreak");
+        assert_eq!(upload_name("  "), "file");
+        assert_eq!(upload_name("../"), "file");
+        // Whatever the name, the command is one shell word for the script
+        // and one for the name.
+        let command = upload_command("it's (1).png", 42);
+        assert!(command.starts_with("/bin/sh -c '") && command.ends_with(r"sh 'it'\''s (1).png' 42"), "{command}");
+    }
+
+    #[test]
+    fn the_host_says_where_an_upload_landed() {
+        assert_eq!(
+            uploaded_path(b"Welcome!\n\nthinkterm-upload /home/user/ThinkTerm_Uploads/a (1).png\n"),
+            Some("/home/user/ThinkTerm_Uploads/a (1).png".to_string())
+        );
+        assert_eq!(uploaded_path(b"sh: cat: write error\n"), None);
+        assert_eq!(uploaded_path(b"thinkterm-upload relative\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_upload_command_keeps_both_of_two_files_with_one_name() {
+        use std::io::Write as _;
+        let home = tempfile::tempdir().unwrap();
+        let send = |name: &str, bytes: &[u8], size: u64| {
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(upload_command(name, size))
+                .env("HOME", home.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("running /bin/sh");
+            child.stdin.take().unwrap().write_all(bytes).unwrap();
+            let out = child.wait_with_output().unwrap();
+            uploaded_path(&out.stdout)
+        };
+        let run = |name: &str, bytes: &[u8]| send(name, bytes, bytes.len() as u64).expect("a path");
+        let dir = home.path().join(UPLOADS);
+        let first = run("shot 1.png", b"one");
+        assert_eq!(first, dir.join("shot 1.png").to_string_lossy());
+        let second = run("shot 1.png", b"two");
+        assert_eq!(second, dir.join("shot 1 (1).png").to_string_lossy());
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
+        // No extension, and a quote in the name.
+        assert_eq!(run("it's", b"x"), dir.join("it's").to_string_lossy());
+        assert_eq!(run("it's", b"y"), dir.join("it's (1)").to_string_lossy());
+        // One that came short -- given up, or cut off -- leaves nothing.
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(send("half.bin", b"12345", 10), None);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before, "nothing of it is kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uploads_of_one_name_ending_together_each_keep_their_own() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        // The shells a host's /bin/sh may be, where this machine has them.
+        for shell in ["/bin/sh", "/bin/dash", "/bin/bash"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let home = tempfile::tempdir().unwrap();
+            let command = upload_command("same.txt", 2).replacen("/bin/sh -c", &format!("{shell} -c"), 1);
+            let mut children = Vec::new();
+            let mut inputs = Vec::new();
+            for i in 0..16 {
+                let mut child = Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .env("HOME", home.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("running the shell");
+                let mut input = child.stdin.take().unwrap();
+                input.write_all(format!("{i:02}").as_bytes()).unwrap();
+                inputs.push(input);
+                children.push((i, child));
+            }
+            // Every one has its bytes; their ends come all at once.
+            drop(inputs);
+            let mut landed = std::collections::HashSet::new();
+            for (i, child) in children {
+                let out = child.wait_with_output().unwrap();
+                let path = uploaded_path(&out.stdout).unwrap_or_else(|| panic!("{shell}: upload {i} landed nowhere"));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{i:02}"), "{shell}: {path}");
+                assert!(landed.insert(path.clone()), "{shell}: two uploads took {path}");
+            }
+            let kept = std::fs::read_dir(home.path().join(UPLOADS)).unwrap().count();
+            assert_eq!(kept, 16, "{shell}: one file each, nothing else left");
         }
     }
 }
