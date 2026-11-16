@@ -4,6 +4,12 @@ import SwiftUI
 /// straight from the desktop's), by name. Read once, on first use.
 enum Schemes {
     static let followDesktop = "desktop"
+    /// What a light interface gets when no scheme is picked, as on the
+    /// desktop (`config::MACOS_LIGHT_COLOR_SCHEME`).
+    static let lightDefault = "Apple System Colors (Light)"
+    /// What a macOS host fills in when its configuration names no scheme
+    /// (`config::MACOS_DEFAULT_COLOR_SCHEME`): no choice of its own.
+    static let darkDefault = "Apple System Colors"
 
     /// Every scheme's name, in the file's order (alphabetical).
     static var names: [String] { table.names }

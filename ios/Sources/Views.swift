@@ -60,6 +60,50 @@ struct NavView: Decodable, Hashable, Identifiable {
     var id: Int { rect.pane }
 }
 
+/// The Agents panel: `App::agents_view`.
+struct AgentsView: Decodable, Hashable {
+    var rows: [AgentRow]
+    var summary: String
+}
+
+/// One pane an agent runs in.
+struct AgentRow: Decodable, Hashable, Identifiable {
+    var pane: Int
+    var name: String
+    var title: String
+    /// "working", "blocked", "error", "done", "idle" or "unknown".
+    var state: String
+    var state_label: String
+    /// "Project · Thread", or the workspace when no thread claims it.
+    var place: String
+    var pane_card: String?
+    var kind: String?
+    var said: String?
+    var id: Int { pane }
+}
+
+/// The panes of the tab on show, each where the split puts it, in cells
+/// of a grid `cols` by `rows`: `App::panes_view`.
+struct PanesView: Decodable, Hashable {
+    var cols: Int
+    var rows: Int
+    var zoomed: Int?
+    var panes: [PaneBox]
+}
+
+/// One frame of the split: the pane in front of it, and every pane that
+/// shares it.
+struct PaneBox: Decodable, Hashable, Identifiable {
+    var pane: Int
+    var left: Int
+    var top: Int
+    var cols: Int
+    var rows: Int
+    var focused: Bool
+    var members: [CapsuleView]
+    var id: Int { pane }
+}
+
 /// The desktop's sidebar layer with its tabs: `App::threads_view`.
 struct ThreadsView: Decodable, Hashable {
     var space: String
@@ -79,6 +123,11 @@ struct ThreadView: Decodable, Hashable, Identifiable {
     var current: Bool
     var window: Int?
     var tabs: [ThreadTab]
+    /// A program in it stopped on an error: it has a mark of its own.
+    var failed: Bool?
+
+    /// The status word its mark is drawn for (`threadMark`).
+    var markStatus: String { failed == true ? "Failed" : status }
 }
 
 struct ThreadTab: Decodable, Hashable, Identifiable {
@@ -246,6 +295,13 @@ struct ThreadRow: Decodable, Hashable, Identifiable {
     var live: Bool
     var selected: Bool
     var deleting: Bool
+    /// The cards of what it runs (`ThreadCards`); none from a core before them.
+    var icons: [String]?
+    /// A program in it stopped on an error: it has a mark of its own.
+    var failed: Bool?
+
+    /// The status word its mark is drawn for (`threadMark`).
+    var markStatus: String { failed == true ? "Failed" : status }
 }
 
 struct Editing: Decodable, Hashable {

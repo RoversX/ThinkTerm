@@ -2,10 +2,11 @@ import SwiftUI
 import UIKit
 
 /// The card heading a tab or a pane's capsule, as the desktop draws it: a
-/// coloured circle carrying the mark of what the pane runs, in the card's
-/// glyph colour (`Core.tabIcon`). A busy pane's mark gives way to the
-/// spinner, which shows alone where there is no card (tab icons off, or
-/// a card from before the host's came).
+/// lit circle carrying the mark of what the pane runs. The core draws it
+/// (`Core.cardsPicture`, from the look every client shares); this shows
+/// the picture. A busy pane's mark gives way to the spinner, which shows
+/// alone where there is no card (tab icons off, or a card from before the
+/// host's came).
 struct TabIconCard: View {
     let core: Core
     var id: String?
@@ -15,19 +16,16 @@ struct TabIconCard: View {
     /// draws the card again.
     var revision: UInt64 = 0
     @Environment(\.displayScale) private var scale
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        if let id, let icon = TabIconImages.shared.icon(id, points: size, scale: scale, core: core) {
+        let images = TabIconImages.shared
+        if let id, let cards = images.cards([id], points: size, scale: scale, dark: scheme == .dark, glyphs: !busy, core: core) {
             ZStack {
-                Circle().fill(icon.circle)
+                CardsImage(cards: cards)
                 if busy {
-                    Spinner(color: icon.glyph).padding(size * 0.22)
-                } else if let mask = icon.mask {
-                    Image(uiImage: mask)
-                        .renderingMode(.template)
-                        .resizable()
-                        .foregroundColor(icon.glyph)
-                        .frame(width: size * 0.56, height: size * 0.56)
+                    Spinner(color: images.icon(id, points: size, scale: scale, core: core)?.glyph ?? .white)
+                        .padding(size * 0.22)
                 }
             }
             .frame(width: size, height: size)
@@ -38,6 +36,51 @@ struct TabIconCard: View {
                 .frame(width: size, height: size)
                 .accessibilityHidden(true)
         }
+    }
+}
+
+/// What a thread runs, leading its row as the desktop's does: the first
+/// program's card, the second's small at its corner -- or, with more, how
+/// many more. One picture from the core, in the room every row keeps for
+/// its icons; only the number is written here, in the system's figures.
+struct ThreadCards: View {
+    let core: Core
+    var icons: [String]
+    var revision: UInt64
+    var size: CGFloat = 30
+    @Environment(\.displayScale) private var scale
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        if let cards = TabIconImages.shared.cards(icons, points: size, scale: scale, dark: scheme == .dark, glyphs: true, core: core) {
+            ZStack(alignment: .topLeading) {
+                CardsImage(cards: cards)
+                if let count = cards.count {
+                    Text("\(min(count.more, 99))")
+                        .font(.system(size: count.rect.width * 0.65, weight: .bold))
+                        .foregroundColor(.white)
+                        .frame(width: count.rect.width, height: count.rect.height)
+                        .offset(x: count.rect.minX - cards.inset, y: count.rect.minY - cards.inset)
+                }
+            }
+            .frame(width: cards.slot, height: size, alignment: .topLeading)
+            .accessibilityHidden(true)
+        }
+    }
+}
+
+/// A picture of cards at its own size, its icons' box at the corner of
+/// what lays it out: the shadows fall outside, as the desktop's do.
+private struct CardsImage: View {
+    let cards: TabIconImages.Cards
+
+    var body: some View {
+        Color.clear
+            .overlay(alignment: .topLeading) {
+                Image(uiImage: cards.image)
+                    .fixedSize()
+                    .offset(x: -cards.inset, y: -cards.inset)
+            }
     }
 }
 
@@ -54,7 +97,23 @@ final class TabIconImages {
         let mask: UIImage?
     }
 
+    /// A row's icons as the core drew them (`Core.cardsPicture`), in points.
+    struct Cards {
+        let image: UIImage
+        /// How far into the picture the icons' own box starts.
+        let inset: CGFloat
+        /// The box's width: the room a row keeps for its icons.
+        let slot: CGFloat
+        /// The disc for the programs past the first, in the picture.
+        let count: (more: Int, rect: CGRect)?
+    }
+
     private var cache: [String: Icon] = [:]
+    /// The pictures drawn so far, by what they show; nil for cards there
+    /// are none of. A thread's programs come and go, so it is emptied when
+    /// it reaches `pictureLimit` as well as with the cards.
+    private var pictures: [String: Cards?] = [:]
+    private static let pictureLimit = 256
     /// Ids the cards have none for, so as not to ask again.
     private var missing: Set<String> = []
     /// The core's revision of the cards in `cache`.
@@ -67,17 +126,48 @@ final class TabIconImages {
         ) { [weak self] _ in
             self?.cache.removeAll()
             self?.missing.removeAll()
+            self?.pictures.removeAll()
+        }
+    }
+
+    func cards(_ ids: [String], points: CGFloat, scale: CGFloat, dark: Bool, glyphs: Bool, core: Core) -> Cards? {
+        guard !ids.isEmpty else { return nil }
+        refresh(core)
+        let pixels = UInt32((points * scale).rounded())
+        let key = "\(ids.joined(separator: ","))@\(pixels)\(dark ? "d" : "l")\(glyphs ? "g" : "")"
+        if let known = pictures[key] { return known }
+        if pictures.count >= Self.pictureLimit { pictures.removeAll() }
+        var cards: Cards?
+        if let drawn = core.cardsPicture(ids: ids, diameter: pixels, scale: Float(scale), dark: dark, glyphs: glyphs),
+           let image = Self.image(drawn.picture, scale: scale) {
+            cards = Cards(
+                image: image,
+                inset: CGFloat(drawn.inset) / scale,
+                slot: CGFloat(drawn.slot) / scale,
+                count: drawn.count.map { count in
+                    let side = CGFloat(count.diameter) / scale
+                    return (Int(count.more), CGRect(x: CGFloat(count.x) / scale, y: CGFloat(count.y) / scale, width: side, height: side))
+                }
+            )
+        }
+        pictures[key] = cards
+        return cards
+    }
+
+    /// Another host's cards, or the built-in ones again: what was drawn
+    /// before is stale.
+    private func refresh(_ core: Core) {
+        let now = core.tabIconsRevision()
+        if now != revision {
+            cache.removeAll()
+            missing.removeAll()
+            pictures.removeAll()
+            revision = now
         }
     }
 
     func icon(_ id: String, points: CGFloat, scale: CGFloat, core: Core) -> Icon? {
-        let now = core.tabIconsRevision()
-        if now != revision {
-            // Another host's cards, or the built-in ones again.
-            cache.removeAll()
-            missing.removeAll()
-            revision = now
-        }
+        refresh(core)
         let pixels = UInt32((points * 0.56 * scale).rounded(.up))
         let key = "\(id)@\(pixels)"
         if let icon = cache[key] { return icon }
@@ -117,5 +207,62 @@ final class TabIconImages {
               )
         else { return nil }
         return UIImage(cgImage: image, scale: scale, orientation: .up).withRenderingMode(.alwaysTemplate)
+    }
+
+    /// A picture's pixels as an image `scale` pixels to the point.
+    static func image(_ picture: Picture, scale: CGFloat) -> UIImage? {
+        image(rgba: picture.rgba, width: Int(picture.width), height: Int(picture.height), scale: scale)
+    }
+
+    static func image(rgba: Data, width: Int, height: Int, scale: CGFloat) -> UIImage? {
+        guard width > 0, height > 0, rgba.count == width * height * 4,
+              let provider = CGDataProvider(data: rgba as CFData),
+              let image = CGImage(
+                width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent
+              )
+        else { return nil }
+        return UIImage(cgImage: image, scale: scale, orientation: .up)
+    }
+}
+
+/// The marks of threads as the core drew them (`threadMark`): a handful
+/// of states at the one or two sizes the app shows them, each kept once.
+final class ThreadMarkImages {
+    static let shared = ThreadMarkImages()
+
+    struct Mark {
+        /// One picture, or one for each step of a mark that moves.
+        let frames: [UIImage]
+        /// How long each step is held.
+        let step: TimeInterval
+    }
+
+    private var cache: [String: Mark?] = [:]
+    private static let limit = 128
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.cache.removeAll() }
+    }
+
+    func mark(status: String, dot: String, live: Bool, points: CGFloat, scale: CGFloat, dark: Bool) -> Mark? {
+        let pixels = UInt32((points * scale).rounded())
+        let key = "\(status)|\(dot)|\(live)|\(pixels)|\(dark)"
+        if let known = cache[key] { return known }
+        if cache.count >= Self.limit { cache.removeAll() }
+        var mark: Mark?
+        if let drawn = threadMark(status: status, dot: dot, live: live, size: pixels, dark: dark) {
+            let side = Int(drawn.side)
+            let frames = drawn.frames.compactMap { TabIconImages.image(rgba: $0, width: side, height: side, scale: scale) }
+            if !frames.isEmpty, frames.count == drawn.frames.count {
+                mark = Mark(frames: frames, step: TimeInterval(drawn.stepMs) / 1000)
+            }
+        }
+        cache[key] = mark
+        return mark
     }
 }

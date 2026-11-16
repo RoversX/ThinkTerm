@@ -4,10 +4,15 @@ import UniformTypeIdentifiers
 /// Add or edit one host. The private key never travels back out of the
 /// Keychain into a field: the editor only reports whether one is stored,
 /// and hands a new secret to `save` when the user supplies one.
+///
+/// As a sheet it adds or edits and goes. As a host's own page (`page`),
+/// pushed from the list, it shows the host and its session first, with the
+/// way into its terminal; Save keeps an edit and stays.
 struct HostEditView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var store: HostStore
     @State var host: Host
+    var page: HostPage? = nil
     @ObservedObject private var lang = AppLanguage.shared
     @State private var secret = ""
     @State private var passphrase = ""
@@ -17,44 +22,190 @@ struct HostEditView: View {
     @State private var importing = false
     @State private var importError: String?
     @State private var copiedPublicKey = false
+    /// The page's host as last kept, and the secrets as they were then:
+    /// what Save compares the fields with.
+    @State private var kept: Host?
+    @State private var keptSecret = ""
+    @State private var keptPassphrase = ""
+    @State private var confirmDelete = false
     var save: (Host, String, String?) -> Void
 
     var body: some View {
-        NavigationStack {
-            Form {
-                hostSection
-                groupSection
-                authSection
-                advancedSection
-            }
-            .scrollContentBackground(.hidden)
-            .background(Color.black.ignoresSafeArea())
-            .navigationTitle(host.hostname.isEmpty ? tr("newhost") : host.display)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button(tr("cancel")) { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(tr("save")) {
-                        save(host, secret, passphrase.isEmpty ? nil : passphrase)
+        if let page {
+            form(page)
+                .navigationTitle("")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(tr("save")) { keep() }
+                            .fontWeight(.semibold)
+                            .disabled(!changed || !canSave)
+                    }
+                }
+                .confirmationDialog(tr("host.delete.title"), isPresented: $confirmDelete, titleVisibility: .visible) {
+                    Button(tr("host.delete.confirm", (kept ?? host).display), role: .destructive) {
+                        page.delete()
                         dismiss()
                     }
-                    .fontWeight(.semibold)
-                    .disabled(!canSave)
+                    Button(tr("cancel"), role: .cancel) {}
+                } message: {
+                    Text(tr("host.delete.body"))
                 }
-            }
-            .onAppear { hasStoredSecret = Keychain.load(account: host.id.uuidString) != nil }
-            .fileImporter(isPresented: $importing, allowedContentTypes: [.data, .text]) { result in
-                importKey(result)
-            }
-            .alert(
-                tr("key.importfailed"),
-                isPresented: Binding(get: { importError != nil }, set: { if !$0 { importError = nil } })
-            ) {
-                Button(tr("ok"), role: .cancel) { importError = nil }
-            } message: {
-                Text(importError ?? "")
+        } else {
+            NavigationStack {
+                form(nil)
+                    .navigationTitle(host.hostname.isEmpty ? tr("newhost") : host.display)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) { Button(tr("cancel")) { dismiss() } }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button(tr("save")) {
+                                var edited = edited()
+                                // A key forgotten in the form goes with the save.
+                                if host.knownHost == nil { edited.knownHost = nil }
+                                save(edited, secret, passphrase.isEmpty ? nil : passphrase)
+                                dismiss()
+                            }
+                            .fontWeight(.semibold)
+                            .disabled(!canSave)
+                        }
+                    }
             }
         }
+    }
+
+    private func form(_ page: HostPage?) -> some View {
+        Form {
+            if let page {
+                // The host as kept, its session and the way in, over its
+                // picture's choices.
+                Section {
+                    iconRow
+                } header: {
+                    VStack(spacing: 0) {
+                        HostHero(host: kept ?? host, sessions: page.sessions)
+                        Text(tr("f.icon"))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 26)
+                    }
+                    .textCase(nil)
+                }
+            } else {
+                Section(tr("f.icon")) { iconRow }
+            }
+            hostSection
+            groupSection
+            authSection
+            advancedSection
+            if let page { manageSection(page) }
+        }
+        .scrollContentBackground(.hidden)
+        .background(Color.pageBackdrop.ignoresSafeArea())
+        .onAppear {
+            hasStoredSecret = Keychain.load(account: host.id.uuidString) != nil
+            if kept == nil { kept = host }
+        }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.data, .text]) { result in
+            importKey(result)
+        }
+        .alert(
+            tr("key.importfailed"),
+            isPresented: Binding(get: { importError != nil }, set: { if !$0 { importError = nil } })
+        ) {
+            Button(tr("ok"), role: .cancel) { importError = nil }
+        } message: {
+            Text(importError ?? "")
+        }
+    }
+
+    /// The desktop's host pictures, the one the host wears picked out.
+    private var iconRow: some View {
+        HStack(spacing: 0) {
+            ForEach(Host.icons, id: \.self) { name in
+                let chosen = (host.icon.isEmpty ? Host.icons[0] : host.icon) == name
+                Button {
+                    // The first is the one a host with none chosen wears.
+                    host.icon = name == Host.icons[0] ? "" : name
+                } label: {
+                    Image(systemName: Host.iconSymbol(name))
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(chosen ? Color.white : Color.primary.opacity(0.8))
+                        .frame(width: 36, height: 36)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(chosen ? Color.accentColor : Color(.tertiarySystemFill))
+                        )
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(name)
+                .accessibilityAddTraits(chosen ? .isSelected : [])
+                if name != Host.icons.last { Spacer(minLength: 2) }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Copying the host, forgetting its key, deleting it: at the page's end.
+    private func manageSection(_ page: HostPage) -> some View {
+        Section {
+            Button(tr("host.duplicate")) {
+                page.duplicate()
+                dismiss()
+            }
+            // The key as the store has it now: a connection made from this
+            // page may have pinned one since it opened.
+            if store.hosts.first(where: { $0.id == host.id })?.knownHost != nil {
+                Button(tr("forgetkey")) { page.sessions.forgetHostKey(host.id, store: store) }
+            }
+            Button(tr("host.delete"), role: .destructive) { confirmDelete = true }
+        }
+    }
+
+    /// The page's fields differ from the host as kept.
+    private var changed: Bool {
+        guard let kept else { return false }
+        return !Self.sameEdits(host, kept) || secret != keptSecret || passphrase != keptPassphrase
+    }
+
+    /// What the page edits of a host alike. The rest -- the key pinned on
+    /// a connection, when it was last reached -- the store keeps up to
+    /// date behind the page, and is not the page's to write back.
+    private static func sameEdits(_ a: Host, _ b: Host) -> Bool {
+        a.name == b.name && a.hostname == b.hostname && a.port == b.port && a.user == b.user
+            && a.auth == b.auth && a.remoteCommand == b.remoteCommand && a.group == b.group
+            && a.publicKey == b.publicKey && a.icon == b.icon
+    }
+
+    /// The edit onto the host as the store has it now: the key a
+    /// connection pinned, when it was last reached, are the store's.
+    private func edited() -> Host {
+        var edited = store.hosts.first { $0.id == host.id } ?? host
+        edited.name = host.name
+        edited.hostname = host.hostname
+        edited.port = host.port
+        edited.user = host.user
+        edited.auth = host.auth
+        edited.remoteCommand = host.remoteCommand
+        edited.group = host.group
+        edited.publicKey = host.publicKey
+        edited.icon = host.icon
+        return edited
+    }
+
+    /// Save on the page: the edit goes onto the host as the store has it
+    /// now, and the page goes on with the result. A secret is handed on
+    /// only when it is new since the last keep.
+    private func keep() {
+        let edited = edited()
+        let newSecret = secret == keptSecret ? "" : secret
+        let newPassphrase = passphrase == keptPassphrase || passphrase.isEmpty ? nil : passphrase
+        save(edited, newSecret, newPassphrase)
+        let now = store.hosts.first { $0.id == host.id } ?? edited
+        host = now
+        kept = now
+        keptSecret = secret
+        keptPassphrase = passphrase
+        if !secret.isEmpty { hasStoredSecret = true }
     }
 
     private var hostSection: some View {
@@ -63,7 +214,7 @@ struct HostEditView: View {
                 TextField(tr("optional"), text: $host.name)
             }
             labelled(tr("f.hostname")) {
-                TextField("example.com or 10.0.0.4", text: $host.hostname)
+                TextField("example.com or 192.0.2.10", text: $host.hostname)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
@@ -214,10 +365,12 @@ struct HostEditView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(.vertical, 4)
-                    Button(role: .destructive) {
-                        host.knownHost = nil
-                    } label: {
-                        Label(tr("forgetkey"), systemImage: "xmark.shield")
+                    if page == nil {
+                        Button(role: .destructive) {
+                            host.knownHost = nil
+                        } label: {
+                            Label(tr("forgetkey"), systemImage: "xmark.shield")
+                        }
                     }
                 }
             }
@@ -290,5 +443,134 @@ struct HostEditView: View {
     private func refreshPublicKey() {
         host.publicKey = SSHKey.publicLine(ofPrivate: secret, comment: keyComment)
         copiedPublicKey = false
+    }
+}
+
+/// What a host's own page has beyond the editor: the sessions, for the
+/// host's, and the ways to copy or remove the host.
+struct HostPage {
+    let sessions: Sessions
+    var duplicate: () -> Void
+    var delete: () -> Void
+}
+
+/// The top of a host's page: its picture, name and address as kept, where
+/// its session stands, and the way into its terminal.
+private struct HostHero: View {
+    let host: Host
+    @ObservedObject var sessions: Sessions
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HostTile(size: 76) { Image(systemName: host.iconSymbol).font(.system(size: 32, weight: .medium)) }
+            // The colours themselves: in a section's header the hierarchical
+            // styles are the header's own, a step quieter.
+            Text(host.title)
+                .font(.title2.weight(.bold))
+                .foregroundStyle(Color.primary)
+                .lineLimit(1)
+                .padding(.top, 14)
+            Text(host.address)
+                .font(.subheadline.monospaced())
+                .foregroundStyle(Color.secondary)
+                .lineLimit(1)
+                .padding(.top, 3)
+            if let model = sessions.existing(host.id) {
+                HostHeroSession(host: host, model: model)
+            } else {
+                HostStatusPill(state: .none)
+                HostActions(host: host, state: .none) {}
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 4)
+    }
+}
+
+/// The part of the top that follows a session as it goes.
+private struct HostHeroSession: View {
+    let host: Host
+    @ObservedObject var model: TerminalModel
+    @ObservedObject private var settings = AppSettings.shared
+
+    var body: some View {
+        let state = SessionState(model, autoReconnect: settings.autoReconnect)
+        HostStatusPill(state: state)
+        HostActions(host: host, state: state) { model.disconnect() }
+    }
+}
+
+private struct HostStatusPill: View {
+    let state: SessionState
+
+    private var look: (text: String, color: Color) {
+        switch state {
+        case .connected: return (tr("host.connected"), .green)
+        case .connecting: return (tr("connecting"), .orange)
+        case .lost: return (tr("conn.disconnected"), .red)
+        case .none: return (tr("host.notconnected"), .secondary)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(look.color).frame(width: 8, height: 8)
+            Text(look.text)
+        }
+        .font(.footnote.weight(.medium))
+        .foregroundStyle(look.color)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(look.color.opacity(0.14)))
+        .padding(.top, 10)
+    }
+}
+
+/// Into the terminal -- opened, or connected first -- and, while there is
+/// a session, the way to end it.
+private struct HostActions: View {
+    let host: Host
+    let state: SessionState
+    var disconnect: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            NavigationLink(value: HostTerminal(host: host)) {
+                HStack(spacing: 7) {
+                    Image(systemName: state == .connected ? "terminal" : "link")
+                    Text(tr(state == .connected ? "host.open" : "connect"))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.white)
+                // Clear of the capsule's round ends: a word too long for
+                // its half shrinks a little rather than run under them.
+                .padding(.horizontal, 16)
+                .frame(maxWidth: .infinity, minHeight: 50)
+                .contentShape(Capsule())
+                .glassCapsule(tint: .accentColor)
+            }
+            .buttonStyle(.plain)
+            if state == .connected || state == .connecting {
+                Button(action: disconnect) {
+                    HStack(spacing: 7) {
+                        Image(systemName: "power")
+                        Text(tr("disconnect"))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(Color.primary)
+                    .padding(.horizontal, 16)
+                    .frame(maxWidth: .infinity, minHeight: 50)
+                    .contentShape(Capsule())
+                    .glassCapsule()
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .glassGroup(spacing: 10)
+        .padding(.top, 18)
     }
 }

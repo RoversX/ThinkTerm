@@ -28,6 +28,9 @@ struct Host: Codable, Identifiable, Hashable {
     /// can be shown and copied to the host's authorized_keys.
     var publicKey: String?
     var lastConnected: Date?
+    /// The picture the host wears, by the desktop's name for it
+    /// (`Host.icons`); empty is the server.
+    var icon: String = ""
 
     var display: String {
         name.isEmpty ? "\(user)@\(hostname):\(port)" : name
@@ -39,7 +42,7 @@ struct Host: Codable, Identifiable, Hashable {
 
     // Fields added later are absent from hosts saved before them.
     private enum Keys: String, CodingKey {
-        case id, name, hostname, port, user, auth, knownHost, remoteCommand, group, publicKey, lastConnected
+        case id, name, hostname, port, user, auth, knownHost, remoteCommand, group, publicKey, lastConnected, icon
     }
 
     init(from decoder: Decoder) throws {
@@ -55,7 +58,31 @@ struct Host: Codable, Identifiable, Hashable {
         group = try c.decodeIfPresent(String.self, forKey: .group) ?? ""
         publicKey = try c.decodeIfPresent(String.self, forKey: .publicKey)
         lastConnected = try c.decodeIfPresent(Date.self, forKey: .lastConnected)
+        icon = try c.decodeIfPresent(String.self, forKey: .icon) ?? ""
     }
+}
+
+extension Host {
+    /// The desktop's host icons (thinkterm-core's `HostIcon`), in the order
+    /// its picker offers them; a host with none chosen wears the first.
+    static let icons = ["server", "cloud", "globe", "laptop", "mac-mini", "desktop", "chip", "container"]
+
+    /// The system's own symbol for an icon: the phone draws a host as the
+    /// rest of iOS does, under the desktop's name for it.
+    static func iconSymbol(_ icon: String) -> String {
+        switch icon {
+        case "cloud": return "cloud"
+        case "globe": return "globe"
+        case "laptop": return "laptopcomputer"
+        case "mac-mini": return "macmini"
+        case "desktop": return "desktopcomputer"
+        case "chip": return "cpu"
+        case "container": return "shippingbox"
+        default: return "server.rack"
+        }
+    }
+
+    var iconSymbol: String { Self.iconSymbol(icon) }
 }
 
 extension Host {

@@ -1,20 +1,187 @@
 import SwiftUI
 
-/// The app's preferences, in the prototype's eight sections. The Settings
-/// tab and a terminal's menu show the same page; from a terminal it also
-/// offers the log. Every open terminal follows a change at once.
+/// The app's preferences, as iOS's own Settings lays them out: a list of
+/// what there is to set, each with its symbol, and a page for each. The
+/// Settings tab and a terminal's menu show the same; from a terminal it
+/// also offers the log. Every open terminal follows a change at once.
 struct SettingsView: View {
     @ObservedObject var settings = AppSettings.shared
     @ObservedObject private var lang = AppLanguage.shared
+    @Environment(\.dismiss) private var dismiss
     var showLog: Binding<Bool>?
 
     var body: some View {
         List {
-            Section(tr("sec.general")) {
+            Section {
+                row(.general)
+                row(.appearance)
+                row(.terminal)
+                row(.interface)
+            }
+            Section {
+                row(.keyboard)
+                row(.gestures)
+                row(.connection)
+                NavigationLink {
+                    TailnetSettingsView()
+                } label: {
+                    SettingsRowLabel(symbol: "point.3.connected.trianglepath.dotted", tint: GlassTile.blue, title: "Tailscale")
+                }
+            }
+            Section {
+                if showLog != nil { row(.diagnostics) }
+                row(.about)
+            }
+        }
+        .navigationTitle(tr("settings"))
+    }
+
+    private func row(_ page: SettingsPage) -> some View {
+        NavigationLink {
+            // Show Welcome leaves Settings altogether, whichever way it came.
+            SettingsPageView(page: page, showLog: showLog) { dismiss() }
+        } label: {
+            SettingsRowLabel(symbol: page.symbol, tint: page.tint, title: page.title)
+        }
+    }
+
+}
+
+/// What Settings has a page for.
+enum SettingsPage {
+    case general, appearance, terminal, interface, keyboard, gestures, connection, diagnostics, about
+
+    var title: String {
+        switch self {
+        case .general: return tr("sec.general")
+        case .appearance: return tr("sec.appearance")
+        case .terminal: return tr("sec.terminal")
+        case .interface: return tr("sec.interface")
+        case .keyboard: return tr("sec.keyboard")
+        case .gestures: return tr("sec.gestures")
+        case .connection: return tr("sec.connection")
+        case .diagnostics: return tr("diagnostics")
+        case .about: return tr("sec.about")
+        }
+    }
+
+    /// The system's symbol for it, as iOS's Settings has one per row.
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape.fill"
+        case .appearance: return "paintbrush.pointed.fill"
+        case .terminal: return "apple.terminal.fill"
+        case .interface: return "rectangle.split.2x1.fill"
+        case .keyboard: return "keyboard.fill"
+        case .gestures: return "hand.tap.fill"
+        case .connection: return "antenna.radiowaves.left.and.right"
+        case .diagnostics: return "stethoscope"
+        case .about: return "info.circle.fill"
+        }
+    }
+
+    /// The colour of its tile, as iOS's Settings colours its rows.
+    var tint: Color {
+        switch self {
+        case .general, .keyboard, .about: return GlassTile.gray
+        case .appearance: return GlassTile.blue
+        case .terminal: return GlassTile.indigo
+        case .interface: return GlassTile.teal
+        case .gestures: return GlassTile.orange
+        case .connection: return GlassTile.green
+        case .diagnostics: return GlassTile.red
+        }
+    }
+}
+
+/// A row of Settings' list: its symbol on a glass tile of its colour, as
+/// iOS's Settings has them, and its name.
+struct SettingsRowLabel: View {
+    let symbol: String
+    let tint: Color
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 14) {
+            GlassTile(symbol: symbol, tint: tint)
+            Text(title)
+        }
+    }
+}
+
+/// A symbol in white on a tile of colour, lit as the system's Liquid Glass
+/// icons are: the colour a touch lighter at the top and deeper at the
+/// foot, a faint sheen over its upper half, and a light rim along the top
+/// that fades round the sides.
+struct GlassTile: View {
+    let symbol: String
+    let tint: Color
+    var size: CGFloat = 30
+
+    // The system's colours as its Settings icons wear them: the same in the
+    // dark, not the brighter shades the dark gives text.
+    static let gray = Color(red: 0x8E / 255, green: 0x8E / 255, blue: 0x93 / 255)
+    static let blue = Color(red: 0x00 / 255, green: 0x7A / 255, blue: 0xFF / 255)
+    static let indigo = Color(red: 0x58 / 255, green: 0x56 / 255, blue: 0xD6 / 255)
+    static let teal = Color(red: 0x30 / 255, green: 0xB0 / 255, blue: 0xC7 / 255)
+    static let orange = Color(red: 0xFF / 255, green: 0x95 / 255, blue: 0x00 / 255)
+    static let green = Color(red: 0x34 / 255, green: 0xC7 / 255, blue: 0x59 / 255)
+    static let red = Color(red: 0xFF / 255, green: 0x3B / 255, blue: 0x30 / 255)
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
+        Image(systemName: symbol)
+            .font(.system(size: size * 0.5, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background {
+                ZStack {
+                    shape.fill(LinearGradient(
+                        colors: [tint.mix(with: .white, by: 0.1), tint, tint.mix(with: .black, by: 0.08)],
+                        startPoint: .top, endPoint: .bottom
+                    ))
+                    shape.fill(LinearGradient(
+                        colors: [.white.opacity(0.12), .white.opacity(0)],
+                        startPoint: .top, endPoint: .center
+                    ))
+                }
+            }
+            .overlay {
+                shape.strokeBorder(
+                    LinearGradient(
+                        colors: [.white.opacity(0.45), .white.opacity(0.05), .white.opacity(0.15)],
+                        startPoint: .top, endPoint: .bottom
+                    ),
+                    lineWidth: max(0.6, size / 48)
+                )
+            }
+    }
+}
+
+/// One of Settings' pages: the preferences it holds, as they were.
+struct SettingsPageView: View {
+    let page: SettingsPage
+    var showLog: Binding<Bool>?
+    /// Leaves Settings, for a choice that takes the app elsewhere.
+    var close: () -> Void
+    @ObservedObject var settings = AppSettings.shared
+    @ObservedObject private var lang = AppLanguage.shared
+
+    var body: some View {
+        List { content }
+            .navigationTitle(page.title)
+            .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch page {
+        case .general:
+            Section {
                 push(tr("language"), selection: $settings.language, options: Self.languages)
             }
-
-            Section(tr("sec.appearance")) {
+        case .appearance:
+            Section {
                 NavigationLink {
                     ThemePicker()
                 } label: {
@@ -41,8 +208,8 @@ struct SettingsView: View {
                 push(tr("font.family"), selection: $settings.fontFamily, options: Self.fonts)
                 push(tr("contrast"), selection: $settings.contrast, options: Self.contrasts)
             }
-
-            Section(tr("sec.terminal")) {
+        case .terminal:
+            Section {
                 segment(tr("scroll.mode"), isOn: $settings.smoothScroll, off: tr("scroll.stepped"), on: tr("scroll.smooth"))
                 Toggle(tr("scrollbar"), isOn: $settings.scrollbar)
                 push(tr("cursor"), selection: $settings.cursorStyle, options: Self.cursors)
@@ -50,12 +217,16 @@ struct SettingsView: View {
                 Toggle(tr("bell"), isOn: $settings.bell)
                 push(tr("resize.mode"), selection: $settings.resizeMode, options: Self.resizes)
             }
-
-            Section(tr("sec.interface")) {
+        case .interface:
+            Section {
                 Toggle(tr("i.panebars"), isOn: $settings.paneBars)
+                push(tr("i.spaces"), selection: $settings.spaces, options: [
+                    PickerOption("list", tr("i.spaces.list")),
+                    PickerOption("menu", tr("i.spaces.menu")),
+                ])
             }
-
-            Section(tr("sec.keyboard")) {
+        case .keyboard:
+            Section {
                 NavigationLink {
                     KeyBarKeys()
                 } label: {
@@ -67,14 +238,14 @@ struct SettingsView: View {
                 }
                 Toggle(tr("k.haptics"), isOn: $settings.hapticKeys)
             }
-
-            Section(tr("sec.gestures")) {
+        case .gestures:
+            Section {
                 Toggle(tr("g.pinch"), isOn: $settings.pinchZoom)
                 Toggle(tr("g.twofinger"), isOn: $settings.twoFingerHidesKeyboard)
                 Toggle(tr("g.longpress"), isOn: $settings.longPressSelects)
             }
-
-            Section(tr("sec.connection")) {
+        case .connection:
+            Section {
                 Toggle(tr("c.autoreconnect"), isOn: $settings.autoReconnect)
                 Stepper(value: $settings.keepAliveSeconds, in: 0...300, step: 15) {
                     HStack {
@@ -87,30 +258,98 @@ struct SettingsView: View {
                 }
                 Toggle(tr("c.background"), isOn: $settings.keepSessionInBackground)
             }
-
+        case .diagnostics:
             if let showLog {
                 Section {
                     Toggle(tr("showlog"), isOn: showLog)
                     Toggle(tr("devmode"), isOn: $settings.devMode)
-                } header: {
-                    Text(tr("diagnostics"))
                 } footer: {
                     Text(tr("showlog.foot"))
                 }
             }
-
-            Section(tr("sec.about")) {
-                HStack {
-                    Text(tr("version"))
-                    Spacer()
-                    Text(Self.version).foregroundColor(.secondary)
+        case .about:
+            // As the desktop's About page has it: the app and its version,
+            // what it is built as and under, where it comes from, and who
+            // makes it.
+            Section {
+                AboutHero()
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+            Section {
+                aboutRow("shippingbox.fill", GlassTile.blue, tr("version"), About.version)
+                // A line of its own only when it says something the version
+                // does not.
+                if About.build != About.version {
+                    aboutRow("arrow.triangle.branch", GlassTile.indigo, tr("about.build"), About.build)
                 }
+                aboutRow("cpu", GlassTile.teal, tr("about.platform"), About.platform)
+                aboutRow("doc.text.fill", GlassTile.orange, tr("about.license"), About.license)
+            }
+            Section {
+                aboutLink(tr("about.source"), About.repo)
+                aboutLink(tr("about.releasenotes"), About.repo + "/releases")
+                NavigationLink(tr("licenses")) { LicensesView() }
+                aboutLink(tr("about.privacy"), About.repo + "/blob/main/PRIVACY.md")
+            }
+            Section {
+                // The first run's sky and pages again, over the app.
+                Button(tr("ob.show")) {
+                    close()
+                    WelcomeAgain.shared.show()
+                }
+            } footer: {
+                // Who makes it, at the foot.
+                HStack(alignment: .lastTextBaseline, spacing: 10) {
+                    // In the text's own colour, as the desktop draws it; the
+                    // year a step quieter.
+                    Image("closex-logo")
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(height: 30)
+                        .foregroundStyle(Color.primary)
+                        .accessibilityLabel("CloseX")
+                    Text(verbatim: "© 2026").font(.caption).foregroundStyle(Color.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 36)
             }
         }
-        .navigationTitle(tr("settings"))
     }
 
     // MARK: rows
+
+    /// One of About's facts: its tile, its name, and what it is.
+    private func aboutRow(_ symbol: String, _ tint: Color, _ title: String, _ value: String) -> some View {
+        HStack(spacing: 14) {
+            GlassTile(symbol: symbol, tint: tint)
+            Text(title)
+            Spacer()
+            Text(value)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .textSelection(.enabled)
+        }
+    }
+
+    /// A page of the project's, opened in the browser.
+    @ViewBuilder
+    private func aboutLink(_ title: String, _ address: String) -> some View {
+        if let url = URL(string: address) {
+            Link(destination: url) {
+                HStack {
+                    // The text's own colour: a link is a row here, as the
+                    // licences' is, not a word in a sentence.
+                    Text(title).foregroundStyle(Color.primary)
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Color(.tertiaryLabel))
+                }
+            }
+        }
+    }
 
     /// A row that pushes a one-of-these screen and shows the choice.
     private func push(_ title: String, selection: Binding<String>, options: [PickerOption]) -> some View {
@@ -128,20 +367,6 @@ struct SettingsView: View {
     }
 
     /// The prototype's segmented row: a quiet label with the control under it.
-    private func segment(_ title: String, selection: Binding<String>,
-                         _ first: (String, String), _ second: (String, String)) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(title).font(.subheadline).foregroundColor(.secondary)
-            Picker(title, selection: selection) {
-                Text(first.1).tag(first.0)
-                Text(second.1).tag(second.0)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-        }
-        .padding(.vertical, 3)
-    }
-
     private func segment(_ title: String, isOn: Binding<Bool>, off: String, on: String) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title).font(.subheadline).foregroundColor(.secondary)
@@ -193,12 +418,88 @@ struct SettingsView: View {
         PickerOption("live", tr("resize.live")),
         PickerOption("release", tr("resize.release")),
     ] }
+}
+
+/// What About tells of the app, as the desktop's About page does.
+enum About {
+    /// The project's home, as the desktop's About links it.
+    static let repo = "https://github.com/RoversX/thinkterm"
+    /// As the packages declare it, the desktop's About says the same.
+    static let license = "GPL-3.0-only"
 
     static var version: String {
-        let info = Bundle.main.infoDictionary
-        let short = info?["CFBundleShortVersionString"] as? String ?? "0"
-        let build = info?["CFBundleVersion"] as? String ?? "0"
-        return "\(short) (\(build))"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    }
+
+    static var build: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+    }
+
+    /// The system and its version, and the kind of device.
+    static var platform: String {
+        "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion) · \(UIDevice.current.model)"
+    }
+
+    /// The device's own model name ("iPhone17,1"), for a bug report.
+    private static var machine: String {
+        var info = utsname()
+        uname(&info)
+        return withUnsafeBytes(of: &info.machine) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+    }
+
+    /// What Copy Info puts on the clipboard: what a bug report needs on its
+    /// first lines so nobody has to ask.
+    static var info: String {
+        [
+            "ThinkTerm \(version)",
+            "Build: \(build)",
+            "OS: \(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
+            "Device: \(machine)",
+        ].joined(separator: "\n")
+    }
+}
+
+/// The head of About: the app's icon, its name, its version, and the way
+/// to copy what a bug report needs.
+private struct AboutHero: View {
+    @ObservedObject private var lang = AppLanguage.shared
+    @State private var copied = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Image("app-icon")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 92, height: 92)
+                .accessibilityHidden(true)
+            Text(verbatim: "ThinkTerm")
+                .font(.title.weight(.bold))
+                .foregroundStyle(Color.primary)
+                .padding(.top, 10)
+            Text(tr("about.versionline", About.version))
+                .font(.subheadline)
+                .foregroundStyle(Color.secondary)
+                .padding(.top, 3)
+            Button {
+                UIPasteboard.general.string = About.info
+                copied = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
+            } label: {
+                Label(tr(copied ? "copied" : "about.copy"), systemImage: copied ? "checkmark" : "doc.on.doc")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.primary)
+                    .padding(.horizontal, 18)
+                    .frame(height: 38)
+                    .contentShape(Capsule())
+                    .glassCapsule()
+            }
+            .buttonStyle(.borderless)
+            .padding(.top, 14)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.bottom, 4)
     }
 }
 

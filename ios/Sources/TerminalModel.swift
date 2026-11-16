@@ -42,6 +42,29 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     @Published private(set) var nameAsks = 0
     @Published var tree: TreeView?
     @Published var navs: [NavView] = []
+    /// The panes of the tab on show, for the switcher under the terminal.
+    @Published var panes: PanesView?
+    /// Every pane an agent runs in, for the right sidebar.
+    @Published var agents: AgentsView?
+    /// Files on their way to the host, and those that just got there or
+    /// did not (`upload`): shown over the keys until they have said so.
+    @Published private(set) var uploads: [Upload] = []
+    private var uploadTimer: Timer?
+    /// An upload ended, one way or the other (the self-test listens).
+    var onUploadEnded: ((Upload) -> Void)?
+
+    struct Upload: Identifiable, Equatable {
+        let id: UInt64
+        let name: String
+        /// The app's own copy, read as it is sent and removed after.
+        let file: URL
+        var sent: UInt64 = 0
+        var total: UInt64 = 0
+        /// Where it is on the host, once it is.
+        var path: String?
+        var error: String?
+        var ended: Date?
+    }
     @Published var status: StatusView?
     @Published var title = ""
     @Published var connection = ""
@@ -86,6 +109,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// The chrome's ink over `background`: white over a dark scheme, near
     /// black over a light one.
     @Published private(set) var ink = Color.white
+    /// Whether `background` is a dark one, which `ink` is white over.
+    var dark: Bool { ink == .white }
 
     private static func ink(over color: Color) -> Color {
         var (r, g, b, a): (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
@@ -122,6 +147,16 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// core is told, so a session behind the screen takes nothing.
     private var onScreen = false
     private var inFront = true
+    /// The app is in front (not in the background).
+    var isInFront: Bool { inFront }
+    /// The terminal's screen shows this host.
+    var isOnScreen: Bool { onScreen }
+    /// A list shows this host's threads while its terminal is off screen
+    /// (`setViewsListed`): the views are read for it as the core says they
+    /// changed, a few times a second at most, and not in the background,
+    /// where nobody sees the list.
+    private var listed = false
+    private var listRefreshQueued = false
     /// The preferences, followed as they change.
     let settings = AppSettings.shared
     var smoothScroll: Bool { settings.smoothScroll }
@@ -191,6 +226,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         #endif
 
         let link = CADisplayLink(target: self, selector: #selector(tick))
+        // At rest until the terminal is on screen (`enterScreen`): a host
+        // the list connected by itself is drawn by nobody.
+        link.isPaused = true
         link.add(to: .main, forMode: .common)
         displayLink = link
         // Every published change redraws the screen (and closes an open
@@ -205,18 +243,20 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         #endif
         applyScrollMode()
         applyScheme()
-        settings.$schemeName.dropFirst().sink { [weak self] _ in self?.applyScheme() }.store(in: &subscriptions)
-        settings.$smoothScroll.dropFirst().sink { [weak self] _ in self?.applyScrollMode() }.store(in: &subscriptions)
+        // A setting publishes before it is stored: each of these reads the
+        // settings again, so it waits a turn for the new value to be there.
+        settings.$schemeName.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyScheme() }.store(in: &subscriptions)
+        settings.$smoothScroll.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyScrollMode() }.store(in: &subscriptions)
         applyTerminalPrefs()
-        settings.$cursorStyle.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
-        settings.$cursorBlink.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
-        settings.$contrast.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
-        settings.$resizeMode.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
-        settings.$autoReconnect.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
-        settings.$paneBars.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
-        settings.$language.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$cursorStyle.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$cursorBlink.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$contrast.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$resizeMode.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$autoReconnect.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$paneBars.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$language.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
         // A face is shaped at connect time: the connection is made again.
-        settings.$fontFamily.dropFirst().removeDuplicates().sink { [weak self] _ in
+        settings.$fontFamily.dropFirst().removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
             guard let self, self.connection.hasPrefix("pane ") else { return }
             self.disconnect()
             self.connect()
@@ -232,7 +272,12 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if args.contains("--treetest") { scheduleTreeTest() }
         if args.contains("--uitest") { scheduleUiTest() }
         if args.contains("--accepttest") { scheduleAcceptTest() }
+        if args.contains("--uploadtest") { scheduleUploadTest() }
         #endif
+        // Off screen until its screen says otherwise: a host connected for
+        // the list alone must not claim the desktop's tab, move its focus
+        // or mark its threads seen.
+        updateShown()
     }
 
     /// The sidebar's "+": the screen asks for the folder.
@@ -246,6 +291,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         displayLink?.isPaused = true
         onScreen = false
         updateShown()
+        queueListRefresh()
     }
 
     func enterScreen() {
@@ -256,10 +302,72 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     private func updateShown() { core.setShown(shown: onScreen && inFront) }
 
+    /// The list of every host's threads shows this one's, or stopped:
+    /// while it does the core keeps the views current with the terminal
+    /// off screen, and the list reads them (`refreshViews`).
+    ///
+    /// The core attaches to the server -- and has threads to list -- only
+    /// once it has a surface to draw on, so a host listed while its
+    /// terminal is off screen is lent one of the screen's size that
+    /// nothing shows. The terminal's own takes its place when it comes
+    /// (`surfaceReady`), and it is taken back when the list goes.
+    func setViewsListed(_ listed: Bool) {
+        self.listed = listed
+        core.setViewsListed(listed: listed)
+        queueListRefresh()
+        if listed, generation == 0 {
+            let screen = UIApplication.shared.connectedScenes
+                .compactMap { ($0 as? UIWindowScene)?.screen }.first
+            let scale = Double(screen?.scale ?? 3)
+            let points = screen?.bounds.size ?? CGSize(width: 390, height: 844)
+            let width = Int((Double(points.width) * scale).rounded())
+            let height = Int((Double(points.height) * scale).rounded())
+            let standIn = listSurface ?? CAMetalLayer()
+            standIn.contentsScale = CGFloat(scale)
+            standIn.bounds = CGRect(origin: .zero, size: points)
+            standIn.drawableSize = CGSize(width: width, height: height)
+            listSurface = standIn
+            attach(standIn, width: width, height: height, scale: scale)
+            onListSurface = generation != 0
+        } else if !listed, onListSurface {
+            onListSurface = false
+            detach()
+        }
+    }
+
+    /// The surface lent for the list, and whether the core draws on it.
+    private var listSurface: CAMetalLayer?
+    private var onListSurface = false
+
+    /// From the core thread: the views changed. On screen the frame loop
+    /// reads them; off it, a list may be.
+    fileprivate func coreChanged() {
+        DispatchQueue.main.async { [weak self] in self?.queueListRefresh() }
+    }
+
+    /// The list's read of the views, soon and once for a burst of changes.
+    private func queueListRefresh() {
+        guard listed, !onScreen, inFront, !listRefreshQueued else { return }
+        listRefreshQueued = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            self.listRefreshQueued = false
+            guard self.listed, !self.onScreen, self.inFront else { return }
+            self.refreshViews()
+        }
+    }
+
     func shutdown() {
         clearHostKeyRequest()
         displayLink?.invalidate()
         statsTimer?.invalidate()
+        // Uploads end with the core: their copies go now, as nothing reads
+        // them, and nothing is asked of it after.
+        uploadTimer?.invalidate()
+        uploadTimer = nil
+        for upload in uploads where upload.ended == nil {
+            try? FileManager.default.removeItem(at: upload.file.deletingLastPathComponent())
+        }
         detach()
         core.disconnect()
         core.shutdown()
@@ -372,6 +480,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         // key brought the modifier itself, so it never lingers past it.
         let stickyCtrl = takeSticky(\.ctrlSticky)
         let stickyAlt = takeSticky(\.altSticky)
+        inputView?.lineDisturbed()
         core.key(name: name, ctrl: ctrl || stickyCtrl, alt: alt || stickyAlt, shift: shift)
     }
 
@@ -382,11 +491,13 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             key(text)
             return
         }
+        inputView?.lineDisturbed()
         core.text(text: text)
     }
 
     func pasteFromClipboard() {
         if let text = UIPasteboard.general.string, !text.isEmpty {
+            inputView?.lineDisturbed()
             core.paste(text: text)
         }
     }
@@ -426,14 +537,179 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// A passing remark of the shell's own, where the App's go.
+    func note(_ text: String) {
+        toastTimer?.invalidate()
+        toastText = text
+        toastTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
+            guard let self, self.toastText == text else { return }
+            self.toastText = nil
+        }
+    }
+
+    // MARK: uploads
+
+    /// Leave a picture in hand (a photo, the clipboard's) in the host's
+    /// uploads folder and put its path on the focused pane's command
+    /// line, as the desktop does with a file dropped on a remote terminal.
+    /// `begun` is the upload as it was chosen (`beginUpload`), for one that
+    /// took a while to load; none, begun now.
+    func upload(name: String, data: Data, begun: UInt64? = nil) {
+        let id = begun ?? beginUpload()
+        guard let file = Self.uploadFile(named: name), (try? data.write(to: file)) != nil else {
+            core.cancelUpload(id: id)
+            return note(tr("upload.unread", name))
+        }
+        startUpload(id: id, name: name, file: file)
+    }
+
+    /// An upload begun as its file is chosen: its path goes into the pane
+    /// focused now, however long the file takes to be ready.
+    func beginUpload() -> UInt64 {
+        core.uploadBegin()
+    }
+
+    /// The same for a file elsewhere (the Files app's): copied into the
+    /// app's own room while its door is held, so the upload reads it at
+    /// its own pace. Off the main thread, as a large file takes a while;
+    /// and as a coordinated read, which has one in iCloud and not on the
+    /// phone yet fetched first.
+    func upload(copying url: URL) {
+        let name = url.lastPathComponent
+        let id = beginUpload()
+        guard let file = Self.uploadFile(named: name) else {
+            core.cancelUpload(id: id)
+            return note(tr("upload.unread", name))
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var copied = false
+            do {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                var refused: NSError?
+                NSFileCoordinator().coordinate(readingItemAt: url, options: .withoutChanges, error: &refused) { readable in
+                    copied = (try? FileManager.default.copyItem(at: readable, to: file)) != nil
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self, copied else {
+                    try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+                    self?.core.cancelUpload(id: id)
+                    self?.note(tr("upload.unread", name))
+                    return
+                }
+                self.startUpload(id: id, name: name, file: file)
+            }
+        }
+    }
+
+    /// Give an upload up: the host keeps nothing of it.
+    func cancelUpload(_ id: UInt64) {
+        core.cancelUpload(id: id)
+    }
+
+    private static var uploadsFolder: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("uploads", isDirectory: true)
+    }
+
+    /// What a process before this one left in the uploads folder, stopped
+    /// in the middle of an upload: cleared once, before this one's first
+    /// copy is made there.
+    private static let clearedUploads: Void = {
+        try? FileManager.default.removeItem(at: uploadsFolder)
+    }()
+
+    /// A place of the app's own for a file on its way, in a folder to
+    /// itself so the name is the file's.
+    private static func uploadFile(named name: String) -> URL? {
+        _ = clearedUploads
+        let folder = uploadsFolder.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        guard (try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)) != nil else { return nil }
+        return folder.appendingPathComponent(name.isEmpty ? "file" : name)
+    }
+
+    private func startUpload(id: UInt64, name: String, file: URL) {
+        core.uploadFile(id: id, name: name, path: file.path)
+        uploads.append(Upload(id: id, name: name, file: file))
+        guard uploadTimer == nil else { return }
+        uploadTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.pollUploads() }
+    }
+
+    /// How each upload stands, as the core has it; one that is done pastes
+    /// its path and stays a moment to say so, one that failed a little
+    /// longer to say why, and one given up goes at once.
+    private func pollUploads() {
+        for index in uploads.indices where uploads[index].ended == nil {
+            guard let status = core.uploadStatus(id: uploads[index].id) else {
+                try? FileManager.default.removeItem(at: uploads[index].file.deletingLastPathComponent())
+                uploads[index].ended = Date()
+                continue
+            }
+            (uploads[index].sent, uploads[index].total) = (status.sent, status.total)
+            guard status.done else { continue }
+            uploads[index].ended = Date()
+            try? FileManager.default.removeItem(at: uploads[index].file.deletingLastPathComponent())
+            if status.error.isEmpty {
+                uploads[index].path = status.path
+                inputView?.lineDisturbed()
+                // Into the pane it was started from, not whichever has
+                // the focus now.
+                core.pasteUpload(id: uploads[index].id, text: status.paste)
+            } else {
+                uploads[index].error = status.error
+            }
+            onUploadEnded?(uploads[index])
+        }
+        let now = Date()
+        uploads.removeAll { upload in
+            guard let ended = upload.ended else { return false }
+            if upload.error == "cancelled" { return true }
+            return now.timeIntervalSince(ended) > (upload.error == nil ? 1.5 : 5)
+        }
+        if uploads.isEmpty {
+            uploadTimer?.invalidate()
+            uploadTimer = nil
+        }
+    }
+
+    /// The phone is in its light appearance: read from the screen, which
+    /// the window's own appearance (the terminal's, `TerminalScreen`)
+    /// does not change.
+    private static var systemLight: Bool {
+        UIScreen.main.traitCollection.userInterfaceStyle == .light
+    }
+    /// The appearance the scheme was last chosen for.
+    private var schemeForLight: Bool?
+
+    /// The appearance may have changed while the app was away.
+    func appearanceMayHaveChanged() {
+        if schemeForLight != Self.systemLight { applyScheme() }
+    }
+
+    /// The scheme the user picked; with none picked, the one that goes
+    /// with the side the phone is on, as the desktop decides its own
+    /// (`native_settings::effective_color_scheme`): light gets the light
+    /// half of the default, dark the host's own.
     private func applyScheme() {
         let schemeName = settings.schemeName
+        let light = Self.systemLight
+        schemeForLight = light
         if schemeName == Schemes.followDesktop || Schemes.json(named: schemeName) == nil {
             core.setSetting(key: "terminal-scheme", value: "\"desktop\"")
             core.setPalette(scheme: nil)
+            // On a light phone the light default stands in for a host's
+            // scheme that is no choice at all, as the desktop decides its
+            // own (`native_settings::resolve_color_scheme`): a scheme the
+            // host's configuration names is kept on either side.
+            let lightScheme = light ? Schemes.json(named: Schemes.lightDefault) : nil
+            core.setFallbackPalette(
+                scheme: lightScheme,
+                unchosen: lightScheme == nil ? nil : Schemes.json(named: Schemes.darkDefault)
+            )
         } else {
             core.setSetting(key: "terminal-scheme", value: "\"" + schemeName.replacingOccurrences(of: "\"", with: "\\\"") + "\"")
             core.setPalette(scheme: Schemes.json(named: schemeName))
+            core.setFallbackPalette(scheme: nil, unchosen: nil)
         }
     }
 
@@ -547,10 +823,18 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     // MARK: the App's chrome
 
     func chromeClick(_ action: String, pane: Int? = nil, tab: Int? = nil) {
+        // Another pane may have the line now: what the keyboard typed on
+        // this one is not to be changed there (`lineDisturbed`).
+        inputView?.lineDisturbed()
         core.chromeClick(action: action, pane: pane.map { UInt32($0) }, tab: tab.map { UInt32($0) })
     }
 
+    /// One pane of a tab at a time, whole, where the screen has no room
+    /// for a split's panes side by side.
+    func setOnePane(_ one: Bool) { core.setOnePane(one: one) }
+
     func sideClick(_ kind: String, id: String? = nil, flag: Bool? = nil) {
+        inputView?.lineDisturbed()
         core.sideClick(kind: kind, id: id, flag: flag)
     }
 
@@ -628,6 +912,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// each frame the revision moved; a burst of changes is one read, and
     /// it never waits for the core thread.
     func refreshViews() {
+        // The count first: the views are copied only when they changed.
+        guard core.viewsRevision() != lastViews?.revision else { return }
         let views = core.views()
         guard views.revision != lastViews?.revision else { return }
         let last = lastViews
@@ -661,6 +947,14 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if views.navs != last?.navs {
             let navs = ViewJSON.decode([NavView].self, views.navs) ?? []
             if navs != self.navs { self.navs = navs }
+        }
+        if views.panes != last?.panes {
+            let panes = ViewJSON.decode(PanesView.self, views.panes)
+            if panes != self.panes { self.panes = panes }
+        }
+        if views.agents != last?.agents {
+            let agents = ViewJSON.decode(AgentsView.self, views.agents)
+            if agents != self.agents { self.agents = agents }
         }
         if views.status != last?.status {
             let status = ViewJSON.decode(StatusView.self, views.status)
@@ -698,6 +992,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     // MARK: surface lifecycle, all on the main thread
 
     func surfaceReady(_ layer: CAMetalLayer, width: Int, height: Int, scale: Double) {
+        if onListSurface {
+            // The terminal's own surface, in the place of the list's.
+            onListSurface = false
+            detach()
+        }
         self.layer = layer
         wantsSurface = true
         if generation == 0 {
@@ -773,10 +1072,15 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func reattachAfterBackground() {
         inFront = true
         updateShown()
+        queueListRefresh()
         endBackgroundTask()
         if pausedForBackground {
             pausedForBackground = false
             connect()
+        } else {
+            // What the wait cut is found out now, and what was already
+            // down is tried again at once.
+            core.checkConnection()
         }
         guard wantsSurface, generation == 0, let layer, let size = drawableSize(of: layer) else { return }
         attach(layer, width: size.0, height: size.1, scale: size.2)
@@ -1180,6 +1484,39 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// `--uploadtest`: a small picture left on the probe's host twice
+    /// under one name, as the attach button would leave it; the second
+    /// keeps both. Each answer is on the console.
+    private func scheduleUploadTest() {
+        let q = DispatchQueue.main
+        q.asyncAfter(deadline: .now() + 1.5) { self.connectProbe() }
+        q.asyncAfter(deadline: .now() + 9.0) {
+            let picture = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).image { context in
+                UIColor.systemBlue.setFill()
+                context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+            }
+            guard let data = picture.pngData() else { return self.check("upload picture", false, "none made") }
+            var ended: [Upload] = []
+            self.onUploadEnded = { upload in
+                ended.append(upload)
+                if ended.count == 1 {
+                    self.check("upload lands in the uploads folder", upload.path?.hasSuffix("/ThinkTerm_Uploads/Upload test.png") == true, upload.path ?? upload.error ?? "")
+                    self.check("all of it went", upload.total > 0 && upload.sent == upload.total, "\(upload.sent) of \(upload.total)")
+                    // One at a time, so which is first is not a race.
+                    self.upload(name: "Upload test.png", data: data)
+                } else if ended.count == 2 {
+                    self.check("a second keeps both", upload.path?.hasSuffix("/ThinkTerm_Uploads/Upload test (1).png") == true, upload.path ?? upload.error ?? "")
+                    // A larger one, given up as it sets off: nothing of it stays.
+                    self.upload(name: "Given up.bin", data: Data(count: 8 << 20))
+                    if let last = self.uploads.last { self.cancelUpload(last.id) }
+                } else if ended.count == 3 {
+                    self.check("one given up says so", upload.error == "cancelled", upload.error ?? upload.path ?? "")
+                }
+            }
+            self.upload(name: "Upload test.png", data: data)
+        }
+    }
+
     private func scheduleImeTest() {
         let q = DispatchQueue.main
         var sent: Int { Int(inputsSent()) }
@@ -1230,8 +1567,36 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
                             v.unmarkText()
                             q.asyncAfter(deadline: .now() + 0.3) {
                                 self.check("leftover composition commits once", sent == b2 + 1, "sent \(sent - b2)")
-                                self.key("Enter")
-                                q.asyncAfter(deadline: .now() + 1.5) {
+                                // A dictation hears its last word again: four
+                                // backspaces and the better word.
+                                let b3 = sent
+                                v.insertText("helo wrld")
+                                if let end = v.position(from: v.endOfDocument, offset: 0),
+                                   let start = v.position(from: end, offset: -4),
+                                   let word = v.textRange(from: start, to: end) {
+                                    let read = v.text(in: word) ?? ""
+                                    v.replace(word, withText: "world")
+                                    q.asyncAfter(deadline: .now() + 0.3) {
+                                        self.check(
+                                            "a replaced word is typed over", read == "wrld" && sent == b3 + 6 && v.typed.hasSuffix("helo world"),
+                                            "read \(read), sent \(sent - b3), typed \(v.typed)"
+                                        )
+                                        let b4 = sent
+                                        v.insertText(" ")
+                                        v.deleteBackward()
+                                        v.insertText(". ")
+                                        self.key("ArrowLeft")
+                                        v.replace(word, withText: "x")
+                                        q.asyncAfter(deadline: .now() + 0.3) {
+                                            self.check(
+                                                "two spaces stay, and a moved line is typed into", sent == b4 + 5 && v.typed.hasSuffix("helo world  x"),
+                                                "sent \(sent - b4), typed \(v.typed)"
+                                            )
+                                            self.key("Enter")
+                                        }
+                                    }
+                                }
+                                q.asyncAfter(deadline: .now() + 2.5) {
                                     self.report("ime done")
                                     print("IMETEST DONE")
                                 }
@@ -1286,8 +1651,9 @@ private final class NotifySink: Notify, @unchecked Sendable {
     func onStatus(status: String) { model?.coreStatus(status) }
     func onLog(line: String) { model?.coreLogged(line) }
     func onTitle(title: String) { model?.coreTitle(title) }
-    /// The display link reads the views' count each frame instead.
-    func onChange() {}
+    /// On screen the display link reads the views' count each frame; off
+    /// it, a list showing the host's threads is told.
+    func onChange() { model?.coreChanged() }
     func onClipboard(text: String) {
         DispatchQueue.main.async {
             UIPasteboard.general.string = text
@@ -1321,7 +1687,46 @@ private final class NotifySink: Notify, @unchecked Sendable {
 /// Paints the graphemes the bundled faces lack with CoreText, which falls
 /// through the system's cascade list (PingFang for Han, Apple Color Emoji
 /// for emoji) on its own. Called on the core thread.
+///
+/// A character that is text unless asked to be a picture -- the record
+/// mark a program heads its lines with, a check, a warning sign -- is
+/// drawn as text: the cascade hands such a one to the emoji font whenever
+/// Menlo lacks it, and a terminal would show a coloured button where the
+/// desktop shows a plain mark.
 final class CoreTextPainter: GlyphPainter, @unchecked Sendable {
+    /// Whether `text` asks for a picture: it says so with the variation
+    /// selector, or is a character that is one by default.
+    private static func asksForPicture(_ text: String) -> Bool {
+        let scalars = text.unicodeScalars
+        if scalars.contains(where: { $0.value == 0xFE0F }) { return true }
+        if scalars.contains(where: { $0.value == 0xFE0E }) { return false }
+        // A sequence -- a flag, a family, a skin tone -- is a picture.
+        return scalars.count > 1 || scalars.first?.properties.isEmojiPresentation == true
+    }
+
+    /// The face to draw `text` in: the cascade's, unless that is the emoji
+    /// font for text that did not ask for a picture and a plain face has
+    /// it.
+    private static func face(for text: String, px: Double) -> CTFont {
+        let base = CTFontCreateWithName("Menlo" as CFString, CGFloat(px), nil)
+        let units = Array(text.utf16)
+        let cascade = CTFontCreateForString(base, text as CFString, CFRange(location: 0, length: units.count))
+        guard (CTFontCopyPostScriptName(cascade) as String).hasPrefix("AppleColorEmoji"), !asksForPicture(text) else {
+            return cascade
+        }
+        for name in TerminalFaces.plainFaces {
+            let plain = CTFontCreateWithName(name as CFString, CGFloat(px), nil)
+            var glyphs = [CGGlyph](repeating: 0, count: units.count)
+            // A name the system has not got comes back as another face:
+            // only the one asked for counts.
+            if (CTFontCopyPostScriptName(plain) as String) == name,
+               CTFontGetGlyphsForCharacters(plain, units, &glyphs, units.count) {
+                return plain
+            }
+        }
+        return cascade
+    }
+
     func paint(text: String, px: Double, width: UInt32, height: UInt32, penX: Double, baseline: Double, red: UInt8, green: UInt8, blue: UInt8) -> Data {
         let w = Int(width), h = Int(height)
         guard w > 0, h > 0 else { return Data() }
@@ -1333,8 +1738,7 @@ final class CoreTextPainter: GlyphPainter, @unchecked Sendable {
         ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
         // Menlo's own cascade list does not reach Apple Color Emoji on iOS;
         // asking CoreText for the font that can draw this string does.
-        let base = CTFontCreateWithName("Menlo" as CFString, CGFloat(px), nil)
-        let font = CTFontCreateForString(base, text as CFString, CFRange(location: 0, length: (text as NSString).length))
+        let font = Self.face(for: text, px: px)
         let color = CGColor(red: CGFloat(red) / 255, green: CGFloat(green) / 255, blue: CGFloat(blue) / 255, alpha: 1)
         let attrs: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String): font,

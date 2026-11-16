@@ -228,7 +228,7 @@ private struct CardHeading: View {
     var body: some View {
         let running = (thread.tabs.first(where: \.current) ?? thread.tabs.first)?.title ?? ""
         HStack(spacing: 6) {
-            ThreadMark(status: thread.status, dot: thread.dot, size: 7)
+            ThreadMark(status: thread.markStatus, dot: thread.dot, size: 7)
             // The title keeps its room; what runs gives way first.
             Text(title).font(.subheadline.weight(.semibold)).lineLimit(1).layoutPriority(1)
             Spacer(minLength: 4)
@@ -429,6 +429,18 @@ enum ScreenPainter {
 /// known to CoreText too, for the pictures of screens; the icons' face
 /// after either, as the core falls back to it.
 enum TerminalFaces {
+    /// The system's faces with plain forms of the symbols that are text
+    /// unless asked to be pictures, in the order tried: what the app's own
+    /// faces and Menlo lack of them, the system's cascade hands to the
+    /// emoji font. Of the 207 such characters these and Menlo have all
+    /// that any plain face on an iPhone has; the 91 left are pictures
+    /// wherever they are drawn (a thermometer, a cloud).
+    static let plainFaces = ["STIXTwoMath-Regular", "AppleSymbols", "ZapfDingbatsITC", "STIXGeneral-Regular", "HiraMinProN-W3"]
+
+    private static let plain: [CTFontDescriptor] = plainFaces.map {
+        CTFontDescriptorCreateWithNameAndSize($0 as CFString, 0)
+    }
+
     private static let symbols: [CTFontDescriptor] = {
         for name in ["JetBrainsMono-Regular", "FiraCode-Regular", "SymbolsNerdFontMono-Regular"] {
             if let url = Bundle.main.url(forResource: name, withExtension: "ttf") {
@@ -440,11 +452,12 @@ enum TerminalFaces {
     }()
 
     /// `face`, by its PostScript name, at `size`; what it lacks is looked
-    /// for in the icons' face before the system's.
+    /// for in the icons' face, then in the plain faces, before the
+    /// system's -- so a screen's picture draws a symbol as the screen does.
     static func font(_ face: String, size: CGFloat) -> CTFont {
         let descriptor = CTFontDescriptorCreateWithAttributes([
             kCTFontNameAttribute: face,
-            kCTFontCascadeListAttribute: symbols,
+            kCTFontCascadeListAttribute: symbols + plain,
         ] as CFDictionary)
         return CTFontCreateWithFontDescriptor(descriptor, size, nil)
     }

@@ -9,6 +9,7 @@ import SwiftUI
 struct SidebarPanel: View {
     @ObservedObject var model: TerminalModel
     @ObservedObject private var lang = AppLanguage.shared
+    @ObservedObject private var settings = AppSettings.shared
     var hostName: String
     var connected: Bool
     /// Something was picked: a drawer closes, a column stays.
@@ -16,6 +17,8 @@ struct SidebarPanel: View {
     var onEditHost: () -> Void
     var onSettings: () -> Void
     var onOverview: () -> Void
+    /// Back to the list of every host's threads.
+    var onLeave: () -> Void
     /// The overview is up: its row is lit.
     var overviewOn = false
     /// Someone sees it: a drawer shut under the screen makes no rows, and
@@ -39,7 +42,7 @@ struct SidebarPanel: View {
         return .red
     }
 
-    private static let backdrop = Color(white: 0.07)
+    private static let backdrop = Color.chromeBackdrop
     /// The header's row and the footer's, their padding included.
     private static let headerHeight: CGFloat = 60
     private static let footerHeight: CGFloat = 64
@@ -48,7 +51,7 @@ struct SidebarPanel: View {
         Group {
             if live { list } else { Color.clear }
         }
-        .foregroundColor(.white)
+        .foregroundColor(.primary)
         .background(Self.backdrop.ignoresSafeArea())
         .onChange(of: spaces.isEmpty, initial: true) { _, empty in
             // Once the tree is in: the panel is made before it arrives.
@@ -58,8 +61,9 @@ struct SidebarPanel: View {
         }
     }
 
-    /// The list runs the panel's full height, under the host at the top
-    /// and the buttons at the bottom, fading as it goes.
+    /// The list runs the panel's full height, under the buttons at the
+    /// top and those at the bottom, blurring and fading as it goes under
+    /// them. The host's name is its first row, and goes under with it.
     private var list: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
@@ -94,54 +98,78 @@ struct SidebarPanel: View {
 
     // MARK: the top
 
-    /// The host -- the tree's root and the connection's menu -- and the
-    /// search button.
+    /// The way back to every host's threads and the search button; with
+    /// the Spaces as a menu (`AppSettings.spaces`), the Space on show is
+    /// between them, as it heads the desktop's sidebar. The host's own
+    /// name is the list's first row (`host`), and scrolls away with it.
     private var header: some View {
         HStack(spacing: 10) {
-            Menu {
-                Button(connected ? tr("disconnect") : tr("reconnect")) {
-                    if connected { model.disconnect() } else { model.connect() }
-                }
-                if model.host != nil {
-                    Button(tr("edithost")) { onEditHost() }
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Text(hostName)
-                        .font(.title2.weight(.bold))
-                        .lineLimit(1)
-                    Circle().fill(connectionColor).frame(width: 8, height: 8)
-                }
-            }
-            .buttonStyle(.plain)
-            Spacer(minLength: 0)
-            Button {
-                withAnimation(.easeOut(duration: 0.2)) {
-                    searching.toggle()
-                    if !searching { search.query = "" }
-                }
-                // The field takes the keyboard as it comes up, not each
-                // time the panel makes it again.
-                search.focusNext = searching
-            } label: {
-                Image(systemName: searching ? "xmark" : "magnifyingglass")
-                    .font(.body.weight(.medium))
+            Button { done(); onLeave() } label: {
+                DesktopIcon(name: "chevron-left")
                     .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .glassCircle()
-            .accessibilityLabel(tr(searching ? "cancel" : "thread.find"))
+            .accessibilityLabel(tr("back"))
+            if settings.spaces == "menu", spaces.count > 1, let shown = spaces.first(where: \.current) {
+                spaceMenu(shown)
+            }
+            Spacer(minLength: 0)
+            searchButton
         }
-        .padding(.leading, max(20, headerRoom.leading))
+        .padding(.leading, max(14, headerRoom.leading))
         .padding(.trailing, 14)
         .padding(.top, 6 + max(0, headerRoom.top))
-        .padding(.bottom, 10)
+        .padding(.bottom, 8)
+    }
+
+    /// The host's name and how its connection stands; its menu ends or
+    /// starts the connection and edits the host.
+    private var host: some View {
+        Menu {
+            Button(connected ? tr("disconnect") : tr("reconnect")) {
+                if connected { model.disconnect() } else { model.connect() }
+            }
+            if model.host != nil {
+                Button(tr("edithost")) { onEditHost() }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(hostName)
+                    .font(.title2.weight(.bold))
+                    .lineLimit(1)
+                Circle().fill(connectionColor).frame(width: 8, height: 8)
+            }
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var searchButton: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) {
+                searching.toggle()
+                if !searching { search.query = "" }
+            }
+            // The field takes the keyboard as it comes up, not each
+            // time the panel makes it again.
+            search.focusNext = searching
+        } label: {
+            DesktopIcon(name: searching ? "x" : "search")
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassCircle()
+        .accessibilityLabel(tr(searching ? "cancel" : "thread.find"))
     }
 
     private var searchField: some View {
         HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+            DesktopIcon(name: "search", size: 18).foregroundColor(.secondary)
             SearchField(search: search, prompt: tr("thread.find"))
         }
         .padding(.horizontal, 14)
@@ -162,20 +190,22 @@ struct SidebarPanel: View {
                 model.sideClick("new-thread")
                 done()
             } label: {
-                Label(tr("thread.new"), systemImage: "square.and.pencil")
-                    .font(.body.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                    .padding(.horizontal, 18)
-                    .frame(height: 50)
-                    .contentShape(Capsule())
+                HStack(spacing: 8) {
+                    DesktopIcon(name: "square-pen")
+                    Text(tr("thread.new"))
+                        .font(.body.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                .padding(.horizontal, 18)
+                .frame(height: 50)
+                .contentShape(Capsule())
             }
             .buttonStyle(.plain)
             .glassCapsule(tint: .accentColor)
             Spacer(minLength: 0)
             Button { done(); onSettings() } label: {
-                Image(systemName: "gearshape")
-                    .font(.title3)
+                DesktopIcon(name: "settings", size: 22)
                     .frame(width: 50, height: 50)
                     .contentShape(Circle())
             }
@@ -195,8 +225,11 @@ struct SidebarPanel: View {
 
     @ViewBuilder
     private var tree: some View {
+        // The host: the tree's root and the connection's menu, a row like
+        // any other, gone with the list as it scrolls.
+        host
         // The screen shuts the drawer itself, and waits for it.
-        SidebarRow(icon: "square.grid.2x2", title: tr("overview"), selected: overviewOn) { onOverview() }
+        SidebarRow(icon: "grid-2x2", title: tr("overview"), selected: overviewOn) { onOverview() }
 
         // The Space on show's, as the desktop pins them; they leave their
         // projects' lists.
@@ -212,6 +245,11 @@ struct SidebarPanel: View {
             }
         }
 
+        // As a menu, the Space on show heads its projects and holds the
+        // others, as the desktop's sidebar has them; as a list, every
+        // Space is a row under the title.
+        let menu = settings.spaces == "menu" && spaces.count > 1
+        let shown = spaces.first(where: \.current)
         HStack {
             sectionTitle(tr("workspaces"))
             Spacer()
@@ -219,8 +257,7 @@ struct SidebarPanel: View {
                 model.sideClick("new-project")
                 model.askName()
             } label: {
-                Image(systemName: "plus")
-                    .font(.subheadline.weight(.medium))
+                DesktopIcon(name: "project-add", size: 18)
                     .foregroundColor(.secondary)
                     .frame(width: 36, height: 36)
                     .contentShape(Rectangle())
@@ -237,6 +274,8 @@ struct SidebarPanel: View {
         // One Space needs no row of its own: its projects stand at the top.
         if spaces.count == 1, let space = spaces.first {
             ForEach(space.projects) { project in projectRows(space, project, depth: 0) }
+        } else if menu, let shown {
+            ForEach(shown.projects) { project in projectRows(shown, project, depth: 0) }
         } else {
             ForEach(spaces) { space in spaceRows(space) }
         }
@@ -244,6 +283,29 @@ struct SidebarPanel: View {
         if let error = model.sidebar?.new_project_error {
             Text(error).font(.footnote).foregroundColor(.red).padding(.horizontal, 12).padding(.vertical, 8)
         }
+    }
+
+    /// The Space on show; its menu is the App's for a Space, which holds
+    /// the others to go to as well as a new Space and a new name.
+    private func spaceMenu(_ shown: TreeSpace) -> some View {
+        Menu {
+            // The App's own menu for a Space: the Spaces to go to, the one
+            // on show ticked, then a new one and a new name.
+            AppMenuItems(model: model, kind: "space", id: "")
+        } label: {
+            HStack(spacing: 8) {
+                DesktopIcon(name: "layers", size: 18).foregroundColor(.secondary)
+                Text(shown.name)
+                    .font(.body.weight(.semibold))
+                    .lineLimit(1)
+                DesktopIcon(name: "chevrons-up-down", size: 14).foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 44)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .glassCapsule()
     }
 
     private func sectionTitle(_ text: String) -> some View {
@@ -272,7 +334,7 @@ struct SidebarPanel: View {
     private func spaceRows(_ space: TreeSpace) -> some View {
         let key = "space:" + space.id
         SidebarRow(
-            icon: "square.stack.3d.up",
+            icon: "layers",
             title: space.name,
             bold: space.current,
             chevron: space.projects.isEmpty ? nil : !isFolded(key)
@@ -297,18 +359,17 @@ struct SidebarPanel: View {
         // Pinned threads have their own rows, the Space on show's only.
         let threads = space.current ? project.threads.filter { !$0.pinned } : project.threads
         SidebarRow(
-            icon: "folder",
+            icon: isFolded(key) ? "folder" : "folder-open",
             title: project.name,
             depth: depth,
-            chevron: threads.isEmpty ? nil : !isFolded(key),
+            dim: true,
             trailing: AnyView(
                 Button {
                     model.setSpace(space.id)
                     model.sideClick("new-thread", id: project.id)
                     done()
                 } label: {
-                    Image(systemName: "plus")
-                        .font(.subheadline)
+                    DesktopIcon(name: "circle-plus", size: 18)
                         .foregroundColor(.secondary)
                         .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
@@ -320,18 +381,18 @@ struct SidebarPanel: View {
         .contextMenu { AppMenuItems(model: model, kind: "project", id: project.id) }
         if !isFolded(key) {
             ForEach(threads) { thread in
-                threadRow(thread, space: space, depth: depth + 1)
+                threadRow(thread, space: space, depth: depth)
             }
         }
     }
 
     private func threadRow(_ thread: ThreadRow, space: TreeSpace, depth: Int, subtitle: String? = nil) -> some View {
         SidebarRow(
-            mark: AnyView(ThreadMark(status: thread.status, dot: thread.dot, size: 9)),
+            lead: AnyView(ThreadCards(core: model.core, icons: thread.icons ?? [], revision: model.iconsRevision)),
+            mark: AnyView(ThreadMark(status: thread.markStatus, dot: thread.dot, live: thread.live, size: 9)),
             title: thread.name,
             subtitle: subtitle,
             depth: depth,
-            bold: thread.unread,
             dim: !thread.live,
             selected: thread.selected
         ) {
@@ -355,7 +416,7 @@ struct SidebarPanel: View {
             switch row {
             case .archived(_, let open, let label):
                 // The label carries the count.
-                SidebarRow(icon: "archivebox", title: label, dim: true, chevron: open) {
+                SidebarRow(icon: "archive", title: label, dim: true, chevron: open) {
                     model.sideClick("toggle-archived", flag: !open)
                 }
             case .project(let id, let name, _, _, true):
@@ -364,7 +425,7 @@ struct SidebarPanel: View {
             case .others:
                 sectionTitle(tr("otherwindows"))
             case .window(let id, let title, let selected):
-                SidebarRow(icon: "macwindow", title: title.isEmpty ? tr("window.n", id) : title, selected: selected) {
+                SidebarRow(icon: "app-window", title: title.isEmpty ? tr("window.n", id) : title, selected: selected) {
                     model.sideClick("window", id: String(id))
                     done()
                 }
@@ -410,7 +471,7 @@ private struct ThreadSearchResults: View {
         }
         ForEach(found, id: \.thread.id) { entry in
             SidebarRow(
-                mark: AnyView(ThreadMark(status: entry.thread.status, dot: entry.thread.dot, size: 9)),
+                mark: AnyView(ThreadMark(status: entry.thread.markStatus, dot: entry.thread.dot, live: entry.thread.live, size: 9)),
                 title: entry.thread.name,
                 subtitle: entry.project.name,
                 selected: entry.thread.selected
@@ -439,7 +500,7 @@ private struct SearchField: UIViewRepresentable {
         field.font = .preferredFont(forTextStyle: .body)
         field.adjustsFontForContentSizeCategory = true
         field.maximumContentSizeCategory = .extraExtraLarge
-        field.textColor = .white
+        field.textColor = .label
         field.autocapitalizationType = .none
         field.autocorrectionType = .no
         field.spellCheckingType = .no
@@ -481,8 +542,42 @@ private struct SearchField: UIViewRepresentable {
 /// One row of the sidebar: an icon or a status mark, the title, an
 /// optional fold chevron and trailing button; a rounded fill when it is
 /// the one on show. Its text follows the system's size.
-private struct SidebarRow: View {
+/// One of the desktop's icons (`ios/build.sh` makes the catalog), tinted
+/// with the text colour round it.
+struct DesktopIcon: View {
+    var name: String
+    var size: CGFloat = 20
+
+    var body: some View {
+        Image("lucide-" + name)
+            .renderingMode(.template)
+            .resizable()
+            .scaledToFit()
+            .frame(width: size, height: size)
+    }
+}
+
+/// A maker's mark (`ios/build.sh` makes these from third_party/simple-icons,
+/// as the desktop's icons.rs has them), in one colour as `DesktopIcon` is.
+struct BrandIcon: View {
+    var name: String
+    var size: CGFloat = 20
+
+    var body: some View {
+        Image("brand-" + name)
+            .renderingMode(.template)
+            .resizable()
+            .scaledToFit()
+            .frame(width: size, height: size)
+    }
+}
+
+struct SidebarRow: View {
+    /// A desktop icon's name (`DesktopIcon`).
     var icon: String?
+    /// What leads the row in the icon's place: a thread's program cards.
+    var lead: AnyView?
+    /// A thread's mark, at the row's end.
     var mark: AnyView?
     var title: String
     var subtitle: String?
@@ -496,11 +591,12 @@ private struct SidebarRow: View {
     var action: () -> Void
 
     init(
-        icon: String? = nil, mark: AnyView? = nil, title: String, subtitle: String? = nil,
+        icon: String? = nil, lead: AnyView? = nil, mark: AnyView? = nil, title: String, subtitle: String? = nil,
         depth: Int = 0, bold: Bool = false, dim: Bool = false, selected: Bool = false,
         chevron: Bool? = nil, trailing: AnyView? = nil, action: @escaping () -> Void
     ) {
         self.icon = icon
+        self.lead = lead
         self.mark = mark
         self.title = title
         self.subtitle = subtitle
@@ -516,16 +612,17 @@ private struct SidebarRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Group {
-                if let mark {
-                    mark
+                if let lead {
+                    lead
                 } else if let icon {
-                    Image(systemName: icon).font(.body).foregroundColor(.secondary)
+                    DesktopIcon(name: icon).foregroundColor(.secondary)
                 }
             }
-            .frame(width: 24)
+            // A thread's cards keep the room the core says a row keeps.
+            .frame(width: lead == nil ? 24 : nil)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.body.weight(bold ? .semibold : .regular))
+                    .font(.body.weight(bold || lead != nil ? .semibold : .regular))
                     .foregroundColor(dim ? .secondary : .primary)
                     .lineLimit(1)
                 if let subtitle {
@@ -534,9 +631,10 @@ private struct SidebarRow: View {
             }
             Spacer(minLength: 0)
             if let trailing { trailing }
+            // A thread's mark ends its row, as on the desktop.
+            if let mark { mark.padding(.trailing, 4) }
             if let chevron {
-                Image(systemName: "chevron.right")
-                    .font(.footnote.weight(.semibold))
+                DesktopIcon(name: "chevron-right", size: 14)
                     .foregroundColor(.secondary)
                     .rotationEffect(.degrees(chevron ? 90 : 0))
             }
@@ -544,10 +642,7 @@ private struct SidebarRow: View {
         .padding(.leading, 12 + CGFloat(depth) * 18)
         .padding(.trailing, 10)
         .frame(minHeight: 44)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(selected ? Color.white.opacity(0.13) : Color.clear)
-        )
+        .selectedPill(selected)
         .contentShape(Rectangle())
         .onTapGesture(perform: action)
         .accessibilityElement(children: .combine)
@@ -555,7 +650,48 @@ private struct SidebarRow: View {
     }
 }
 
+extension Color {
+    /// The ground of the app's own lists -- the threads, the sidebar --
+    /// in the system's appearance.
+    static let chromeBackdrop = Color(UIColor { traits in
+        traits.userInterfaceStyle == .dark ? UIColor(white: 0.07, alpha: 1) : UIColor(white: 0.95, alpha: 1)
+    })
+    /// The ground of the pages pushed over them: black in the dark, as it
+    /// was, and the system's grouped ground in the light.
+    static let pageBackdrop = Color(UIColor { traits in
+        traits.userInterfaceStyle == .dark ? .black : .systemGroupedBackground
+    })
+}
+
 extension View {
+    /// The row on show: the desktop's pill, in the system's Liquid Glass
+    /// from iOS 26 and as a faint fill with an edge before it.
+    @ViewBuilder
+    func selectedPill(_ selected: Bool) -> some View {
+        if !selected {
+            self
+        } else if #available(iOS 26.0, *) {
+            glassEffect(.regular, in: .capsule)
+        } else {
+            background(
+                Capsule(style: .continuous)
+                    .fill(Color.primary.opacity(0.13))
+                    .overlay(Capsule(style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
+            )
+        }
+    }
+
+    /// A panel floating over the terminal, in the system's Liquid Glass
+    /// from iOS 26 and a material before it.
+    @ViewBuilder
+    func glassPanel(radius: CGFloat) -> some View {
+        if #available(iOS 26.0, *) {
+            glassEffect(.regular, in: .rect(cornerRadius: radius))
+        } else {
+            background(.regularMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        }
+    }
+
     /// The system's Liquid Glass round a button, from iOS 26; a material
     /// before it.
     @ViewBuilder

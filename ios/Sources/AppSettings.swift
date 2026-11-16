@@ -74,6 +74,13 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(paneBars, forKey: "ui.panebars") }
     }
 
+    /// How the sidebar shows the Spaces: "list", every Space a row that
+    /// folds, or "menu", the Space on show with the others in its menu,
+    /// as the desktop's sidebar has them.
+    @Published var spaces: String {
+        didSet { defaults.set(spaces, forKey: "ui.spaces") }
+    }
+
     // MARK: keyboard
 
     /// A tap on a key taps back. The key bar and the key panel read it.
@@ -124,6 +131,11 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(devMode, forKey: "dev.mode") }
     }
 
+    /// The first run's pages were gone through (`Onboarding`).
+    @Published var onboarded: Bool {
+        didSet { defaults.set(onboarded, forKey: "onboarded") }
+    }
+
     private let defaults = UserDefaults.standard
 
     private init() {
@@ -141,6 +153,7 @@ final class AppSettings: ObservableObject {
         bell = d.object(forKey: "bell") as? Bool ?? false
         resizeMode = d.string(forKey: "resize.mode") ?? "auto"
         paneBars = d.object(forKey: "ui.panebars") as? Bool ?? true
+        spaces = d.string(forKey: "ui.spaces") ?? "list"
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
         autoKeyPanel = d.object(forKey: "key.autopanel") as? Bool ?? false
         pinchZoom = d.object(forKey: "gesture.pinch") as? Bool ?? true
@@ -150,5 +163,6 @@ final class AppSettings: ObservableObject {
         keepAliveSeconds = d.object(forKey: "conn.keepalive") as? Int ?? 30
         keepSessionInBackground = d.object(forKey: "conn.background") as? Bool ?? true
         devMode = d.object(forKey: "dev.mode") as? Bool ?? false
+        onboarded = d.object(forKey: "onboarded") as? Bool ?? false
     }
 }

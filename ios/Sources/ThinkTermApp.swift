@@ -9,16 +9,35 @@ struct ThinkTermApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if TerminalModel.automated {
+                if TerminalModel.automated, !ProcessInfo.processInfo.arguments.contains("--auto-home") {
                     // The automated flows go straight to the probe's host.
                     NavigationStack { TerminalScreen(model: sessions.model(for: nil, store: store)) }
                 } else {
-                    RootTabs(store: store)
+                    // `--auto-home` (debug builds) is the list with the
+                    // probe's key trusted as the flows trust it: a
+                    // screenshot of it needs no tap.
+                    ThreadsHome()
                 }
             }
+            // A fresh start opens on the starry sky; the automated flows do
+            // not. A first run with no host kept has its pages on it. Inside
+            // the objects below, so the pages' own screens have them too.
+            .modifier(LaunchSky(
+                play: !TerminalModel.automated,
+                onboard: Self.replayOnboarding || !AppSettings.shared.onboarded && store.hosts.isEmpty
+            ))
             .environmentObject(store)
             .environmentObject(sessions)
-            .preferredColorScheme(.dark)
+            // The tailnet ThinkTerm joins by itself is up before any host
+            // of it is dialled.
+            .onAppear {
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("--tailnettest") {
+                    return TailnetStore.shared.debugJoin()
+                }
+                #endif
+                TailnetStore.shared.apply()
+            }
         }
         // Every open connection hears about the background, on screen or
         // not, whichever way the app was opened.
@@ -29,6 +48,16 @@ struct ThinkTermApp: App {
             default: break
             }
         }
+    }
+
+    /// `--replay-onboarding`: the first run's pages again, hosts or not.
+    /// Debug builds only.
+    static var replayOnboarding: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--replay-onboarding")
+        #else
+        false
+        #endif
     }
 
     /// `--seed-probe-host`: save the probe as an ordinary host whose key
@@ -52,34 +81,5 @@ struct ThinkTermApp: App {
         #else
         return nil
         #endif
-    }
-}
-
-/// The two tabs. Its own view so the language switch relabels the tab bar
-/// with the rest of the app.
-private struct RootTabs: View {
-    let store: HostStore
-    @State private var path = NavigationPath()
-    @ObservedObject private var lang = AppLanguage.shared
-
-    var body: some View {
-        TabView {
-            NavigationStack(path: $path) {
-                HostsView()
-                    .onAppear {
-                        // A saved host for the probe, with its key in the
-                        // Keychain, opened over the list: the same path a
-                        // real host takes, back included.
-                        if path.isEmpty, let seeded = ThinkTermApp.seededHost(into: store) {
-                            path.append(seeded)
-                        }
-                    }
-            }
-            .tabItem { Label(tr("hosts"), systemImage: "server.rack") }
-            NavigationStack {
-                SettingsView(showLog: nil)
-            }
-            .tabItem { Label(tr("settings"), systemImage: "gearshape") }
-        }
     }
 }

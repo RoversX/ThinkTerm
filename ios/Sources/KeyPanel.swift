@@ -40,16 +40,14 @@ struct KeyCap: Identifiable {
 /// The key bar's row and the panel's grid, and the one place a cap turns
 /// into input.
 enum KeyCaps {
-    /// The bar under the terminal: the keys a soft keyboard has not got.
+    /// The bar under the terminal: the keys a soft keyboard has not got,
+    /// the four a terminal asks for all the time in sight and the rest a
+    /// swipe along the bar away. The arrows are in the panel.
     static var bar: [KeyCap] { [
         .dom("esc", "Escape"),
         .dom("tab", "Tab"),
         KeyCap(label: "ctrl", action: .sticky(.ctrl)),
         KeyCap(label: "alt", action: .sticky(.alt)),
-        .dom("↑", "ArrowUp"),
-        .dom("↓", "ArrowDown"),
-        .dom("←", "ArrowLeft"),
-        .dom("→", "ArrowRight"),
         .dom("home", "Home"),
         .dom("end", "End"),
         .dom("pgup", "PageUp"),
@@ -199,7 +197,7 @@ struct KeyPanel: View {
             body(for: tab)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
-            Rectangle().fill(Color.white.opacity(0.08)).frame(height: 0.5)
+            Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5)
 
             Picker(tr("p.panel"), selection: $tab) {
                 ForEach(KeyPanelTab.allCases) { Text($0.title).tag($0) }
@@ -214,7 +212,9 @@ struct KeyPanel: View {
         .padding(.bottom, 20)
         .frame(height: 268)
         .background(model.background)
-        .environment(\.colorScheme, .dark)
+        // Its words and keys over the terminal's own background, light or
+        // dark as that is.
+        .environment(\.colorScheme, model.dark ? .dark : .light)
         .sheet(item: $draft) { draft in
             SnippetEditor(draft: draft)
         }
@@ -268,11 +268,11 @@ struct KeyPanel: View {
                             .minimumScaleFactor(0.8)
                             .frame(maxWidth: .infinity)
                             .frame(height: 42)
-                            .background(Color.white.opacity(0.07))
+                            .background(Color.primary.opacity(0.07))
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                     }
                     .buttonStyle(.plain)
-                    .foregroundColor(.white)
+                    .foregroundColor(.primary)
                 }
             }
             .padding(.horizontal, 10)
@@ -285,7 +285,7 @@ struct KeyPanel: View {
             Text(title.uppercased())
                 .font(.system(size: 10, weight: .semibold))
                 .kerning(0.6)
-                .foregroundColor(.white.opacity(0.45))
+                .foregroundColor(.primary.opacity(0.45))
             LazyVGrid(columns: columns, spacing: 8) {
                 ForEach(caps) { cap in
                     Button { KeyCaps.send(cap, to: model) } label: {
@@ -295,11 +295,11 @@ struct KeyPanel: View {
                             .minimumScaleFactor(0.7)
                             .frame(maxWidth: .infinity)
                             .frame(height: 38)
-                            .background(Color.white.opacity(0.07))
+                            .background(Color.primary.opacity(0.07))
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                     }
                     .buttonStyle(.plain)
-                    .foregroundColor(.white)
+                    .foregroundColor(.primary)
                 }
             }
         }
@@ -330,16 +330,16 @@ struct KeyPanel: View {
                             .frame(height: 42)
                         }
                         .buttonStyle(.plain)
-                        .foregroundColor(.white)
+                        .foregroundColor(.primary)
                         Button { draft = SnippetDraft(snippet: snippet, isNew: false) } label: {
                             Image(systemName: "slider.horizontal.3")
                                 .font(.system(size: 13))
                                 .frame(width: 40, height: 42)
                         }
                         .buttonStyle(.plain)
-                        .foregroundColor(.white.opacity(0.5))
+                        .foregroundColor(.primary.opacity(0.5))
                     }
-                    .background(Color.white.opacity(0.07))
+                    .background(Color.primary.opacity(0.07))
                     .clipShape(RoundedRectangle(cornerRadius: 11))
                 }
                 Button {
@@ -349,11 +349,11 @@ struct KeyPanel: View {
                         .font(.system(size: 14))
                         .frame(maxWidth: .infinity)
                         .frame(height: 42)
-                        .background(Color.white.opacity(0.07))
+                        .background(Color.primary.opacity(0.07))
                         .clipShape(RoundedRectangle(cornerRadius: 11))
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(.white.opacity(0.65))
+                .foregroundColor(.primary.opacity(0.65))
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -374,7 +374,7 @@ struct KeyPanel: View {
             if history.lines.isEmpty {
                 Text(tr("hist.empty"))
                     .font(.system(size: 13))
-                    .foregroundColor(.white.opacity(0.45))
+                    .foregroundColor(.primary.opacity(0.45))
                     .frame(maxWidth: .infinity)
                     .padding(.top, 28)
             } else {
@@ -391,11 +391,11 @@ struct KeyPanel: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 12)
                                 .frame(height: 42)
-                                .background(Color.white.opacity(0.07))
+                                .background(Color.primary.opacity(0.07))
                                 .clipShape(RoundedRectangle(cornerRadius: 11))
                         }
                         .buttonStyle(.plain)
-                        .foregroundColor(.white)
+                        .foregroundColor(.primary)
                     }
                 }
                 .padding(.horizontal, 10)
@@ -436,14 +436,14 @@ struct KeyPanel: View {
             VStack(spacing: 5) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(Schemes.background(of: name) ?? Color.white.opacity(0.12))
+                        .fill(Schemes.background(of: name) ?? Color.primary.opacity(0.12))
                     RoundedRectangle(cornerRadius: 10)
-                        .stroke(picked ? Color.accentColor : Color.white.opacity(0.18),
+                        .stroke(picked ? Color.accentColor : Color.primary.opacity(0.18),
                                 lineWidth: picked ? 2 : 1)
                     if name == Schemes.followDesktop {
                         Image(systemName: "desktopcomputer")
                             .font(.system(size: 15))
-                            .foregroundColor(.white.opacity(0.8))
+                            .foregroundColor(.primary.opacity(0.8))
                     } else {
                         Text("Aa")
                             .font(.system(size: 13, design: .monospaced))
@@ -455,11 +455,11 @@ struct KeyPanel: View {
                     .font(.system(size: 9.5))
                     .lineLimit(1)
                     .frame(width: 66)
-                    .foregroundColor(picked ? .accentColor : .white.opacity(0.6))
+                    .foregroundColor(picked ? .accentColor : .primary.opacity(0.6))
             }
         }
         .buttonStyle(.plain)
-        .foregroundColor(.white)
+        .foregroundColor(.primary)
     }
 
     // MARK: chrome
@@ -472,11 +472,11 @@ struct KeyPanel: View {
             }
             .frame(maxWidth: .infinity)
             .frame(height: 36)
-            .background(Color.white.opacity(0.07))
+            .background(Color.primary.opacity(0.07))
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
-        .foregroundColor(.white.opacity(0.75))
+        .foregroundColor(.primary.opacity(0.75))
     }
 }
 

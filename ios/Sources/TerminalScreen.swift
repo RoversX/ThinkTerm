@@ -10,6 +10,7 @@ struct TerminalScreen: View {
     @ObservedObject private var lang = AppLanguage.shared
     @Environment(\.dismiss) private var dismiss
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.colorScheme) private var scheme
     /// The drawer is out (a narrow screen).
     @State private var showTree = false
     /// The screen is wide enough to keep the sidebar beside the terminal,
@@ -48,6 +49,16 @@ struct TerminalScreen: View {
     @State private var overviewOpen = false
     @State private var overviewVisible = false
     @State private var cardsAlpha: Double = 0
+    /// The split of the tab on show is up as a map (`PaneMap`).
+    @State private var showPanes = false
+    /// The right sidebar is out from under the screen (`RightPanel`).
+    @State private var showRight = false
+    /// It is made: while it shows, and until it has slid away.
+    @State private var rightShown = false
+    /// How far the screen has been pulled off it by a swipe from the
+    /// right edge, and that swipe.
+    @GestureState private var rightPull: CGFloat = 0
+    @State private var rightDrag = EdgeDrag()
     /// Where the live card's picture is while the terminal is on its way
     /// into it; every card's is in `moves`.
     @State private var landingThumb: CGRect?
@@ -80,6 +91,9 @@ struct TerminalScreen: View {
             let drawerOpen = showTree && !wide
             let drawerWidth = min(Self.columnWidth + 40, geo.size.width * 0.84)
             let pulled = drawerOpen || edgePull > 0
+            // The right sidebar is the drawer's mirror: under the screen
+            // at its other edge, the screen sliding off it the other way.
+            let rightPulled = showRight || rightPull > 0
             ZStack(alignment: .topLeading) {
                 if !wide {
                     // The drawer lies under the screen, which slides off it.
@@ -89,25 +103,52 @@ struct TerminalScreen: View {
                         .allowsHitTesting(drawerOpen)
                         .accessibilityHidden(!drawerOpen)
                 }
+                if rightPulled || rightShown {
+                    RightPanel(model: model) { showRight = false }
+                        .frame(width: drawerWidth)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .opacity(rightPulled ? 1 : 0)
+                        .allowsHitTesting(showRight)
+                        .accessibilityHidden(!showRight)
+                }
                 HStack(spacing: 0) {
                     if wide && sidebarPinned {
                         sidebar(live: true).frame(width: Self.columnWidth)
-                        Rectangle().fill(Color.white.opacity(0.08)).frame(width: 1).ignoresSafeArea()
+                        Rectangle().fill(Color.primary.opacity(0.08)).frame(width: 1).ignoresSafeArea()
                     }
                     screen
-                        .clipShape(RoundedRectangle(cornerRadius: pulled ? 28 : 0, style: .continuous))
+                        // The whole screen's height, the status bar's band
+                        // and the home indicator's included: clipped to its
+                        // own frame, the card stopped short of both and the
+                        // drawer's ground showed above and below it.
+                        .mask {
+                            RoundedRectangle(cornerRadius: pulled || rightPulled ? 28 : 0, style: .continuous)
+                                .ignoresSafeArea()
+                        }
                         .overlay {
-                            if drawerOpen {
+                            if drawerOpen || showRight {
                                 // What shows of the screen takes it back.
+                                // Fainter on a light page, where the dark
+                                // one's shade reads as a grey veil.
                                 RoundedRectangle(cornerRadius: 28, style: .continuous)
-                                    .fill(Color.black.opacity(0.35))
+                                    .fill(Color.black.opacity(scheme == .dark ? 0.35 : 0.08))
                                     .ignoresSafeArea()
-                                    .onTapGesture { showTree = false }
+                                    .onTapGesture {
+                                        showTree = false
+                                        showRight = false
+                                    }
                             }
                         }
-                        .shadow(color: .black.opacity(pulled ? 0.55 : 0), radius: 20)
+                        .shadow(
+                            color: .black.opacity(pulled || rightPulled ? (scheme == .dark ? 0.55 : 0.14) : 0),
+                            radius: scheme == .dark ? 20 : 12
+                        )
                 }
-                .offset(x: drawerOpen ? drawerWidth : min(edgePull, drawerWidth))
+                .offset(
+                    x: drawerOpen ? drawerWidth
+                        : showRight ? -drawerWidth
+                        : min(edgePull, drawerWidth) - min(rightPull, drawerWidth)
+                )
             }
             .simultaneousGesture(
                 // A swipe right from the left edge opens the drawer, the
@@ -131,29 +172,56 @@ struct TerminalScreen: View {
                 including: wide || drawerOpen ? .subviews : .all
             )
             .simultaneousGesture(
-                DragGesture(minimumDistance: 24).onEnded { drag in
-                    // A swipe to the left, not a scroll of the list that
-                    // drifts.
-                    let move = drag.translation
-                    if move.width < -60 && abs(move.width) > abs(move.height) { showTree = false }
-                },
-                including: drawerOpen ? .all : .subviews
+                // The same from the right edge, for the right sidebar.
+                DragGesture(minimumDistance: 10, coordinateSpace: .global)
+                    .updating($rightPull) { drag, pull, transaction in
+                        let next = pullsRight(drag, right: geo.frame(in: .global).maxX) ? max(0, -drag.translation.width) : 0
+                        if next == 0 && pull > 0 {
+                            transaction.animation = Self.slide
+                        }
+                        pull = next
+                    }
+                    .onEnded { drag in
+                        let far = -drag.translation.width > drawerWidth / 3 || -drag.predictedEndTranslation.width > drawerWidth / 2
+                        if far && drag.velocity.width < 200 && pullsRight(drag, right: geo.frame(in: .global).maxX) { openRight() }
+                        rightDrag.start = nil
+                    },
+                including: drawerOpen || showRight || overviewOpen ? .subviews : .all
             )
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 24).onEnded { drag in
+                    // A swipe back toward the side it came from, not a
+                    // scroll of the list that drifts.
+                    let move = drag.translation
+                    guard abs(move.width) > abs(move.height) else { return }
+                    if drawerOpen && move.width < -60 { showTree = false }
+                    if showRight && move.width > 60 { showRight = false }
+                },
+                including: drawerOpen || showRight ? .all : .subviews
+            )
+            .animation(Self.slide, value: showRight)
             .animation(Self.slide, value: showTree)
             .animation(Self.slide, value: sidebarPinned)
             .onAppear {
                 self.wide = wide
                 model.edgePullsDrawer = !wide && !showTree
+                // No room for a split's panes side by side: one at a time.
+                model.setOnePane(!wide)
             }
             .onChange(of: wide) { _, wide in
                 self.wide = wide
                 if wide { showTree = false }
                 model.edgePullsDrawer = !wide && !showTree
+                model.setOnePane(!wide)
             }
         }
         // Under the status bar: the terminal's colour, or the sidebar's
         // beside an open drawer (the screen is clipped to its frame).
-        .background((drawerOpen ? Color(white: 0.07) : cardsAlpha > 0 ? OverviewScreen.backdrop : model.background).ignoresSafeArea())
+        .background((drawerOpen || showRight ? Color.chromeBackdrop : cardsAlpha > 0 ? OverviewScreen.backdrop : model.background).ignoresSafeArea())
+        // The terminal is as dark as its colour scheme, whatever the
+        // system's appearance: the bars and the sidebar beside it follow
+        // it, as does the status bar over it. The overview is dark.
+        .preferredColorScheme(model.dark || cardsAlpha > 0 ? .dark : .light)
         .onChange(of: drawerOpen) { _, open in
             model.edgePullsDrawer = !wide && !open
             if open {
@@ -163,6 +231,16 @@ struct TerminalScreen: View {
                 UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     if !drawerOpen { drawerShown = false }
+                }
+            }
+        }
+        .onChange(of: showRight) { _, open in
+            // Made while it shows and until it has slid away, as the drawer.
+            if open {
+                rightShown = true
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    if !showRight { rightShown = false }
                 }
             }
         }
@@ -198,6 +276,19 @@ struct TerminalScreen: View {
         return edgeDrag.pulls
     }
 
+    /// `pullsDrawer`, from the right edge and leftward: the right sidebar.
+    /// `right` is where that edge is on screen -- in from the screen's own
+    /// by the safe area, sideways.
+    private func pullsRight(_ drag: DragGesture.Value, right: CGFloat) -> Bool {
+        if rightDrag.start != drag.startLocation {
+            let move = drag.translation
+            rightDrag.start = drag.startLocation
+            rightDrag.pulls = drag.startLocation.x > right - Self.edgeWidth && -move.width > abs(move.height)
+                && terminalSpan.contains(drag.startLocation.y) && model.inputView?.holdsSelection != true
+        }
+        return rightDrag.pulls
+    }
+
     /// The sidebar, opened (a drawer) or brought back (a column).
     private func showSidebar() {
         moves.waiting = false
@@ -209,6 +300,14 @@ struct TerminalScreen: View {
     private func toggleSidebar() {
         moves.waiting = false
         if wide { sidebarPinned.toggle() } else { model.dismissKeyboard(); showTree.toggle() }
+    }
+
+    /// The right sidebar, the screen sliding off it; it takes the
+    /// keyboard down, as the drawer does.
+    private func openRight() {
+        moves.waiting = false
+        model.dismissKeyboard()
+        showRight = true
     }
 
     /// Back to the hosts, an overview waiting to open left shut: the
@@ -236,6 +335,7 @@ struct TerminalScreen: View {
             onEditHost: { showTree = false; editingHost = model.host },
             onSettings: { showSettings = true },
             onOverview: { openOverview() },
+            onLeave: { leave() },
             overviewOn: overviewOpen,
             live: live
         )
@@ -255,6 +355,13 @@ struct TerminalScreen: View {
         // Another keyboard (the sidebar's search, a name being asked for)
         // is not the terminal's: it does not resize it.
         .ignoresSafeArea(keyboardUp ? [] : .keyboard, edges: .bottom)
+        // Over the whole page, the bars at its foot included.
+        .overlay {
+            if showPanes {
+                PaneMap(model: model) { showPanes = false }
+            }
+        }
+        .animation(.easeOut(duration: 0.18), value: showPanes)
     }
 
     /// The sidebar, back to the hosts, and the strip in the rest of the
@@ -265,10 +372,6 @@ struct TerminalScreen: View {
                 .buttonStyle(.plain)
                 .glassCircle()
                 .accessibilityLabel(tr("sidebar"))
-            Button { leave() } label: { barIcon("chevron.left") }
-                .buttonStyle(.plain)
-                .glassCircle()
-                .accessibilityLabel(tr("hosts"))
             if overviewOpen {
                 // The overview's own bar: its name, and the way back.
                 Text(tr("overview"))
@@ -283,6 +386,10 @@ struct TerminalScreen: View {
                     .accessibilityLabel(tr("done"))
             } else {
                 tabStrip.frame(maxWidth: .infinity, alignment: .leading)
+                Button { openRight() } label: { barIcon("sidebar.right") }
+                    .buttonStyle(.plain)
+                    .glassCircle()
+                    .accessibilityLabel(tr("panel.right"))
             }
         }
         // The screen's left side is the sidebar's while it stays there.
@@ -322,23 +429,44 @@ struct TerminalScreen: View {
             VStack(spacing: 0) {
                 terminal
                     .opacity(terminalAlpha)
+                    // Files on their way float over the terminal's foot:
+                    // in the layout they would resize it as they come
+                    // and go.
+                    .overlay(alignment: .bottom) {
+                        UploadStrip(model: model).padding(.bottom, 8)
+                    }
+                    // The connection's word floats over the terminal's top
+                    // for the same reason.
+                    .overlay(alignment: .top) {
+                        statusCapsule
+                            .padding(.top, 8)
+                            .padding(.horizontal, 16)
+                            .opacity(overviewOpen ? 0 : 1)
+                    }
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("screen")) } action: { terminalFrame = $0 }
                     .onGeometryChange(for: ClosedRange<CGFloat>.self) { geo in
                         let frame = geo.frame(in: .global)
                         return frame.minY...max(frame.minY, frame.maxY)
                     } action: { terminalSpan = $0 }
                     .zIndex(2)
-                statusLine.opacity(overviewOpen ? 0 : 1)
-                if (keyboardUp || model.panelOpen) && !overviewOpen {
-                    // With the keyboard down the bar sits on the home
-                    // indicator's inset; with it up, on the keyboard.
-                    KeyBar(model: model)
-                        .padding(.bottom, keyboardUp ? 0 : Self.bottomInset)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                if !overviewOpen {
+                    // Under the terminal whether the keyboard is up or
+                    // not, so the terminal is sized once as it comes and
+                    // goes: the tab's panes, then the keys. With the
+                    // keyboard down they sit on the home indicator's
+                    // inset; with it up, on the keyboard.
+                    VStack(spacing: 8) {
+                        PaneSwitcher(model: model) { showPanes = true }
+                        KeyBar(model: model, keyboardUp: keyboardUp)
+                    }
+                    .padding(.top, 6)
+                    .padding(.bottom, keyboardUp ? 6 : max(Self.bottomInset, 8))
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .animation(.easeOut(duration: 0.2), value: keyboardUp)
             .animation(.easeOut(duration: 0.2), value: model.panelOpen)
+            .animation(.easeOut(duration: 0.2), value: model.uploads.map(\.id))
             .zIndex(1)
             .allowsHitTesting(!overviewVisible)
             // A picture of the terminal on its way into a card or out of one.
@@ -470,7 +598,8 @@ struct TerminalScreen: View {
                 if !secret.isEmpty { Keychain.save(secret, account: edited.id.uuidString) }
                 if let passphrase { Keychain.save(passphrase, account: edited.id.uuidString + ".passphrase") }
                 model.store?.upsert(edited)
-                model.host = edited
+                // As stored: a new address drops the old pin.
+                model.host = model.store?.hosts.first { $0.id == edited.id } ?? edited
                 model.connect()
             }
         }
@@ -478,8 +607,11 @@ struct TerminalScreen: View {
             moves.onScreen = true
             model.enterScreen()
             // The automated flows connect on their own schedule; a session
-            // found open is simply shown.
-            if !TerminalModel.automated, !model.isConnected {
+            // found open is simply shown. One lost and not redialing by
+            // itself (auto-reconnect off) is dialled again: coming to it --
+            // the host page's Connect, a thread of it -- is the tap that
+            // asks for it.
+            if !TerminalModel.automated, !model.isConnected || (model.reconnecting && !settings.autoReconnect) {
                 model.connect()
             }
             #if DEBUG
@@ -504,6 +636,8 @@ struct TerminalScreen: View {
             // Screenshots of the sheets, which no script can tap open.
             if let t = when("--open-tree", 14) { after(t) { showSidebar() } }
             if let t = when("--open-overview", 14) { after(t) { openOverview() } }
+            if let t = when("--open-panes", 14) { after(t) { showPanes = true } }
+            if let t = when("--open-right", 14) { after(t) { openRight() } }
             // The overview's ways back: a running thread's card by its
             // place among them, or the close button.
             if let at = args.firstIndex(of: "--overview-pick"), at + 1 < args.count, let n = Int(args[at + 1]) {
@@ -1128,19 +1262,55 @@ struct TerminalScreen: View {
             }
     }
 
+    /// Another device holds the terminal, or none does: a card of glass at
+    /// the terminal's foot, out of the way of what it shows -- what holds
+    /// it and what a tap does, then the button that takes it, the card's
+    /// width. While the server is asked the button waits; refused, the card
+    /// says so and offers to try again. The Android app draws the same.
     private func takeOverCard(_ card: Card) -> some View {
-        VStack(spacing: 8) {
-            Text(card.title).font(.headline)
-            Text(card.hint).font(.caption).multilineTextAlignment(.center)
-            Button(card.action) { model.takeOver() }
-                .buttonStyle(.borderedProminent)
-                .disabled(card.state == "taking")
+        let taking = card.state == "taking"
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(model.ink.opacity(0.1))
+                    switch card.state {
+                    case "taking": Spinner(color: .accentColor).frame(width: 18, height: 18)
+                    case "refused": DesktopIcon(name: "triangle-alert").foregroundColor(.orange)
+                    case "free": DesktopIcon(name: "hand")
+                    default: DesktopIcon(name: "monitor-smartphone")
+                    }
+                }
+                .frame(width: 40, height: 40)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(card.title)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(2)
+                    Text(card.hint)
+                        .font(.footnote)
+                        .foregroundColor(model.ink.opacity(0.62))
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 0)
+            }
+            Button { model.takeOver() } label: {
+                Text(card.action)
+                    .font(.body.weight(.semibold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 44)
+                    .background(Color.accentColor.opacity(taking ? 0.45 : 1), in: Capsule())
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(taking)
         }
-        .padding(16)
-        .frame(maxWidth: 320)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .foregroundColor(model.ink)
+        .padding(14)
+        .frame(maxWidth: 520)
+        .glassPanel(radius: 26)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
     }
 
     private var logView: some View {
@@ -1158,20 +1328,48 @@ struct TerminalScreen: View {
 
     // MARK: the status line
 
-    @ViewBuilder
-    private var statusLine: some View {
+    /// The App's remark, "copied", or the connection's own line while it is
+    /// not yet a pane: a capsule of glass over the terminal's top, so the
+    /// terminal keeps its size as it comes and goes. It turns while the
+    /// connection is on its way back, and warns once it is given up.
+    private var statusCapsule: some View {
         let text = model.copied ? tr("copied") : (model.toastText ?? "")
-        let showing = !text.isEmpty || model.connection.hasPrefix("connecting") || model.connection.hasPrefix("disconnected") || model.connection.hasPrefix("failed") || model.connection.contains("reconnect")
-        if showing {
-            Text(text.isEmpty ? model.connection : text)
-                .font(.system(size: 11, design: .monospaced))
-                .lineLimit(2)
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color(white: 0.2))
+        let connection = model.connection
+        let showing = !text.isEmpty || connection.hasPrefix("connecting") || connection.hasPrefix("disconnected")
+            || connection.hasPrefix("failed") || connection.contains("reconnect")
+        // The App's word stays up once the connection is lost; it is on
+        // its way back only where it redials by itself.
+        let redialing = model.reconnecting && settings.autoReconnect
+        let turning = !model.copied
+            && (redialing || connection.hasPrefix("connecting") || connection.contains("reconnect"))
+        // Lost with nothing redialing it warns too, though the status
+        // still names the pane.
+        let lost = !model.copied && !turning
+            && (connection.hasPrefix("disconnected") || connection.hasPrefix("failed") || model.reconnecting)
+        return ZStack {
+            if showing {
+                HStack(spacing: 8) {
+                    if model.copied {
+                        Image(systemName: "checkmark").font(.footnote.weight(.semibold))
+                    } else if turning {
+                        Spinner(color: model.ink).frame(width: 14, height: 14)
+                    } else if lost {
+                        DesktopIcon(name: "triangle-alert", size: 15).foregroundColor(.orange)
+                    }
+                    Text(text.isEmpty ? connection : text)
+                        .font(.footnote)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .foregroundColor(model.ink)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .glassCapsule()
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
+        .animation(.easeOut(duration: 0.2), value: showing)
+        .allowsHitTesting(false)
     }
 }
 
@@ -1183,47 +1381,40 @@ struct MenuSheet: Identifiable {
     var key: String { kind + ":" + id }
 }
 
-/// A thread's status as the desktop's sidebar shows it: a spinner while
-/// it works, an alert while it waits on someone, a check when it finished
-/// unseen; otherwise the core's dot -- the one on show, open, pinned,
-/// unread or quiet. Every state takes the same square, `size` × 2, so a
-/// row or a chip keeps its width as the status changes.
+/// A thread's mark as the desktop's sidebar draws it: the core's picture
+/// (`threadMark`, from the look every client shares), and for a mark that
+/// moves the picture of the step the wall clock is at, so every mark on
+/// every screen steps together. Every state takes the same square, `size`
+/// × 2, so a row keeps its width as the status changes; the tick of a
+/// finished thread is the larger and reaches past it, as on the desktop.
 struct ThreadMark: View {
     var status: String
     var dot: String
+    /// Whether the thread has terminals (`ThreadRow.live`).
+    var live = true
     var size: CGFloat
-
-    // The web page's tokens (tokens.css), which follow the desktop's.
-    static let open = Color(hex: "#61B8FF") ?? .blue
-    static let done = Color(hex: "#7CE5A2") ?? .green
-    static let warn = Color(hex: "#DB7320") ?? .orange
+    @Environment(\.displayScale) private var scale
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        Group {
-            switch status {
-            case "Running":
-                Spinner(color: Self.open).padding(size * 0.15)
-            case "NeedsAttention":
-                Image(systemName: "exclamationmark.circle.fill")
-                    .resizable().scaledToFit().foregroundColor(Self.warn)
-            case "Done":
-                Image(systemName: "checkmark.circle.fill")
-                    .resizable().scaledToFit().foregroundColor(Self.done)
-            default:
-                Circle().fill(Self.dotColor(dot)).frame(width: size, height: size)
+        let side = size * 2
+        let mark = ThreadMarkImages.shared.mark(
+            status: status, dot: dot, live: live, points: side, scale: scale, dark: scheme == .dark
+        )
+        Color.clear
+            .frame(width: side, height: side)
+            .overlay {
+                if let mark {
+                    if mark.frames.count > 1 {
+                        TimelineView(.periodic(from: .now, by: mark.step)) { moment in
+                            let step = Int(moment.date.timeIntervalSince1970 / mark.step)
+                            Image(uiImage: mark.frames[step % mark.frames.count]).fixedSize()
+                        }
+                    } else {
+                        Image(uiImage: mark.frames[0]).fixedSize()
+                    }
+                }
             }
-        }
-        .frame(width: size * 2, height: size * 2)
-    }
-
-    static func dotColor(_ dot: String) -> Color {
-        switch dot {
-        case "Active": return done
-        case "Open": return open
-        case "Pinned": return Color(hex: "#C7C7CC") ?? .gray
-        case "Unread": return Color(hex: "#8E8E93") ?? .gray
-        default: return Color.white.opacity(0.16)
-        }
     }
 }
 

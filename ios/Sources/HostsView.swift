@@ -1,16 +1,18 @@
 import SwiftUI
 
-/// The hosts, and the way in. The probe's local sshd is a debug-only row of
+/// The hosts, each a row that opens its own page; connecting is that page's,
+/// a row's menu's, or home's. The probe's local sshd is a debug-only row of
 /// its own so the automated flows and a quick check need no setup.
 struct HostsView: View {
     @EnvironmentObject var store: HostStore
     @EnvironmentObject var sessions: Sessions
     @ObservedObject private var lang = AppLanguage.shared
-    @State private var editing: Host?
     @State private var adding = false
     @State private var search = ""
     @State private var pendingDelete: Host?
     @State private var connecting: ConnectTarget?
+    /// A host about to be added for a machine of the tailnet.
+    @State private var addingMachine: Host?
     #if DEBUG
     // Built once: a fresh Host would get a new id on every body pass, and
     // NavigationLink needs the value to stay equal across redraws.
@@ -47,40 +49,50 @@ struct HostsView: View {
                 }
             }
 
+            // The tailnet ThinkTerm joined by itself, and its machines.
+            TailnetSection(
+                saved: { peer in
+                    let names = peer.names(among: TailnetStore.shared.machines)
+                    return store.hosts.first { names.contains($0.hostname.lowercased()) }
+                },
+                add: { addingMachine = $0 }
+            )
+
             #if DEBUG
             Section(tr("dev")) {
                 NavigationLink(value: probe) {
-                    HostRowLayout(
-                        symbol: "hammer",
-                        tint: .gray,
-                        title: tr("thismac"),
-                        subtitle: "probe sshd on 127.0.0.1:2299"
-                    )
+                    HostRowLayout(title: tr("thismac"), subtitle: "probe sshd on 127.0.0.1:2299") {
+                        Image(systemName: "hammer").font(.system(size: 17, weight: .medium))
+                    }
                 }
             }
             #endif
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
-        .background(Color.black.ignoresSafeArea())
+        .background(Color.pageBackdrop.ignoresSafeArea())
         .navigationTitle(tr("hosts"))
         .navigationBarTitleDisplayMode(.large)
         .searchable(text: $search, placement: .navigationBarDrawer, prompt: tr("hosts.search"))
         .navigationDestination(for: Host.self) { host in
             #if DEBUG
             // The development row's stand-in host, told by its id: a real
-            // host may well be called "probe".
+            // host may well be called "probe". It has no page; it connects.
             if host.id == probe.id {
                 TerminalScreen(model: sessions.model(for: nil, store: store))
             } else {
-                TerminalScreen(model: sessions.model(for: host, store: store))
+                page(host)
             }
             #else
-            TerminalScreen(model: sessions.model(for: host, store: store))
+            page(host)
             #endif
         }
-        // A separate destination type so the context menu's Connect can push
-        // without fighting the value-based destination above.
+        // A host's page opens its terminal by value, in this same stack.
+        .navigationDestination(for: HostTerminal.self) { target in
+            TerminalScreen(model: sessions.model(for: target.host, store: store))
+        }
+        // A separate destination type so the menu's Connect can push
+        // without fighting the value-based destinations above.
         .navigationDestination(item: $connecting) { target in
             TerminalScreen(model: sessions.model(for: target.host, store: store))
         }
@@ -91,20 +103,12 @@ struct HostsView: View {
             }
         }
         .sheet(isPresented: $adding) {
-            HostEditView(host: Host()) { host, secret, passphrase in
-                Keychain.save(secret, account: host.id.uuidString)
-                if let passphrase { Keychain.save(passphrase, account: host.id.uuidString + ".passphrase") }
-                store.upsert(host)
-            }
-            .environmentObject(store)
+            HostEditView(host: Host()) { host, secret, passphrase in keep(host, secret: secret, passphrase: passphrase) }
+                .environmentObject(store)
         }
-        .sheet(item: $editing) { host in
-            HostEditView(host: host) { host, secret, passphrase in
-                if !secret.isEmpty { Keychain.save(secret, account: host.id.uuidString) }
-                if let passphrase { Keychain.save(passphrase, account: host.id.uuidString + ".passphrase") }
-                store.upsert(host)
-            }
-            .environmentObject(store)
+        .sheet(item: $addingMachine) { machine in
+            HostEditView(host: machine) { host, secret, passphrase in keep(host, secret: secret, passphrase: passphrase) }
+                .environmentObject(store)
         }
         .confirmationDialog(
             tr("host.delete.title"),
@@ -112,10 +116,25 @@ struct HostsView: View {
             titleVisibility: .visible,
             presenting: pendingDelete
         ) { host in
-            Button(tr("host.delete.confirm", host.display), role: .destructive) { sessions.close(host.id); store.remove(host) }
+            Button(tr("host.delete.confirm", host.display), role: .destructive) { remove(host) }
             Button(tr("cancel"), role: .cancel) {}
         } message: { _ in
             Text(tr("host.delete.body"))
+        }
+    }
+
+    /// A host's own page: its picture and session, its settings to edit.
+    private func page(_ host: Host) -> some View {
+        HostEditView(
+            host: host,
+            page: HostPage(
+                sessions: sessions,
+                // As the store has it now: the page may have saved edits.
+                duplicate: { duplicate(store.hosts.first { $0.id == host.id } ?? host) },
+                delete: { remove(host) }
+            )
+        ) { host, secret, passphrase in
+            keep(host, secret: secret, passphrase: passphrase)
         }
     }
 
@@ -126,22 +145,49 @@ struct HostsView: View {
         }
         .swipeActions(edge: .trailing) {
             Button(role: .destructive) { pendingDelete = host } label: { Label(tr("delete"), systemImage: "trash") }
-            Button { editing = host } label: { Label(tr("edit"), systemImage: "pencil") }
-                .tint(.indigo)
+            Button { connecting = ConnectTarget(host: host) } label: { Label(tr("connect"), systemImage: "bolt.horizontal") }
+                .tint(.green)
         }
         .contextMenu {
             Button { connecting = ConnectTarget(host: host) } label: { Label(tr("connect"), systemImage: "bolt.horizontal") }
             if let session = sessions.existing(host.id), session.isConnected {
-                Button { sessions.close(host.id) } label: { Label(tr("disconnect"), systemImage: "power") }
+                // Disconnected, not closed: a session the list no longer
+                // holds is one home connects again.
+                Button { sessions.existing(host.id)?.disconnect() } label: { Label(tr("disconnect"), systemImage: "power") }
             }
-            Button { editing = host } label: { Label(tr("edit"), systemImage: "pencil") }
             Button { duplicate(host) } label: { Label(tr("duplicate"), systemImage: "plus.square.on.square") }
             if host.knownHost != nil {
-                Button { store.forgetHostKey(for: host.id) } label: { Label(tr("forgetkey"), systemImage: "xmark.shield") }
+                Button { sessions.forgetHostKey(host.id, store: store) } label: { Label(tr("forgetkey"), systemImage: "xmark.shield") }
             }
             Divider()
             Button(role: .destructive) { pendingDelete = host } label: { Label(tr("delete"), systemImage: "trash") }
         }
+    }
+
+    /// Keeps a host as edited or added, its secret in the Keychain; a
+    /// session open on it takes the edit, as stored: another address, login
+    /// or key is a connection made again.
+    private func keep(_ host: Host, secret: String, passphrase: String?) {
+        if !secret.isEmpty { Keychain.save(secret, account: host.id.uuidString) }
+        if let passphrase { Keychain.save(passphrase, account: host.id.uuidString + ".passphrase") }
+        let before = store.hosts.first { $0.id == host.id }
+        store.upsert(host)
+        if let model = sessions.existing(host.id), let saved = store.hosts.first(where: { $0.id == host.id }) {
+            model.host = saved
+            let reached = before.map {
+                $0.hostname != saved.hostname || $0.port != saved.port || $0.user != saved.user
+                    || $0.auth != saved.auth || $0.remoteCommand != saved.remoteCommand
+            } ?? true
+            if (reached || !secret.isEmpty || passphrase != nil), model.isConnected {
+                model.disconnect()
+                model.connect()
+            }
+        }
+    }
+
+    private func remove(_ host: Host) {
+        sessions.close(host.id)
+        store.remove(host)
     }
 
     /// A copy under a new id, with the Keychain secret copied across so the
@@ -193,76 +239,77 @@ private struct HostSection: Identifiable {
     let hosts: [Host]
 }
 
-/// The push target for the context menu's Connect. Its own type so it does
-/// not collide with the list's `navigationDestination(for: Host.self)`.
+/// The push target for the menu's Connect. Its own type so it does not
+/// collide with the list's `navigationDestination(for: Host.self)`.
 private struct ConnectTarget: Hashable {
     let host: Host
 }
 
+/// A host's terminal, pushed from its page.
+struct HostTerminal: Hashable {
+    let host: Host
+}
+
+/// One host: its picture, with a dot while its session is up or on its
+/// way, its name and its address.
 struct HostRow: View {
     let host: Host
-    /// The host's open session, if any: a dot says so.
+    /// The host's open session, if any.
     var session: TerminalModel? = nil
     @ObservedObject private var lang = AppLanguage.shared
 
     var body: some View {
-        HostRowLayout(
-            symbol: "server.rack",
-            tint: host.tint,
-            title: host.title,
-            subtitle: host.address
-        ) {
-            HStack(spacing: 6) {
-                if let session { ConnectionDot(model: session) }
-                Text(host.lastConnectedText)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                Text(host.auth == .key ? tr("badge.key") : tr("badge.password"))
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(Color.secondary.opacity(0.18)))
-            }
-            .padding(.top, 1)
+        HostRowLayout(title: host.title, subtitle: host.address, monospaced: true, session: session) {
+            Image(systemName: host.iconSymbol).font(.system(size: 17, weight: .medium))
         }
     }
 }
 
-/// The shared shape of a row: a tinted disc, a name, an address, and an
-/// optional third line.
-struct HostRowLayout<Detail: View>: View {
-    let symbol: String
-    let tint: Color
+/// The square a host or a machine leads with: its picture on a quiet fill,
+/// and the session's dot at the corner (`SessionDot`).
+struct HostTile<Mark: View>: View {
+    var size: CGFloat = 40
+    var session: TerminalModel? = nil
+    @ViewBuilder var mark: () -> Mark
+
+    var body: some View {
+        mark()
+            .foregroundStyle(Color.primary.opacity(0.88))
+            .frame(width: size, height: size)
+            .background(
+                RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                    .fill(Color(.tertiarySystemFill))
+            )
+            .overlay(alignment: .bottomTrailing) {
+                if let session {
+                    SessionDot(model: session).offset(x: 3, y: 3)
+                }
+            }
+    }
+}
+
+/// The shape of a row: a tile, a name, and an address under it.
+struct HostRowLayout<Mark: View>: View {
     let title: String
     let subtitle: String
-    @ViewBuilder var detail: () -> Detail
+    /// The address in the terminal's kind of type.
+    var monospaced = false
+    var session: TerminalModel? = nil
+    @ViewBuilder var mark: () -> Mark
 
     var body: some View {
         HStack(spacing: 12) {
-            ZStack {
-                Circle().fill(tint.gradient).frame(width: 40, height: 40)
-                Image(systemName: symbol)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
+            HostTile(session: session, mark: mark)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.headline).lineLimit(1)
+                Text(title).font(.body.weight(.semibold)).lineLimit(1)
                 Text(subtitle)
-                    .font(.subheadline)
+                    .font(monospaced ? .footnote.monospaced() : .footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                detail()
             }
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 6)
-    }
-}
-
-extension HostRowLayout where Detail == EmptyView {
-    init(symbol: String, tint: Color, title: String, subtitle: String) {
-        self.init(symbol: symbol, tint: tint, title: title, subtitle: subtitle) { EmptyView() }
+        .padding(.vertical, 3)
     }
 }
 
@@ -298,30 +345,8 @@ struct HostsEmptyState: View {
     }
 }
 
-private let hostRelativeFormatter: RelativeDateTimeFormatter = {
-    let formatter = RelativeDateTimeFormatter()
-    formatter.unitsStyle = .abbreviated
-    return formatter
-}()
-
 extension Host {
-    /// A stable colour per host. String.hashValue is seeded per process, so
-    /// the bytes are hashed here instead to survive a relaunch.
     /// The headline of a row: `display` would repeat the address below it
     /// when the host has no name.
     var title: String { name.isEmpty ? hostname : name }
-
-    var tint: Color {
-        let palette: [Color] = [.blue, .indigo, .purple, .pink, .orange, .teal, .green, .cyan]
-        var hash: UInt64 = 5381
-        for byte in (name + hostname + user).utf8 { hash = hash &* 33 &+ UInt64(byte) }
-        return palette[Int(hash % UInt64(palette.count))]
-    }
-
-    var lastConnectedText: String {
-        guard let last = lastConnected else { return tr("hosts.never") }
-        // "13m ago" follows the app's language, not the phone's.
-        hostRelativeFormatter.locale = Locale(identifier: L10n.currentTag)
-        return hostRelativeFormatter.localizedString(for: last, relativeTo: Date())
-    }
 }
