@@ -64,6 +64,10 @@ on:
         description: Linux arm64 (deb + rpm + AppImage + tarballs)
         type: boolean
         default: true
+      android_arm64:
+        description: Android arm64 (APK)
+        type: boolean
+        default: true
       publish:
         description: Publish to a GitHub Release (otherwise artifacts only)
         type: boolean
@@ -184,6 +188,7 @@ jobs:
             echo "| macOS | \`$(jq -r 'if length == 0 then "none" else [.[].arch] | join(", ") end' <<<"$macos_matrix")\` |"
             echo "| Windows | \`$(jq -r 'if length == 0 then "none" else [.[].arch] | join(", ") end' <<<"$windows_matrix")\` |"
             echo "| Linux | \`$(jq -r 'if length == 0 then "none" else [.[] | "\(.name)/\(.arch)"] | join(", ") end' <<<"$linux_matrix")\` |"
+            echo "| Android arm64 | ${{ inputs.android_arm64 }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # One job per architecture, each producing its own zip. We deliberately do not
@@ -680,14 +685,12 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  # The phone app ships with every release, never on its own: it speaks the
-  # mux codec of the commit it was built from and connects only to servers
-  # on that same codec, so each release builds it from the same commit as
-  # the servers and gives it their version. It has no deselect box for the
-  # same reason.
+  # Selected by default. The phone app speaks the mux codec of the commit
+  # it was built from, so it shares the servers' commit and version.
   android:
     name: android arm64
     needs: [prepare, web]
+    if: inputs.android_arm64
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # The app signing key is this environment's secret, as the macOS

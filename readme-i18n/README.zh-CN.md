@@ -6,6 +6,8 @@
 
 **[点击下载](https://github.com/RoversX/ThinkTerm/releases)** - 获取最新版本
 
+📱 **Android**：[添加 F-Droid 软件源](https://github.com/RoversX/fdroid/tree/dist)以接收更新。页面提供软件源地址和二维码。
+
 🍺 **Homebrew**（macOS）： 
 ```
 brew install --cask roversx/tap/thinkterm

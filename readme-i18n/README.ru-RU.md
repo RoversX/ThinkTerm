@@ -6,6 +6,8 @@
 
 **[Скачать здесь](https://github.com/RoversX/ThinkTerm/releases)** - последняя версия
 
+📱 **Android**: [Добавьте репозиторий F-Droid](https://github.com/RoversX/fdroid/tree/dist), чтобы получать обновления. На странице есть адрес репозитория и QR-код.
+
 🍺 **Homebrew** (macOS): 
 ```
 brew install --cask roversx/tap/thinkterm
