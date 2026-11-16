@@ -5,8 +5,10 @@
 name: ThinkTerm
 options:
   bundleIdPrefix: com.roversx.thinkterm
+  # iOS 26: the liquid-glass look is the app's own from there on, and one
+  # system is what the app is tried on.
   deploymentTarget:
-    iOS: "18.0"
+    iOS: "26.0"
   createIntermediateGroups: true
 configFiles:
   # The developer's own signing team, untracked; see ios/build.sh.
@@ -41,18 +43,38 @@ targets:
         buildPhase: resources
       - path: Assets.xcassets
         buildPhase: resources
+      # Why the app calls the APIs Apple asks a reason for; App Store
+      # Connect refuses an upload that calls them without one.
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - sdk: Metal.framework
       - sdk: QuartzCore.framework
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # The release, as the desktop's: an app speaks to the ThinkTerm of
+        # its own release only. `ios/build.sh archive VERSION` sets both;
+        # a build made otherwise is 0.0.0 (1).
+        MARKETING_VERSION: "0.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        # iPhone only: an iPad build must allow every orientation, and the
+        # app has not been tried on one.
+        TARGETED_DEVICE_FAMILY: "1"
+        # The launch screen, black (Info.plist); the other keys are below.
+        INFOPLIST_FILE: Info.plist
         INFOPLIST_KEY_CFBundleDisplayName: ThinkTerm
+        # Asked when a machine on the same network is first reached: an ssh
+        # host there, or a tailnet's machine reached directly rather than
+        # through a relay.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: ThinkTerm connects to the machines you add, including ones on your local network.
         PRODUCT_BUNDLE_IDENTIFIER: com.roversx.thinkterm.ios
         ASSETCATALOG_COMPILER_APPICON_NAME: ThinkTerm
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         SWIFT_VERSION: "5.9"
+        # `#file` as "ThinkTerm/File.swift", not the build machine's path:
+        # it is what fatalError and the bindings' checks put in the binary.
+        SWIFT_UPCOMING_FEATURE_CONCISE_MAGIC_FILE: YES
         SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated
         # The crate also emits a cdylib (for Android later); naming the .a by
         # path keeps the linker from preferring the .dylib next to it.
