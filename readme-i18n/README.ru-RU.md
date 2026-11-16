@@ -6,8 +6,6 @@
 
 **[Скачать здесь](https://github.com/RoversX/ThinkTerm/releases)** - последняя версия
 
-📱 **Android**: [Добавьте репозиторий F-Droid](https://github.com/RoversX/fdroid/tree/dist), чтобы получать обновления. На странице есть адрес репозитория и QR-код.
-
 🍺 **Homebrew** (macOS): 
 ```
 brew install --cask roversx/tap/thinkterm
@@ -228,6 +226,8 @@ TUI поддерживает навигацию по рабочим простр
 ### Мобильная разработка
 
 Приложения для [iOS](../ios) и [Android](../android) используют нативные интерфейсы и общее [мобильное ядро](../thinkterm-mobile). Они подключаются по SSH к сеансам на другой машине. Они в активной разработке и здесь не представлены как выпущенные мобильные продукты.
+
+Обновления Android: [репозиторий F-Droid](https://github.com/RoversX/fdroid/tree/dist).
 
 ## Начало работы
 

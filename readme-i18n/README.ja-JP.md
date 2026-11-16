@@ -6,8 +6,6 @@
 
 **[こちらからダウンロード](https://github.com/RoversX/ThinkTerm/releases)** - 最新リリースを入手
 
-📱 **Android**：[F-Droid リポジトリを追加](https://github.com/RoversX/fdroid/tree/dist)して更新を受け取れます。リンク先にリポジトリのアドレスと QR コードがあります。
-
 🍺 **Homebrew**（macOS）： 
 ```
 brew install --cask roversx/tap/thinkterm
@@ -226,6 +224,8 @@ TUI はワークスペースの移動、タブ、ペイン分割、サイズ変�
 ### モバイル版の開発
 
 [iOS](../ios) と [Android](../android) のアプリは、ネイティブ UI と共有の[モバイルコア](../thinkterm-mobile)を使用します。SSH で別のマシン上のセッションに接続します。現在も開発中であり、リリース済みのモバイル製品としては案内していません。
+
+Android の更新：[F-Droid リポジトリ](https://github.com/RoversX/fdroid/tree/dist).
 
 ## 使い始める
 

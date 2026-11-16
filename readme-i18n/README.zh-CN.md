@@ -6,8 +6,6 @@
 
 **[点击下载](https://github.com/RoversX/ThinkTerm/releases)** - 获取最新版本
 
-📱 **Android**：[添加 F-Droid 软件源](https://github.com/RoversX/fdroid/tree/dist)以接收更新。页面提供软件源地址和二维码。
-
 🍺 **Homebrew**（macOS）： 
 ```
 brew install --cask roversx/tap/thinkterm
@@ -226,6 +224,8 @@ TUI 支持工作空间导航、标签页、分屏、调整大小、复制模式�
 ### 移动端开发
 
 [iOS](../ios) 和 [Android](../android) 应用采用原生界面，共享[移动端核心](../thinkterm-mobile)，通过 SSH 连接另一台机器上的会话。它们仍在积极开发中，目前不作为已发布的移动产品介绍。
+
+Android 更新：[F-Droid 软件源](https://github.com/RoversX/fdroid/tree/dist).
 
 ## 开始使用
 

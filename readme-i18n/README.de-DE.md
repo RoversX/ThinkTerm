@@ -6,8 +6,6 @@
 
 **[Hier herunterladen](https://github.com/RoversX/ThinkTerm/releases)** - Die neueste Version erhalten
 
-📱 **Android**: [F-Droid-Paketquelle hinzufügen](https://github.com/RoversX/fdroid/tree/dist), um Updates zu erhalten. Die Seite enthält die Adresse und einen QR-Code.
-
 🍺 **Homebrew** (macOS): 
 ```
 brew install --cask roversx/tap/thinkterm
@@ -226,6 +224,8 @@ Die Anleitung zum [Browserzugriff](../docs/thinkterm/web-access.md) beschreibt L
 ### Mobile Entwicklung
 
 Die Apps für [iOS](../ios) und [Android](../android) verwenden native Oberflächen und den gemeinsamen [mobilen Kern](../thinkterm-mobile). Sie verbinden sich per SSH mit Sitzungen auf einem anderen Rechner. Sie befinden sich in aktiver Entwicklung und werden hier nicht als bereits veröffentlichte mobile Produkte angeboten.
+
+Android-Updates: [F-Droid-Paketquelle](https://github.com/RoversX/fdroid/tree/dist).
 
 ## Erste Schritte
 
