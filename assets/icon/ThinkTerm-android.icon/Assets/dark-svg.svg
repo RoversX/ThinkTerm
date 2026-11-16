@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1037 1037" width="1037" height="1037" role="img" aria-label="Pure vector glossy black bezel with transparent center">
+  <title>Glossy black bezel — pure editable vectors, transparent center</title>
+  <defs>
+    <linearGradient id="body" x1="0%" y1="0%" x2="95%" y2="100%">
+      <stop offset="0" stop-color="#636262"/><stop offset=".12" stop-color="#212121"/>
+      <stop offset=".37" stop-color="#101010"/><stop offset=".68" stop-color="#060606"/>
+      <stop offset=".88" stop-color="#191919"/><stop offset="1" stop-color="#515151"/>
+    </linearGradient>
+    <linearGradient id="outerLip" x1="2%" y1="4%" x2="96%" y2="97%">
+      <stop offset="0" stop-color="#f2f1ee"/><stop offset=".06" stop-color="#91908e"/>
+      <stop offset=".18" stop-color="#555453"/><stop offset=".49" stop-color="#0c0c0c"/>
+      <stop offset=".72" stop-color="#272727"/><stop offset=".92" stop-color="#636362"/><stop offset="1" stop-color="#898988"/>
+    </linearGradient>
+    <linearGradient id="bevel" x1="0" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#454444"/><stop offset=".12" stop-color="#161616"/>
+      <stop offset=".5" stop-color="#030303"/><stop offset=".76" stop-color="#090909"/>
+      <stop offset="1" stop-color="#222222"/>
+    </linearGradient>
+    <linearGradient id="midRim" x1="0%" y1="3%" x2="99%" y2="100%">
+      <stop offset="0" stop-color="#686767"/><stop offset=".09" stop-color="#555453"/>
+      <stop offset=".34" stop-color="#202020"/><stop offset=".6" stop-color="#5b5b5a"/>
+      <stop offset=".82" stop-color="#373737"/><stop offset="1" stop-color="#141414"/>
+    </linearGradient>
+    <linearGradient id="innerEdge" x1="0" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#a4a29f"/><stop offset=".25" stop-color="#434240"/>
+      <stop offset=".52" stop-color="#171717"/><stop offset=".82" stop-color="#282827"/>
+      <stop offset="1" stop-color="#494949"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0%" y1="0%" x2="30%" y2="70%">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".55"/>
+      <stop offset=".17" stop-color="#ffffff" stop-opacity=".17"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="groove" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#212121"/><stop offset=".45" stop-color="#070707"/><stop offset="1" stop-color="#292929"/>
+    </linearGradient>
+    <linearGradient id="innerStroke" x1="0" y1="0" x2="0.75" y2="1">
+      <stop offset="0" stop-color="#2f2e2e"/><stop offset=".35" stop-color="#080809"/>
+      <stop offset=".8" stop-color="#343335"/><stop offset="1" stop-color="#111112"/>
+    </linearGradient>
+    <clipPath id="windowCut" clipPathUnits="userSpaceOnUse">
+      <path d="M 209 2 H 828 C 941 2 1035 94 1035 207 V 830 C 1035 945 944 1035 828 1035 H 209 C 95 1035 2 944 2 830 V 207 C 2 94 94 2 209 2 Z M 280 78 C 164 78 79 161 79 279 L 79 773 C 79 892 165 962 282 962 H 774 C 890 962 959 894 959 775 V 277 C 959 161 877 78 759 78 Z" fill-rule="evenodd" clip-rule="evenodd"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#windowCut)">
+    <path d="M 209 2 H 828 C 941 2 1035 94 1035 207 V 830 C 1035 945 944 1035 828 1035 H 209 C 95 1035 2 944 2 830 V 207 C 2 94 94 2 209 2 Z" fill="url(#body)" stroke="url(#outerLip)" stroke-width="3.5"/>
+    <rect x="9" y="8" width="1019" height="1021" rx="204" fill="none" stroke="url(#outerLip)" stroke-width="5.6" opacity=".65"/>
+    <rect x="16" y="16" width="1005" height="1005" rx="206" fill="url(#bevel)" stroke="#0a0a0a" stroke-width="3"/>
+    <rect x="24" y="21" width="988" height="991" rx="207" fill="url(#body)"/>
+    <path d="M 204 20 C 99 20 20 98 20 208 L 20 827" fill="none" stroke="url(#gloss)" stroke-width="12" opacity=".25" stroke-linecap="round"/>
+    <rect x="54" y="55" width="928" height="928" rx="201" fill="#020202" stroke="#050505" stroke-width="3"/>
+    <rect x="59" y="59" width="918" height="919" rx="204" fill="url(#groove)" stroke="url(#midRim)" stroke-width="5"/>
+    <rect x="64" y="63" width="909" height="910" rx="204" fill="#080808" stroke="url(#innerEdge)" stroke-width="2.5"/>
+    <rect x="71" y="70" width="894" height="897" rx="199" fill="#020203" stroke="#080808" stroke-width="5"/>
+    <path d="M 280 78 C 164 78 79 161 79 279 L 79 773 C 79 892 165 962 282 962 H 774 C 890 962 959 894 959 775 V 277 C 959 161 877 78 759 78 Z" fill="#010101" stroke="url(#innerStroke)" stroke-width="9"/>
+    <path d="M 281 77 C 171 77 77 163 77 279 L 77 770 C 77 884 167 963 282 963 H 775 C 893 963 962 886 962 774 V 279 C 962 163 873 77 760 77 Z" fill="none" stroke="#151515" stroke-width="3" opacity=".9"/>
+    <path d="M 205 4 C 91 4 4 98 4 210" fill="none" stroke="#e5e4e2" stroke-width="3.8" opacity=".45"/>
+    <path d="M 210 6 H 827 C 942 6 1031 95 1031 208" fill="none" stroke="#c3c3c1" stroke-width="2.1" opacity=".28"/>
+    <path d="M 65 268 C 65 156 154 64 268 64 H 767" fill="none" stroke="#9d9c9a" stroke-width="1.5" opacity=".43"/>
+    <path d="M 962 786 C 962 883 887 963 781 963 H 278" fill="none" stroke="#5d5b5a" stroke-width="2" opacity=".35"/>
+  </g>
+</svg>
