@@ -7,6 +7,24 @@ use fcwrap::{CharSet, FontSet, Pattern as FontPattern, FC_CHARCELL, FC_DUAL, FC_
 use std::collections::HashSet;
 use std::convert::TryInto;
 
+/// The language of the user's locale in the form fontconfig expects
+/// (`zh-cn`, not `zh_CN`), so a fallback is picked for the script the user
+/// actually reads rather than for whatever the cache happens to list first.
+fn locale_lang() -> Option<String> {
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        let language = value.split('.').next().unwrap_or(&value).replace('_', "-");
+        let language = language.to_lowercase();
+        if language.is_empty() || language == "c" || language == "posix" {
+            continue;
+        }
+        return Some(language);
+    }
+    None
+}
+
 /// Allow for monospace, dual and charcell spacing; these are
 /// fixed width styles so are desirable for a terminal use case.
 const SPACING: [i32; 3] = [FC_MONO, FC_DUAL, FC_CHARCELL];
@@ -197,72 +215,83 @@ impl FontLocator for FontConfigFontLocator {
                 }
             }
 
-            let mut pushed_this_pass = 0;
-
             let mut charset = CharSet::new()?;
             charset.add(c)?;
 
-            // Make two passes to locate a fallback: first try to find any
-            // strictly monospace version, then, if we didn't find any matches,
-            // look for a version with any spacing.
-            for only_monospace in [true, false] {
-                let mut pattern = FontPattern::new()?;
-                pattern.add_charset(&charset)?;
-                pattern.add_integer("weight", 80)?;
-                pattern.add_integer("slant", 0)?;
+            // Take the font fontconfig itself considers the best match for
+            // this codepoint rather than the first font in its cache that has
+            // it. `FcFontList` answers in cache order, and on Ubuntu that puts
+            // the Arphic UKai/UMing faces -- a brush-written kai, not the sans
+            // face the rest of the desktop draws -- ahead of Noto Sans CJK, so
+            // every CJK cell in the terminal came out looking like a woodblock
+            // print. `FcFontSort` on the same query, with the generic
+            // monospace family and the user's language applied, puts the
+            // system's own preference first: Noto Sans Mono CJK SC on zh_CN.
+            let mut pattern = FontPattern::new()?;
+            pattern.family("monospace")?;
+            if let Some(lang) = locale_lang() {
+                pattern.add_string("lang", &lang)?;
+            }
+            pattern.add_charset(&charset)?;
+            pattern.add_integer("weight", 80)?;
+            pattern.add_integer("slant", 0)?;
+            pattern.config_substitute(fcwrap::MatchKind::Pattern)?;
+            pattern.default_substitute();
 
-                let mut lists = vec![pattern
+            let push_font = |pat: &FontPattern, fonts: &mut Vec<ParsedFont>| -> anyhow::Result<bool> {
+                let num = pat.charset_intersect_count(&charset)?;
+                if num == 0 {
+                    log::error!(
+                        "Skipping bogus font-config result {:?} because it doesn't overlap",
+                        pat
+                    );
+                    return Ok(false);
+                }
+
+                let Ok(file) = pat.get_file().context("pat.get_file") else {
+                    return Ok(false);
+                };
+                log::trace!("{file:?} has {num} codepoints from {codepoints:?}");
+                let handle = FontDataHandle {
+                    source: FontDataSource::OnDisk(file.into()),
+                    index: pat.get_integer("index")?.try_into()?,
+                    variation: 0,
+                    origin: FontOrigin::FontConfig,
+                    coverage: pat.get_charset().ok().map(|c| c.to_range_set()),
+                };
+                if let Ok(parsed) = crate::parser::ParsedFont::from_locator(&handle) {
+                    fonts.push(parsed);
+                    return Ok(true);
+                }
+                Ok(false)
+            };
+
+            let mut pushed = false;
+            for pat in pattern
+                .sort(true)
+                .context("pattern.sort with charset")?
+                .iter()
+            {
+                if push_font(&pat, &mut fonts)? {
+                    pushed = true;
+                    break;
+                }
+            }
+
+            if !pushed {
+                // A fontconfig that trimmed everything (an empty or broken
+                // cache) still has an unsorted answer; take that over none.
+                let mut plain = FontPattern::new()?;
+                plain.add_charset(&charset)?;
+                for pat in plain
                     .list()
-                    .context("pattern.list with no spacing constraint")?];
-
-                if only_monospace {
-                    for &spacing in &SPACING {
-                        pattern.delete_property("spacing")?;
-                        pattern.add_integer("spacing", spacing)?;
-                        lists.push(
-                            pattern.list().with_context(|| {
-                                format!("pattern.list with spacing={}", spacing)
-                            })?,
-                        );
+                    .context("pattern.list with no spacing constraint")?
+                    .iter()
+                {
+                    if push_font(&pat, &mut fonts)? {
+                        break;
                     }
                 }
-
-                for list in lists {
-                    for pat in list.iter() {
-                        let num = pat.charset_intersect_count(&charset)?;
-                        if num == 0 {
-                            log::error!(
-                                "Skipping bogus font-config result {:?} because it doesn't overlap",
-                                pat
-                            );
-                            continue;
-                        }
-
-                        if let Ok(file) = pat.get_file().context("pat.get_file") {
-                            log::trace!("{file:?} has {num} codepoints from {codepoints:?}");
-                            let handle = FontDataHandle {
-                                source: FontDataSource::OnDisk(file.into()),
-                                index: pat.get_integer("index")?.try_into()?,
-                                variation: 0,
-                                origin: FontOrigin::FontConfig,
-                                coverage: pat.get_charset().ok().map(|c| c.to_range_set()),
-                            };
-                            if let Ok(parsed) = crate::parser::ParsedFont::from_locator(&handle) {
-                                fonts.push(parsed);
-                                pushed_this_pass += 1;
-                            }
-                        }
-                    }
-                }
-
-                if pushed_this_pass == 0 {
-                    // If we get here on the first iteration, then we didn't
-                    // find a monospace version of fonts with those codepoints,
-                    // let's continue and try any matching font
-                    continue;
-                }
-
-                break;
             }
         }
 
