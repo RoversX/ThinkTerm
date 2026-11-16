@@ -1,10 +1,9 @@
 //! A node in the tailnet, on a Tokio runtime of its own: the library needs
-//! one, and nothing else in `thinkterm-tailnet` runs on Tokio.
+//! one, and what holds a node need not run on Tokio itself.
 
 use crate::status::{Family, Peer, Status};
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// How long a connection asked for while the node is still getting in
 /// waits for its list of machines: at launch, restored tabs ask before the
 /// node has reached the control server.
-pub(crate) const STARTING_WAIT: Duration = Duration::from_secs(15);
+pub const STARTING_WAIT: Duration = Duration::from_secs(15);
 
 /// How long a stopped node gets to wind down before what is left of it is
 /// dropped.
@@ -32,14 +31,14 @@ const STARTING_ANEW: &str = "the tailnet stopped working; starting it again";
 /// started anew (see `Node::is_broken`): half a minute, doubled for each
 /// node given up in a row before it, up to two, so that one left offline
 /// for hours tries now and then.
-pub(crate) fn broken_after(given_up: u32) -> Duration {
+pub fn broken_after(given_up: u32) -> Duration {
     Duration::from_secs(30) * 2u32.pow(given_up.min(2))
 }
 
 /// What a node starts with. No Debug: it holds the auth key and the node's
 /// private keys.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct NodeConfig {
+pub struct NodeConfig {
     pub control_url: Option<String>,
     pub hostname: Option<String>,
     pub auth_key: Option<String>,
@@ -87,16 +86,17 @@ impl NodeConfig {
     }
 }
 
-pub(crate) struct Node {
+pub struct Node {
     config: NodeConfig,
+    /// When it was started.
+    started: Instant,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     shared: Arc<Shared>,
-    /// Where the machine's other ThinkTerm processes reach this node (see
-    /// crate::proxy); gone with it.
-    socket: Option<PathBuf>,
+    /// What its holder has done with it stopped (see `Node::at_stop`).
+    at_stop: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
-pub(crate) struct Shared {
+pub struct Shared {
     state: Mutex<(Status, Vec<Peer>)>,
     device: Mutex<Option<Arc<Device>>>,
     /// The tailnet's own domain, as this machine's full name has it.
@@ -108,6 +108,10 @@ pub(crate) struct Shared {
     broken: AtomicBool,
     /// Set once the node has got in.
     was_in: AtomicBool,
+    /// What held up the node's last try to get in, while the library tries
+    /// again by itself (its sign-in retry): the status says it is still
+    /// getting in, this says why it is taking a while.
+    problem: Mutex<Option<String>>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -166,6 +170,38 @@ impl Shared {
         self.state.lock().unwrap().0.clone()
     }
 
+    /// What held up the node's last try to get in, while it tries again;
+    /// none once it got past it.
+    pub fn problem(&self) -> Option<String> {
+        self.problem.lock().unwrap().clone()
+    }
+
+    /// A question to the library that failed, as it failed. Where a part of
+    /// the library is gone (`library_gone`) the node is given up at once,
+    /// once it was in: left to the watchdog's patience it would carry
+    /// nothing for half a minute or more -- a part that stopped while the
+    /// app was away, say. One that never got in is left to the watchdog, so
+    /// that a library that cannot start is not made anew again and again.
+    fn library_failed(&self, err: tailscale::Error) -> anyhow::Error {
+        if library_gone(&err) && self.was_in.load(Ordering::SeqCst) {
+            self.give_up(Status::Failed {
+                error: STARTING_ANEW.into(),
+            });
+        }
+        anyhow!(err)
+    }
+
+    fn set_problem(&self, problem: Option<String>) {
+        {
+            let mut held = self.problem.lock().unwrap();
+            if *held == problem {
+                return;
+            }
+            *held = problem;
+        }
+        (self.changed)();
+    }
+
     /// Whether the node is on its way out: stopped, or given up to be
     /// started anew. What is asked of it is better asked of the node in its
     /// place.
@@ -210,10 +246,10 @@ impl Shared {
         match tokio::time::timeout(timeout, device.tcp_connect(to)).await {
             Ok(Ok(stream)) => Ok(stream),
             Ok(Err(err)) => {
-                use tailscale::InternalErrorKind::InternalChannelClosed;
-                // Its netstack gone, the node connects nowhere again while
-                // saying it is in: nothing else would notice.
-                if err == tailscale::Error::Internal(InternalChannelClosed) {
+                // A part of the library gone -- its netstack, an actor of its
+                // runtime -- the node connects nowhere again while saying it
+                // is in: nothing else would notice soon.
+                if library_gone(&err) {
                     self.give_up(Status::Failed {
                         error: STARTING_ANEW.into(),
                     });
@@ -227,8 +263,23 @@ impl Shared {
 
 /// How long a connection waits for a node that is still getting in, out of
 /// the time it has.
-pub(crate) fn starting_wait(timeout: Duration) -> Duration {
+pub fn starting_wait(timeout: Duration) -> Duration {
     timeout.min(STARTING_WAIT)
+}
+
+/// Whether the library failed because a part of it is gone -- its netstack,
+/// an actor of its runtime -- which nothing brings back: the node connects
+/// nowhere again, whatever its status still says.
+fn library_gone(err: &tailscale::Error) -> bool {
+    use tailscale::InternalErrorKind::{Actor, InternalChannelClosed};
+    matches!(err, tailscale::Error::Internal(Actor | InternalChannelClosed))
+}
+
+/// Whether `Shared::tcp_connect` failed because the machine itself turned
+/// the connection away (nothing listens on that port, say): it was
+/// reached, so the way there works.
+pub fn turned_away(err: &anyhow::Error) -> bool {
+    matches!(err.downcast_ref::<tailscale::Error>(), Some(tailscale::Error::ConnectionReset))
 }
 
 /// Shared::resolve, with what it asks passed in.
@@ -283,7 +334,7 @@ fn one_named(mut named: Vec<Peer>, domain: Option<&str>) -> Option<Peer> {
 }
 
 /// The keys of a new node, as [`NodeConfig::node_keys`] keeps them.
-pub(crate) fn new_node_keys() -> Result<String> {
+pub fn new_node_keys() -> Result<String> {
     Ok(serde_json::to_string(
         &tailscale::keys::PersistState::default(),
     )?)
@@ -295,7 +346,7 @@ pub(crate) fn new_node_keys() -> Result<String> {
 /// names "node". It stays while the machine keeps its keys and changes
 /// with them at logout, so the new node does not take the old one's name
 /// while the tailnet still lists it.
-pub(crate) fn automatic_name(keys: &tailscale::keys::PersistState) -> String {
+pub fn automatic_name(keys: &tailscale::keys::PersistState) -> String {
     let public = keys.machine_key.import().public;
     let key = public.to_x25519_dalek().to_bytes();
     format!("thinkterm-{:02x}{:02x}", key[0], key[1])
@@ -336,6 +387,7 @@ impl Node {
             stopped: AtomicBool::new(false),
             broken: AtomicBool::new(false),
             was_in: AtomicBool::new(false),
+            problem: Mutex::new(None),
             changed,
         });
         watched(
@@ -356,33 +408,44 @@ impl Node {
                 async move { control_server_answers(&control).await.is_ok() }
             }),
         );
-        // A node the other processes cannot reach still serves this one.
-        let socket = match crate::proxy::bind() {
-            Ok((listener, path)) => {
-                watched(
-                    runtime.handle(),
-                    &shared,
-                    crate::proxy::serve(Arc::clone(&shared), listener),
-                );
-                Some(path)
-            }
-            Err(err) => {
-                log::warn!(
-                    "tailnet: sharing the node with this machine's other processes: {err:#}"
-                );
-                None
-            }
-        };
         Ok(Self {
             config,
+            started: Instant::now(),
             runtime: Mutex::new(Some(runtime)),
             shared,
-            socket,
+            at_stop: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The half of the node what runs beside it holds: where it is, the
+    /// machines it sees and the way through it.
+    pub fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
+
+    /// Runs `task` beside the node on its runtime, for as long as the
+    /// node runs and watched as its own loops are: one that panics gives
+    /// the node up. A holder's way of answering for the node -- to the
+    /// machine's other processes, say. Nothing runs on a node stopped.
+    pub fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        if let Some(runtime) = self.runtime.lock().unwrap().as_ref() {
+            watched(runtime.handle(), &self.shared, task);
+        }
+    }
+
+    /// Has `done` called once the node has stopped: for what its holder
+    /// set up beside it and has to take down after it.
+    pub fn at_stop(&self, done: impl FnOnce() + Send + 'static) {
+        self.at_stop.lock().unwrap().push(Box::new(done));
     }
 
     pub fn config(&self) -> &NodeConfig {
         &self.config
+    }
+
+    /// When the node was started.
+    pub fn started(&self) -> Instant {
+        self.started
     }
 
     pub fn status(&self) -> Status {
@@ -400,7 +463,10 @@ impl Node {
     pub fn stop(&self) {
         self.shared.stopped.store(true, Ordering::SeqCst);
         let device = self.shared.device.lock().unwrap().take();
-        if let Some(runtime) = self.runtime.lock().unwrap().take() {
+        // Taken out, not held while it winds down: `spawn` asks for it
+        // from other runtimes' threads, and finds none at once.
+        let runtime = self.runtime.lock().unwrap().take();
+        if let Some(runtime) = runtime {
             // The library's own way down first, for as long as it takes
             // within half the wait; what is left of it goes with the
             // runtime.
@@ -409,8 +475,8 @@ impl Node {
             }
             runtime.shutdown_timeout(STOP_WAIT);
         }
-        if let Some(socket) = &self.socket {
-            let _ = std::fs::remove_file(socket);
+        for done in std::mem::take(&mut *self.at_stop.lock().unwrap()) {
+            done();
         }
     }
 
@@ -456,27 +522,49 @@ async fn run(
         let snapshot = authorized_snapshot(
             answer(&mut asking_authorization, || {
                 let device = Arc::clone(&device);
+                let shared = Arc::clone(&shared);
                 async move {
                     // Turned away by the control server: why, rather than
-                    // a node that seems never to get anywhere.
-                    if let Some(reason) = device.registration_error().await? {
-                        bail!("{reason}");
+                    // a node that seems never to get anywhere. A device not
+                    // let in, in the words whoever shows the node tells it
+                    // by; any other failure the library asks again by itself
+                    // (its sign-in retry), the node still on its way in and
+                    // held up by it meanwhile.
+                    match device
+                        .registration_error()
+                        .await
+                        .map_err(|err| shared.library_failed(err))?
+                    {
+                        Some(reason) if reason == tailscale::REGISTRATION_NOT_LET_IN => {
+                            shared.set_problem(None);
+                            bail!(crate::NOT_LET_IN);
+                        }
+                        Some(reason) => {
+                            shared.set_problem(Some(reason));
+                            return Ok(None);
+                        }
+                        None => shared.set_problem(None),
                     }
                     device
                         .current_auth_state()
                         .await
-                        .map_err(anyhow::Error::from)
+                        .map_err(|err| shared.library_failed(err))
                 }
             }),
             answer(&mut asking_netmap, || {
                 let device = Arc::clone(&device);
+                let shared = Arc::clone(&shared);
                 async move {
                     // Both come with the first netmap; until then the node is
                     // still getting in, the machines included.
-                    let Some(this) = device.current_self_node().await? else {
+                    let Some(this) = device
+                        .current_self_node()
+                        .await
+                        .map_err(|err| shared.library_failed(err))?
+                    else {
                         return Ok(None);
                     };
-                    let Some(nodes) = device.peers().await? else {
+                    let Some(nodes) = device.peers().await.map_err(|err| shared.library_failed(err))? else {
                         return Ok(None);
                     };
                     Ok(Some((this, nodes)))
@@ -485,6 +573,11 @@ async fn run(
             Duration::from_secs(5),
         )
         .await;
+        // Given up meanwhile, or stopped: the node in its place carries on,
+        // and this one's status stays as it was left -- why it went.
+        if shared.is_going() {
+            return;
+        }
         match snapshot {
             Ok((this, nodes)) => {
                 let addresses: Vec<IpAddr> = [
@@ -645,9 +738,12 @@ where
 
 /// Whether a node is stuck at `status`: anywhere short of in, or as far as
 /// a login. Connections through one that is not in time out: the library
-/// asks its control part for every one.
+/// asks its control part for every one. Not one waiting for an admin's
+/// approval: the library asks control again by itself at a steady pace (its
+/// sign-in retry) and gets in once approved, where a node made anew would
+/// only ask the same, later.
 fn is_stuck(status: &Status) -> bool {
-    !matches!(status, Status::Connected { .. } | Status::NeedsLogin { .. })
+    !matches!(status, Status::Connected { .. } | Status::NeedsLogin { .. }) && !status.awaits_approval()
 }
 
 /// Runs one of the node's own loops. One that panics leaves nothing to
@@ -735,7 +831,7 @@ async fn forward_ssh_to_this_machine(device: Arc<Device>, shared: Arc<Shared>, o
 /// Copies both ways until either side ends, then closes both. The tailnet's
 /// streams cannot half-close, so waiting on the other direction after one
 /// has ended could wait forever.
-pub(crate) async fn bridge(a: impl AsyncRead + AsyncWrite, b: impl AsyncRead + AsyncWrite) {
+pub async fn bridge(a: impl AsyncRead + AsyncWrite, b: impl AsyncRead + AsyncWrite) {
     let (mut a_read, mut a_write) = tokio::io::split(a);
     let (mut b_read, mut b_write) = tokio::io::split(b);
     tokio::select! {
@@ -1205,6 +1301,7 @@ mod tests {
             stopped: AtomicBool::new(false),
             broken: AtomicBool::new(false),
             was_in: AtomicBool::new(false),
+            problem: Mutex::new(None),
             changed: Box::new({
                 let said = Arc::clone(&said);
                 move || {
@@ -1231,6 +1328,35 @@ mod tests {
     }
 
     #[test]
+    fn a_part_of_the_library_gone_gives_a_node_that_was_in_up_at_once() {
+        use tailscale::InternalErrorKind::{Actor, InternalChannelClosed};
+        assert!(library_gone(&tailscale::Error::Internal(Actor)));
+        assert!(library_gone(&tailscale::Error::Internal(InternalChannelClosed)));
+        // The machine turning a connection away is no part of the library.
+        assert!(!library_gone(&tailscale::Error::ConnectionReset));
+
+        // Never in: left to the watchdog, the error passed on as it was.
+        let (shared, _) = shared_counting();
+        let err = shared.library_failed(tailscale::Error::Internal(Actor));
+        assert!(!shared.is_going());
+        assert_eq!(err.to_string(), tailscale::Error::Internal(Actor).to_string());
+
+        // In before: given up at once, to be made anew.
+        let (shared, said) = shared_counting();
+        shared.was_in.store(true, Ordering::SeqCst);
+        shared.library_failed(tailscale::Error::Internal(Actor));
+        assert!(shared.is_going());
+        assert_eq!(shared.status(), Status::Failed { error: STARTING_ANEW.into() });
+        assert!(said.load(Ordering::SeqCst) > 0, "the holder is told");
+
+        // Another failure gives nothing up.
+        let (shared, _) = shared_counting();
+        shared.was_in.store(true, Ordering::SeqCst);
+        shared.library_failed(tailscale::Error::ConnectionReset);
+        assert!(!shared.is_going());
+    }
+
+    #[test]
     fn a_node_short_of_in_or_a_login_is_stuck() {
         assert!(is_stuck(&Status::Starting));
         assert!(is_stuck(&Status::Failed {
@@ -1242,6 +1368,10 @@ mod tests {
         }));
         assert!(!is_stuck(&Status::NeedsLogin {
             url: "https://login.example.com/node".into(),
+        }));
+        // Waiting for an admin: the library asks again by itself.
+        assert!(!is_stuck(&Status::Failed {
+            error: crate::NOT_LET_IN.into(),
         }));
     }
 

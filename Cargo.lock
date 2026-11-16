@@ -9709,13 +9709,26 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
- "tailscale",
  "tempfile",
  "thinkterm-core",
+ "thinkterm-tailnet-engine",
+ "tokio",
+ "url",
+ "wezterm-ssh",
+]
+
+[[package]]
+name = "thinkterm-tailnet-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+ "tailscale",
  "tokio",
  "ts_control",
  "url",
- "wezterm-ssh",
 ]
 
 [[package]]

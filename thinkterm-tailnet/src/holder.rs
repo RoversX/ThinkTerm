@@ -354,6 +354,18 @@ fn reconcile() -> Next {
         }),
     ) {
         Ok(node) => {
+            // A node the other processes cannot reach still serves this one.
+            match crate::proxy::bind() {
+                Ok((listener, path)) => {
+                    node.spawn(crate::proxy::serve(node.shared(), listener));
+                    node.at_stop(move || {
+                        let _ = std::fs::remove_file(&path);
+                    });
+                }
+                Err(err) => log::warn!(
+                    "tailnet: sharing the node with this machine's other processes: {err:#}"
+                ),
+            }
             *NODE.lock().unwrap() = Some(Arc::new(node));
             *IDLE.lock().unwrap() = Status::Off;
             Next::Settled

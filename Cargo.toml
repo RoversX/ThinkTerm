@@ -10,6 +10,7 @@ members = [
   "thinkterm-reverse-access",
   "thinkterm-connect-auth",
   "thinkterm-tailnet",
+  "thinkterm-tailnet-engine",
   "thinkterm-tailnet-node",
   "thinkterm-file-index",
   "thinkterm-font-core",
@@ -192,6 +193,7 @@ colorgrad = "0.6"
 config = { path = "config" }
 thinkterm-core = { path = "thinkterm-core" }
 thinkterm-tailnet = { path = "thinkterm-tailnet" }
+thinkterm-tailnet-engine = { path = "thinkterm-tailnet-engine" }
 thinkterm-file-index = { path = "thinkterm-file-index" }
 thinkterm-font-core = { path = "thinkterm-font-core" }
 thinkterm-font-web = { path = "thinkterm-font-web" }

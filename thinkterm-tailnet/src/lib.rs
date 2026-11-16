@@ -23,8 +23,10 @@ mod status;
 mod holder;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod keeper;
+// The node itself is thinkterm-tailnet-engine's: the one caller of the
+// library, which a phone's app holds too.
 #[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
-mod node;
+pub(crate) use thinkterm_tailnet_engine::node;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod proxy;
 
@@ -142,19 +144,7 @@ pub fn control_url_as_kept(text: &str) -> Result<Option<String>> {
     Ok(Some(url.to_string()))
 }
 
-/// What a person types for a control server, as a URL: "https://" when no
-/// scheme is given.
-pub(crate) fn control_url(text: &str) -> Result<url::Url> {
-    let text = text.trim();
-    let with_scheme = if text.contains("://") {
-        text.to_string()
-    } else {
-        format!("https://{text}")
-    };
-    with_scheme
-        .parse()
-        .with_context(|| format!("the control server address {text:?}"))
-}
+pub(crate) use thinkterm_tailnet_engine::control_url;
 
 /// Whether a control server answers at `text` -- Tailscale's own when it is
 /// empty -- the way it answers a node about to join: with its key, over
@@ -209,7 +199,7 @@ pub fn use_for_ssh() {
     }
     wezterm_ssh::set_dialer(Some(std::sync::Arc::new(
         |host: &str, port: u16, family, timeout, cancelled: &dyn Fn() -> bool| {
-            dial(host, port, Family::from(family), timeout, cancelled)
+            dial(host, port, status::family(family), timeout, cancelled)
         },
     )));
 }
@@ -223,7 +213,7 @@ pub fn use_for_ssh_in_server() {
     }
     wezterm_ssh::set_dialer(Some(std::sync::Arc::new(
         |host: &str, port: u16, family, timeout, cancelled: &dyn Fn() -> bool| {
-            server_dial(host, port, Family::from(family), timeout, cancelled)
+            server_dial(host, port, status::family(family), timeout, cancelled)
         },
     )));
 }

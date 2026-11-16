@@ -10,8 +10,8 @@ ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at t
 crate (ts_keys, ts_tunnel, ...) still comes from crates.io, held at the same version by
 Cargo.lock.
 
-Only thinkterm-tailnet/src/node.rs calls the library; the rest of ThinkTerm goes through
-thinkterm-tailnet.
+Only thinkterm-tailnet-engine/src/node.rs calls the library; the rest of ThinkTerm goes
+through it: thinkterm-tailnet on a desktop or a server, thinkterm-mobile on a phone.
 
 Finding our changes
 -------------------

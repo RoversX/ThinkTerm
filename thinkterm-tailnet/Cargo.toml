@@ -10,7 +10,7 @@ publish = false
 # settings, reads the node's reports, asks for connections through it, and
 # keeps it running -- all the app, `thinkterm` and the mux server need,
 # without the library in them.
-node = ["dep:tailscale", "dep:tokio", "dep:ts_control"]
+node = ["thinkterm-tailnet-engine/node", "dep:tokio"]
 
 [dependencies]
 anyhow.workspace = true
@@ -20,6 +20,8 @@ serde = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 socket2.workspace = true
 thinkterm-core.workspace = true
+# The node, and the words for where one is (Status, Peer).
+thinkterm-tailnet-engine.workspace = true
 url.workspace = true
 # Only for the dialer a process registers with it (see use_for_ssh).
 wezterm-ssh.workspace = true
@@ -31,9 +33,9 @@ nix = { workspace = true, features = ["signal", "user"] }
 # without it and SUPPORTED says so.
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 http_req.workspace = true
-tailscale = { version = "0.6.1", optional = true }
+# For what runs beside the node on its runtime: the socket the machine's
+# other processes ask it on.
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
-ts_control = { version = "0.6.1", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

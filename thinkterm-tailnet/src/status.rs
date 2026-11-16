@@ -3,122 +3,16 @@
 //! app and `thinkterm tailnet` learn what the node is doing without asking it.
 
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum Status {
-    /// No node runs in this process.
-    #[default]
-    Off,
-    /// Reaching the control server.
-    Starting,
-    /// The control server wants a person to approve this machine at `url`.
-    NeedsLogin { url: String },
-    Connected {
-        /// This machine's name in the tailnet.
-        name: String,
-        address: Option<IpAddr>,
-    },
-    /// It stopped trying, or is waiting to try again.
-    Failed { error: String },
-    /// This process should hold the node, but another one on this machine
-    /// does; this one takes over when that one lets go.
-    HeldElsewhere,
-}
+pub use thinkterm_tailnet_engine::{Family, Peer, Status};
 
-/// Another machine in the tailnet.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Peer {
-    /// What a host's address can say to reach it.
-    pub name: String,
-    /// The name with the tailnet's domain, for when two machines share one.
-    pub fqdn: String,
-    pub ipv4: Option<Ipv4Addr>,
-    pub ipv6: Option<Ipv6Addr>,
-    /// None while the control server has not said.
-    pub online: Option<bool>,
-    /// What the machine says it runs, as Tailscale names it: "macOS",
-    /// "iOS", "android", "linux", "windows"... Empty when it does not say,
-    /// as in a report from before it was kept.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub os: String,
-    /// Its Linux distribution ("ubuntu"), when it says.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub distro: String,
-    /// The model of a phone or tablet ("iPad13,4"), when it says.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub model: String,
-}
-
-/// Which of a machine's addresses a connection may go to, as AddressFamily
-/// in the SSH config says.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Family {
-    #[default]
-    Any,
-    V4,
-    V6,
-}
-
-impl From<wezterm_ssh::AddressFamily> for Family {
-    fn from(family: wezterm_ssh::AddressFamily) -> Self {
-        match family {
-            wezterm_ssh::AddressFamily::Any => Family::Any,
-            wezterm_ssh::AddressFamily::Inet => Family::V4,
-            wezterm_ssh::AddressFamily::Inet6 => Family::V6,
-        }
-    }
-}
-
-impl Family {
-    #[cfg(feature = "node")]
-    pub fn allows(self, ip: IpAddr) -> bool {
-        match self {
-            Family::Any => true,
-            Family::V4 => ip.is_ipv4(),
-            Family::V6 => ip.is_ipv6(),
-        }
-    }
-}
-
-impl Peer {
-    /// The address a connection to it goes to.
-    pub fn address(&self) -> Option<IpAddr> {
-        self.address_in(Family::Any)
-    }
-
-    /// The address a connection to it goes to, of those `family` allows.
-    pub(crate) fn address_in(&self, family: Family) -> Option<IpAddr> {
-        let ipv4 = self.ipv4.map(IpAddr::V4);
-        let ipv6 = self.ipv6.map(IpAddr::V6);
-        match family {
-            Family::Any => ipv4.or(ipv6),
-            Family::V4 => ipv4,
-            Family::V6 => ipv6,
-        }
-    }
-
-    /// Whether `host`, as a host's address or SSH config spells it, names
-    /// this machine.
-    pub fn answers_to(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.');
-        match host.parse::<IpAddr>() {
-            Ok(IpAddr::V4(ip)) => self.ipv4 == Some(ip),
-            Ok(IpAddr::V6(ip)) => self.ipv6 == Some(ip),
-            Err(_) => self.name.eq_ignore_ascii_case(host) || self.fqdn.eq_ignore_ascii_case(host),
-        }
-    }
-
-    /// Whether its full name is in `domain`, a tailnet's own: one shared in
-    /// from another tailnet keeps that one's.
-    pub fn in_domain(&self, domain: &str) -> bool {
-        self.fqdn
-            .trim_end_matches('.')
-            .split_once('.')
-            .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(domain.trim_end_matches('.')))
+/// AddressFamily in the SSH config, as the node takes it.
+pub(crate) fn family(family: wezterm_ssh::AddressFamily) -> Family {
+    match family {
+        wezterm_ssh::AddressFamily::Any => Family::Any,
+        wezterm_ssh::AddressFamily::Inet => Family::V4,
+        wezterm_ssh::AddressFamily::Inet6 => Family::V6,
     }
 }
 
@@ -215,6 +109,7 @@ pub(crate) fn write_report(report: &Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn peer() -> Peer {
         Peer {

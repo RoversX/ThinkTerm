@@ -1,0 +1,33 @@
+[package]
+name = "thinkterm-tailnet-engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A node in a tailnet and what it says of itself: the one place ThinkTerm
+# calls Tailscale's Rust library (deps/tailscale-rs). No files and no
+# processes of its own -- who holds a node, on what settings and for whom
+# is its users' business: `thinkterm-tailnet` on a desktop or a server,
+# where a program apart holds it for the whole machine, and
+# `thinkterm-mobile` on a phone, where the app holds its own.
+
+[features]
+# The node itself. Without it this crate is the words for one -- its
+# status, the machines it sees -- for the programs that only read them.
+node = ["dep:tailscale", "dep:tokio", "dep:ts_control", "dep:log", "dep:serde_json"]
+
+[dependencies]
+anyhow.workspace = true
+log = { workspace = true, optional = true }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, optional = true }
+url.workspace = true
+
+# The library runs where it has a network monitor: macOS and Linux, and
+# iOS by the vendored ts_netmon (deps/tailscale-rs/PATCHES.txt); on Android,
+# which to Rust is not Linux, without one (the same file). Elsewhere this
+# crate builds without it and SUPPORTED says so.
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "ios", target_os = "android"))'.dependencies]
+tailscale = { version = "0.6.1", optional = true }
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
+ts_control = { version = "0.6.1", optional = true }
