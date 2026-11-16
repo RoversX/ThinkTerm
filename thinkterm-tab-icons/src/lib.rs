@@ -13,6 +13,8 @@
 //! drawn in the card's glyph colour, so every icon in a row belongs to the
 //! same family whatever it was drawn in.
 
+pub mod look;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

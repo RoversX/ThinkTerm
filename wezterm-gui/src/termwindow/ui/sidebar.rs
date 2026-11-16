@@ -877,25 +877,29 @@ impl crate::TermWindow {
         current: bool,
         foreground: LinearRgba,
     ) -> LinearRgba {
-        if current {
-            thread_marks::CURRENT_COLOR
-        } else if !session.is_materialized {
-            thread_marks::closed_color(foreground)
-        } else if session.is_unread {
-            thread_marks::unread_color(foreground)
-        } else {
-            thread_marks::OPEN_COLOR
-        }
+        thread_marks::tone_color(
+            thinkterm_tab_icons::look::still_tone(
+                current,
+                session.is_materialized,
+                session.is_unread,
+            ),
+            foreground,
+        )
     }
 
     /// A thread's state in the status colours; the one the user is in,
     /// `current`, works in its own green.
     fn sidebar_thread_status_color(status: UiStatusKind, current: bool) -> LinearRgba {
+        thinkterm_tab_icons::look::status_color(Self::sidebar_thread_status_mark(status), current)
+            .map(thread_marks::opaque)
+            .unwrap_or(thread_marks::OPEN_COLOR)
+    }
+
+    fn sidebar_thread_status_mark(status: UiStatusKind) -> Mark {
         match status {
-            UiStatusKind::Running if current => thread_marks::CURRENT_COLOR,
-            UiStatusKind::Running => thread_marks::WORKING_COLOR,
-            UiStatusKind::NeedsAttention => thread_marks::WAITING_COLOR,
-            UiStatusKind::Done => thread_marks::FINISHED_COLOR,
+            UiStatusKind::Running => Mark::Working,
+            UiStatusKind::NeedsAttention => Mark::Waiting,
+            UiStatusKind::Done => Mark::Finished,
         }
     }
 
@@ -1124,11 +1128,7 @@ impl crate::TermWindow {
                 (Mark::Failed, chrome.danger)
             }
             Some(status) => (
-                match status {
-                    UiStatusKind::Running => Mark::Working,
-                    UiStatusKind::NeedsAttention => Mark::Waiting,
-                    UiStatusKind::Done => Mark::Finished,
-                },
+                Self::sidebar_thread_status_mark(status),
                 Self::sidebar_thread_status_color(status, current),
             ),
             None => (

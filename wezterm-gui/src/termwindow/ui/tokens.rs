@@ -135,7 +135,7 @@ pub const TAB_VERTICAL_PADDING: usize = 8;
 /// circle concentric with the pill's rounded end.
 pub const TAB_ICON_CIRCLE_INSET: usize = 6;
 /// A pane tab icon's glyph, as a share of its circle.
-pub const TAB_ICON_GLYPH_RATIO: f32 = 0.56;
+pub const TAB_ICON_GLYPH_RATIO: f32 = thinkterm_tab_icons::look::GLYPH_RATIO;
 
 pub const PANE_NAV_INSET: usize = 10;
 pub const PANE_NAV_ICON_GAP: usize = 8;

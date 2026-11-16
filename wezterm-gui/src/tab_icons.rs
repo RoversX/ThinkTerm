@@ -267,21 +267,22 @@ fn remove_unreferenced_svgs(settings: &NativeTabIconSettings) {
 // Drawing, shared by the pane tabs and the settings page so both show the
 // same icon.
 
-/// How a tab icon's circle is lit: the fill lightens toward white at the
-/// top and darkens toward black at the bottom, and the rim -- one point on
-/// a 25pt icon -- does the same more strongly, so the edge reads as a bevel
-/// in the circle's own colour. The shadow is in its hue too.
-pub(crate) const PLATE: TileStyle = TileStyle {
-    fill_top_lighten: 0.18,
-    fill_bottom_darken: 0.13,
-    rim_top_lighten: 0.42,
-    rim_bottom_darken: 0.25,
-    rim_per_side: 1.0 / 25.0,
-    shadow_darken: 0.55,
-    shadow_alpha_dark: 0.5,
-    shadow_alpha_light: 0.32,
-    shadow_sigma: 3.5,
-    shadow_drop: 2.5,
+/// How a tab icon's circle is lit, as every client's is
+/// (`thinkterm_tab_icons::look::PLATE`).
+pub(crate) const PLATE: TileStyle = {
+    let look = &thinkterm_tab_icons::look::PLATE;
+    TileStyle {
+        fill_top_lighten: look.fill_top_lighten,
+        fill_bottom_darken: look.fill_bottom_darken,
+        rim_top_lighten: look.rim_top_lighten,
+        rim_bottom_darken: look.rim_bottom_darken,
+        rim_per_side: look.rim_per_side,
+        shadow_darken: look.shadow_darken,
+        shadow_alpha_dark: look.shadow_alpha_dark,
+        shadow_alpha_light: look.shadow_alpha_light,
+        shadow_sigma: look.shadow_sigma,
+        shadow_drop: look.shadow_drop,
+    }
 };
 
 /// The circle a glyph sits on. `dark` is the chrome's appearance.

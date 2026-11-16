@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use thinkterm_tab_icons::look::{self, MARK_STEPS};
+pub(crate) use thinkterm_tab_icons::look::Mark;
 use wezterm_font::LoadedFont;
 use window::bitmaps::TextureRect;
 use window::color::LinearRgba;
@@ -30,12 +32,8 @@ const LAYER: usize = 2;
 /// program said it changed: panes open and close without saying so.
 const ICONS_TTL: Duration = Duration::from_secs(1);
 
-/// The marks step on this clock, a little slower than the spinner's 80ms:
-/// a spinner turning at the same time costs some repaints of its own.
-pub(crate) const MARK_STEP: Duration = Duration::from_millis(100);
-
-/// Steps in one turn of a working mark.
-const MARK_STEPS: u64 = 8;
+/// The marks step on this clock, every client's (`look::MARK_STEP_MS`).
+pub(crate) const MARK_STEP: Duration = Duration::from_millis(look::MARK_STEP_MS);
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -87,13 +85,7 @@ pub(crate) fn icons_by_workspace() -> Rc<HashMap<String, Vec<ResolvedIcon>>> {
 }
 
 fn rank(card: &Card) -> u8 {
-    if !card.agents.is_empty() {
-        0
-    } else if card.id == TERMINAL_CARD {
-        2
-    } else {
-        1
-    }
+    look::row_rank(!card.agents.is_empty(), card.id == TERMINAL_CARD)
 }
 
 fn build(catalog: &Catalog) -> HashMap<String, Vec<ResolvedIcon>> {
@@ -139,7 +131,7 @@ fn build(catalog: &Catalog) -> HashMap<String, Vec<ResolvedIcon>> {
 /// `diameter` across; the trailing layout keeps none.
 pub(crate) fn slot_width(layout: NativeThreadIcons, diameter: f32) -> f32 {
     match layout {
-        NativeThreadIcons::Badge => diameter * 1.33,
+        NativeThreadIcons::Badge => diameter * look::BADGE_WIDTH,
         NativeThreadIcons::Coins => diameter * 1.35,
         NativeThreadIcons::Cluster => diameter * 1.2,
         NativeThreadIcons::Trailing => 0.0,
@@ -150,7 +142,9 @@ pub(crate) fn slot_width(layout: NativeThreadIcons, diameter: f32) -> f32 {
 /// them apart from a row: centred on their own, say.
 pub(crate) fn drawn_width(layout: NativeThreadIcons, count: usize, diameter: f32) -> f32 {
     match layout {
-        NativeThreadIcons::Badge | NativeThreadIcons::Trailing if count > 1 => diameter * 1.33,
+        NativeThreadIcons::Badge | NativeThreadIcons::Trailing if count > 1 => {
+            diameter * look::BADGE_WIDTH
+        }
         NativeThreadIcons::Badge | NativeThreadIcons::Trailing => diameter,
         NativeThreadIcons::Coins => diameter * (1.0 + 0.175 * (count.clamp(1, 3) - 1) as f32),
         NativeThreadIcons::Cluster => diameter * 1.2,
@@ -187,14 +181,14 @@ pub(crate) fn draw_slot(
         return Ok(());
     };
     let d = diameter;
-    let gap = (d * 0.08).round().max(1.0);
+    let gap = look::ring(d);
     match layout {
         NativeThreadIcons::Badge | NativeThreadIcons::Trailing => {
             let y = cy - d / 2.0;
             draw_icon(ctx, layers, first, x, y, d, style, true, 0.0)?;
-            // Out to the right rather than down, so it stays within the row.
-            let small = (d * 0.55).round();
-            let (bx, by) = (x + d * 0.78, y + d * 0.55);
+            let badge = look::badge(d);
+            let small = badge.small;
+            let (bx, by) = (x + badge.x, y + badge.y);
             match icons.len() {
                 1 => {}
                 2 => draw_icon(ctx, layers, &icons[1], bx, by, small, style, true, gap)?,
@@ -251,7 +245,7 @@ pub(crate) fn draw_trailing(
         return Ok(right);
     }
     let d = diameter;
-    let gap = (d * 0.08).round().max(1.0);
+    let gap = look::ring(d);
     let shown = icons.len().min(3);
     let step = d * 0.75;
     let more = (icons.len() > shown).then(|| format!("+{}", icons.len() - shown));
@@ -374,10 +368,11 @@ fn draw_count(
         ctx.draw_disc(layers, LAYER, cx, cy, d + ring * 2.0, style.surface)?;
     }
     let disc = if style.dark {
-        LinearRgba::with_srgba(72, 72, 74, 255)
+        look::COUNT_DISC_DARK
     } else {
-        LinearRgba::with_srgba(142, 142, 147, 255)
-    };
+        look::COUNT_DISC_LIGHT
+    }
+    .linear();
     ctx.draw_disc(layers, LAYER, cx, cy, d, disc)?;
     let text = count.min(99).to_string();
     let width = count_text_width(ctx, &text, style);
@@ -440,15 +435,20 @@ fn text_top(metrics: &crate::utilsprites::RenderMetrics, cy: f32) -> f32 {
 // ---------------------------------------------------------------------------
 // Marks.
 
+pub(crate) const fn opaque(color: [f32; 3]) -> LinearRgba {
+    LinearRgba::with_components(color[0], color[1], color[2], 1.0)
+}
+
 /// The one set of colours a thread's or an agent's state is shown in,
 /// wherever it is shown -- the sidebar, the thread search, the Agents
-/// panel -- so a colour means the same thing everywhere. An error is the
-/// chrome's own danger red.
-pub(crate) const WORKING_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
+/// panel, and every client (`thinkterm_tab_icons::look`) -- so a colour
+/// means the same thing everywhere. An error is the chrome's own danger
+/// red.
+pub(crate) const WORKING_COLOR: LinearRgba = opaque(look::WORKING);
 /// Waiting on the user: amber, a question rather than something wrong.
-pub(crate) const WAITING_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
+pub(crate) const WAITING_COLOR: LinearRgba = opaque(look::WAITING);
 /// A finished result nobody has looked at yet.
-pub(crate) const FINISHED_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
+pub(crate) const FINISHED_COLOR: LinearRgba = opaque(look::FINISHED);
 
 /// The thread the user is in, at rest or working. It never has an unseen
 /// result, being looked at, so the green cannot be mistaken for one.
@@ -460,23 +460,20 @@ pub(crate) const OPEN_COLOR: LinearRgba = WORKING_COLOR;
 
 /// Open with output nobody has seen: brighter than idle.
 pub(crate) fn unread_color(text: LinearRgba) -> LinearRgba {
-    text.mul_alpha(0.85)
+    text.mul_alpha(look::UNREAD_ALPHA)
 }
 
 /// Saved but not open.
 pub(crate) fn closed_color(text: LinearRgba) -> LinearRgba {
-    text.mul_alpha(0.16)
+    text.mul_alpha(look::CLOSED_ALPHA)
 }
 
-/// What a thread's mark says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mark {
-    Working,
-    Waiting,
-    Failed,
-    Finished,
-    /// Anything else: active, unread, open, closed -- told apart by colour.
-    Still,
+/// `tone` as a colour, on a row whose text is `text`.
+pub(crate) fn tone_color(tone: look::Tone, text: LinearRgba) -> LinearRgba {
+    match tone {
+        look::Tone::Color(color) => opaque(color),
+        look::Tone::Text(alpha) => text.mul_alpha(alpha),
+    }
 }
 
 /// Steps of [`MARK_STEP`] since the epoch, so every working mark in every
@@ -498,15 +495,6 @@ pub(crate) fn next_mark_step() -> Instant {
     Instant::now() + Duration::from_millis((step - into) as u64)
 }
 
-/// Pixels lit by a still mark, row by row.
-const PLUS: [usize; 5] = [1, 3, 4, 5, 7];
-const CROSS: [usize; 5] = [0, 2, 4, 6, 8];
-/// The ring a working mark runs round, clockwise from the top left.
-const RING: [usize; 8] = [0, 1, 2, 5, 8, 7, 6, 3];
-/// How lit a pixel of a working mark is, by steps since the run passed it.
-const TRAIL: [f32; 4] = [1.0, 0.8, 0.6, 0.39];
-const UNLIT: f32 = 0.18;
-
 /// A three-by-three grid of pixels in the `size` square at `x`, `y`.
 /// `step` is [`mark_step`] for a mark that moves, `None` for a still
 /// picture of one.
@@ -521,16 +509,14 @@ pub(crate) fn draw_pixels(
     size: f32,
     color: LinearRgba,
 ) -> Result<()> {
-    // Three pixels and two gaps a little wider than the square, centred
-    // on it; corners round enough to show at this size, as drawing snaps
-    // a radius to whole pixels.
-    let cell = (size * 0.34).round().max(2.0);
-    let gap = (size * 0.1).round().max(1.0);
-    let grid = cell * 3.0 + gap * 2.0;
-    let left = (x + (size - grid) / 2.0).round();
-    let top = (y + (size - grid) / 2.0).round();
+    // The grid every client's mark has (`look::pixel_grid`), on whole
+    // pixels: drawing snaps a radius to them.
+    let grid = look::pixel_grid(size);
+    let (cell, gap) = (grid.cell, grid.gap);
+    let left = (x + grid.inset).round();
+    let top = (y + grid.inset).round();
     for index in 0..9 {
-        let alpha = pixel_alpha(mark, step, index);
+        let alpha = look::pixel_alpha(mark, step, index);
         let (column, row) = ((index % 3) as f32, (index / 3) as f32);
         ctx.draw_rounded_rect(
             layers,
@@ -540,28 +526,10 @@ pub(crate) fn draw_pixels(
             cell,
             cell,
             color.mul_alpha(alpha),
-            cell * 0.3,
+            grid.radius,
         )?;
     }
     Ok(())
-}
-
-fn pixel_alpha(mark: Mark, step: Option<u64>, index: usize) -> f32 {
-    let lit = |pixels: &[usize]| if pixels.contains(&index) { 1.0 } else { UNLIT };
-    match mark {
-        Mark::Working => {
-            let Some(place) = RING.iter().position(|&pixel| pixel == index) else {
-                return 0.5;
-            };
-            // A still picture shows the run three pixels in.
-            let step = step.unwrap_or(2);
-            let since = (step + MARK_STEPS - place as u64 % MARK_STEPS) % MARK_STEPS;
-            TRAIL.get(since as usize).copied().unwrap_or(UNLIT)
-        }
-        Mark::Failed => lit(&CROSS),
-        Mark::Finished => 1.0,
-        Mark::Waiting | Mark::Still => lit(&PLUS),
-    }
 }
 
 /// How high a dot of a working mark is lifted, by steps since the wave
@@ -679,32 +647,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_working_mark_runs_round_the_edge_and_leaves_the_middle_half_lit() {
-        assert_eq!(pixel_alpha(Mark::Working, Some(0), 0), 1.0);
-        assert_eq!(pixel_alpha(Mark::Working, Some(1), 1), 1.0);
-        assert_eq!(pixel_alpha(Mark::Working, Some(1), 0), 0.8);
-        // Step 3 is at the top right's neighbour below it.
-        assert_eq!(pixel_alpha(Mark::Working, Some(3), 5), 1.0);
-        assert_eq!(pixel_alpha(Mark::Working, Some(3), 3), UNLIT);
-        assert_eq!(pixel_alpha(Mark::Working, Some(7), 4), 0.5);
-        assert_eq!(pixel_alpha(Mark::Working, Some(8), 0), 1.0);
-    }
-
-    #[test]
     fn working_dots_rise_one_after_another() {
         // Each dot peaks two steps after the one before it.
         assert_eq!(dot_lift(Some(2), 0), 1.0);
         assert_eq!(dot_lift(Some(4), 1), 1.0);
         assert_eq!(dot_lift(Some(6), 2), 1.0);
         assert_eq!(dot_lift(Some(2), 2), 0.0);
-    }
-
-    #[test]
-    fn still_marks_light_a_plus_a_cross_or_every_pixel() {
-        let lit = |mark| (0..9).filter(|&i| pixel_alpha(mark, None, i) == 1.0).collect::<Vec<_>>();
-        assert_eq!(lit(Mark::Still), PLUS);
-        assert_eq!(lit(Mark::Waiting), PLUS);
-        assert_eq!(lit(Mark::Failed), CROSS);
-        assert_eq!(lit(Mark::Finished), (0..9).collect::<Vec<_>>());
     }
 }
