@@ -2235,6 +2235,12 @@ pub fn tooltip_left_aligns(item_type: &UIItemType) -> bool {
 /// when that window loses focus or goes away.
 static FOCUSED_WINDOW: parking_lot::Mutex<Option<u64>> = parking_lot::Mutex::new(None);
 
+/// Rows one notch of a notched wheel moves. Three is what GNU/Linux terminals
+/// and Windows Terminal do, and it keeps a pane in step with the chrome's own
+/// three-row notch. A device that reports pixels is unaffected: it is already
+/// at the distance the finger travelled.
+const ROWS_PER_WHEEL_NOTCH: f32 = 3.0;
+
 impl TermWindow {
     /// The pane in front of someone has been seen. Whenever the active pane
     /// of a focused window changes -- a click, a tab or thread switch, a
@@ -11608,17 +11614,20 @@ impl TermWindow {
             }
             if let Some(lines) = event.precise_wheel_lines {
                 if lines != 0.0 {
-                    self.scroll_by_pixels(-lines * cell_h, pane)?;
+                    self.scroll_by_pixels(-lines * cell_h * ROWS_PER_WHEEL_NOTCH, pane)?;
                 }
                 return Ok(());
             }
             if amount != 0 {
-                self.start_scroll_glide(amount as f32 * cell_h, pane);
+                self.start_scroll_glide(amount as f32 * cell_h * ROWS_PER_WHEEL_NOTCH, pane);
             }
             return Ok(());
         }
         if amount != 0 {
-            self.scroll_by_line(amount.into(), pane)?;
+            let lines = (amount as f32 * ROWS_PER_WHEEL_NOTCH).round() as isize;
+            if lines != 0 {
+                self.scroll_by_line(lines, pane)?;
+            }
         }
         Ok(())
     }
