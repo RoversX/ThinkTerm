@@ -47,7 +47,7 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwi
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::{
     KeyboardLedStatus, Modifiers, MouseButtons, MouseEvent, MouseEventKind, MousePress,
-    PreciseScrollDelta, ScreenPoint, WindowDecorations,
+    ScreenPoint, WindowDecorations,
 };
 
 use crate::wayland::WaylandConnection;
@@ -57,6 +57,21 @@ use crate::{
     Point, Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, Window, WindowEvent,
     WindowEventSender, WindowKeyEvent, WindowOps, WindowState,
 };
+
+/// Axis units per notch on Wayland.
+///
+/// `wl_pointer.axis` values are not pixels and not lines: the protocol puts a
+/// whole notch of a classic wheel at 10 units (libinput reports the same notch
+/// as 120 of its 1/120 units, and the compositor divides by twelve), while a
+/// touchpad hands over a fraction of one. Neither treating the value as pixels
+/// (half a row a notch, and the chrome crawled) nor truncating it into lines
+/// (ten rows a notch in stepped mode) is right; dividing here gives both
+/// consumers what they expect.
+const AXIS_UNITS_PER_NOTCH: f64 = 10.0;
+
+fn axis_to_notches(value: f64) -> f64 {
+    value / AXIS_UNITS_PER_NOTCH
+}
 
 /// Wayland-specific coordinate conversion methods for Dimensions
 trait WaylandDimensions {
@@ -1107,16 +1122,14 @@ impl WaylandWindowInner {
         }
 
         if let Some((value_x, value_y)) = PendingMouse::scroll(&pending_mouse) {
-            let factor = self.get_dpi_factor() as f64;
-
             if value_x.signum() != self.hscroll_remainder.signum() {
                 // reset accumulator when changing scroll direction
                 self.hscroll_remainder = 0.0;
             }
-            let scaled_x = (value_x * factor) + self.hscroll_remainder;
-            let discrete_x = scaled_x.trunc();
-            self.hscroll_remainder = scaled_x - discrete_x;
-            if scaled_x.abs() > f64::EPSILON {
+            let notches_x = axis_to_notches(value_x) + self.hscroll_remainder;
+            let discrete_x = notches_x.trunc();
+            self.hscroll_remainder = notches_x - discrete_x;
+            if notches_x.abs() > f64::EPSILON {
                 let event = MouseEvent {
                     kind: MouseEventKind::HorzWheel(-discrete_x as i16),
                     coords: self.last_mouse_coords,
@@ -1126,13 +1139,14 @@ impl WaylandWindowInner {
                     ),
                     mouse_buttons: self.mouse_buttons,
                     modifiers: self.modifiers,
-                    precise_scroll_delta: Some(PreciseScrollDelta {
-                        x: -scaled_x as f32,
-                        y: 0.0,
-                    }),
+                    // Wayland hands over notches, not pixels: the consumers
+                    // that want the fine distance multiply the fraction of a
+                    // notch themselves (a notch is a row in the terminal and
+                    // `wheel_travel_pixels` in the chrome).
+                    precise_scroll_delta: None,
                     scroll_phase: None,
                     momentum_phase: None,
-                    precise_wheel_lines: None,
+                    precise_wheel_lines: Some(-notches_x as f32),
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }
@@ -1140,10 +1154,10 @@ impl WaylandWindowInner {
             if value_y.signum() != self.vscroll_remainder.signum() {
                 self.vscroll_remainder = 0.0;
             }
-            let scaled_y = (value_y * factor) + self.vscroll_remainder;
-            let discrete_y = scaled_y.trunc();
-            self.vscroll_remainder = scaled_y - discrete_y;
-            if scaled_y.abs() > f64::EPSILON {
+            let notches_y = axis_to_notches(value_y) + self.vscroll_remainder;
+            let discrete_y = notches_y.trunc();
+            self.vscroll_remainder = notches_y - discrete_y;
+            if notches_y.abs() > f64::EPSILON {
                 let event = MouseEvent {
                     kind: MouseEventKind::VertWheel(-discrete_y as i16),
                     coords: self.last_mouse_coords,
@@ -1153,13 +1167,12 @@ impl WaylandWindowInner {
                     ),
                     mouse_buttons: self.mouse_buttons,
                     modifiers: self.modifiers,
-                    precise_scroll_delta: Some(PreciseScrollDelta {
-                        x: 0.0,
-                        y: -scaled_y as f32,
-                    }),
+                    precise_scroll_delta: None,
                     scroll_phase: None,
                     momentum_phase: None,
-                    precise_wheel_lines: None,
+                    // Positive is towards older rows, the same sign the
+                    // Windows precision-touchpad path uses.
+                    precise_wheel_lines: Some(-notches_y as f32),
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }
@@ -1995,6 +2008,19 @@ impl HasWindowHandle for WaylandWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One notch of a classic wheel arrives as ten axis units; a trackpad
+    /// sends a fraction of that. Both have to become notches, so that a
+    /// notch is a row in the terminal and `wheel_travel_pixels` in the
+    /// chrome, not ten rows and not ten pixels.
+    #[test]
+    fn a_wheel_notch_is_ten_axis_units_and_one_notch() {
+        assert!((axis_to_notches(10.0) - 1.0).abs() < f64::EPSILON);
+        assert!((axis_to_notches(-10.0) + 1.0).abs() < f64::EPSILON);
+        assert!((axis_to_notches(30.0) - 3.0).abs() < f64::EPSILON);
+        assert!((axis_to_notches(2.5) - 0.25).abs() < f64::EPSILON);
+        assert!((axis_to_notches(0.0)).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn integrated_buttons_use_client_mode_without_fallback_header() {
