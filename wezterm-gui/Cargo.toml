@@ -183,6 +183,7 @@ windows = { workspace=true, features = [
 winreg.workspace = true
 
 [dev-dependencies]
+wezterm-font = { workspace = true, features = ["test-support"] }
 benchmarking.workspace = true
 env_logger.workspace = true
 k9.workspace = true

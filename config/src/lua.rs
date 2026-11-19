@@ -525,22 +525,26 @@ impl<'lua> FromLua<'lua> for LuaFontAttributes {
     }
 }
 
-/// On macOS, both Menlo and Monaco fonts have ligatures for `fi` that
-/// take effect for words like `find` and which are a source of
-/// confusion/annoyance and issues filed on Github.
-/// Let's default to disabling ligatures for these fonts unless
-/// the user has explicitly specified harfbuzz_features.
-/// <https://github.com/wezterm/wezterm/issues/1736>
-/// <https://github.com/wezterm/wezterm/issues/1786>
-fn disable_ligatures_for_menlo_or_monaco(mut attrs: FontAttributes) -> FontAttributes {
-    if attrs.harfbuzz_features.is_none() && (attrs.family == "Menlo" || attrs.family == "Monaco") {
-        attrs.harfbuzz_features = Some(vec![
-            "kern".to_string(),
-            "clig".to_string(),
-            "liga=0".to_string(),
-        ]);
+impl LuaFontAttributes {
+    fn into_font_attributes(self, is_fallback: bool) -> mlua::Result<FontAttributes> {
+        Ok(FontAttributes {
+            family: self.family,
+            stretch: self.stretch,
+            weight: self.weight,
+            style: self.style,
+            is_fallback,
+            is_synthetic: false,
+            harfbuzz_features: self.harfbuzz_features,
+            freetype_load_target: self.freetype_load_target,
+            freetype_render_target: self.freetype_render_target,
+            freetype_load_flags: match self.freetype_load_flags {
+                Some(flags) => Some(TryFrom::try_from(flags).map_err(mlua::Error::external)?),
+                None => None,
+            },
+            scale: self.scale,
+            assume_emoji_presentation: self.assume_emoji_presentation,
+        })
     }
-    attrs
 }
 
 /// Given a simple font family name, returns a text style instance.
@@ -570,25 +574,7 @@ fn font<'lua>(
         text_style.foreground = map_defaults.foreground;
     }
 
-    text_style
-        .font
-        .push(disable_ligatures_for_menlo_or_monaco(FontAttributes {
-            family: attrs.family,
-            stretch: attrs.stretch,
-            weight: attrs.weight,
-            style: attrs.style,
-            is_fallback: false,
-            is_synthetic: false,
-            harfbuzz_features: attrs.harfbuzz_features,
-            freetype_load_target: attrs.freetype_load_target,
-            freetype_render_target: attrs.freetype_render_target,
-            freetype_load_flags: match attrs.freetype_load_flags {
-                Some(flags) => Some(TryFrom::try_from(flags).map_err(mlua::Error::external)?),
-                None => None,
-            },
-            scale: attrs.scale,
-            assume_emoji_presentation: attrs.assume_emoji_presentation,
-        }));
+    text_style.font.push(attrs.into_font_attributes(false)?);
 
     Ok(text_style)
 }
@@ -619,25 +605,7 @@ fn font_with_fallback<'lua>(
             text_style.foreground = map_defaults.foreground;
         }
 
-        text_style
-            .font
-            .push(disable_ligatures_for_menlo_or_monaco(FontAttributes {
-                family: attrs.family,
-                stretch: attrs.stretch,
-                weight: attrs.weight,
-                style: attrs.style,
-                is_fallback: idx != 0,
-                is_synthetic: false,
-                harfbuzz_features: attrs.harfbuzz_features,
-                freetype_load_target: attrs.freetype_load_target,
-                freetype_render_target: attrs.freetype_render_target,
-                freetype_load_flags: match attrs.freetype_load_flags {
-                    Some(flags) => Some(TryFrom::try_from(flags).map_err(mlua::Error::external)?),
-                    None => None,
-                },
-                scale: attrs.scale,
-                assume_emoji_presentation: attrs.assume_emoji_presentation,
-            }));
+        text_style.font.push(attrs.into_font_attributes(idx != 0)?);
     }
 
     Ok(text_style)

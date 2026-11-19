@@ -8,29 +8,64 @@ use mux::tab::PositionedPane;
 use window::color::LinearRgba;
 use window::RectF;
 
-fn fancy_tab_bar_pixel_height(cell_height: usize, dpi: usize) -> usize {
-    crate::termwindow::ui::tokens::tab_row_height_for_cell(cell_height)
-        + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
+fn fancy_tab_bar_pixel_height(content_height: usize, dpi: usize) -> usize {
+    content_height + scale_ui_usize(WINDOW_TAB_TOP_SPACER, dpi)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fancy_tab_bar_pixel_height;
+    use crate::termwindow::ui::tab_height_for_lines;
+    fn fancy_height(cell_height: usize, dpi: usize) -> usize {
+        super::fancy_tab_bar_pixel_height(tab_height_for_lines(cell_height, cell_height, dpi), dpi)
+    }
+
+    #[test]
+    fn tabs_use_available_room_before_growing_for_a_taller_font() {
+        let dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
+        let normal = tab_height_for_lines(40, 40, dpi);
+        assert_eq!(tab_height_for_lines(40, 35, dpi), normal);
+        assert_eq!(tab_height_for_lines(40, 46, dpi), normal);
+        assert_eq!(tab_height_for_lines(40, 100, dpi), 116);
+    }
+
+    #[test]
+    fn changing_family_preserves_both_tab_sizes_across_dpi_changes() -> anyhow::Result<()> {
+        let _turn = wezterm_font::harfbuzz_turn();
+        use crate::termwindow::ui::tab_content_row_height;
+        use wezterm_font::FontConfiguration;
+        let config = config::ConfigHandle::default_config();
+        let default = FontConfiguration::new(Some(config.clone()), 96)?;
+        let custom = FontConfiguration::new(Some(config), 96)?;
+        custom.set_ui_font_family(Some("JetBrains Mono".into()));
+        for dpi in [96, 192, 96] {
+            default.change_scaling(1.0, dpi);
+            custom.change_scaling(1.0, dpi);
+            for size in [14.0, 18.0] {
+                let (reference, _) = custom.title_line_heights(size)?;
+                assert_eq!(reference, default.title_line_heights(size)?.0);
+                assert_eq!(
+                    tab_content_row_height(&custom, size)?,
+                    tab_content_row_height(&default, size)?
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn fancy_height_scales_with_monitor_dpi() {
         let design_dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
-        let base = fancy_tab_bar_pixel_height(20, design_dpi);
-        let doubled = fancy_tab_bar_pixel_height(40, design_dpi * 2);
+        let base = fancy_height(20, design_dpi);
+        let doubled = fancy_height(40, design_dpi * 2);
         assert_eq!(doubled, base * 2);
     }
 
     #[test]
     fn fancy_height_keeps_compact_comfortable_proportion() {
         let dpi = if cfg!(target_os = "macos") { 144 } else { 192 };
-        assert_eq!(fancy_tab_bar_pixel_height(20, dpi), 49);
+        assert_eq!(fancy_height(20, dpi), 49);
         assert_eq!(
-            fancy_tab_bar_pixel_height(30, dpi) - fancy_tab_bar_pixel_height(20, dpi),
+            fancy_height(30, dpi) - fancy_height(20, dpi),
             22
         );
     }
@@ -248,16 +283,11 @@ impl crate::TermWindow {
     pub fn tab_bar_pixel_height_impl(
         fontconfig: &wezterm_font::FontConfiguration,
     ) -> anyhow::Result<f32> {
-        // The row uses its own UI font. Basing its height on the terminal
-        // font made the chrome unexpectedly tall whenever the terminal font
-        // was enlarged, even though the tab text stayed at its configured
-        // size.
-        let font = fontconfig.title_font_with_size(crate::native_settings::tab_font_size())?;
-        let tab_metrics = RenderMetrics::with_font_metrics(&font.metrics());
-        Ok(fancy_tab_bar_pixel_height(
-            tab_metrics.cell_size.height.max(1) as usize,
-            fontconfig.get_dpi(),
-        ) as f32)
+        let height = crate::termwindow::ui::tab_content_row_height(
+            fontconfig,
+            crate::native_settings::tab_font_size(),
+        )?;
+        Ok(fancy_tab_bar_pixel_height(height, fontconfig.get_dpi()) as f32)
     }
 
     pub fn tab_bar_pixel_height(&self) -> anyhow::Result<f32> {

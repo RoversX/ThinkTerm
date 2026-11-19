@@ -393,6 +393,15 @@ impl std::fmt::Display for FontAttributes {
 }
 
 impl FontAttributes {
+    /// Menlo and Monaco form an unwanted `fi` ligature in terminal text
+    /// (wezterm#1736, wezterm#1786). Explicit feature choices take precedence.
+    pub fn resolved_harfbuzz_features(&self) -> Option<Vec<String>> {
+        self.harfbuzz_features.clone().or_else(|| {
+            matches!(self.family.as_str(), "Menlo" | "Monaco")
+                .then(|| vec!["kern".into(), "clig".into(), "liga=0".into()])
+        })
+    }
+
     pub fn new(family: &str) -> Self {
         Self {
             family: family.into(),
@@ -471,6 +480,15 @@ impl Default for TextStyle {
 }
 
 impl TextStyle {
+    /// Change the primary family, preserving its attributes and the fallback list.
+    pub fn set_primary_family(&mut self, family: &str) {
+        if let Some(primary) = self.font.first_mut() {
+            family.clone_into(&mut primary.family);
+        } else {
+            self.font.push(FontAttributes::new(family));
+        }
+    }
+
     /// Make a version of this style where the first entry
     /// has any explicitly named bold/italic components
     /// removed.  The intent is to set it up for make_bold
@@ -703,6 +721,43 @@ pub enum FontShaperSelection {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn picked_ligature_defaults_match_lua_and_preserve_explicit_features() {
+        let lua = crate::lua::make_lua_context(std::path::Path::new("example.lua")).unwrap();
+        for family in ["Menlo", "Monaco"] {
+            lua.globals().set("family", family).unwrap();
+            let from_lua: TextStyle = lua
+                .load("return require('wezterm').font(family)")
+                .eval()
+                .unwrap();
+            let mut switched = from_lua.clone();
+            switched.set_primary_family("Example Sans");
+            assert!(switched.font[0].harfbuzz_features.is_none());
+            let mut picked = TextStyle::default();
+            picked.set_primary_family(family);
+            assert_eq!(
+                picked.font[0].harfbuzz_features,
+                from_lua.font[0].harfbuzz_features
+            );
+            let defaults = vec!["kern".to_string(), "clig".into(), "liga=0".into()];
+            assert_eq!(
+                picked.font[0].resolved_harfbuzz_features().as_ref(),
+                Some(&defaults)
+            );
+            assert_eq!(switched.font[0].resolved_harfbuzz_features(), None);
+            for features in [defaults, vec!["liga=1".into()], vec![]] {
+                picked.font[0].harfbuzz_features = Some(features.clone());
+                picked.set_primary_family(family);
+                assert_eq!(
+                    picked.font[0].resolved_harfbuzz_features().as_ref(),
+                    Some(&features)
+                );
+                picked.set_primary_family("Example Sans");
+                assert_eq!(picked.font[0].resolved_harfbuzz_features(), Some(features));
+            }
+        }
+    }
 
     #[test]
     fn test_reduce() {

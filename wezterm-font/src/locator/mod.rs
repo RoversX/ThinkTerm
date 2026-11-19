@@ -199,7 +199,18 @@ impl FontDataHandle {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FontPurpose {
+    Terminal,
+    Interface,
+}
+
 pub trait FontLocator {
+    /// Family names only, for a picker; do not parse every font file.
+    fn enumerate_family_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec![])
+    }
+
     /// Given a font selection, return the list of successfully loadable
     /// FontDataHandle's that correspond to it
     fn load_fonts(
@@ -208,6 +219,16 @@ pub trait FontLocator {
         loaded: &mut HashSet<FontAttributes>,
         pixel_size: u16,
     ) -> anyhow::Result<Vec<ParsedFont>>;
+
+    fn load_fonts_for(
+        &self,
+        _purpose: FontPurpose,
+        selection: &[FontAttributes],
+        loaded: &mut HashSet<FontAttributes>,
+        pixel_size: u16,
+    ) -> anyhow::Result<Vec<ParsedFont>> {
+        self.load_fonts(selection, loaded, pixel_size)
+    }
 
     fn enumerate_all_fonts(&self) -> anyhow::Result<Vec<ParsedFont>> {
         Ok(vec![])

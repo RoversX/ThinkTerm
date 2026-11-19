@@ -784,7 +784,7 @@ impl ParsedFont {
     /// Update self to reflect whether the rasterizer might need to synthesize
     /// italic for this font.
     pub fn synthesize(mut self, attr: &FontAttributes) -> Self {
-        self.harfbuzz_features = attr.harfbuzz_features.clone();
+        self.harfbuzz_features = attr.resolved_harfbuzz_features();
         self.freetype_render_target = attr.freetype_render_target;
         self.freetype_load_target = attr.freetype_load_target;
         self.freetype_load_flags = attr.freetype_load_flags;

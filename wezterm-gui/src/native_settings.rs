@@ -910,19 +910,86 @@ pub(crate) fn window_opacity_preview(percent: u8) -> (f32, i64) {
     )
 }
 
-/// Every configuration key Settings overrides in a window -- the colour
-/// scheme, the window's opacity and what goes with it -- and with what.
-/// `None` removes a key. New windows seed their overrides from this and open
-/// ones are brought to it, so both always agree.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FontChanges {
+    pub family: bool,
+    pub fallback: bool,
+}
+
+/// A picked family is merged separately into each window's own font style.
 pub(crate) fn settings_config_overrides(
     settings: &ThinkTermNativeSettings,
     config: &ConfigHandle,
+    include_fallback: bool,
 ) -> Vec<(&'static str, Option<wezterm_dynamic::Value>)> {
     use wezterm_dynamic::ToDynamic;
     let scheme = effective_color_scheme(settings, config);
     let mut overrides = vec![("color_scheme", scheme.map(|scheme| scheme.to_dynamic()))];
     overrides.extend(window_opacity_overrides(settings));
+    if include_fallback && cfg!(all(unix, not(target_os = "macos"))) {
+        overrides.push((
+            "fontconfig_prefer_system_fallback",
+            settings
+                .terminal
+                .fontconfig_prefer_system_fallback
+                .map(|value| value.to_dynamic()),
+        ));
+    }
     overrides
+}
+
+pub(crate) fn terminal_font_family(settings: &ThinkTermNativeSettings) -> Option<&str> {
+    settings
+        .terminal
+        .font_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+}
+
+pub(crate) fn terminal_font_style(config: &ConfigHandle, family: &str) -> config::TextStyle {
+    let mut style = config.font.clone();
+    style.set_primary_family(family.trim());
+    style
+}
+
+pub(crate) fn font_fallback_config(
+    settings: &ThinkTermNativeSettings,
+    config: &ConfigHandle,
+) -> ConfigHandle {
+    let prefer = settings
+        .terminal
+        .fontconfig_prefer_system_fallback
+        .filter(|_| cfg!(all(unix, not(target_os = "macos"))));
+    let family = terminal_font_family(settings);
+    if prefer.is_none_or(|prefer| prefer == config.fontconfig_prefer_system_fallback)
+        && family.is_none()
+    {
+        return config.clone();
+    }
+    config.adjusted(|adjusted| {
+        if let Some(prefer) = prefer {
+            adjusted.fontconfig_prefer_system_fallback = prefer;
+        }
+        if let Some(family) = family {
+            adjusted.font = terminal_font_style(config, family);
+        }
+    })
+}
+
+pub(crate) fn apply_ui_font_to_app(settings: &ThinkTermNativeSettings) {
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            let family = settings.chrome.ui_font_family.clone();
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |window| {
+                        window.apply_ui_font_family(family);
+                    },
+                )));
+        }
+    }
 }
 
 /// Bring every window to the window opacity `settings` asks for: all a
@@ -982,6 +1049,7 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) split_animation: bool,
     pub(crate) font_size: Option<f64>,
     pub(crate) font_family: Option<String>,
+    pub(crate) fontconfig_prefer_system_fallback: Option<bool>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
     pub(crate) scroll_mode: NativeScrollMode,
     #[serde(deserialize_with = "choice_or_default")]
@@ -1029,6 +1097,7 @@ impl Default for NativeTerminalSettings {
             split_animation: true,
             font_size: None,
             font_family: None,
+            fontconfig_prefer_system_fallback: None,
             remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
             scroll_mode: NativeScrollMode::default(),
             selection_style: NativeSelectionStyle::default(),
@@ -1215,6 +1284,7 @@ pub(crate) fn default_shell() -> Option<Vec<String>> {
 #[serde(default)]
 pub(crate) struct NativeChromeSettings {
     pub(crate) settings_font_size: Option<f64>,
+    pub(crate) ui_font_family: Option<String>,
     pub(crate) settings_font_weight: Option<u16>,
     pub(crate) home_font_size: Option<f64>,
     pub(crate) sidebar_font_size: Option<f64>,
@@ -2553,8 +2623,16 @@ fn take_in_external_settings(data: &[u8]) {
 /// and the like) is picked up by the next window, as it is when another
 /// window changes it.
 fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNativeSettings) {
+    if before.chrome.ui_font_family != after.chrome.ui_font_family {
+        apply_ui_font_to_app(after);
+    }
     let language = before.localization.language != after.localization.language
         || before.onboarding.language != after.onboarding.language;
+    let fonts = FontChanges {
+        family: before.terminal.font_family != after.terminal.font_family,
+        fallback: before.terminal.fontconfig_prefer_system_fallback
+            != after.terminal.fontconfig_prefer_system_fallback,
+    };
     if language
         || before.appearance.theme_mode != after.appearance.theme_mode
         || before.appearance.app_icon != after.appearance.app_icon
@@ -2567,9 +2645,11 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.sidebar_thread_icons != after.appearance.sidebar_thread_icons
         || before.appearance.sidebar_thread_status != after.appearance.sidebar_thread_status
         || before.appearance.agents_status != after.appearance.agents_status
+        || fonts.family
+        || fonts.fallback
     {
         // Language, theme, colour scheme, opacity, chrome and app icon.
-        apply_to_app(after);
+        apply_to_app_with_font_changes(after, fonts);
     }
     if before.keymap != after.keymap
         || before.command_palette.hotkey != after.command_palette.hotkey
@@ -2985,6 +3065,13 @@ pub(crate) fn apply_preferred_appearance(mode: NativeThemeMode) {
 }
 
 pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
+    apply_to_app_with_font_changes(settings, FontChanges::default());
+}
+
+pub(crate) fn apply_to_app_with_font_changes(
+    settings: &ThinkTermNativeSettings,
+    fonts: FontChanges,
+) {
     crate::i18n::activate_from_settings(settings);
     apply_preferred_appearance(settings.appearance.theme_mode);
     // Tell the windows directly rather than waiting for the appearance event
@@ -3000,14 +3087,23 @@ pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
     // no-op, so the common case -- a mode change that does not move the
     // default -- costs nothing.
     // All at once, so a window reloads its configuration once for them.
-    let overrides = settings_config_overrides(settings, &config::configuration());
+    let overrides = settings_config_overrides(settings, &config::configuration(), fonts.fallback);
+    let family = if fonts.family {
+        terminal_font_family(settings)
+    } else {
+        None
+    };
     if let Some(front_end) = crate::frontend::try_front_end() {
         for gui_window in front_end.gui_windows() {
-            let overrides = overrides.clone();
+            let mut overrides = overrides.clone();
+            let family = family.map(str::to_owned);
             gui_window
                 .window
                 .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                     move |term_window| {
+                        if fonts.family {
+                            overrides.extend(term_window.settings_font_change(family.as_deref()));
+                        }
                         term_window.apply_settings_overrides(&overrides);
                         term_window.refresh_chrome();
                     },
@@ -3847,6 +3943,75 @@ mod tests {
         assert_eq!(settings.terminal.text_contrast, NativeTextContrast::Off);
         assert_eq!(settings.terminal.text_contrast.ratio(), None);
         assert!(settings.terminal.scroll_mode == NativeScrollMode::Smooth);
+    }
+
+    #[test]
+    fn font_choices_preserve_defaults_and_configured_fallbacks() {
+        let mut settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        let config = ConfigHandle::default_config().adjusted(|config| {
+            config
+                .font
+                .font
+                .push(config::FontAttributes::new_fallback("Example Fallback"));
+        });
+        assert!(settings.chrome.ui_font_family.is_none());
+        assert!(settings.terminal.font_family.is_none());
+        let original = config.font.clone();
+        assert_eq!(font_fallback_config(&settings, &config).font, original);
+        settings.terminal.font_family = Some("Example Mono".to_string());
+        settings.chrome.ui_font_family = Some("Example Sans".to_string());
+        let changed = font_fallback_config(&settings, &config);
+        assert_eq!(changed.font.font[0].family, "Example Mono");
+        assert_eq!(changed.font.font[1..], original.font[1..]);
+        assert_eq!(config.font, original);
+        let decoded: ThinkTermNativeSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            decoded.chrome.ui_font_family.as_deref(),
+            Some("Example Sans")
+        );
+        assert_eq!(
+            decoded.terminal.font_family.as_deref(),
+            Some("Example Mono")
+        );
+        settings.terminal.font_family = None;
+        assert_eq!(font_fallback_config(&settings, &config).font, original);
+    }
+
+    #[test]
+    fn system_font_fallback_is_opt_in_and_round_trips() {
+        let mut settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        let config = ConfigHandle::default_config();
+        assert!(!config.fontconfig_prefer_system_fallback);
+        assert_eq!(settings.terminal.fontconfig_prefer_system_fallback, None);
+        assert!(!font_fallback_config(&settings, &config).fontconfig_prefer_system_fallback);
+
+        for enabled in [true, false] {
+            settings.terminal.fontconfig_prefer_system_fallback = Some(enabled);
+            let encoded = serde_json::to_string(&settings).unwrap();
+            let loaded: ThinkTermNativeSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                loaded.terminal.fontconfig_prefer_system_fallback,
+                Some(enabled)
+            );
+            if cfg!(all(unix, not(target_os = "macos"))) {
+                let unrelated = settings_config_overrides(&loaded, &config, false);
+                assert!(!unrelated
+                    .iter()
+                    .any(|(key, _)| *key == "fontconfig_prefer_system_fallback"));
+                assert_eq!(
+                    font_fallback_config(&loaded, &config).fontconfig_prefer_system_fallback,
+                    enabled
+                );
+                let overrides = settings_config_overrides(&loaded, &config, true);
+                assert!(overrides.contains(&(
+                    "fontconfig_prefer_system_fallback",
+                    Some(wezterm_dynamic::Value::Bool(enabled)),
+                )));
+            } else {
+                assert!(!font_fallback_config(&loaded, &config).fontconfig_prefer_system_fallback);
+            }
+        }
     }
 
     #[test]

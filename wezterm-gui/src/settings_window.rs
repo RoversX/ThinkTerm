@@ -1,3 +1,5 @@
+mod font_picker;
+use font_picker::{FontCatalog, FontPicker, FontTarget};
 use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
@@ -2411,6 +2413,7 @@ enum SettingsAction {
     ToggleBottomQuote,
     SetRemotePaneResizeMode(NativeRemotePaneResizeMode),
     SetScrollMode(crate::native_settings::NativeScrollMode),
+    ToggleSystemFontFallback,
     SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
     ToggleCopyOnSelect,
     TogglePasteConfirmation,
@@ -2452,6 +2455,14 @@ enum SettingsAction {
     IncreaseSettingsFontWeight,
     ResetSettingsFontWeight,
     FontFamilyInput,
+    OpenFontPicker(FontTarget),
+    FontPickerSearch,
+    FontPickerDefault,
+    FontPickerChoose(u16, u64),
+    FontPickerPage(i8),
+    FontPickerApply,
+    FontPickerCancel,
+    ToggleFontAdvanced,
     ClearSearch,
     SidebarResize,
     SidebarScrollArea,
@@ -3001,6 +3012,9 @@ struct SettingsUiState {
     font_size_input: TextInputState,
     font_family_input: TextInputState,
     font_family_input_dirty: bool,
+    font_catalog: FontCatalog,
+    font_picker: Option<FontPicker>,
+    font_advanced_expanded: bool,
     remote_drop_input: TextInputState,
     remote_drop_input_dirty: bool,
     interaction: InteractionState<SettingsAction>,
@@ -3146,6 +3160,9 @@ impl SettingsUiState {
             font_size_input: TextInputState::new(),
             font_family_input: TextInputState::new(),
             font_family_input_dirty: false,
+            font_catalog: FontCatalog::default(),
+            font_picker: None,
+            font_advanced_expanded: false,
             remote_drop_input: TextInputState::new(),
             remote_drop_input_dirty: false,
             interaction: InteractionState::default(),
@@ -4065,6 +4082,7 @@ struct SettingsWindow {
     window_state: WindowState,
     fonts: Rc<FontConfiguration>,
     ui_font: Rc<LoadedFont>,
+    button_reference_font: Option<Rc<LoadedFont>>,
     /// The same family two weights lighter, for every secondary line. One
     /// weight for labels and explanations made the two read as equally
     /// important; macOS separates them by weight, not only by color.
@@ -4149,10 +4167,12 @@ impl SettingsWindow {
     }
 
     async fn open(instance_id: u64) -> anyhow::Result<()> {
-        let config = configuration();
+        let native_settings = Self::load_native_settings();
+        let config =
+            crate::native_settings::font_fallback_config(&native_settings, &configuration());
         let dpi = window::default_dpi() as usize;
         let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
-        let native_settings = Self::load_native_settings();
+        fonts.set_ui_font_family(native_settings.chrome.ui_font_family.clone());
         let active_main_renderer =
             crate::native_settings::main_window_renderer(&native_settings, config.front_end);
         let settings_font_size = crate::native_settings::settings_font_size(&native_settings);
@@ -4168,6 +4188,8 @@ impl SettingsWindow {
         )?;
         let ui_font = fonts
             .command_palette_font_with_size_and_weight(settings_font_size, settings_font_weight)?;
+        let button_reference_font =
+            fonts.button_reference_font(settings_font_size, settings_font_weight)?;
         let body_font = fonts.command_palette_font_with_size_and_weight(
             settings_font_size,
             settings_body_font_weight(settings_font_weight),
@@ -4254,6 +4276,7 @@ impl SettingsWindow {
             window_state: WindowState::default(),
             fonts: Rc::clone(&fonts),
             ui_font,
+            button_reference_font,
             body_font,
             control_font,
             import_body_font,
@@ -4432,6 +4455,20 @@ impl SettingsWindow {
             }
         }
 
+        #[cfg(debug_assertions)]
+        if let Ok(target) = std::env::var("THINKTERM_SETTINGS_EXPAND") {
+            let target = match target.as_str() {
+                "interface-font" => Some(FontTarget::Interface),
+                "terminal-font" => Some(FontTarget::Terminal),
+                _ => None,
+            };
+            if let (Some(target), Some(settings)) =
+                (target, settings_window_for_instance(instance_id))
+            {
+                settings.borrow_mut().open_font_picker(target);
+            }
+        }
+
         window.show();
         window.invalidate();
 
@@ -4443,6 +4480,8 @@ impl SettingsWindow {
             return;
         }
         self.cleaned_up = true;
+        self.close_font_picker();
+        self.ui.font_catalog.invalidate();
         self.leave_reverse_editor();
         self.commit_focused_input();
         // Closed mid-drag: what the windows are previewing is what is kept.
@@ -4708,6 +4747,7 @@ impl SettingsWindow {
                     Some(
                         SettingsAction::SearchInput
                         | SettingsAction::FontFamilyInput
+                        | SettingsAction::FontPickerSearch
                         | SettingsAction::RemoteDropDestinationInput
                         | SettingsAction::TabIconProgramInput
                         | SettingsAction::TabIconNameInput
@@ -5039,6 +5079,10 @@ impl SettingsWindow {
             return false;
         }
 
+        if self.ui.font_picker.is_some() && event.key == KeyCode::Char('\u{1b}') {
+            self.close_font_picker();
+            return true;
+        }
         let Some(focused) = self.ui.interaction.focused else {
             return false;
         };
@@ -5149,6 +5193,9 @@ impl SettingsWindow {
         match action {
             SettingsAction::SearchInput => Some(&self.ui.search),
             SettingsAction::FontFamilyInput => Some(&self.ui.font_family_input),
+            SettingsAction::FontPickerSearch => {
+                self.ui.font_picker.as_ref().map(|picker| &picker.search)
+            }
             SettingsAction::RemoteDropDestinationInput => Some(&self.ui.remote_drop_input),
             SettingsAction::TabIconProgramInput => Some(&self.ui.tab_icon_program_input),
             SettingsAction::TabIconNameInput => Some(&self.ui.tab_icon_name_input),
@@ -5191,6 +5238,15 @@ impl SettingsWindow {
                 self.ui.sidebar_scroll.reset();
                 self.sync_selected_section_with_search();
                 true
+            }
+            SettingsAction::FontPickerSearch => {
+                if let Some(picker) = &mut self.ui.font_picker {
+                    f(&mut picker.search);
+                    picker.page = 0;
+                    true
+                } else {
+                    false
+                }
             }
             SettingsAction::FontFamilyInput => {
                 f(&mut self.ui.font_family_input);
@@ -5821,6 +5877,9 @@ impl SettingsWindow {
         self.ui_font = self
             .fonts
             .command_palette_font_with_size_and_weight(settings_font_size, settings_font_weight)?;
+        self.button_reference_font = self
+            .fonts
+            .button_reference_font(settings_font_size, settings_font_weight)?;
         self.title_font = self
             .fonts
             .title_font_with_size_and_weight(
@@ -5856,9 +5915,32 @@ impl SettingsWindow {
         Ok(())
     }
 
+    fn reload_configured_fonts(&mut self, base: &config::ConfigHandle) -> anyhow::Result<()> {
+        let config = crate::native_settings::font_fallback_config(&self.native_settings, base);
+        self.ui.preview_fonts.clear();
+        if let Some(picker) = &mut self.ui.font_picker {
+            picker.clear_preview();
+        }
+        self.ui.stale_glyphs = true;
+        self.fonts.config_changed(&config)?;
+        self.invalidate_font_catalog();
+        self.reload_settings_fonts()
+    }
+
     fn save_and_apply_native_terminal_settings(&mut self) {
+        let family_changed = crate::native_settings::load_shared().terminal.font_family
+            != self.native_settings.terminal.font_family;
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
+                if family_changed {
+                    crate::native_settings::apply_to_app_with_font_changes(
+                        &self.native_settings,
+                        crate::native_settings::FontChanges {
+                            family: true,
+                            ..Default::default()
+                        },
+                    );
+                }
                 self.apply_terminal_font_size_to_open_windows();
                 self.status = crate::i18n::tr("settings-status-terminal-saved");
             }
@@ -6263,7 +6345,30 @@ impl SettingsWindow {
     /// window picked arrives this way and the cache would otherwise be stale
     /// until the next appearance event.
     fn set_native_settings(&mut self, settings: ThinkTermNativeSettings) {
+        let fallback_changed = self
+            .native_settings
+            .terminal
+            .fontconfig_prefer_system_fallback
+            != settings.terminal.fontconfig_prefer_system_fallback;
+        let terminal_family_changed =
+            self.native_settings.terminal.font_family != settings.terminal.font_family;
+        let ui_family_changed = self
+            .fonts
+            .set_ui_font_family(settings.chrome.ui_font_family.clone());
         self.native_settings = settings;
+        if terminal_family_changed
+            || (fallback_changed && cfg!(all(unix, not(target_os = "macos"))))
+        {
+            if let Err(err) = self.reload_configured_fonts(&configuration()) {
+                log::warn!("settings window fallback fonts: {err:#}");
+            }
+        }
+        if ui_family_changed {
+            if let Err(error) = self.reload_settings_fonts() {
+                log::warn!("interface font: {error:#}");
+            }
+            self.ui.stale_glyphs = true;
+        }
         self.refresh_chrome();
     }
 
@@ -6485,6 +6590,7 @@ impl SettingsWindow {
     }
 
     fn enter_section(&mut self, section: SettingsSection) {
+        self.close_font_picker();
         if section != SettingsSection::Agents {
             self.leave_reverse_editor();
         }
@@ -6567,6 +6673,23 @@ impl SettingsWindow {
 
     fn perform_action(&mut self, action: SettingsAction, window: &Window) {
         match action {
+            SettingsAction::OpenFontPicker(target) => self.open_font_picker(target),
+            SettingsAction::FontPickerDefault => self.choose_font(None),
+            SettingsAction::FontPickerChoose(index, generation) => {
+                self.choose_font(Some((index, generation)))
+            }
+            SettingsAction::FontPickerPage(delta) => {
+                if let Some(picker) = &mut self.ui.font_picker {
+                    picker.page = picker.page.saturating_add_signed(delta as isize);
+                }
+            }
+            SettingsAction::FontPickerApply => self.apply_font_picker(),
+            SettingsAction::FontPickerCancel => self.close_font_picker(),
+            SettingsAction::FontPickerSearch => self.set_focused_input(Some(action)),
+            SettingsAction::ToggleFontAdvanced => {
+                self.ui.font_advanced_expanded = !self.ui.font_advanced_expanded
+            }
+
             SettingsAction::SelectImportSource(source) => {
                 if self.import_busy() { return; }
                 if self.ui.import_source != source {
@@ -7240,6 +7363,46 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SetScrollMode(mode) => self.apply_scroll_mode(mode),
+            SettingsAction::ToggleSystemFontFallback => {
+                let on = !self
+                    .native_settings
+                    .terminal
+                    .fontconfig_prefer_system_fallback
+                    .unwrap_or_else(|| configuration().fontconfig_prefer_system_fallback);
+                let mut changed = false;
+                match crate::native_settings::update(|settings| {
+                    let option = &mut settings.terminal.fontconfig_prefer_system_fallback;
+                    changed = *option != Some(on);
+                    *option = Some(on);
+                }) {
+                    Ok(settings) => {
+                        self.set_native_settings((*settings).clone());
+                        crate::native_settings::apply_to_app_with_font_changes(
+                            &settings,
+                            crate::native_settings::FontChanges {
+                                fallback: changed,
+                                ..Default::default()
+                            },
+                        );
+                        self.status = settings_tr(
+                            "settings-status-value-now",
+                            &[
+                                ("setting", crate::i18n::tr("settings-system-font-fallback")),
+                                (
+                                    "value",
+                                    crate::i18n::tr(if on { "common-on" } else { "common-off" }),
+                                ),
+                            ],
+                        );
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-terminal-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleSplitAnimation => {
                 let on = !self.native_settings.terminal.split_animation;
                 let done = settings_tr(
@@ -10756,6 +10919,8 @@ impl SettingsWindow {
         top: f32,
         width: f32,
     ) -> anyhow::Result<f32> {
+        let extra = self.paint_font_choice(layers, x, top, width, FontTarget::Interface, false)?;
+        let top = top + self.settings_row_visual_height() + extra + self.ui_px(28.0);
         let diagram_bottom = self.paint_typography_diagram(layers, x, top, width)?;
         let band = self.compact_row_step();
         let slot = self.ui_px(ROW_TILE_SIDE);
@@ -14392,7 +14557,6 @@ impl SettingsWindow {
         });
         let size_description =
             crate::i18n::tr_args("settings-terminal-font-size-from-lua", &lua_size);
-        let font_family = Self::effective_font_family(&config);
         let card_y = self.paint_card_heading(
             layers,
             x,
@@ -14413,14 +14577,12 @@ impl SettingsWindow {
                 SvgIcon::Type,
                 TileColor::Indigo,
             )?;
-            rows.add(this.paint_setting_row(
+            rows.add(this.paint_font_choice(
                 layers,
                 tx,
                 rows.y,
                 tw,
-                &crate::i18n::tr("settings-terminal-font-family"),
-                &crate::i18n::tr("settings-terminal-font-family-description"),
-                &font_family,
+                FontTarget::Terminal,
                 rows.rule(),
             )?);
             let (tx, tw) = this.paint_row_tile(
@@ -14445,6 +14607,45 @@ impl SettingsWindow {
                 SettingsAction::IncreaseFontSize,
                 rows.rule(),
             )?);
+            if cfg!(all(unix, not(target_os = "macos")))
+                && config.font_locator == config::FontLocatorSelection::FontConfig
+            {
+                this.draw_button(
+                    layers,
+                    row_x,
+                    rows.y,
+                    row_width,
+                    &crate::i18n::tr("settings-font-advanced"),
+                    SettingsAction::ToggleFontAdvanced,
+                )?;
+                rows.add(this.ui_px(8.0));
+                if this.ui.font_advanced_expanded {
+                    let (tx, tw) = this.paint_row_tile(
+                        layers,
+                        row_x,
+                        rows.y,
+                        row_width,
+                        SvgIcon::Type,
+                        TileColor::Indigo,
+                    )?;
+                    rows.add(
+                        this.paint_toggle_setting_row(
+                            layers,
+                            tx,
+                            rows.y,
+                            tw,
+                            &crate::i18n::tr("settings-system-font-fallback"),
+                            &crate::i18n::tr("settings-system-font-fallback-description"),
+                            this.native_settings
+                                .terminal
+                                .fontconfig_prefer_system_fallback
+                                .unwrap_or(config.fontconfig_prefer_system_fallback),
+                            SettingsAction::ToggleSystemFontFallback,
+                            rows.rule(),
+                        )?,
+                    );
+                }
+            }
             Ok(rows.bottom)
         })?;
 
@@ -15195,7 +15396,8 @@ impl SettingsWindow {
             // The one it replaces leaves its glyphs in the atlas.
             self.ui.stale_glyphs = true;
         }
-        let config = configuration();
+        let config =
+            crate::native_settings::font_fallback_config(&self.native_settings, &configuration());
         let built = match which {
             PreviewFont::Terminal => self.fonts.terminal_font_uncached(&config, size),
             PreviewFont::Quote => self.fonts.command_palette_font_uncached(&config, size, 500),
@@ -21093,6 +21295,27 @@ impl SettingsWindow {
         action: SettingsAction,
         selected: bool,
     ) -> anyhow::Result<LinearRgba> {
+        self.paint_dropdown_row_on_layer(
+            layers,
+            card,
+            row,
+            label_y,
+            action,
+            selected,
+            DROPDOWN_LAYER,
+        )
+    }
+
+    fn paint_dropdown_row_on_layer(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        card: &crate::ui::UiPalette,
+        row: window::RectF,
+        label_y: f32,
+        action: SettingsAction,
+        selected: bool,
+        layer: usize,
+    ) -> anyhow::Result<LinearRgba> {
         self.ui_context.push(row, WidgetKind::Button, action);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -21107,7 +21330,7 @@ impl SettingsWindow {
             let height = row.size.height - inset_y * 2.0;
             self.draw_rounded_rect(
                 layers,
-                DROPDOWN_LAYER,
+                layer,
                 row.origin.x + inset_x,
                 row.origin.y + inset_y,
                 row.size.width - inset_x * 2.0,
@@ -21530,8 +21753,12 @@ impl SettingsWindow {
 
     fn button_width_for_label(&self, label: &str, min_width: f32) -> f32 {
         // min_width is in design pixels, like the layout constants
-        (self.measure_text_width(&Rc::clone(&self.ui_font), label) + self.ui_px(44.0))
-            .max(self.ui_px(min_width))
+        let selected = self.measure_text_width(&self.ui_font, label);
+        let reference = self
+            .button_reference_font
+            .as_ref()
+            .map_or(selected, |font| self.measure_text_width(font, label));
+        (reference.max(selected) + self.ui_px(44.0)).max(self.ui_px(min_width))
     }
 
     fn control_text_y(&self, y: f32, height: f32) -> f32 {

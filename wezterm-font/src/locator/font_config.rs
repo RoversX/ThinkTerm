@@ -1,5 +1,5 @@
 use crate::fcwrap;
-use crate::locator::{FontDataHandle, FontDataSource, FontLocator, FontOrigin};
+use crate::locator::{FontDataHandle, FontDataSource, FontLocator, FontOrigin, FontPurpose};
 use crate::parser::ParsedFont;
 use anyhow::Context;
 use config::{FontAttributes, FontStyle, FontWeight};
@@ -22,10 +22,22 @@ impl FontLocator for FontConfigFontLocator {
         loaded: &mut HashSet<FontAttributes>,
         pixel_size: u16,
     ) -> anyhow::Result<Vec<ParsedFont>> {
+        self.load_fonts_for(FontPurpose::Terminal, fonts_selection, loaded, pixel_size)
+    }
+
+    fn load_fonts_for(
+        &self,
+        purpose: FontPurpose,
+        fonts_selection: &[FontAttributes],
+        loaded: &mut HashSet<FontAttributes>,
+        pixel_size: u16,
+    ) -> anyhow::Result<Vec<ParsedFont>> {
         let mut fonts = vec![];
 
-        /// Returns a FontSet list filtered to only mono/dual spaced fonts
-        fn monospaced(matches: FontSet) -> Vec<FontPattern> {
+        fn matching_spacing(matches: FontSet, purpose: FontPurpose) -> Vec<FontPattern> {
+            if purpose == FontPurpose::Interface {
+                return matches.iter().collect();
+            }
             matches
                 .iter()
                 .filter_map(|p| match p.get_integer("spacing") {
@@ -38,11 +50,14 @@ impl FontLocator for FontConfigFontLocator {
         }
 
         /// Search fontconfig using only the family name
-        fn by_family(attr: &FontAttributes) -> anyhow::Result<Vec<FontPattern>> {
+        fn by_family(
+            attr: &FontAttributes,
+            purpose: FontPurpose,
+        ) -> anyhow::Result<Vec<FontPattern>> {
             let mut pattern = FontPattern::new()?;
             let start = std::time::Instant::now();
             pattern.family(&attr.family)?;
-            let matches = monospaced(pattern.list()?);
+            let matches = matching_spacing(pattern.list()?, purpose);
             log::trace!(
                 "listing {:?} by family took {:?} to compute and is {:?}",
                 attr.family,
@@ -53,11 +68,14 @@ impl FontLocator for FontConfigFontLocator {
         }
 
         /// Search fontconfig using on the postscript name
-        fn by_postscript(attr: &FontAttributes) -> anyhow::Result<Vec<FontPattern>> {
+        fn by_postscript(
+            attr: &FontAttributes,
+            purpose: FontPurpose,
+        ) -> anyhow::Result<Vec<FontPattern>> {
             let mut pattern = FontPattern::new()?;
             let start = std::time::Instant::now();
             pattern.add_string("postscriptname", &attr.family)?;
-            let matches = monospaced(pattern.list()?);
+            let matches = matching_spacing(pattern.list()?, purpose);
             log::trace!(
                 "listing {:?} by postscriptname took {:?} to compute and is {:?}",
                 attr.family,
@@ -91,7 +109,7 @@ impl FontLocator for FontConfigFontLocator {
 
             // Aggregate results of both family and postscript name lookups
             for resolver in &[by_family, by_postscript] {
-                match resolver(attr) {
+                match resolver(attr, purpose) {
                     Ok(matches) => {
                         for pat in matches {
                             let handle = to_handle(pat, None)?;
@@ -134,17 +152,13 @@ impl FontLocator for FontConfigFontLocator {
                     start.elapsed(),
                     best_match
                 );
-                // For the fallback, be very careful, only select known monospace
-                if let Ok(spacing) = best_match.get_integer("spacing") {
-                    if spacing == FC_MONO || spacing == FC_DUAL {
-                        let handle = to_handle(best_match, Some(attr.family.clone()))?;
-                        if let Ok(parsed) = crate::parser::ParsedFont::from_locator(&handle) {
-                            log::trace!(
-                                "found font-config fallback match for {:?}",
-                                parsed.names()
-                            );
-                            candidates.push(parsed);
-                        }
+                if purpose == FontPurpose::Interface
+                    || matches!(best_match.get_integer("spacing"), Ok(FC_MONO | FC_DUAL))
+                {
+                    let handle = to_handle(best_match, Some(attr.family.clone()))?;
+                    if let Ok(parsed) = crate::parser::ParsedFont::from_locator(&handle) {
+                        log::trace!("found font-config fallback match for {:?}", parsed.names());
+                        candidates.push(parsed);
                     }
                 }
             }
@@ -279,6 +293,15 @@ impl FontLocator for FontConfigFontLocator {
         } else {
             self.locate_fallback_for_codepoints(codepoints)
         }
+    }
+
+    fn enumerate_family_names(&self) -> anyhow::Result<Vec<String>> {
+        let pattern = FontPattern::new()?;
+        Ok(pattern
+            .list()?
+            .iter()
+            .filter_map(|font| font.get_string("family").ok())
+            .collect())
     }
 
     fn enumerate_all_fonts(&self) -> anyhow::Result<Vec<ParsedFont>> {

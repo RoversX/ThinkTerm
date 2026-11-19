@@ -63,6 +63,13 @@ impl FontDatabase {
         Ok(db)
     }
 
+    pub(crate) fn family_names(&self) -> impl Iterator<Item = &str> {
+        self.by_full_name
+            .values()
+            .flatten()
+            .map(|font| font.names().family.as_str())
+    }
+
     pub fn list_available(&self) -> Vec<ParsedFont> {
         let mut fonts = vec![];
         for parsed_list in self.by_full_name.values() {

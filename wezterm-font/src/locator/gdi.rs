@@ -360,6 +360,13 @@ impl FontLocator for GdiFontLocator {
         Ok(handles)
     }
 
+    fn enumerate_family_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(dwrote::FontCollection::system()
+            .families_iter()
+            .filter_map(|family| family.family_name().ok())
+            .collect())
+    }
+
     fn enumerate_all_fonts(&self) -> anyhow::Result<Vec<ParsedFont>> {
         let collection = dwrote::FontCollection::system();
         let mut fonts = vec![];

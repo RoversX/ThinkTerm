@@ -274,6 +274,13 @@ impl FontLocator for CoreTextFontLocator {
         Ok(matches.into_iter().map(|(_len, handle)| handle).collect())
     }
 
+    fn enumerate_family_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(core_text::font_collection::get_family_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect())
+    }
+
     fn enumerate_all_fonts(&self) -> anyhow::Result<Vec<ParsedFont>> {
         let mut fonts = vec![];
 

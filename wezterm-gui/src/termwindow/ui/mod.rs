@@ -13,19 +13,29 @@ pub mod sidebar_jump;
 pub mod status_icon;
 pub mod tokens;
 
-use crate::utilsprites::RenderMetrics;
-
 pub use right_sidebar::{
     right_sidebar_file_preview_width, right_sidebar_note_pane_width_for_dpi,
     right_sidebar_width_for_metrics,
 };
 pub use sidebar::workspace_sidebar_width_for_metrics;
 
-pub fn pane_nav_bar_height_for_metrics(render_metrics: RenderMetrics) -> usize {
-    // Match the primary tab content height so both tab levels keep the same
-    // vertical rhythm on every monitor DPI.
-    let cell_height = render_metrics.cell_size.height.max(1) as usize;
-    crate::termwindow::ui::tokens::tab_row_height_for_cell(cell_height)
+pub(crate) fn tab_content_row_height(
+    fonts: &wezterm_font::FontConfiguration,
+    size: f64,
+) -> anyhow::Result<usize> {
+    let (reference, selected) = fonts.title_line_heights(size)?;
+    Ok(tab_height_for_lines(reference, selected, fonts.get_dpi()))
+}
+
+pub(super) fn tab_height_for_lines(reference: usize, selected: usize, dpi: usize) -> usize {
+    let normal = tokens::tab_row_height_for_cell(reference);
+    // Preserve the normal capsule, using its spare room first. Grow only
+    // when the selected line would no longer fit between the outer insets.
+    if selected > reference {
+        normal.max(selected + 2 * crate::ui::scale_ui_usize(tokens::TAB_VERTICAL_PADDING, dpi))
+    } else {
+        normal
+    }
 }
 
 impl crate::TermWindow {
@@ -167,14 +177,12 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn pane_nav_bar_height(&self) -> usize {
-        let metrics = self
-            .fonts
-            .title_font_with_size(crate::native_settings::pane_header_font_size(
-                &crate::native_settings::load_shared(),
-            ))
-            .map(|font| RenderMetrics::with_font_metrics(&font.metrics()))
-            .unwrap_or(self.render_metrics);
-        pane_nav_bar_height_for_metrics(metrics)
+        let size = crate::native_settings::pane_header_font_size(
+            &crate::native_settings::load_shared(),
+        );
+        tab_content_row_height(&self.fonts, size).unwrap_or_else(|_| {
+            tokens::tab_row_height_for_cell(self.render_metrics.cell_size.height.max(1) as usize)
+        })
     }
 }
 

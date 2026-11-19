@@ -2503,46 +2503,106 @@ fn frame_can_acknowledge_output(outcome: PaintOutcome, presented: bool) -> bool 
     presented && outcome.draw_submitted && outcome.frame_complete
 }
 
-/// How solid the chrome is in a window whose terminal has `window_opacity`:
-/// a quarter of the way from that to opaque. Enough to read as the frame
-/// around the terminal and still let the window behind through; an opaque
-/// window keeps opaque chrome.
-/// What Settings' `changes` come to in a window whose overrides are
-/// `current`. `owned` holds the window opacity overrides Settings put there
-/// before, and is brought up to date: a window opacity key Settings no
-/// longer sets is taken out only while it still holds Settings' value.
+const FONT_FALLBACK_KEY: &str = "fontconfig_prefer_system_fallback";
+
+#[derive(Clone)]
+struct SettingsOverride<T> {
+    value: T,
+    displaced: Option<wezterm_dynamic::Value>,
+}
+
+/// Reset an owned override only if the window still has the last value
+/// Settings applied. A font preference can displace a window's Lua override.
 fn settings_override_changes(
     changes: &[(&'static str, Option<wezterm_dynamic::Value>)],
-    owned: &mut HashMap<&'static str, wezterm_dynamic::Value>,
+    owned: &mut HashMap<&'static str, SettingsOverride<wezterm_dynamic::Value>>,
     current: &wezterm_dynamic::Value,
 ) -> Vec<(&'static str, Option<wezterm_dynamic::Value>)> {
     use wezterm_dynamic::{ToDynamic, Value};
     let mut applied = Vec::with_capacity(changes.len());
     for (key, value) in changes {
-        if !crate::native_settings::WINDOW_OPACITY_KEYS.contains(key) {
+        if *key != FONT_FALLBACK_KEY && !crate::native_settings::WINDOW_OPACITY_KEYS.contains(key) {
             applied.push((*key, value.clone()));
             continue;
         }
+        let current = match current {
+            Value::Object(map) => map.get(&key.to_dynamic()),
+            _ => None,
+        };
+        let ours = owned
+            .remove(key)
+            .filter(|ours| Some(&ours.value) == current);
         match value {
             Some(value) => {
-                owned.insert(key, value.clone());
+                let displaced = if *key == FONT_FALLBACK_KEY {
+                    match ours {
+                        Some(ours) => ours.displaced,
+                        None => current.cloned(),
+                    }
+                } else {
+                    None
+                };
+                owned.insert(
+                    key,
+                    SettingsOverride {
+                        value: value.clone(),
+                        displaced,
+                    },
+                );
                 applied.push((*key, Some(value.clone())));
             }
             None => {
-                let Some(ours) = owned.remove(key) else {
-                    continue;
-                };
-                let still_ours = match current {
-                    Value::Object(map) => map.get(&key.to_dynamic()) == Some(&ours),
-                    _ => false,
-                };
-                if still_ours {
-                    applied.push((*key, None));
+                if let Some(ours) = ours {
+                    applied.push((*key, ours.displaced));
                 }
             }
         }
     }
     applied
+}
+
+/// Keep the displaced Lua override across successive picks. A reload may
+/// update a Settings-owned style, but only a new pick may replace a script's.
+fn window_font_change(
+    owned: &mut Option<SettingsOverride<config::TextStyle>>,
+    overrides: &wezterm_dynamic::Value,
+    base: &config::TextStyle,
+    family: Option<&str>,
+    new_pick: bool,
+) -> Option<(&'static str, Option<wezterm_dynamic::Value>)> {
+    use wezterm_dynamic::{FromDynamic, ToDynamic, Value};
+    let current = match overrides {
+        Value::Object(map) => map.get(&"font".to_dynamic()),
+        _ => None,
+    };
+    // Lua tables omit nil fields when a script reads and writes them back.
+    let decode = |value: &Value| config::TextStyle::from_dynamic(value, Default::default()).ok();
+    let current_style = current.and_then(decode);
+    let ours = owned
+        .take()
+        .filter(|ours| Some(&ours.value) == current_style.as_ref());
+    if !new_pick && ours.is_none() {
+        return None;
+    }
+    let Some(family) = family else {
+        return ours.map(|ours| ("font", ours.displaced));
+    };
+    let displaced = match ours {
+        Some(ours) => ours.displaced,
+        None => current.cloned(),
+    };
+    let mut style = displaced
+        .as_ref()
+        .and_then(decode)
+        .unwrap_or_else(|| base.clone());
+    style.set_primary_family(family);
+    let change =
+        (Some(&style) != current_style.as_ref()).then(|| ("font", Some(style.to_dynamic())));
+    *owned = Some(SettingsOverride {
+        value: style,
+        displaced,
+    });
+    change
 }
 
 #[cfg(test)]
@@ -2574,6 +2634,107 @@ mod settings_override_tests {
             map.insert(key.to_dynamic(), value.to_dynamic());
         }
         Value::Object(map)
+    }
+
+    fn with_font(font: Value) -> Value {
+        let mut map = wezterm_dynamic::Object::default();
+        map.insert("font".to_dynamic(), font);
+        Value::Object(map)
+    }
+
+    #[test]
+    fn a_lua_round_trip_preserves_ownership_and_restores_the_displaced_font() {
+        use super::window_font_change;
+        let base = config::TextStyle::default();
+        let mut script = base.clone();
+        script.font[0].harfbuzz_features = Some(vec!["calt=0".into()]);
+        script
+            .font
+            .push(config::FontAttributes::new_fallback("Window Symbols"));
+        let original = script.to_dynamic();
+        let mut owner = None;
+        let mut current = with_font(original.clone());
+        for family in ["First", "Second"] {
+            let (_, Some(picked)) =
+                window_font_change(&mut owner, &current, &base, Some(family), true).unwrap()
+            else {
+                panic!("expected a picked font")
+            };
+            let mut expected = script.clone();
+            expected.set_primary_family(family);
+            assert_eq!(picked, expected.to_dynamic());
+            let lua = mlua::Lua::new();
+            let table = luahelper::dynamic_to_lua_value(&lua, with_font(picked)).unwrap();
+            lua.globals().set("overrides", table).unwrap();
+            let updated = lua
+                .load("overrides.window_background_opacity = 0.8; return overrides")
+                .eval()
+                .unwrap();
+            current = luahelper::lua_value_to_dynamic(updated).unwrap();
+            assert!(window_font_change(&mut owner, &current, &base, Some(family), false).is_none());
+            assert!(owner.is_some());
+        }
+        assert_eq!(
+            window_font_change(&mut owner, &current, &base, None, true),
+            Some(("font", Some(original)))
+        );
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn reload_updates_inherited_fallbacks_and_relinquishes_a_script_replacement() {
+        use super::window_font_change;
+        let mut base = config::TextStyle::default();
+        let mut owner = None;
+        let (_, Some(first)) =
+            window_font_change(&mut owner, &Value::Null, &base, Some("Picked"), true).unwrap()
+        else {
+            panic!("expected a picked font")
+        };
+        base.font
+            .push(config::FontAttributes::new_fallback("New fallback"));
+        let (_, Some(reloaded)) =
+            window_font_change(&mut owner, &with_font(first), &base, Some("Picked"), false)
+                .unwrap()
+        else {
+            panic!("expected new fallbacks")
+        };
+        let mut expected = base.clone();
+        expected.set_primary_family("Picked");
+        assert_eq!(reloaded, expected.to_dynamic());
+        let script = with_font(base.to_dynamic());
+        assert!(window_font_change(&mut owner, &script, &base, Some("Picked"), false).is_none());
+        assert!(owner.is_none());
+        assert!(window_font_change(&mut owner, &script, &base, None, true).is_none());
+    }
+
+    #[test]
+    fn untouched_font_fallback_does_not_clear_a_script_override() {
+        let key = "fontconfig_prefer_system_fallback";
+        let mut map = wezterm_dynamic::Object::default();
+        map.insert(Value::String(key.to_string()), Value::Bool(true));
+        let current = Value::Object(map);
+        let mut owned = HashMap::new();
+        assert!(settings_override_changes(&[(key, None)], &mut owned, &current).is_empty());
+        settings_override_changes(&[(key, Some(Value::Bool(true)))], &mut owned, &Value::Null);
+        assert_eq!(
+            settings_override_changes(&[(key, None)], &mut owned, &current),
+            vec![(key, None)],
+        );
+        settings_override_changes(&[(key, Some(Value::Bool(false)))], &mut owned, &Value::Null);
+        assert!(settings_override_changes(&[(key, None)], &mut owned, &current).is_empty());
+        assert!(owned.is_empty());
+        let original = Value::Bool(true);
+        let change = [(key, Some(Value::Bool(false)))];
+        settings_override_changes(&change, &mut owned, &current);
+        let mut map = wezterm_dynamic::Object::default();
+        map.insert(key.to_dynamic(), Value::Bool(false));
+        let picked = Value::Object(map);
+        assert!(settings_override_changes(&[], &mut owned, &picked).is_empty());
+        assert_eq!(
+            settings_override_changes(&[(key, None)], &mut owned, &picked),
+            vec![(key, Some(original))],
+        );
     }
 
     #[test]
@@ -2998,9 +3159,10 @@ pub struct TermWindow {
     /// screen is opaque. See `config_for_window_state`.
     configured_config: ConfigHandle,
     pub config_overrides: wezterm_dynamic::Value,
-    /// The window opacity overrides Settings has put in `config_overrides`,
+    /// The opacity and fallback overrides Settings has put in `config_overrides`,
     /// so that it takes out only those. See `apply_settings_overrides`.
-    settings_opacity_overrides: HashMap<&'static str, wezterm_dynamic::Value>,
+    settings_owned_overrides: HashMap<&'static str, SettingsOverride<wezterm_dynamic::Value>>,
+    settings_font_override: Option<SettingsOverride<config::TextStyle>>,
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
@@ -5019,15 +5181,22 @@ impl TermWindow {
         // window's opacity -- applies from the first frame; seeding
         // config_overrides here is what makes it stick for new windows.
         let mut seeded = wezterm_dynamic::Object::default();
-        let settings_overrides =
-            crate::native_settings::settings_config_overrides(&native_settings, &config);
-        let settings_opacity_overrides: HashMap<&'static str, wezterm_dynamic::Value> =
-            settings_overrides
-                .iter()
-                .filter(|(key, _)| crate::native_settings::WINDOW_OPACITY_KEYS.contains(key))
-                .filter_map(|(key, value)| Some((*key, value.clone()?)))
-                .collect();
-        for (key, value) in settings_overrides {
+        let mut settings_overrides =
+            crate::native_settings::settings_config_overrides(&native_settings, &config, true);
+        let mut settings_font_override = None;
+        settings_overrides.extend(window_font_change(
+            &mut settings_font_override,
+            &wezterm_dynamic::Value::Null,
+            &config.font,
+            crate::native_settings::terminal_font_family(&native_settings),
+            true,
+        ));
+        let mut settings_owned_overrides = HashMap::new();
+        for (key, value) in settings_override_changes(
+            &settings_overrides,
+            &mut settings_owned_overrides,
+            &wezterm_dynamic::Value::Null,
+        ) {
             use wezterm_dynamic::ToDynamic;
             let Some(value) = value else {
                 continue;
@@ -5073,6 +5242,7 @@ impl TermWindow {
         };
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
+        fontconfig.set_ui_font_family(native_settings.chrome.ui_font_family.clone());
 
         let mux = Mux::get();
         let size = match mux.get_active_tab_for_window(mux_window_id) {
@@ -5264,7 +5434,8 @@ impl TermWindow {
             config: config.clone(),
             configured_config: config.clone(),
             config_overrides,
-            settings_opacity_overrides,
+            settings_owned_overrides,
+            settings_font_override,
             palette: None,
             focused: None,
             seen_active_pane: None,
@@ -8664,6 +8835,22 @@ impl TermWindow {
         self.invalidate_window();
     }
 
+    pub(crate) fn apply_ui_font_family(&mut self, family: Option<String>) {
+        if self.fonts.set_ui_font_family(family) {
+            self.invalidate_fancy_tab_bar();
+            self.invalidate_modal();
+            self.close_command_palette();
+            self.overview_font_warmup = OverviewFontWarmup::default();
+            // The tab row uses the interface font's metrics. Keep the
+            // terminal grid in sync without reloading its fonts.
+            if let Some(window) = self.window.clone() {
+                let dimensions = self.dimensions;
+                self.apply_dimensions(&dimensions, None, &window);
+            }
+            self.refresh_chrome();
+        }
+    }
+
     /// Re-resolve the cached chrome colours. `config_was_reloaded` does this
     /// too; this is the direct route, for when the appearance moved without a
     /// configuration reload behind it.
@@ -8697,11 +8884,29 @@ impl TermWindow {
         self.apply_config_overrides(&[("color_scheme", name.map(|scheme| scheme.to_dynamic()))])
     }
 
+    pub(crate) fn settings_font_change(
+        &mut self,
+        family: Option<&str>,
+    ) -> Option<(&'static str, Option<wezterm_dynamic::Value>)> {
+        let base = if self.settings_font_override.is_some() {
+            configuration()
+        } else {
+            self.configured_config.clone()
+        };
+        window_font_change(
+            &mut self.settings_font_override,
+            &self.config_overrides,
+            &base.font,
+            family,
+            true,
+        )
+    }
+
     /// Set (`Some`) or clear (`None`) keys in this window's configuration
     /// overrides, as `apply_color_scheme_override` does for the scheme, and
     /// reload once if anything moved. True when it did.
     /// Settings' overrides, as `apply_config_overrides` takes them -- but a
-    /// window opacity key Settings has stopped setting comes out only while
+    /// tracked key Settings has stopped setting comes out only while
     /// it still holds what Settings put in: one a script set with
     /// `window:set_config_overrides` is the script's.
     pub(crate) fn apply_settings_overrides(
@@ -8710,7 +8915,7 @@ impl TermWindow {
     ) -> bool {
         let applied = settings_override_changes(
             changes,
-            &mut self.settings_opacity_overrides,
+            &mut self.settings_owned_overrides,
             &self.config_overrides,
         );
         self.apply_config_overrides(&applied)
@@ -8872,6 +9077,28 @@ impl TermWindow {
     }
 
     pub fn config_was_reloaded(&mut self) {
+        if self.settings_font_override.is_some() {
+            let change = window_font_change(
+                &mut self.settings_font_override,
+                &self.config_overrides,
+                &configuration().font,
+                crate::native_settings::terminal_font_family(&crate::native_settings::load_shared()),
+                false,
+            );
+            if let (Some((key, value)), wezterm_dynamic::Value::Object(map)) =
+                (change, &mut self.config_overrides)
+            {
+                use wezterm_dynamic::ToDynamic;
+                match value {
+                    Some(style) => {
+                        map.insert(key.to_dynamic(), style);
+                    }
+                    None => {
+                        map.remove(&key.to_dynamic());
+                    }
+                }
+            }
+        }
         log::debug!(
             "config was reloaded, overrides: {:?}",
             self.config_overrides

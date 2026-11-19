@@ -1,5 +1,5 @@
 use crate::db::FontDatabase;
-use crate::locator::{new_locator, FontLocator};
+use crate::locator::{new_locator, FontLocator, FontPurpose};
 use crate::parser::ParsedFont;
 use crate::rasterizer::{new_rasterizer, FontRasterizer};
 use crate::shaper::{harfbuzz::HarfbuzzShaper, new_native_shaper, FontShaper, PresentationWidth};
@@ -9,7 +9,7 @@ use config::{
     FontRasterizerSelection, FontStretch, FontStyle, FontWeight, TextStyle,
 };
 use rangeset::RangeSet;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::{Rc, Weak};
@@ -665,6 +665,9 @@ struct FontConfigInner {
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
     entity_font_overrides: RefCell<HashMap<(Entity, u64, u16, bool), Rc<LoadedFont>>>,
+    ui_font_family: RefCell<Option<String>>,
+    // The window and pane tab rows each have one configurable point size.
+    title_reference_heights: Cell<[Option<(f64, usize)>; 2]>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
 }
 
@@ -687,6 +690,8 @@ impl FontConfigInner {
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
             entity_font_overrides: RefCell::new(HashMap::new()),
+            ui_font_family: RefCell::new(None),
+            title_reference_heights: Cell::new([None; 2]),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
@@ -706,6 +711,7 @@ impl FontConfigInner {
         self.char_select_font.borrow_mut().take();
         self.command_palette_font.borrow_mut().take();
         self.entity_font_overrides.borrow_mut().clear();
+        self.title_reference_heights.set([None; 2]);
         self.metrics.borrow_mut().take();
         *self.font_dirs.borrow_mut() = Arc::new(FontDatabase::with_font_dirs(config)?);
         Ok(())
@@ -750,7 +756,11 @@ impl FontConfigInner {
         }
     }
 
-    fn compute_title_font(&self, config: &ConfigHandle, make_bold: bool) -> (TextStyle, f64) {
+    fn ui_font_style(
+        config: &ConfigHandle,
+        entity: Entity,
+        family: Option<&str>,
+    ) -> (TextStyle, f64) {
         fn weighted(family: &str, weight: FontWeight) -> FontAttributes {
             FontAttributes {
                 family: family.to_string(),
@@ -759,6 +769,30 @@ impl FontConfigInner {
             }
         }
 
+        let (font_size, configured) = match entity {
+            Entity::Title => (
+                config
+                    .window_frame
+                    .font_size
+                    .unwrap_or(if cfg!(windows) { 11. } else { 14. }),
+                None,
+            ),
+            Entity::CommandPalette => (
+                config.command_palette_font_size,
+                config.command_palette_font.as_ref(),
+            ),
+            Entity::CharSelect => (config.char_select_font_size, config.char_select_font.as_ref()),
+            Entity::PaneSelect => (config.pane_select_font_size, config.pane_select_font.as_ref()),
+        };
+        if let Some(style) = configured.or(config.window_frame.font.as_ref()) {
+            let mut style = style.clone();
+            if let Some(family) = family {
+                style.set_primary_family(family);
+            }
+            return (style, font_size);
+        }
+
+        let make_bold = entity != Entity::CommandPalette;
         let mut fonts = vec![if cfg!(target_os = "macos") {
             weighted(
                 ".AppleSystemUIFont",
@@ -791,6 +825,21 @@ impl FontConfigInner {
             fonts.push(fallback);
         }
 
+        if let Some(family) = family {
+            for font in &mut fonts {
+                font.is_fallback = true;
+            }
+            let primary = weighted(
+                family,
+                if make_bold {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::REGULAR
+                },
+            );
+            fonts.insert(0, primary);
+        }
+
         // Fallback to their main font selection, so that we can pick up
         // any fallback fonts they might have configured in the main
         // config and so that they don't have to replicate that list for
@@ -800,8 +849,6 @@ impl FontConfigInner {
             font.is_fallback = true;
             fonts.push(font);
         }
-
-        let font_size = if cfg!(windows) { 11. } else { 14. };
 
         (
             TextStyle {
@@ -824,6 +871,7 @@ impl FontConfigInner {
         self.make_entity_font_from(
             myself,
             &config,
+            self.ui_font_family.borrow().as_deref(),
             entity,
             override_font_size,
             override_weight,
@@ -837,53 +885,32 @@ impl FontConfigInner {
         &self,
         myself: &Rc<Self>,
         config: &ConfigHandle,
+        ui_family: Option<&str>,
         entity: Entity,
         override_font_size: Option<f64>,
         override_weight: Option<config::FontWeight>,
         override_italic: bool,
     ) -> anyhow::Result<Rc<LoadedFont>> {
-        let make_bold = entity != Entity::CommandPalette;
-        let (sys_font, sys_size) = self.compute_title_font(&config, make_bold);
-
-        let (configured_font_size, text_style) = match entity {
-            Entity::Title => (config.window_frame.font_size.unwrap_or(sys_size), None),
-            Entity::CommandPalette => (
-                config.command_palette_font_size,
-                config.command_palette_font.as_ref(),
-            ),
-            Entity::CharSelect => (
-                config.char_select_font_size,
-                config.char_select_font.as_ref(),
-            ),
-            Entity::PaneSelect => (
-                config.pane_select_font_size,
-                config.pane_select_font.as_ref(),
-            ),
-        };
+        let (mut text_style, configured_font_size) = Self::ui_font_style(config, entity, ui_family);
         let font_size = override_font_size.unwrap_or(configured_font_size);
-
-        let text_style =
-            text_style.unwrap_or(config.window_frame.font.as_ref().unwrap_or(&sys_font));
-        let override_style;
-        let text_style = if override_weight.is_some() || override_italic {
-            override_style = {
-                let mut style = text_style.clone();
-                for attr in &mut style.font {
-                    if let Some(weight) = override_weight {
-                        attr.weight = weight;
-                    }
-                    if override_italic {
-                        attr.style = config::FontStyle::Italic;
-                    }
+        if override_weight.is_some() || override_italic {
+            for attr in &mut text_style.font {
+                if let Some(weight) = override_weight {
+                    attr.weight = weight;
                 }
-                style
-            };
-            &override_style
-        } else {
-            text_style
-        };
+                if override_italic {
+                    attr.style = config::FontStyle::Italic;
+                }
+            }
+        }
 
-        self.build_font(myself, &config, text_style, font_size)
+        self.build_font(
+            myself,
+            config,
+            &text_style,
+            font_size,
+            FontPurpose::Interface,
+        )
     }
 
     /// `text_style` at `font_size` points, as a new font owned by the
@@ -894,12 +921,13 @@ impl FontConfigInner {
         config: &ConfigHandle,
         text_style: &TextStyle,
         font_size: f64,
+        purpose: FontPurpose,
     ) -> anyhow::Result<Rc<LoadedFont>> {
         let dpi = *self.dpi.borrow() as u32;
         let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
 
         let attributes = text_style.font_with_fallback();
-        let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
+        let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size, purpose)?;
 
         let shaper = new_native_shaper(config, &handles)?;
 
@@ -1016,6 +1044,7 @@ impl FontConfigInner {
         &self,
         attributes: &[FontAttributes],
         pixel_size: u16,
+        purpose: FontPurpose,
     ) -> anyhow::Result<(Vec<ParsedFont>, HashSet<FontAttributes>)> {
         let preferred_attributes = attributes
             .iter()
@@ -1041,7 +1070,7 @@ impl FontConfigInner {
             let mut loaded_ignored = HashSet::new();
             let located = self
                 .locator
-                .load_fonts(attrs, &mut loaded_ignored, pixel_size)?;
+                .load_fonts_for(purpose, attrs, &mut loaded_ignored, pixel_size)?;
             for font in &located {
                 candidates.push(font);
             }
@@ -1108,7 +1137,8 @@ impl FontConfigInner {
     ) -> anyhow::Result<(Box<HarfbuzzShaper>, Vec<ParsedFont>)> {
         let attributes = style.font_with_fallback();
 
-        let (handles, loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
+        let (handles, loaded) =
+            self.resolve_font_helper_impl(&attributes, pixel_size, FontPurpose::Terminal)?;
 
         for attr in &attributes {
             if !attr.is_synthetic && !attr.is_fallback && !loaded.contains(attr) {
@@ -1270,6 +1300,7 @@ impl FontConfigInner {
             // text at the old backing scale while its controls use the new
             // scale.
             self.entity_font_overrides.borrow_mut().clear();
+            self.title_reference_heights.set([None; 2]);
         }
 
         (prior_font, prior_dpi)
@@ -1371,6 +1402,62 @@ impl FontConfiguration {
         Ok(Self { inner })
     }
 
+    /// Change only interface font caches; terminal fonts remain loaded.
+    pub fn set_ui_font_family(&self, family: Option<String>) -> bool {
+        let family = family
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if *self.inner.ui_font_family.borrow() == family {
+            return false;
+        }
+        if family.is_none() {
+            self.inner.title_reference_heights.set([None; 2]);
+        }
+        *self.inner.ui_font_family.borrow_mut() = family;
+        self.inner.title_font.borrow_mut().take();
+        self.inner.command_palette_font.borrow_mut().take();
+        self.inner.char_select_font.borrow_mut().take();
+        self.inner.pane_select_font.borrow_mut().take();
+        self.inner.entity_font_overrides.borrow_mut().clear();
+        true
+    }
+
+    pub fn ui_font_preview(
+        &self,
+        family: Option<&str>,
+        size: f64,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.make_entity_font_from(
+            &self.inner,
+            &self.config(),
+            family,
+            Entity::CommandPalette,
+            Some(size),
+            None,
+            false,
+        )
+    }
+
+    /// Run off the UI thread. Only names are retained, bounded by the picker.
+    pub fn font_family_catalog_job(
+        &self,
+    ) -> impl FnOnce() -> anyhow::Result<Vec<String>> + Send + 'static {
+        let locator = self.inner.locator.clone();
+        let directories = Arc::clone(&self.inner.font_dirs.borrow());
+        let built_in = Arc::clone(&self.inner.built_in.borrow());
+        move || {
+            let mut names = locator.enumerate_family_names()?;
+            names.extend(
+                directories.family_names().chain(built_in.family_names()).map(str::to_owned),
+            );
+            names.retain(|name| !name.is_empty() && !name.starts_with('.'));
+            names.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
+            names.dedup();
+            names.truncate(4096);
+            Ok(names)
+        }
+    }
+
     pub fn config_changed(&self, config: &ConfigHandle) -> anyhow::Result<()> {
         self.inner.config_changed(config)
     }
@@ -1386,6 +1473,27 @@ impl FontConfiguration {
     pub fn title_font_with_size(&self, font_size: f64) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner
             .entity_font_with_size(&self.inner, Entity::Title, font_size, None, false)
+    }
+
+    /// Default and selected title line heights at this size and backing scale.
+    pub fn title_line_heights(&self, size: f64) -> anyhow::Result<(usize, usize)> {
+        let size = size.clamp(6.0, 72.0);
+        let line_height = |font: &LoadedFont| font.metrics().cell_height.get().ceil().max(1.0) as usize;
+        let selected = self.title_font_with_size(size)?;
+        let selected = line_height(&selected);
+        if self.inner.ui_font_family.borrow().is_none() {
+            return Ok((selected, selected));
+        }
+        let cached = self.inner.title_reference_heights.get();
+        if let Some((_, reference)) = cached.iter().flatten().find(|(points, _)| *points == size) {
+            return Ok((*reference, selected));
+        }
+        let font = self.inner.make_entity_font_from(
+            &self.inner, &self.config(), None, Entity::Title, Some(size), None, false,
+        )?;
+        let reference = line_height(&font);
+        self.inner.title_reference_heights.set([Some((size, reference)), cached[0]]);
+        Ok((reference, selected))
     }
 
     pub fn title_font_with_size_and_weight(
@@ -1444,6 +1552,28 @@ impl FontConfiguration {
         )
     }
 
+    /// Reference font for sizing settings buttons when a custom UI family is active.
+    pub fn button_reference_font(
+        &self,
+        size: f64,
+        weight: u16,
+    ) -> anyhow::Result<Option<Rc<LoadedFont>>> {
+        if self.inner.ui_font_family.borrow().is_none() {
+            return Ok(None);
+        }
+        self.inner
+            .make_entity_font_from(
+                &self.inner,
+                &self.config(),
+                None,
+                Entity::CommandPalette,
+                Some(size.clamp(6.0, 72.0)),
+                (weight > 0).then(|| config::FontWeight::from_opentype_weight(weight)),
+                false,
+            )
+            .map(Some)
+    }
+
     pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.pane_select_font(&self.inner)
     }
@@ -1462,6 +1592,7 @@ impl FontConfiguration {
             config,
             &config.font,
             font_size.clamp(6.0, 72.0),
+            FontPurpose::Terminal,
         )
     }
 
@@ -1477,6 +1608,7 @@ impl FontConfiguration {
         self.inner.make_entity_font_from(
             &self.inner,
             config,
+            self.inner.ui_font_family.borrow().as_deref(),
             Entity::CommandPalette,
             Some(font_size.clamp(6.0, 72.0)),
             (font_weight > 0).then(|| config::FontWeight::from_opentype_weight(font_weight)),
@@ -1543,8 +1675,9 @@ impl FontConfiguration {
 /// HarfBuzz is built without thread safety, which suits the one thread that
 /// shapes text in the program. The test harness has many: tests that use it
 /// take turns, or they crash each other now and then.
-#[cfg(test)]
-pub(crate) fn harfbuzz_turn() -> std::sync::MutexGuard<'static, ()> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn harfbuzz_turn() -> std::sync::MutexGuard<'static, ()> {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -1638,5 +1771,92 @@ mod fallback_memo_test {
         memo.insert(2, vec!['z'], vec![], false);
         assert!(memo.get(2, &['z'], false).is_some());
         assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
+    }
+}
+
+#[cfg(test)]
+mod font_picker_tests {
+    use super::*;
+
+    #[test]
+    fn interface_choice_preserves_each_configured_style_and_its_fallbacks() {
+        let style = |fallback| {
+            let mut primary = FontAttributes::new("Original");
+            primary.weight = FontWeight::BOLD;
+            TextStyle {
+                font: vec![primary, FontAttributes::new_fallback(fallback)],
+                foreground: None,
+            }
+        };
+        let config = ConfigHandle::default_config().adjusted(|cfg| {
+            cfg.window_frame.font = Some(style("Frame Symbols"));
+            cfg.command_palette_font = Some(style("Palette Symbols"));
+        });
+        for (entity, fallback) in [
+            (Entity::Title, "Frame Symbols"),
+            (Entity::CharSelect, "Frame Symbols"),
+            (Entity::PaneSelect, "Frame Symbols"),
+            (Entity::CommandPalette, "Palette Symbols"),
+        ] {
+            let expected = style(fallback);
+            let (original, _) = FontConfigInner::ui_font_style(&config, entity, None);
+            assert_eq!(original, expected);
+            let (picked, _) = FontConfigInner::ui_font_style(&config, entity, Some("Chosen"));
+            assert_eq!(picked.font[0].family, "Chosen");
+            assert_eq!(picked.font[0].weight, FontWeight::BOLD);
+            assert_eq!(picked.font[1..], expected.font[1..]);
+        }
+    }
+
+    #[test]
+    fn button_reference_preserves_localized_label_widths() -> anyhow::Result<()> {
+        let _turn = harfbuzz_turn();
+        let fonts = FontConfiguration::new(Some(ConfigHandle::default_config()), 144)?;
+        let measure = |font: &LoadedFont, label: &str| -> anyhow::Result<f64> {
+            Ok(font
+                .blocking_shape(label, None, Direction::LeftToRight, None, None)?
+                .iter()
+                .map(|glyph| glyph.x_advance.get())
+                .sum())
+        };
+        let original = fonts.command_palette_font_with_size_and_weight(15.0, 500)?;
+        assert!(fonts.button_reference_font(15.0, 500)?.is_none());
+        fonts.set_ui_font_family(Some("JetBrains Mono".into()));
+        let reference = fonts
+            .button_reference_font(15.0, 500)?
+            .expect("custom family");
+        for label in ["恢复默认", "Alle Tastenkürzel zurücksetzen"] {
+            let expected = measure(&original, label)?;
+            assert!(expected > 0.0);
+            assert_eq!(measure(&reference, label)?, expected);
+        }
+        fonts.set_ui_font_family(None);
+        assert!(fonts.button_reference_font(15.0, 500)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn interface_font_changes_and_previews_preserve_terminal_fonts() -> anyhow::Result<()> {
+        let _turn = harfbuzz_turn();
+        let config = ConfigHandle::default_config();
+        let fonts = FontConfiguration::new(Some(config), 96)?;
+        let terminal = fonts.default_font()?;
+        let original = fonts.command_palette_font()?;
+        let _preview = fonts.ui_font_preview(Some("JetBrains Mono"), 14.0)?;
+        assert!(Rc::ptr_eq(&original, &fonts.command_palette_font()?));
+        assert!(Rc::ptr_eq(&terminal, &fonts.default_font()?));
+        assert!(fonts.set_ui_font_family(Some("JetBrains Mono".to_string())));
+        let changed = fonts.command_palette_font()?;
+        assert!(!Rc::ptr_eq(&original, &changed));
+        assert!(changed
+            .clone_handles()
+            .iter()
+            .any(|font| font.names().family == "JetBrains Mono"));
+        assert!(Rc::ptr_eq(&terminal, &fonts.default_font()?));
+        assert!(!fonts.set_ui_font_family(Some("JetBrains Mono".to_string())));
+        assert!(Rc::ptr_eq(&changed, &fonts.command_palette_font()?));
+        assert!(fonts.set_ui_font_family(None));
+        assert!(Rc::ptr_eq(&terminal, &fonts.default_font()?));
+        Ok(())
     }
 }
