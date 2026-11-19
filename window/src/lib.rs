@@ -664,16 +664,17 @@ pub enum WindowKeyEvent {
     KeyEvent(KeyEvent),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(derive_more::Debug, Clone, PartialEq, Eq)]
 pub enum DeadKeyStatus {
     /// Not in a dead key processing hold
     None,
     /// Holding until composition is done; the string is the uncommitted
     /// composition text to show as a placeholder
+    #[debug("Composing")]
     Composing(String),
 }
 
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub enum WindowEvent {
     /// Called when the window close button is clicked.
     /// The window closure is deferred and this event is
@@ -728,6 +729,7 @@ pub enum WindowEvent {
 
     AdviseDeadKeyStatus(DeadKeyStatus),
 
+    #[debug("NativeTextInputReplace")]
     NativeTextInputReplace {
         token: u64,
         revision: u64,
@@ -1146,6 +1148,43 @@ impl ResizeIncrement {
             y: 1,
             base_width: 0,
             base_height: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_event_tests {
+    use super::*;
+
+    #[test]
+    fn ime_event_diagnostics_keep_only_the_event_kind() {
+        let preedit = WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::Composing("example".into()));
+        assert_eq!(format!("{preedit:?}"), "AdviseDeadKeyStatus(Composing)");
+
+        let replacement = WindowEvent::NativeTextInputReplace {
+            token: 1,
+            revision: 2,
+            source_range: 0..1,
+            text: "example input".into(),
+        };
+        assert_eq!(format!("{replacement:?}"), "NativeTextInputReplace");
+        assert_eq!(format!("{replacement:#?}"), "NativeTextInputReplace");
+
+        let mut key = KeyEvent {
+            key: KeyCode::LeftArrow,
+            modifiers: Modifiers::NONE,
+            leds: KeyboardLedStatus::empty(),
+            repeat_count: 1,
+            key_is_down: true,
+            raw: None,
+            #[cfg(windows)]
+            win32_uni_char: None,
+        };
+        assert!(format!("{key:?}").contains("LeftArrow"));
+        for text in ["x", "example input"] {
+            key.key = KeyCode::composed(text);
+            let event = WindowEvent::KeyEvent(key.clone());
+            assert_eq!(format!("{event:?}"), "KeyEvent(TextInput)");
         }
     }
 }

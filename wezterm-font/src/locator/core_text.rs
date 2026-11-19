@@ -63,7 +63,7 @@ fn descriptor_from_attr(attr: &FontAttributes) -> anyhow::Result<CFArray<CTFontD
     if array.is_null() {
         anyhow::bail!("no font matches {:?}", attr);
     } else {
-        Ok(unsafe { CFArray::wrap_under_get_rule(array) })
+        Ok(unsafe { CFArray::wrap_under_create_rule(array) })
     }
 }
 
@@ -269,7 +269,11 @@ impl FontLocator for CoreTextFontLocator {
             }
         }
 
-        log::trace!("fallback candidates for {codepoints:?} is {matches:#?}");
+        log::trace!(
+            "found {} fallback candidates for {} codepoints",
+            matches.len(),
+            codepoints.len()
+        );
 
         Ok(matches.into_iter().map(|(_len, handle)| handle).collect())
     }

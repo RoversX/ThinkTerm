@@ -35,10 +35,16 @@ impl TerminalState {
         }
 
         let label = if is_down { "key_down" } else { "key_up" };
-        if self.config.debug_key_events() {
-            log::info!("{}: sending {:?}, {:?} {:?}", label, to_send, key, mods);
+        let level = if self.config.debug_key_events() {
+            log::Level::Info
         } else {
-            log::trace!("{}: sending {:?}, {:?} {:?}", label, to_send, key, mods);
+            log::Level::Trace
+        };
+        // A character here may be an IME commit; its physical origin is gone.
+        if matches!(key, KeyCode::Char(_)) {
+            log::log!(level, "{label}: character input");
+        } else {
+            log::log!(level, "{label}: sending {to_send:?}, {key:?} {mods:?}");
         }
         self.writer.write_all(to_send.as_bytes())?;
         self.writer.flush()?;

@@ -100,7 +100,10 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
         _conn: &wayland_client::Connection,
         _qhandle: &QueueHandle<WaylandState>,
     ) {
-        log::trace!("ZwpTextInputEvent: {event:?}");
+        log::trace!(
+            "ZwpTextInputEvent: {}",
+            ZwpTextInputV3::interface().events[usize::from(event.opcode())].name
+        );
         match event {
             // enter establishes a new text-input focus interval. Requests
             // before it may have been ignored, even with keyboard focus.

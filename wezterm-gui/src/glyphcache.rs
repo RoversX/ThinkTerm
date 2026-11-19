@@ -846,10 +846,8 @@ impl GlyphCache {
                 // as that will result in incomplete window painting.
                 // Log the error and substitute instead.
                 log::error!(
-                    "load_glyph failed; using blank instead. Error: {:#}. {:?} {:?}",
-                    err,
-                    info,
-                    style
+                    "Failed to load a glyph from font {} for {style:?}: {err:#}",
+                    info.font_idx
                 );
                 Rc::new(CachedGlyph {
                     brightness_adjust: 1.0,
@@ -978,11 +976,11 @@ impl GlyphCache {
             #[cfg(debug_assertions)]
             {
                 log::debug!(
-                    "{text} allow_width_overflow={allow_width_overflow} \
+                    "font_idx={font_idx} allow_width_overflow={allow_width_overflow} \
                      is_square_or_wide={is_square_or_wide} aspect={aspect} \
                      max_pixel_width={max_pixel_width} glyph.width={glyph_width} \
                      -> scale={scale} metrics_only_scale={metrics_only_scale}",
-                    text = info.text,
+                    font_idx = info.font_idx,
                     glyph_width = glyph.width,
                 );
             }
@@ -1033,14 +1031,10 @@ impl GlyphCache {
 
             let (scale, raw_im) = if scale != 1.0 {
                 log::trace!(
-                    "physically scaling {:?} by {} bcos {}x{} > {:?}x{:?}. aspect={}",
-                    info,
-                    scale,
+                    "scaling glyph from font {} by {scale}: {}x{} > {cell_width:?}x{cell_height:?}, aspect={aspect}",
+                    info.font_idx,
                     glyph.width,
                     glyph.height,
-                    cell_width,
-                    cell_height,
-                    aspect,
                 );
                 (1.0, raw_im.scale_by(scale))
             } else {
@@ -1066,7 +1060,7 @@ impl GlyphCache {
             if info.font_idx != 0 {
                 // It's generally interesting to examine eg: emoji or ligatures
                 // that we might have fallen back to
-                log::trace!("{:?} {:?}", info, g);
+                log::trace!("cached fallback glyph from font {}: {g:?}", info.font_idx);
             }
 
             g

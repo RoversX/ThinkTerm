@@ -519,6 +519,8 @@ impl super::TermWindow {
         is_down: bool,
         key_event: Option<&KeyEvent>,
     ) -> bool {
+        let debug_key_events =
+            self.config.debug_key_events && !key_event.is_some_and(KeyEvent::is_text_input);
         if is_down && !leader_active {
             // Check to see if this key-press is the leader activating
             if let Some(duration) = self.input_map.is_leader(&keycode, raw_modifiers) {
@@ -655,7 +657,7 @@ impl super::TermWindow {
                 raw_modifiers | leader_mod,
                 only_key_bindings,
             ) {
-                if self.config.debug_key_events {
+                if debug_key_events {
                     log::info!(
                         "{}{:?} {:?} -> perform {:?}",
                         match table_name {
@@ -767,7 +769,7 @@ impl super::TermWindow {
                     let mut did_encode = false;
                     if let Some(key_event) = key_event {
                         if let Some(encoded) = self.encode_win32_input(&pane, &key_event) {
-                            if self.config.debug_key_events {
+                            if debug_key_events {
                                 log::info!("win32: Encoded input as {:?}", encoded);
                             }
                             let stage = crate::input_diagnostics::StageTimer::begin(
@@ -781,7 +783,7 @@ impl super::TermWindow {
                             res.ok();
                             did_encode = true;
                         } else if let Some(encoded) = self.encode_kitty_input(&pane, &key_event) {
-                            if self.config.debug_key_events {
+                            if debug_key_events {
                                 log::info!("kitty: Encoded input as {:?}", encoded);
                             }
                             let stage = crate::input_diagnostics::StageTimer::begin(
@@ -797,7 +799,7 @@ impl super::TermWindow {
                         }
                     };
                     if !did_encode {
-                        if self.config.debug_key_events {
+                        if debug_key_events {
                             log::info!(
                                 "{:?} {:?} -> send to pane {:?} {:?}",
                                 keycode,
@@ -1345,6 +1347,7 @@ impl super::TermWindow {
             stage.finish(true);
         }
 
+        let debug_key_events = self.config.debug_key_events && !window_key.is_text_input();
         match key {
             Key::Code(key) => {
                 if window_key.key_is_down && !key.is_modifier() {
@@ -1368,7 +1371,7 @@ impl super::TermWindow {
                 }
 
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {
-                    if self.config.debug_key_events {
+                    if debug_key_events {
                         log::info!("win32: Encoded input as {:?}", encoded);
                     }
                     let stage = crate::input_diagnostics::StageTimer::begin("encoded_writer_write");
@@ -1379,7 +1382,7 @@ impl super::TermWindow {
                     stage.finish(res.is_ok());
                     res
                 } else if let Some(encoded) = self.encode_kitty_input(&pane, &window_key) {
-                    if self.config.debug_key_events {
+                    if debug_key_events {
                         log::info!("kitty: Encoded input as {:?}", encoded);
                     }
                     let stage = crate::input_diagnostics::StageTimer::begin("encoded_writer_write");
@@ -1390,7 +1393,7 @@ impl super::TermWindow {
                     stage.finish(res.is_ok());
                     res
                 } else {
-                    if self.config.debug_key_events {
+                    if debug_key_events {
                         log::info!(
                             "send to pane {} key={:?} mods={:?}",
                             if window_key.key_is_down { "DOWN" } else { "UP" },
@@ -1456,7 +1459,7 @@ impl super::TermWindow {
                 }
                 self.key_table_state.did_process_key();
                 if self.config.debug_key_events {
-                    log::info!("send to pane string={:?}", s);
+                    log::info!("send composed text to pane");
                 }
                 let stage = crate::input_diagnostics::StageTimer::begin("composed_writer_write");
                 let res = pane.writer().write_all(s.as_bytes());

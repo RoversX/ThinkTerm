@@ -1513,7 +1513,7 @@ impl RawKeyEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyEvent {
     /// Which key was pressed.
     /// This is the potentially processed/composed version
@@ -1535,6 +1535,25 @@ pub struct KeyEvent {
 
     #[cfg(windows)]
     pub win32_uni_char: Option<char>,
+}
+
+impl core::fmt::Debug for KeyEvent {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_text_input() {
+            return f.write_str("TextInput");
+        }
+        let mut event = f.debug_struct("KeyEvent");
+        event
+            .field("key", &self.key)
+            .field("modifiers", &self.modifiers)
+            .field("leds", &self.leds)
+            .field("repeat_count", &self.repeat_count)
+            .field("key_is_down", &self.key_is_down)
+            .field("raw", &self.raw);
+        #[cfg(windows)]
+        event.field("win32_uni_char", &self.win32_uni_char);
+        event.finish()
+    }
 }
 
 fn normalize_shift(key: KeyCode, modifiers: Modifiers) -> (KeyCode, Modifiers) {
@@ -1575,6 +1594,12 @@ fn normalize_ctrl(key: KeyCode, modifiers: Modifiers) -> (KeyCode, Modifiers) {
 }
 
 impl KeyEvent {
+    /// An input method can commit a single character without a physical key.
+    pub fn is_text_input(&self) -> bool {
+        matches!(self.key, KeyCode::Composed(_))
+            || (self.raw.is_none() && matches!(self.key, KeyCode::Char(_)))
+    }
+
     /// if SHIFT is held and we have KeyCode::Char('c') we want to normalize
     /// that keycode to KeyCode::Char('C'); that is what this function does.
     pub fn normalize_shift(mut self) -> Self {

@@ -88,7 +88,9 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
 
     // MARK: connection
 
-    var autoReconnect by pref("conn.autoreconnect", true)
+    var autoReconnect by pref("conn.autoreconnect", true) {
+        Sessions.all.forEach { it.applyAutoReconnect() }
+    }
     /// Seconds between ssh keep-alives, 0 for none; the next connection
     /// takes it.
     var keepAliveSeconds by pref("conn.keepalive", 30)

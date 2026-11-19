@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,7 +7,6 @@ use smithay_client_toolkit::reexports::csd_frame::{DecorationsFrame, FrameClick}
 use smithay_client_toolkit::seat::pointer::{
     PointerData, PointerDataExt, PointerEvent, PointerEventKind, PointerHandler,
 };
-use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, Proxy, QueueHandle};
@@ -29,30 +28,18 @@ impl PointerHandler for WaylandState {
         pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        let mut pstate = pointer
-            .data::<PointerUserData>()
-            .unwrap()
-            .state
-            .lock()
-            .unwrap();
-
         let mut scroll_frame = ScrollFrame::default();
         for evt in events {
             if let PointerEventKind::Enter { .. } = &evt.kind {
-                let surface_id = evt.surface.id();
-                self.active_surface_id = RefCell::new(Some(surface_id.clone()));
-                pstate.active_surface_id = Some(surface_id);
+                *self.active_surface_id.borrow_mut() = Some(evt.surface.id());
+                scroll_frame = ScrollFrame::default();
             }
-            if let Some(serial) = event_serial(&evt) {
+            if let Some(serial) = event_serial(evt) {
                 *self.last_serial.borrow_mut() = serial;
-                pstate.serial = serial;
             }
-            if let Some(pending) = self
-                .surface_to_pending
-                .get(&self.active_surface_id.borrow().as_ref().unwrap())
-            {
+            if let Some(pending) = self.surface_to_pending.get(&evt.surface.id()) {
                 let mut pending = pending.lock().unwrap();
-                if pending.queue(evt, &mut scroll_frame) {
+                if pending.queue(&evt.kind, evt.position, &mut scroll_frame) {
                     WaylandConnection::with_window_inner(pending.window_id, move |inner| {
                         inner.dispatch_pending_mouse();
                         Ok(())
@@ -80,9 +67,7 @@ impl PointerUserData {
 
 #[derive(Default)]
 pub(super) struct PointerState {
-    active_surface_id: Option<ObjectId>,
     pub(super) drag_and_drop: DragAndDrop,
-    serial: u32,
 }
 
 impl PointerDataExt for PointerUserData {
@@ -92,11 +77,19 @@ impl PointerDataExt for PointerUserData {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct PendingButton {
+    pub button: MousePress,
+    pub state: ButtonState,
+    pub serial: u32,
+    pub position: (f64, f64),
+}
+
+#[derive(Clone, Debug)]
 pub struct PendingMouse {
     window_id: usize,
     pub(super) copy_and_paste: Arc<Mutex<CopyAndPaste>>,
     surface_coords: Option<(f64, f64)>,
-    button: Vec<(MousePress, ButtonState, u32)>,
+    buttons: VecDeque<PendingButton>,
     scroll: Option<PendingScroll>,
     in_window: bool,
 }
@@ -109,18 +102,24 @@ impl PendingMouse {
         Arc::new(Mutex::new(Self {
             window_id,
             copy_and_paste: Arc::clone(copy_and_paste),
-            button: vec![],
+            buttons: VecDeque::new(),
             scroll: None,
             surface_coords: None,
             in_window: false,
         }))
     }
 
-    fn queue(&mut self, evt: &PointerEvent, scroll_frame: &mut ScrollFrame) -> bool {
-        match evt.kind {
+    fn queue(
+        &mut self,
+        kind: &PointerEventKind,
+        position: (f64, f64),
+        scroll_frame: &mut ScrollFrame,
+    ) -> bool {
+        match *kind {
             PointerEventKind::Enter { .. } => {
                 self.in_window = true;
-                false
+                self.surface_coords = Some(position);
+                true
             }
             PointerEventKind::Leave { .. } => {
                 let changed = self.in_window;
@@ -130,7 +129,7 @@ impl PendingMouse {
             }
             PointerEventKind::Motion { .. } => {
                 let changed = self.surface_coords.is_none();
-                self.surface_coords.replace(evt.position);
+                self.surface_coords.replace(position);
                 changed
             }
             PointerEventKind::Press { button, serial, .. }
@@ -148,13 +147,18 @@ impl PendingMouse {
                     Some(button) => button,
                     None => return false,
                 };
-                let changed = self.button.is_empty();
-                let button_state = match evt.kind {
-                    PointerEventKind::Press { .. } => ButtonState::Pressed,
-                    PointerEventKind::Release { .. } => ButtonState::Released,
-                    _ => unreachable!(),
+                let changed = self.buttons.is_empty();
+                let state = if matches!(kind, PointerEventKind::Press { .. }) {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
                 };
-                self.button.push((button, button_state, serial));
+                self.buttons.push_back(PendingButton {
+                    button,
+                    state,
+                    serial,
+                    position,
+                });
                 changed
             }
             PointerEventKind::Axis {
@@ -179,15 +183,8 @@ impl PendingMouse {
         }
     }
 
-    pub(super) fn next_button(
-        pending: &Arc<Mutex<Self>>,
-    ) -> Option<(MousePress, ButtonState, u32)> {
-        let mut pending = pending.lock().unwrap();
-        if pending.button.is_empty() {
-            None
-        } else {
-            Some(pending.button.remove(0))
-        }
+    pub(super) fn next_button(pending: &Arc<Mutex<Self>>) -> Option<PendingButton> {
+        pending.lock().unwrap().buttons.pop_front()
     }
 
     pub(super) fn coords(pending: &Arc<Mutex<Self>>) -> Option<(f64, f64)> {
@@ -219,60 +216,94 @@ impl WaylandState {
 
         for evt in events {
             let surface = &evt.surface;
-            if surface.id() == self.active_surface_id.borrow().as_ref().unwrap().clone() {
-                let (x, y) = evt.position;
-                let parent_surface = match evt.surface.data::<SurfaceData>() {
-                    Some(data) => match data.parent_surface() {
-                        Some(sd) => sd,
-                        None => continue,
-                    },
-                    None => continue,
-                };
+            let Some(window) = surface
+                .data::<SurfaceData>()
+                .and_then(SurfaceData::parent_surface)
+                .and_then(SurfaceUserData::try_from_wl)
+                .and_then(|data| windows.get(&data.window_id))
+            else {
+                continue;
+            };
+            let mut inner = window.borrow_mut();
+            let (x, y) = evt.position;
 
-                let wid = SurfaceUserData::from_wl(parent_surface).window_id;
-                let mut inner = windows.get(&wid).unwrap().borrow_mut();
-
-                match evt.kind {
-                    PointerEventKind::Enter { .. } => {
-                        inner.window_frame.click_point_moved(
-                            Duration::ZERO,
-                            &evt.surface.id(),
-                            x,
-                            y,
-                        );
-                    }
-                    PointerEventKind::Leave { .. } => {
-                        inner.window_frame.click_point_left();
-                    }
-                    PointerEventKind::Motion { .. } => {
-                        inner.window_frame.click_point_moved(
-                            Duration::ZERO,
-                            &evt.surface.id(),
-                            x,
-                            y,
-                        );
-                    }
-                    PointerEventKind::Press { button, serial, .. }
-                    | PointerEventKind::Release { button, serial, .. } => {
-                        let pressed = if matches!(evt.kind, PointerEventKind::Press { .. }) {
-                            true
-                        } else {
-                            false
-                        };
-                        let click = match button {
-                            0x110 => FrameClick::Normal,
-                            0x111 => FrameClick::Alternate,
-                            _ => continue,
-                        };
-                        if let Some(action) =
-                            inner.window_frame.on_click(Duration::ZERO, click, pressed)
-                        {
-                            inner.frame_action(pointer, serial, action);
-                        }
-                    }
-                    _ => {}
+            match evt.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    inner
+                        .window_frame
+                        .click_point_moved(Duration::ZERO, &surface.id(), x, y);
                 }
+                PointerEventKind::Leave { .. } => inner.window_frame.click_point_left(),
+                PointerEventKind::Press { button, serial, .. }
+                | PointerEventKind::Release { button, serial, .. } => {
+                    let pressed = matches!(evt.kind, PointerEventKind::Press { .. });
+                    let click = match button {
+                        0x110 => FrameClick::Normal,
+                        0x111 => FrameClick::Alternate,
+                        _ => continue,
+                    };
+                    if let Some(action) =
+                        inner.window_frame.on_click(Duration::ZERO, click, pressed)
+                    {
+                        inner.frame_action(pointer, serial, action);
+                    }
+                }
+                _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buttons_keep_their_own_positions_across_motion_and_leave() {
+        let pending = PendingMouse::create(1, &CopyAndPaste::create());
+        let mut frame = ScrollFrame::default();
+        let press = PointerEventKind::Press {
+            time: 1,
+            button: 0x112,
+            serial: 2,
+        };
+        let release = PointerEventKind::Release {
+            time: 3,
+            button: 0x112,
+            serial: 3,
+        };
+        {
+            let mut mouse = pending.lock().unwrap();
+            mouse.queue(
+                &PointerEventKind::Enter { serial: 1 },
+                (85.0, 45.0),
+                &mut frame,
+            );
+            mouse.queue(&press, (85.0, 45.0), &mut frame);
+            mouse.queue(
+                &PointerEventKind::Motion { time: 2 },
+                (95.0, 55.0),
+                &mut frame,
+            );
+            mouse.queue(&release, (95.0, 55.0), &mut frame);
+            mouse.queue(
+                &PointerEventKind::Leave { serial: 4 },
+                (95.0, 55.0),
+                &mut frame,
+            );
+        }
+        assert!(PendingMouse::coords(&pending).is_none());
+        for (state, serial, position) in [
+            (ButtonState::Pressed, 2, (85.0, 45.0)),
+            (ButtonState::Released, 3, (95.0, 55.0)),
+        ] {
+            let event = PendingMouse::next_button(&pending).unwrap();
+            assert_eq!(event.button, MousePress::Middle);
+            assert_eq!(
+                (event.state, event.serial, event.position),
+                (state, serial, position)
+            );
+        }
+        assert!(PendingMouse::next_button(&pending).is_none());
     }
 }

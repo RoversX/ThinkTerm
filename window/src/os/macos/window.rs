@@ -3668,7 +3668,7 @@ impl WindowView {
     extern "C" fn marked_range(this: &mut Object, _sel: Sel) -> NSRange {
         if let Some(myself) = Self::get_this(this) {
             let inner = myself.inner.borrow();
-            log::trace!("marked_range {:?}", inner.ime_text);
+            log::trace!("marked_range");
             if inner.ime_text.is_empty() {
                 NSRange::new(NSNotFound as _, 0)
             } else {
@@ -3711,11 +3711,7 @@ impl WindowView {
         replacement_range: NSRange,
     ) {
         let s = unsafe { nsstring_to_str(astring) };
-        log::trace!(
-            "insert_text_replacement_range {} {:?}",
-            s,
-            replacement_range
-        );
+        log::trace!("insert_text_replacement_range");
         if let Some(myself) = Self::get_this(this) {
             let mut inner = myself.inner.borrow_mut();
 
@@ -3780,16 +3776,11 @@ impl WindowView {
         this: &mut Object,
         _sel: Sel,
         astring: id,
-        selected_range: NSRange,
-        replacement_range: NSRange,
+        _selected_range: NSRange,
+        _replacement_range: NSRange,
     ) {
         let s = unsafe { nsstring_to_str(astring) };
-        log::trace!(
-            "set_marked_text_selected_range_replacement_range {} {:?} {:?}",
-            s,
-            selected_range,
-            replacement_range
-        );
+        log::trace!("set_marked_text_selected_range_replacement_range");
         if let Some(myself) = Self::get_this(this) {
             let mut inner = myself.inner.borrow_mut();
             inner.ime_text = s.to_string();
@@ -4644,12 +4635,7 @@ impl WindowView {
         let virtual_key = unsafe { nsevent.keyCode() };
 
         log::debug!(
-            "key_common: chars=`{}` unmod=`{}` modifiers=`{:?}` virtual_key={:?} key_is_down:{}",
-            chars.escape_debug(),
-            unmod.escape_debug(),
-            modifiers,
-            virtual_key,
-            key_is_down
+            "key_common modifiers={modifiers:?} virtual_key={virtual_key} key_is_down={key_is_down}"
         );
 
         // `Delete` on macos is really Backspace and emits BS.
@@ -4966,14 +4952,6 @@ impl WindowView {
             }
             .normalize_shift()
             .resurface_positional_modifier_key();
-
-            log::debug!(
-                "key_common {:?} (chars={:?} unmod={:?} modifiers={:?})",
-                event,
-                chars,
-                unmod,
-                modifiers
-            );
 
             if let Some(myself) = Self::get_this(this) {
                 let mut inner = myself.inner.borrow_mut();

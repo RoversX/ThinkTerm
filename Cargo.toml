@@ -217,6 +217,7 @@ criterion = "0.5"
 crossbeam = "0.8"
 csscolorparser = "0.6"
 deltae = "0.3"
+derive_more = { version = "2.1", default-features = false, features = ["debug"] }
 dhat = "0.3"
 dirs-next = "2.0"
 dns-lookup = "2.0"

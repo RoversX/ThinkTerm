@@ -821,7 +821,7 @@ impl Pane for LocalPane {
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
         if self.tmux_domain.lock().is_some() {
-            log::trace!("key: {:?}", key);
+            log::trace!("tmux control key down");
             if key == KeyCode::Char('q') {
                 self.terminal.lock().send_paste("detach\n")?;
             }

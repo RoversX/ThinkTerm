@@ -2101,6 +2101,7 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.110",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -12758,6 +12759,7 @@ dependencies = [
  "config",
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
+ "derive_more",
  "dirs-next",
  "euclid",
  "filedescriptor 0.8.3",

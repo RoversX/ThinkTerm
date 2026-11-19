@@ -28,7 +28,7 @@ class MainActivity : ComponentActivity() {
         AppLanguage.tag = AppSettings.get(this).language
         val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         GlassProbe.on = debuggable && intent.getBooleanExtra("glass_probe", false)
-        val store = HostStore(this)
+        val store = HostStore.get(this)
         // The tailnet ThinkTerm joins by itself is up before any host of it
         // is dialled.
         TailnetStore.init(this, store)

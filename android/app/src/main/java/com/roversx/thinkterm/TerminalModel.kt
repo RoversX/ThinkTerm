@@ -60,7 +60,7 @@ class TerminalModel(
         }
     val autoReconnect: Boolean get() = currentHost.autoConnect && settings.autoReconnect
 
-    private fun applyAutoReconnect() {
+    internal fun applyAutoReconnect() {
         core.setSetting("auto-reconnect", autoReconnect.toString())
     }
     data class HostKeyChallenge(val requestId: String, val endpoint: Host, val fingerprint: String)
@@ -249,6 +249,7 @@ class TerminalModel(
         applyScheme()
         applyScrollMode()
         applyTerminalPrefs()
+        applyAutoReconnect()
         appliedFamily = settings.fontFamily
         appliedSettings = followedSettings()
     }
@@ -257,7 +258,7 @@ class TerminalModel(
     /// watches, and what a session off screen meanwhile catches up on.
     fun followedSettings(): List<Any?> = listOf(
         settings.schemeName, settings.smoothScroll, settings.cursorStyle, settings.cursorBlink,
-        settings.contrast, settings.resizeMode, settings.autoReconnect, settings.paneBars, settings.fontFamily,
+        settings.contrast, settings.resizeMode, settings.paneBars, settings.fontFamily,
         settings.incognitoKeyboard, settings.language,
     )
 
@@ -892,7 +893,6 @@ class TerminalModel(
         val contrast = when (settings.contrast) { "3" -> 3.0; "45" -> 4.5; "7" -> 7.0; else -> 0.0 }
         core.setSetting("min-contrast", contrast.toString())
         core.setSetting("resize-mode", if (settings.resizeMode == "release") "\"release\"" else "\"live\"")
-        applyAutoReconnect()
         core.setSetting("pane-bars", settings.paneBars.toString())
         // The core's own menus and messages follow the app's language.
         core.setSetting("language", "\"${L10n.currentTag(settings.language)}\"")

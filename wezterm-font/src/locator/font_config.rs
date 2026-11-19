@@ -178,7 +178,7 @@ impl FontLocator for FontConfigFontLocator {
         &self,
         codepoints: &[char],
     ) -> anyhow::Result<Vec<ParsedFont>> {
-        log::trace!("locate_fallback_for_codepoints: {:?}", codepoints);
+        log::trace!("locating fallback fonts for {} codepoints", codepoints.len());
         let mut fonts: Vec<ParsedFont> = vec![];
 
         // In <https://github.com/wezterm/wezterm/issues/4310> we discover
@@ -253,7 +253,7 @@ impl FontLocator for FontConfigFontLocator {
                         }
 
                         if let Ok(file) = pat.get_file().context("pat.get_file") {
-                            log::trace!("{file:?} has {num} codepoints from {codepoints:?}");
+                            log::trace!("{file:?} covers {num} requested codepoints");
                             let handle = FontDataHandle {
                                 source: FontDataSource::OnDisk(file.into()),
                                 index: pat.get_integer("index")?.try_into()?,
@@ -365,7 +365,7 @@ impl FontConfigFontLocator {
         &self,
         codepoints: &[char],
     ) -> anyhow::Result<Vec<ParsedFont>> {
-        log::trace!("locate_fallback_for_codepoints: {:?}", codepoints);
+        log::trace!("locating system fallback fonts for {} codepoints", codepoints.len());
         let mut fonts: Vec<ParsedFont> = vec![];
 
         // Fontconfig rules can depend on the requested character. Ask for

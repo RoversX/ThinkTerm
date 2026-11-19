@@ -469,27 +469,20 @@ struct FallbackResolveInfo {
 
 impl FallbackResolveInfo {
     fn process(self) {
-        let fallback_str = self.no_glyphs.iter().collect::<String>();
+        let count = self.no_glyphs.len();
         // The codepoints arrive sorted and deduped from shape_impl; keep a
         // copy as the memo key before `wanted` consumes the list below.
         let memo_glyphs = self.no_glyphs.clone();
         let mut extra_handles = vec![];
 
-        log::trace!(
-            "Looking for {} in fallback fonts",
-            fallback_str.escape_unicode()
-        );
+        log::trace!("Looking for {count} codepoints in fallback fonts");
 
         match self
             .locator
             .locate_fallback_with_config(&self.no_glyphs, &self.config)
         {
             Ok(ref mut handles) => extra_handles.append(handles),
-            Err(err) => log::error!(
-                "Error: {:#} while resolving fallback for {} from font-locator",
-                err,
-                fallback_str.escape_unicode()
-            ),
+            Err(err) => log::error!("font-locator fallback for {count} codepoints failed: {err:#}"),
         }
 
         if self.config.search_font_dirs_for_fallback {
@@ -498,11 +491,7 @@ impl FallbackResolveInfo {
                 .locate_fallback_for_codepoints(&self.no_glyphs)
             {
                 Ok(ref mut handles) => extra_handles.append(handles),
-                Err(err) => log::error!(
-                    "Error: {:#} while resolving fallback for {} from font_dirs",
-                    err,
-                    fallback_str.escape_unicode()
-                ),
+                Err(err) => log::error!("font_dirs fallback for {count} codepoints failed: {err:#}"),
             }
         }
 
@@ -511,22 +500,14 @@ impl FallbackResolveInfo {
             .locate_fallback_for_codepoints(&self.no_glyphs)
         {
             Ok(ref mut handles) => extra_handles.append(handles),
-            Err(err) => log::error!(
-                "Error: {:#} while resolving fallback for {} for built-in fonts",
-                err,
-                fallback_str.escape_unicode()
-            ),
+            Err(err) => log::error!("built-in fallback for {count} codepoints failed: {err:#}"),
         }
 
         let mut wanted = RangeSet::new();
         for c in self.no_glyphs {
             wanted.add(c as u32);
         }
-        log::trace!(
-            "Fallback fonts that match {} before sorting are: {:#?}",
-            fallback_str.escape_unicode(),
-            extra_handles
-        );
+        log::trace!("Fallback fonts for {count} codepoints before sorting: {extra_handles:#?}");
 
         if wanted.len() > 1 && self.config.sort_fallback_fonts_by_coverage {
             // Fontconfig has already selected the preferred face for each
@@ -542,11 +523,7 @@ impl FallbackResolveInfo {
             });
             // Re-arrange to descending coverage
             extra_handles[system..].reverse();
-            log::trace!(
-                "Fallback fonts that match {} after sorting are: {:#?}",
-                fallback_str.escape_unicode(),
-                extra_handles
-            );
+            log::trace!("Fallback fonts for {count} codepoints after sorting: {extra_handles:#?}");
         }
 
         // iteratively reduce to just the fonts that we need
@@ -584,11 +561,6 @@ impl FallbackResolveInfo {
 
         if !wanted.is_empty() {
             // There were some glyphs we couldn't resolve!
-            let fallback_str = wanted
-                .iter_values()
-                .map(|c| std::char::from_u32(c).unwrap_or(' '))
-                .collect::<String>();
-
             let current_gen = self.config.generation();
             let show_warning = self.config.warn_about_missing_glyphs
                 && LAST_WARNING
@@ -607,16 +579,20 @@ impl FallbackResolveInfo {
                     .replace((Instant::now(), self.config.generation()));
                 let url = "https://wezterm.org/config/fonts.html";
                 log::warn!(
-                    "No fonts contain glyphs for these codepoints: {}.\n\
+                    "No fonts contain glyphs for {} codepoints.\n\
                      Placeholder glyphs are being displayed instead.\n\
                      You may wish to install additional fonts, or adjust your\n\
                      configuration so that it can find them.\n\
                      {} has more information about configuring fonts.\n\
                      Set warn_about_missing_glyphs=false to suppress this message.",
-                    fallback_str.escape_unicode(),
+                    wanted.len(),
                     url,
                 );
 
+                let fallback_str = wanted
+                    .iter_values()
+                    .map(|c| std::char::from_u32(c).unwrap_or(' '))
+                    .collect::<String>();
                 ToastNotification {
                     title: "Font problem".to_string(),
                     message: format!(
@@ -634,10 +610,7 @@ impl FallbackResolveInfo {
                 }
                 .show();
             } else {
-                log::debug!(
-                    "No fonts contain glyphs for these codepoints: {}",
-                    fallback_str.escape_unicode()
-                );
+                log::debug!("No fonts contain glyphs for {} codepoints", wanted.len());
             }
         }
     }

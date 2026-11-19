@@ -89,7 +89,7 @@ data class Host(
 
 /// The hosts, in the app's preferences (small, edited rarely), with the
 /// secrets one file over in EncryptedSharedPreferences.
-class HostStore(context: Context) {
+class HostStore private constructor(context: Context) {
     private val app = context.applicationContext
     private val prefs: SharedPreferences = app.getSharedPreferences("thinkterm", Context.MODE_PRIVATE)
     private val secrets: SharedPreferences = openSecrets(app)
@@ -245,22 +245,28 @@ class HostStore(context: Context) {
         }
     }
 
-    private companion object {
-        const val KEY = "hosts.v1"
+    companion object {
+        @Volatile private var instance: HostStore? = null
+
+        fun get(context: Context): HostStore = instance ?: synchronized(this) {
+            instance ?: HostStore(context.applicationContext).also { instance = it }
+        }
+
+        private const val KEY = "hosts.v1"
 
         /// A string field, or null for one absent, null or empty --
         /// `optString` would read a JSON null as the word "null".
-        fun JSONObject.stringOrNull(key: String): String? =
+        private fun JSONObject.stringOrNull(key: String): String? =
             if (!has(key) || isNull(key)) null else optString(key).ifEmpty { null }
 
-        const val SECRETS = "thinkterm-secrets"
+        private const val SECRETS = "thinkterm-secrets"
 
         /// Keystore-backed preferences. A file whose keyset the keystore
         /// can no longer open (a restore onto another device) is thrown
         /// away and made afresh: its secrets were lost with the key. If
         /// the keystore refuses altogether, the secrets live in memory
         /// for this run -- never in a file in the clear.
-        fun openSecrets(app: Context): SharedPreferences {
+        private fun openSecrets(app: Context): SharedPreferences {
             try {
                 return openEncrypted(app)
             } catch (e: Throwable) {

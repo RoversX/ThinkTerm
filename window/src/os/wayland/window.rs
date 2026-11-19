@@ -173,7 +173,7 @@ fn wayland_surface_resize_edge_at(
 }
 
 use super::copy_and_paste::{ClipboardOfferKind, CopyAndPaste};
-use super::pointer::{PendingMouse, PointerUserData};
+use super::pointer::{PendingButton, PendingMouse, PointerUserData};
 use super::state::WaylandState;
 
 #[derive(Debug)]
@@ -1006,6 +1006,13 @@ impl WaylandWindowInner {
         self.dimensions.surface_to_pixels(surface)
     }
 
+    fn surface_point_to_pixels(&self, (x, y): (f64, f64)) -> Point {
+        Point::new(
+            self.surface_to_pixels(x as i32) as isize,
+            self.surface_to_pixels(y as i32) as isize,
+        )
+    }
+
     fn pixels_to_surface(&self, pixels: i32) -> i32 {
         self.dimensions.pixels_to_surface(pixels)
     }
@@ -1023,11 +1030,8 @@ impl WaylandWindowInner {
     pub(crate) fn dispatch_pending_mouse(&mut self) {
         let pending_mouse = Arc::clone(&self.pending_mouse);
 
-        if let Some((x, y)) = PendingMouse::coords(&pending_mouse) {
-            let coords = Point::new(
-                self.surface_to_pixels(x as i32) as isize,
-                self.surface_to_pixels(y as i32) as isize,
-            );
+        if let Some(position) = PendingMouse::coords(&pending_mouse) {
+            let coords = self.surface_point_to_pixels(position);
             self.last_mouse_coords = coords;
             if let Some(edge) = self.surface_resize_edge_at(coords) {
                 self.set_cursor(Some(edge.cursor()));
@@ -1059,7 +1063,14 @@ impl WaylandWindowInner {
             self.refresh_frame();
         }
 
-        while let Some((button, state, serial)) = PendingMouse::next_button(&pending_mouse) {
+        while let Some(PendingButton {
+            button,
+            state,
+            serial,
+            position,
+        }) = PendingMouse::next_button(&pending_mouse)
+        {
+            let coords = self.surface_point_to_pixels(position);
             if button == MousePress::Left && self.surface_resize_in_progress {
                 if state == ButtonState::Released {
                     self.surface_resize_in_progress = false;
@@ -1067,7 +1078,7 @@ impl WaylandWindowInner {
                 continue;
             }
             if button == MousePress::Left && state == ButtonState::Pressed {
-                if let Some(edge) = self.surface_resize_edge_at(self.last_mouse_coords) {
+                if let Some(edge) = self.surface_resize_edge_at(coords) {
                     self.begin_surface_resize(serial, edge);
                     continue;
                 }
@@ -1094,10 +1105,10 @@ impl WaylandWindowInner {
                     ButtonState::Released => MouseEventKind::Release(button),
                     _ => continue,
                 },
-                coords: self.last_mouse_coords,
+                coords,
                 screen_coords: ScreenPoint::new(
-                    self.last_mouse_coords.x + self.dimensions.pixel_width as isize,
-                    self.last_mouse_coords.y + self.dimensions.pixel_height as isize,
+                    coords.x + self.dimensions.pixel_width as isize,
+                    coords.y + self.dimensions.pixel_height as isize,
                 ),
                 mouse_buttons: self.mouse_buttons,
                 modifiers: self.modifiers,

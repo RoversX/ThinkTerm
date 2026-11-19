@@ -506,10 +506,7 @@ impl HarfbuzzShaper {
                     shaped_any = pair.shaped_any;
                     font.shape(&mut buf, pair.features.as_slice());
                     log::trace!(
-                        "shaped font_idx={} {:?} presentation={presentation:?} as: {}",
-                        font_idx,
-                        &s[range.start..range.end],
-                        buf.serialize(Some(&*font))
+                        "shaped {range:?} with font_idx={font_idx} presentation={presentation:?}"
                     );
                     break;
                 }
@@ -597,7 +594,7 @@ impl HarfbuzzShaper {
         };
 
         cluster_resolver.build(hb_infos, s, &range);
-        log::debug!("cluster_resolver: {cluster_resolver:#?}");
+        log::debug!("resolved {} clusters", cluster_resolver.clusters.len());
 
         let info_iter = hb_infos.iter().zip(positions.iter()).peekable();
         for (info, pos) in info_iter {
@@ -623,8 +620,6 @@ impl HarfbuzzShaper {
                 x_offset: pos.x_offset,
                 y_offset: pos.y_offset,
             };
-            log::debug!("hb info.cluster {} -> {info:?}", info.cluster);
-
             if info.codepoint == 0 && !no_more_fallbacks {
                 cluster_info.incomplete = true;
                 // A character that shaped on its own and got no glyph is
@@ -677,8 +672,7 @@ impl HarfbuzzShaper {
             }
             info_clusters.push(vec![info]);
         }
-        //  log::error!("do_shape: font_idx={} {:?} {:#?}", font_idx, &s[range.clone()], info_clusters);
-        log::debug!("font_idx={font_idx} info_clusters: {:#?}", info_clusters);
+        log::debug!("font_idx={font_idx} produced {} clusters", info_clusters.len());
 
         let mut direct_clusters = 0;
 
@@ -709,7 +703,7 @@ impl HarfbuzzShaper {
                 Ok(shape) => shape,
                 Err(e) => {
                     let substr = &s[run.clone()];
-                    error!("{:?} for {:?}", e, substr);
+                    error!("fallback shaping failed for range {run:?}: {e:#}");
                     let question = make_question_string(substr);
                     let mut shape = self.do_shape(
                         0,
@@ -837,10 +831,7 @@ impl FontShaper for HarfbuzzShaper {
         let range = range.unwrap_or_else(|| 0..text.len());
         self.unload_fruitless_fallbacks();
 
-        log::trace!(
-            "shape {range:?} `{}` with presentation={presentation:?}",
-            text.escape_debug()
-        );
+        log::trace!("shape {range:?} with presentation={presentation:?}");
         let start = std::time::Instant::now();
         let result = self.do_shape(
             0,
