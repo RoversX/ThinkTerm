@@ -2002,7 +2002,6 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             log::warn!("connection lost: {reason}");
         }
-        self.show_reconnect_status();
         self.schedule_reconnect(0.0);
     }
 
@@ -2021,7 +2020,9 @@ impl<P: Platform, L: Link> App<P, L> {
         };
         let mut args = thinkterm_i18n::FluentArgs::new();
         args.set("reason", reason);
-        let text = if inner.reconnect_attempts >= RECONNECT_DOUBT_AFTER {
+        let text = if !inner.settings.auto_reconnect {
+            thinkterm_i18n::tr_args("web-toast-connection-lost", &args)
+        } else if inner.reconnect_attempts >= RECONNECT_DOUBT_AFTER {
             args.set("n", inner.reconnect_attempts);
             thinkterm_i18n::tr_args("web-toast-still-reconnecting", &args)
         } else {
@@ -2060,19 +2061,14 @@ impl<P: Platform, L: Link> App<P, L> {
                 return;
             }
             if !inner.settings.auto_reconnect {
-                // Asked not to: the remark stays, sticky, until a reconnect
-                // is asked for.
-                let mut args = thinkterm_i18n::FluentArgs::new();
-                args.set("reason", inner.disconnected.clone().unwrap_or_default());
-                Self::set_status(
-                    &inner,
-                    &thinkterm_i18n::tr_args("web-toast-connection-lost", &args),
-                );
+                drop(inner);
+                self.show_reconnect_status();
                 return;
             }
             inner.reconnect_pending = true;
             inner.reconnect_epoch
         };
+        self.show_reconnect_status();
         let weak = Rc::downgrade(self);
         self.platform.set_timeout(
             delay_ms.max(0.0),
@@ -2105,7 +2101,13 @@ impl<P: Platform, L: Link> App<P, L> {
     async fn reconnect_attempt(self: Rc<Self>) {
         let (link, pane_id, tab_id, size, nav_rows) = {
             let inner = self.inner.borrow();
+            // The user may have disabled retries while this attempt was waiting.
             if inner.disconnected.is_none() {
+                return;
+            }
+            if !inner.settings.auto_reconnect {
+                drop(inner);
+                self.show_reconnect_status();
                 return;
             }
             let size = inner.link.lease().reported;
@@ -2162,7 +2164,6 @@ impl<P: Platform, L: Link> App<P, L> {
                     inner.reconnect_delay
                 };
                 log::warn!("reconnect failed, retrying in {delay:.0} ms: {err:#}");
-                self.show_reconnect_status();
                 self.schedule_reconnect(delay);
             }
         }
@@ -6739,6 +6740,15 @@ impl<P: Platform, L: Link> App<P, L> {
             "auto-reconnect" => {
                 if redial {
                     self.reconnect_now();
+                } else {
+                    let mut inner = self.inner.borrow_mut();
+                    if !inner.settings.auto_reconnect && inner.reconnect_pending {
+                        inner.reconnect_epoch += 1;
+                        inner.reconnect_pending = false;
+                        drop(inner);
+                        self.show_reconnect_status();
+                        return Ok(());
+                    }
                 }
                 Self::notify(&self.inner.borrow());
             }

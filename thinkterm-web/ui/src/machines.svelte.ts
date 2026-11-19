@@ -60,9 +60,6 @@ export type OpenMachine = {
   failure: Failure | null;
   /** Shown once it is ready: the person asked for it, not a reload. */
   showWhenReady: boolean;
-  /** Reopened on the next load: it came from the last one, or it has been
-      up. A machine that only ever failed is not tried again on every load. */
-  remembered: boolean;
 };
 
 export const machines = $state({
@@ -108,32 +105,63 @@ function relaySocket(): WebSocket {
 export function configure(next: Boot, hub: Client) {
   boot = next;
   clients.set(HERE, hub);
-  const reopen = storedOpen();
+  void restoreOpen();
+}
+
+async function restoreOpen() {
+  const reopen = await withOpenStore(storedOpen, []);
   if (reopen.length === 0) return;
   // The list first: it names them. Without one (the relay down for a
   // moment) nothing is opened, and nothing is forgotten either.
-  void refreshList().then(() => {
-    if (!machines.listed || machines.error !== '') return;
-    for (const id of reopen) if (machines.list.some((m) => m.id === id)) void connect(id, false, true);
-    storeOpen();
-  });
+  await refreshList();
+  const saved = await withOpenStore(storedOpen, []);
+  if (!machines.enabled || !machines.listed || machines.error !== '') return;
+  for (const id of reopen) {
+    if (!saved.includes(id)) continue;
+    if (machines.list.some((m) => m.id === id)) void connect(id, false, true);
+    else void storeOpen(id, false);
+  }
 }
 
 function storedOpen(): string[] {
+  const raw = localStorage.getItem(OPEN_STORE);
   try {
-    const value: unknown = JSON.parse(localStorage.getItem(OPEN_STORE) ?? '[]');
+    const value: unknown = JSON.parse(raw ?? '[]');
     return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
   } catch {
     return [];
   }
 }
 
-function storeOpen() {
+// Tabs share the ordered list. Run each read/modify/write under the same lock.
+async function withOpenStore<T>(operation: () => T, fallback: T): Promise<T> {
+  const access = () => {
+    try { return operation(); } catch { return fallback; }
+  };
   try {
-    localStorage.setItem(OPEN_STORE, JSON.stringify(machines.open.filter((m) => m.remembered).map((m) => m.id)));
+    const locks = globalThis.navigator?.locks;
+    if (locks) return await locks.request(OPEN_STORE, access);
   } catch {
-    // A browser that blocks storage reopens nothing next time.
+    // Some browsing contexts expose Web Locks but disallow requesting one.
   }
+  return access();
+}
+
+function storeOpen(id: string, open: boolean): Promise<void> {
+  return withOpenStore(() => {
+    const ids = storedOpen();
+    const index = ids.indexOf(id);
+    if (open === (index !== -1)) return;
+    if (open) {
+      // Connections can finish out of opening order.
+      const later = machines.open.slice(machines.open.findIndex((m) => m.id === id) + 1);
+      const next = later.find((m) => ids.includes(m.id));
+      ids.splice(next ? ids.indexOf(next.id) : ids.length, 0, id);
+    } else {
+      ids.splice(index, 1);
+    }
+    localStorage.setItem(OPEN_STORE, JSON.stringify(ids));
+  }, undefined);
 }
 
 /** One request to the relay that ends with the list: it opens a socket,
@@ -229,6 +257,9 @@ export async function addMachine(form: NewMachine): Promise<boolean> {
 
 export async function forgetMachine(id: string): Promise<void> {
   await request({ op: 'forget', id });
+  if (machines.error === '' && machines.enabled && !machines.list.some((m) => m.id === id)) {
+    await storeOpen(id, false);
+  }
 }
 
 /** The page in the terminal's place, for what hands the keys back to the
@@ -361,9 +392,9 @@ function opener(id: string, n: number): () => Promise<WebSocket> {
             ws.close();
             reject(new Error(reply.message));
             if (!RETRYABLE.has(reply.reason)) {
-              // Not worth opening on the next load either.
-              m.remembered = false;
-              storeOpen();
+              // Turning the relay off stops this attempt, but the host can
+              // still be restored on a later visit when it is on again.
+              if (reply.reason !== 'off') void storeOpen(id, false);
               if (clients.has(id)) giveUp(id);
             }
             break;
@@ -416,13 +447,13 @@ export function answer(id: string, value: string | null, remember = false) {
 
 /** Open a machine: its own client, on a canvas of its own. `show` brings it
     on show once it is ready. */
-export async function connect(id: string, show: boolean, remembered = false): Promise<void> {
+export async function connect(id: string, show: boolean, restoring = false): Promise<void> {
   if (!boot) return;
   const existing = find(id);
   if (existing) {
     if (existing.state === 'failed') {
       // Again, from the start.
-      close(id);
+      releaseConnection(id);
     } else {
       if (show) {
         // One with a terminal already -- up, or reconnecting behind the
@@ -449,9 +480,7 @@ export async function connect(id: string, show: boolean, remembered = false): Pr
     log: [],
     failure: null,
     showWhenReady: show,
-    remembered,
   });
-  storeOpen();
   // The canvas and the field have to be in the page before the client
   // looks them up.
   flushSync();
@@ -480,8 +509,8 @@ export async function connect(id: string, show: boolean, remembered = false): Pr
   attach(client, () => onChange(id, n));
   m.state = 'ready';
   m.step = null;
-  m.remembered = true;
-  storeOpen();
+  // A restore consumes the saved entry. Another tab may have closed it since.
+  const recording = restoring ? undefined : storeOpen(id, true);
   // Brought on show as asked -- unless the person is in the middle of
   // answering something else, whose keys would land in this terminal.
   if (m.showWhenReady && !typingElsewhere() && !machines.open.some((o) => o.ask)) {
@@ -489,6 +518,7 @@ export async function connect(id: string, show: boolean, remembered = false): Pr
     closePanel();
   }
   m.showWhenReady = false;
+  return recording;
 }
 
 /** The person is typing an answer or a path, not at a terminal. (No
@@ -530,6 +560,12 @@ export function showMachine(key: string, focus = true) {
 
 /** Close a machine's connection and let its client go. */
 export function close(id: string) {
+  if (!find(id)) return;
+  void storeOpen(id, false);
+  releaseConnection(id);
+}
+
+function releaseConnection(id: string) {
   const m = find(id);
   if (!m) return;
   asking.get(id)?.cancel();
@@ -538,7 +574,6 @@ export function close(id: string) {
   const client = clients.get(id);
   clients.delete(id);
   machines.open = machines.open.filter((o) => o.id !== id);
-  storeOpen();
   if (client) {
     client.close();
     client.free();

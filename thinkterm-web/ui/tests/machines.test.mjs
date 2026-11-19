@@ -32,7 +32,7 @@ function client() {
   };
 }
 
-async function setup(start) {
+async function setup(start, storage = new Map(), locks) {
   const clients = new Map();
   const handle = { client: null };
   const changes = [];
@@ -44,7 +44,11 @@ async function setup(start) {
   }
   const context = vm.createContext({
     window: { thinkterm: handle },
-    localStorage: { getItem: () => null, setItem() {} },
+    navigator: { locks },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+    },
     location: { protocol: 'https:', host: 'example' },
     WebSocket: Socket,
     setTimeout,
@@ -79,6 +83,118 @@ async function setup(start) {
   api.configure({ start, prepare() {}, token: '' }, handle.client);
   return { api, clients, handle, changes, sockets };
 }
+
+async function replyList(socket, ids, enabled = true) {
+  socket.onmessage({ data: JSON.stringify({
+    op: 'machines', here: 'gateway', enabled,
+    machines: ids.map((id) => ({ id, label: id })),
+  }) });
+  await new Promise(setImmediate);
+}
+
+const openStore = 'thinkterm.machines';
+
+test('a disabled relay keeps the previous visit’s open hosts in order', async () => {
+  const ids = ['server-b', 'server-a'];
+  const storage = new Map([[openStore, JSON.stringify(ids)]]);
+  const off = await setup(async () => client(), storage);
+  await replyList(off.sockets[0], [], false);
+  assert.equal(off.api.machines.open.length, 0);
+  assert.deepEqual(JSON.parse(storage.get(openStore)), ids);
+
+  const on = await setup(async () => client(), storage);
+  await replyList(on.sockets[0], ids);
+  assert.deepEqual(Array.from(on.api.machines.open, (m) => m.id), ids);
+});
+
+test('relay shutdown during a restore keeps the host, but a permanent refusal removes it', async () => {
+  for (const [reason, expected] of [['off', ['server-a']], ['declined', []]]) {
+    const storage = new Map([[openStore, '["server-a"]']]);
+    const tab = await setup(async (_canvas, _field, open) => { await open(); return client(); }, storage);
+    await replyList(tab.sockets[0], ['server-a']);
+    tab.sockets[1].onmessage({ data: JSON.stringify({ op: 'failed', reason, message: 'Stopped' }) });
+    await new Promise(setImmediate);
+    assert.equal(tab.api.machines.open[0].state, 'failed');
+    assert.deepEqual(JSON.parse(storage.get(openStore)), expected);
+  }
+});
+
+test('a closing tab wins over a delayed host list and a delayed background connection', async () => {
+  const storage = new Map([[openStore, '["server-a"]']]);
+  const pending = deferred();
+  const closing = await setup(async () => client(), storage);
+  const opening = await setup(() => pending.promise, storage);
+  const listing = await setup(async () => client(), storage);
+  await replyList(closing.sockets[0], ['server-a']);
+  await replyList(opening.sockets[0], ['server-a']);
+  assert.equal(opening.api.machines.open[0].state, 'connecting');
+
+  closing.api.close('server-a');
+  pending.resolve(client());
+  await replyList(listing.sockets[0], ['server-a']);
+  assert.equal(listing.api.machines.open.length, 0);
+  assert.equal(opening.api.machines.open[0].state, 'ready');
+  assert.deepEqual(JSON.parse(storage.get(openStore)), []);
+
+  // This tab still has A open. Its next manual connection adds only B.
+  await opening.api.connect('server-b', false);
+  const next = await setup(async () => client(), storage);
+  await replyList(next.sockets[0], ['server-a', 'server-b']);
+  assert.deepEqual(Array.from(next.api.machines.open, (m) => m.id), ['server-b']);
+});
+
+test('successful manual connections are restored in opening order', async () => {
+  const storage = new Map();
+  const pending = deferred();
+  let starts = 0;
+  const { api } = await setup(() => ++starts === 1 ? pending.promise : Promise.resolve(client()), storage);
+  const first = api.connect('server-a', false);
+  await api.connect('server-b', false);
+  assert.deepEqual(JSON.parse(storage.get(openStore)), ['server-b']);
+  pending.resolve(client());
+  await first;
+  assert.deepEqual(JSON.parse(storage.get(openStore)), ['server-a', 'server-b']);
+});
+
+test('concurrent edits in different tabs share the open-list lock', async () => {
+  let turn = Promise.resolve();
+  const locks = { request(name, callback) {
+    assert.equal(name, openStore);
+    turn = turn.then(callback);
+    return turn;
+  } };
+  const storage = new Map([[openStore, '["server-a"]']]);
+  const a = await setup(async () => client(), storage, locks);
+  const b = await setup(async () => client(), storage, locks);
+  await new Promise(setImmediate);
+  await replyList(a.sockets[0], ['server-a']);
+  await replyList(b.sockets[0], ['server-a']);
+
+  const write = storage.set.bind(storage);
+  storage.set = (key, value) => {
+    storage.set = write;
+    a.api.close('server-a');
+    return write(key, value);
+  };
+  await b.api.connect('server-b', false);
+  await turn;
+  assert.deepEqual(JSON.parse(storage.get(openStore)), ['server-b']);
+});
+
+test('manual connections still work with restricted browser storage', async () => {
+  const denied = { request: async () => { throw new Error('Locks blocked'); } };
+  const storage = new Map();
+  const tab = await setup(async () => client(), storage, denied);
+  await tab.api.connect('server-a', false);
+  assert.deepEqual(JSON.parse(storage.get(openStore)), ['server-a']);
+
+  const blocked = { get() { throw new Error('Storage blocked'); } };
+  const other = await setup(async () => client(), blocked);
+  await other.api.connect('server-b', false);
+  assert.equal(other.api.machines.open[0].state, 'ready');
+  other.api.close('server-b');
+  assert.equal(other.api.machines.open.length, 0);
+});
 
 test('switching machines moves the mounted panel subscription to the active client', async (t) => {
   const next = client();
