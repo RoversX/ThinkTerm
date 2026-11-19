@@ -253,6 +253,17 @@ impl TextInputState {
         Some(self.text.chars().skip(start).take(end - start).collect())
     }
 
+    /// Show an input method's marked text in place of the selection until it commits.
+    /// The returned range uses the same character indices as the caret.
+    pub(crate) fn display_with_preedit(&self, marked: &str) -> (String, std::ops::Range<usize>) {
+        let (start, end) = self
+            .caret_selection_range()
+            .unwrap_or((self.cursor, self.cursor));
+        let mut display = self.text.clone();
+        display.replace_range(self.byte_idx_for(start)..self.byte_idx_for(end), marked);
+        (display, start..start + marked.chars().count())
+    }
+
     pub(crate) fn caret_delete_selection(&mut self) -> bool {
         let Some((start, end)) = self.caret_selection_range() else {
             return false;
@@ -646,6 +657,21 @@ mod text_input_tests {
         i.caret_insert(", ", false);
         assert_eq!(i.text, "hello, world");
         assert_eq!(i.cursor, 7);
+    }
+
+    #[test]
+    fn preedit_replaces_the_selection_only_on_commit() {
+        let mut field = input("A字B");
+        field.caret_set(2, false);
+        assert_eq!(field.display_with_preedit("ni"), ("A字niB".into(), 2..4));
+        field.caret_set(1, true);
+        assert_eq!(field.display_with_preedit("ni"), ("AniB".into(), 1..3));
+        assert_eq!(field.display_with_preedit("你"), ("A你B".into(), 1..2));
+        assert_eq!(field.text(), "A字B");
+        assert_eq!(field.caret_selected_text().as_deref(), Some("字"));
+        field.caret_insert("你", false);
+        assert_eq!(field.text(), "A你B");
+        assert_eq!(field.cursor, 2);
     }
 
     #[test]

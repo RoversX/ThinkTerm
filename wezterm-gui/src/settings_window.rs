@@ -3004,6 +3004,8 @@ struct SettingsUiState {
     remote_drop_input: TextInputState,
     remote_drop_input_dirty: bool,
     interaction: InteractionState<SettingsAction>,
+    input_preedit: Option<String>,
+    input_cursor_rect: Cell<Option<window::Rect>>,
     drag: Option<SettingsDrag>,
     /// The window-opacity slider's track as last painted: its left edge and
     /// width, for turning the pointer's x into a value.
@@ -3147,6 +3149,8 @@ impl SettingsUiState {
             remote_drop_input: TextInputState::new(),
             remote_drop_input_dirty: false,
             interaction: InteractionState::default(),
+            input_preedit: None,
+            input_cursor_rect: Cell::new(None),
             drag: None,
             window_opacity_track: None,
             window_opacity_previewed: None,
@@ -4534,6 +4538,38 @@ impl SettingsWindow {
                 }
                 Ok(true)
             }
+            WindowEvent::PerformKeyAssignment(action) if !self.ui.keymap.is_recording() => {
+                use config::keyassignment::{
+                    ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment,
+                };
+                if let Some(focused) = self.ui.interaction.focused {
+                    match action {
+                        KeyAssignment::CopyTo(ClipboardCopyDestination::Clipboard) => {
+                            self.copy_focused_input(focused, window);
+                        }
+                        KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard) => {
+                            self.paste_focused_input_from_clipboard(focused, window);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(true)
+            }
+            WindowEvent::AdviseDeadKeyStatus(status) => {
+                let marked = match status {
+                    window::DeadKeyStatus::Composing(text)
+                        if self.ui.interaction.focused.is_some() && !text.is_empty() =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                };
+                if self.ui.input_preedit != marked {
+                    self.ui.input_preedit = marked;
+                    window.invalidate();
+                }
+                Ok(true)
+            }
             WindowEvent::MouseLeave => {
                 self.ui.interaction.hovered = None;
                 self.ui.interaction.pressed = None;
@@ -4545,10 +4581,14 @@ impl SettingsWindow {
                 window.invalidate();
                 Ok(true)
             }
-            WindowEvent::FocusChanged(false) if self.ui.keymap.is_recording() => {
+            WindowEvent::FocusChanged(false) => {
                 // Recording keeps every window's shortcuts from the menus on
                 // macOS, so it ends when Settings is left.
-                self.ui.keymap.stop_recording();
+                if self.ui.keymap.is_recording() {
+                    self.ui.keymap.stop_recording();
+                }
+                self.ui.input_preedit = None;
+                self.ui.input_cursor_rect.set(None);
                 window.invalidate();
                 Ok(true)
             }
@@ -5280,6 +5320,8 @@ impl SettingsWindow {
     fn set_focused_input(&mut self, focused: Option<SettingsAction>) {
         if self.ui.interaction.focused != focused {
             self.commit_focused_input();
+            self.ui.input_preedit = None;
+            self.ui.input_cursor_rect.set(None);
         }
         self.ui.interaction.focused = focused;
     }
@@ -19843,7 +19885,6 @@ impl SettingsWindow {
         placeholder: &str,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
         let control_x = control_rect.origin.x;
         let control_y = control_rect.origin.y;
         let control_width = control_rect.size.width;
@@ -19878,73 +19919,25 @@ impl SettingsWindow {
             self.ui_px(CONTROL_RADIUS),
         )?;
 
-        let display = if value.trim().is_empty() {
-            placeholder
-        } else {
-            value
-        };
-        let text_color = if value.trim().is_empty() {
-            palette.muted_text
-        } else {
-            palette.text
-        };
-        let text_left = control_x + self.ui_px(16.0);
-        let text_area = (control_width - self.ui_px(32.0)).max(0.0);
-        let selection = self
-            .caret_for_input(action)
-            .and_then(|caret| caret.selection)
-            .filter(|(start, end)| start != end)
-            .or_else(|| {
-                let selected_all = self
-                    .input_state_for(action)
-                    .is_some_and(|input| input.selected_all);
-                (selected_all && !value.is_empty()).then(|| (0, value.chars().count()))
-            });
-        if focused && !value.is_empty() {
-            if let Some((start, end)) = selection {
-                let start_x = self
-                    .text_width_to_char(&ui_font, value, start)
-                    .min(text_area);
-                let end_x = self.text_width_to_char(&ui_font, value, end).min(text_area);
-                self.draw_rounded_rect(
-                    layers,
-                    1,
-                    text_left + start_x - self.ui_px(4.0),
-                    control_y + self.ui_px(6.0),
-                    (end_x - start_x) + self.ui_px(8.0),
-                    self.ui_px(CONTROL_HEIGHT - 12.0),
-                    palette.nav_selected_bg.mul_alpha(0.56),
-                    self.ui_px(CONTROL_RADIUS - 4.0),
-                )?;
-            }
-        }
-        self.draw_text(
+        self.paint_input_contents(
             layers,
-            &ui_font,
-            text_left,
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            display,
-            text_color,
-            text_area,
-        )?;
-        if focused && selection.is_none() {
-            let caret_text = if value.trim().is_empty() { "" } else { value };
-            let caret_dx = match self.caret_for_input(action) {
-                Some(caret) => self.text_width_to_char(&ui_font, caret_text, caret.cursor),
-                None => self.measure_text_width(&ui_font, caret_text),
-            };
-            let caret_width = self.ui_px(3.0).max(1.0);
-            self.draw_rect(
-                layers,
-                1,
-                text_left + caret_dx.min(text_area) - caret_width / 3.0,
-                control_y + self.ui_px(8.0),
-                caret_width,
-                self.ui_px(CONTROL_HEIGHT - 16.0),
-                palette.nav_selected_bg,
-            )?;
-        }
-        Ok(())
+            1,
+            TextInputSpec {
+                text: if !focused && value.trim().is_empty() {
+                    ""
+                } else {
+                    value
+                },
+                placeholder,
+                rect: control_rect,
+                focused,
+                selected_all: self
+                    .input_state_for(action)
+                    .is_some_and(|input| input.selected_all),
+                action,
+            },
+            self.ui_px(16.0),
+        )
     }
 
     /// How long the next link lasts. A dropdown rather than a fixed value
@@ -21263,41 +21256,50 @@ impl SettingsWindow {
             border,
             radius,
         )?;
-        let text = if spec.text.is_empty() && !spec.focused {
-            spec.placeholder
-        } else {
-            spec.text
-        };
-        let color = if spec.text.is_empty() && !spec.focused {
-            palette.muted_text
-        } else {
-            palette.text
-        };
-        let font = Rc::clone(&self.ui_font);
-        let text_left = spec.rect.origin.x + self.ui_px(58.0);
-        let text_area = (spec.rect.size.width - self.ui_px(116.0)).max(0.0);
-        let selection = self
-            .caret_for_input(spec.action)
+        self.paint_input_contents(
+            layers,
+            layer_num,
+            TextInputSpec {
+                placeholder: if spec.focused { "" } else { spec.placeholder },
+                ..spec
+            },
+            self.ui_px(58.0),
+        )
+    }
+
+    fn paint_input_contents(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        spec: TextInputSpec<'_, SettingsAction>,
+        padding: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let font = &self.ui_font;
+        let caret = self.caret_for_input(spec.action);
+        let preedit = self.ui.input_preedit.as_deref().and_then(|marked| {
+            let input = self.input_state_for(spec.action)?;
+            spec.focused.then(|| input.display_with_preedit(marked))
+        });
+        let text = preedit
+            .as_ref()
+            .map_or(spec.text, |(text, _)| text.as_str());
+        let text_left = spec.rect.min_x() + padding;
+        let text_area = (spec.rect.width() - padding * 2.0).max(0.0);
+        let x_at = |idx| text_left + self.text_width_to_char(font, text, idx).min(text_area);
+        let selection = caret
             .and_then(|caret| caret.selection)
-            .filter(|(start, end)| start != end)
-            .or_else(|| {
-                (spec.selected_all && !spec.text.is_empty()).then(|| (0, spec.text.chars().count()))
-            });
-        if spec.focused && !spec.text.is_empty() {
+            .or_else(|| (spec.selected_all && !text.is_empty()).then(|| (0, text.chars().count())));
+        if spec.focused && preedit.is_none() {
             if let Some((start, end)) = selection {
-                let start_x = self
-                    .text_width_to_char(&font, spec.text, start)
-                    .min(text_area);
-                let end_x = self
-                    .text_width_to_char(&font, spec.text, end)
-                    .min(text_area);
+                let left = x_at(start);
                 self.draw_rounded_rect(
                     layers,
                     layer_num,
-                    text_left + start_x - self.ui_px(4.0),
-                    spec.rect.origin.y + self.ui_px(6.0),
-                    (end_x - start_x) + self.ui_px(8.0),
-                    spec.rect.size.height - self.ui_px(12.0),
+                    left - self.ui_px(4.0),
+                    spec.rect.min_y() + self.ui_px(6.0),
+                    x_at(end) - left + self.ui_px(8.0),
+                    spec.rect.height() - self.ui_px(12.0),
                     palette.nav_selected_bg.mul_alpha(0.56),
                     self.ui.tokens.control_radius - self.ui_px(4.0),
                 )?;
@@ -21306,28 +21308,59 @@ impl SettingsWindow {
         self.draw_text_on_layer(
             layers,
             layer_num,
-            &font,
+            font,
             text_left,
-            self.control_text_y(spec.rect.origin.y, spec.rect.size.height),
-            text,
-            color,
+            self.control_text_y(spec.rect.min_y(), spec.rect.height()),
+            if text.is_empty() {
+                spec.placeholder
+            } else {
+                text
+            },
+            if text.is_empty() {
+                palette.muted_text
+            } else {
+                palette.text
+            },
             text_area,
         )?;
-        if spec.focused && selection.is_none() {
-            let caret_dx = match self.caret_for_input(spec.action) {
-                Some(caret) => self.text_width_to_char(&font, spec.text, caret.cursor),
-                None => self.measure_text_width(&font, spec.text),
-            };
+        if spec.focused {
+            let top = spec.rect.min_y() + self.ui_px(8.0);
+            let height = spec.rect.height() - self.ui_px(16.0);
             let caret_width = self.ui_px(3.0).max(1.0);
-            self.draw_rect(
-                layers,
-                layer_num,
-                text_left + caret_dx.min(text_area) - caret_width / 3.0,
-                spec.rect.origin.y + self.ui_px(8.0),
-                caret_width,
-                spec.rect.size.height - self.ui_px(16.0),
-                palette.nav_selected_bg,
-            )?;
+            let cursor = caret.map_or_else(|| text.chars().count(), |caret| caret.cursor);
+            let left = x_at(preedit.as_ref().map_or(cursor, |(_, range)| range.start));
+            if let Some(window) = self.window.as_ref() {
+                let rect = euclid::rect(
+                    left.round() as isize,
+                    top.round() as isize,
+                    caret_width.ceil() as isize,
+                    height.ceil() as isize,
+                );
+                if self.ui.input_cursor_rect.replace(Some(rect)) != Some(rect) {
+                    window.set_text_cursor_position(rect);
+                }
+            }
+            if let Some((_, marked)) = &preedit {
+                self.draw_rect(
+                    layers,
+                    layer_num,
+                    left,
+                    top + height - 1.0,
+                    x_at(marked.end) - left,
+                    1.0,
+                    palette.text,
+                )?;
+            } else if selection.is_none() {
+                self.draw_rect(
+                    layers,
+                    layer_num,
+                    left - caret_width / 3.0,
+                    top,
+                    caret_width,
+                    height,
+                    palette.nav_selected_bg,
+                )?;
+            }
         }
         Ok(())
     }
