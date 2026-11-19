@@ -165,6 +165,11 @@ enum TearOffPlace {
     Growing,
     /// Here for good.
     Here,
+    /// Here, with the card's chrome queued in the current paint pass.
+    Queued {
+        chrome: Rc<CardRenderTexture>,
+        dimensions: Dimensions,
+    },
     /// Here, with its own window on the way.
     Leaving {
         chrome: Rc<CardRenderTexture>,
@@ -512,8 +517,8 @@ impl TermWindow {
             && !self.window_state.contains(WindowState::FULL_SCREEN)
     }
 
-    /// Render the whole card for a window of its own, and have that made.
-    fn send_thread_card_out(&mut self) -> anyhow::Result<TearOffPlace> {
+    /// Queue the whole card's chrome; its window waits for the draw to submit.
+    fn prepare_thread_card_window(&mut self) -> anyhow::Result<TearOffPlace> {
         let state = self
             .sidebar_row_drag
             .as_ref()
@@ -526,12 +531,6 @@ impl TermWindow {
         let thread_id = thread_id.clone();
         let glass = crate::settings_window::liquid_glass_available();
         let card = self.thread_tear_off_card(&state.grip, state.current, 1.0);
-        let started = state
-            .tear_off
-            .as_ref()
-            .context("a tear-off card with no tear-off")?
-            .started;
-
         let mut heap = HeapQuadAllocator::default();
         self.paint_tear_off_chrome(
             &mut TripleLayerQuadAllocator::Heap(&mut heap),
@@ -570,10 +569,48 @@ impl TermWindow {
             pixel_height: texture.height as usize,
             dpi: self.dimensions.dpi,
         };
-        let window = self
-            .window
-            .clone()
-            .context("a tear-off card with no window")?;
+        Ok(TearOffPlace::Queued {
+            chrome: texture,
+            dimensions,
+        })
+    }
+
+    /// A retried or skipped paint never submitted this texture. No window
+    /// has been requested yet, so its chrome can start over with the pass.
+    pub(crate) fn discard_unsubmitted_thread_card(&mut self) {
+        if let Some(tear_off) = self
+            .sidebar_row_drag
+            .as_mut()
+            .and_then(|state| state.tear_off.as_mut())
+            .filter(|tear_off| matches!(tear_off.place, TearOffPlace::Queued { .. }))
+        {
+            tear_off.place = TearOffPlace::Growing;
+        }
+    }
+
+    /// The card's chrome was submitted on this device; a new window can
+    /// now copy it without depending on an abandoned paint pass.
+    pub(crate) fn show_painted_thread_card(&mut self) {
+        let Some(tear_off) = self
+            .sidebar_row_drag
+            .as_mut()
+            .and_then(|state| state.tear_off.as_mut())
+        else {
+            return;
+        };
+        let TearOffPlace::Queued { chrome, dimensions } = &tear_off.place else {
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let started = tear_off.started;
+        let dimensions = *dimensions;
+        tear_off.place = TearOffPlace::Leaving {
+            chrome: Rc::clone(chrome),
+            dimensions,
+        };
+        let glass = crate::settings_window::liquid_glass_available();
         let config = self.config.adjusted(|config| {
             config.window_background_opacity = 0.0;
             config.macos_window_background_blur = 0;
@@ -614,11 +651,6 @@ impl TermWindow {
             })));
         })
         .detach();
-
-        Ok(TearOffPlace::Leaving {
-            chrome: texture,
-            dimensions,
-        })
     }
 
     fn keep_thread_card_here(&mut self, started: Instant) {
@@ -1063,7 +1095,7 @@ impl TermWindow {
         }
         if growing {
             let place = if self.thread_card_can_leave_window() {
-                self.send_thread_card_out().unwrap_or_else(|err| {
+                self.prepare_thread_card_window().unwrap_or_else(|err| {
                     log::warn!("the tear-off card stays in its window: {err:#}");
                     TearOffPlace::Here
                 })

@@ -1517,7 +1517,10 @@ impl crate::TermWindow {
             self.sidebar_slides.shown();
         }
         let draw_result = if present_frame {
-            self.call_draw(frame).map(|_| true)
+            self.call_draw(frame).map(|_| {
+                self.show_painted_thread_card();
+                true
+            })
         } else {
             Ok(false)
         };
@@ -5013,6 +5016,7 @@ impl crate::TermWindow {
         self.advance_content_view_fade(frame_now);
         self.advance_sidebar_slides(frame_now);
         self.advance_library(frame_now);
+        self.discard_unsubmitted_thread_card();
         // Card texture work is queued per pass, and a retried pass queues its
         // own. A texture whose render is dropped here was never drawn into,
         // and its card -- a cache hit on the retry -- would composite it
