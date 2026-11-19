@@ -29,10 +29,10 @@ impl SeatHandler for WaylandState {
             Capability::Keyboard if self.keyboard.is_none() => {
                 log::trace!("Setting keyboard capability");
                 let keyboard = seat.get_keyboard(qh, KeyboardData {});
-                self.keyboard = Some(keyboard.clone());
+                self.keyboard = Some(keyboard);
 
-                if let Some(text_input) = &self.text_input {
-                    text_input.advise_seat(&seat, &keyboard, qh);
+                if let Some(text_input) = &mut self.text_input {
+                    text_input.advise_seat(&seat, qh);
                 }
             }
             Capability::Pointer if self.pointer.is_none() => {

@@ -14,7 +14,7 @@ use super::SurfaceUserData;
 impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
     fn event(
         state: &mut WaylandState,
-        keyboard: &WlKeyboard,
+        _keyboard: &WlKeyboard,
         event: <WlKeyboard as wayland_client::Proxy>::Event,
         _data: &KeyboardData,
         _conn: &wayland_client::Connection,
@@ -30,27 +30,13 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 if let Some(sud) = SurfaceUserData::try_from_wl(&surface) {
                     let window_id = sud.window_id;
                     state.keyboard_window_id.borrow_mut().replace(window_id);
-                    if let Some(text_input) = &state.text_input {
-                        if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                            input.enable();
-                            input.commit();
-                        }
-                        text_input.advise_surface(surface, keyboard);
-                    }
                 } else {
                     log::warn!("{:?}, no known surface", event);
                 }
             }
-            WlKeyboardEvent::Leave { serial, .. } => {
-                *state.last_serial.borrow_mut() = *serial;
-                if let Some(text_input) = &state.text_input {
-                    if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                        input.disable();
-                        input.commit();
-                    }
-                }
-            }
-            WlKeyboardEvent::Key { serial, .. } | WlKeyboardEvent::Modifiers { serial, .. } => {
+            WlKeyboardEvent::Leave { serial, .. }
+            | WlKeyboardEvent::Key { serial, .. }
+            | WlKeyboardEvent::Modifiers { serial, .. } => {
                 *state.last_serial.borrow_mut() = *serial;
             }
             WlKeyboardEvent::RepeatInfo { rate, delay } => {

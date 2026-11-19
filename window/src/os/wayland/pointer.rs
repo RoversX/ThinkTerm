@@ -17,6 +17,7 @@ use crate::wayland::SurfaceUserData;
 
 use super::copy_and_paste::CopyAndPaste;
 use super::drag_and_drop::DragAndDrop;
+use super::scroll::{PendingScroll, ScrollFrame};
 use super::state::WaylandState;
 use super::WaylandConnection;
 
@@ -35,6 +36,7 @@ impl PointerHandler for WaylandState {
             .lock()
             .unwrap();
 
+        let mut scroll_frame = ScrollFrame::default();
         for evt in events {
             if let PointerEventKind::Enter { .. } = &evt.kind {
                 let surface_id = evt.surface.id();
@@ -50,7 +52,7 @@ impl PointerHandler for WaylandState {
                 .get(&self.active_surface_id.borrow().as_ref().unwrap())
             {
                 let mut pending = pending.lock().unwrap();
-                if pending.queue(evt) {
+                if pending.queue(evt, &mut scroll_frame) {
                     WaylandConnection::with_window_inner(pending.window_id, move |inner| {
                         inner.dispatch_pending_mouse();
                         Ok(())
@@ -95,7 +97,7 @@ pub struct PendingMouse {
     pub(super) copy_and_paste: Arc<Mutex<CopyAndPaste>>,
     surface_coords: Option<(f64, f64)>,
     button: Vec<(MousePress, ButtonState, u32)>,
-    scroll: Option<(f64, f64)>,
+    scroll: Option<PendingScroll>,
     in_window: bool,
 }
 
@@ -114,7 +116,7 @@ impl PendingMouse {
         }))
     }
 
-    pub(super) fn queue(&mut self, evt: &PointerEvent) -> bool {
+    fn queue(&mut self, evt: &PointerEvent, scroll_frame: &mut ScrollFrame) -> bool {
         match evt.kind {
             PointerEventKind::Enter { .. } => {
                 self.in_window = true;
@@ -161,9 +163,17 @@ impl PendingMouse {
                 ..
             } => {
                 let changed = self.scroll.is_none();
-                let (x, y) = self.scroll.take().unwrap_or((0., 0.));
-                self.scroll
-                    .replace((x + horizontal.absolute, y + vertical.absolute));
+                let scroll = self.scroll.get_or_insert_with(PendingScroll::default);
+                scroll_frame.horizontal.accumulate(
+                    &mut scroll.horizontal,
+                    horizontal.absolute,
+                    horizontal.discrete,
+                );
+                scroll_frame.vertical.accumulate(
+                    &mut scroll.vertical,
+                    vertical.absolute,
+                    vertical.discrete,
+                );
                 changed
             }
         }
@@ -184,7 +194,7 @@ impl PendingMouse {
         pending.lock().unwrap().surface_coords.take()
     }
 
-    pub(super) fn scroll(pending: &Arc<Mutex<Self>>) -> Option<(f64, f64)> {
+    pub(super) fn scroll(pending: &Arc<Mutex<Self>>) -> Option<PendingScroll> {
         pending.lock().unwrap().scroll.take()
     }
 

@@ -42,6 +42,7 @@ use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
 use wayland_egl::{is_available as egl_is_available, WlEglSurface};
+use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 use wezterm_font::FontConfiguration;
@@ -798,6 +799,8 @@ pub struct WaylandWindowInner {
     window_id: usize,
     invalidated: bool,
     // font_config: Rc<FontConfiguration>,
+    // Replay the surface's latest caret on text-input enter, even if it
+    // hasn't moved since the last focus interval.
     text_cursor: Option<Rect>,
     appearance: Appearance,
     config: ConfigHandle,
@@ -1106,62 +1109,37 @@ impl WaylandWindowInner {
             self.events.dispatch(WindowEvent::MouseEvent(event));
         }
 
-        if let Some((value_x, value_y)) = PendingMouse::scroll(&pending_mouse) {
-            let factor = self.get_dpi_factor() as f64;
-
-            if value_x.signum() != self.hscroll_remainder.signum() {
-                // reset accumulator when changing scroll direction
-                self.hscroll_remainder = 0.0;
-            }
-            let scaled_x = (value_x * factor) + self.hscroll_remainder;
-            let discrete_x = scaled_x.trunc();
-            self.hscroll_remainder = scaled_x - discrete_x;
-            if scaled_x.abs() > f64::EPSILON {
-                let event = MouseEvent {
-                    kind: MouseEventKind::HorzWheel(-discrete_x as i16),
-                    coords: self.last_mouse_coords,
-                    screen_coords: ScreenPoint::new(
-                        self.last_mouse_coords.x + self.dimensions.pixel_width as isize,
-                        self.last_mouse_coords.y + self.dimensions.pixel_height as isize,
-                    ),
-                    mouse_buttons: self.mouse_buttons,
-                    modifiers: self.modifiers,
-                    precise_scroll_delta: Some(PreciseScrollDelta {
-                        x: -scaled_x as f32,
-                        y: 0.0,
-                    }),
-                    scroll_phase: None,
-                    momentum_phase: None,
-                    precise_wheel_lines: None,
-                };
-                self.events.dispatch(WindowEvent::MouseEvent(event));
-            }
-
-            if value_y.signum() != self.vscroll_remainder.signum() {
-                self.vscroll_remainder = 0.0;
-            }
-            let scaled_y = (value_y * factor) + self.vscroll_remainder;
-            let discrete_y = scaled_y.trunc();
-            self.vscroll_remainder = scaled_y - discrete_y;
-            if scaled_y.abs() > f64::EPSILON {
-                let event = MouseEvent {
-                    kind: MouseEventKind::VertWheel(-discrete_y as i16),
-                    coords: self.last_mouse_coords,
-                    screen_coords: ScreenPoint::new(
-                        self.last_mouse_coords.x + self.dimensions.pixel_width as isize,
-                        self.last_mouse_coords.y + self.dimensions.pixel_height as isize,
-                    ),
-                    mouse_buttons: self.mouse_buttons,
-                    modifiers: self.modifiers,
-                    precise_scroll_delta: Some(PreciseScrollDelta {
-                        x: 0.0,
-                        y: -scaled_y as f32,
-                    }),
-                    scroll_phase: None,
-                    momentum_phase: None,
-                    precise_wheel_lines: None,
-                };
-                self.events.dispatch(WindowEvent::MouseEvent(event));
+        if let Some(scroll) = PendingMouse::scroll(&pending_mouse) {
+            let factor = self.get_dpi_factor();
+            let horizontal = scroll
+                .horizontal
+                .deltas(factor, &mut self.hscroll_remainder);
+            let vertical = scroll.vertical.deltas(factor, &mut self.vscroll_remainder);
+            for (is_horizontal, deltas) in [(true, horizontal), (false, vertical)] {
+                for delta in deltas.iter().flatten() {
+                    let event = MouseEvent {
+                        kind: if is_horizontal {
+                            MouseEventKind::HorzWheel(delta.amount)
+                        } else {
+                            MouseEventKind::VertWheel(delta.amount)
+                        },
+                        coords: self.last_mouse_coords,
+                        screen_coords: ScreenPoint::new(
+                            self.last_mouse_coords.x + self.dimensions.pixel_width as isize,
+                            self.last_mouse_coords.y + self.dimensions.pixel_height as isize,
+                        ),
+                        mouse_buttons: self.mouse_buttons,
+                        modifiers: self.modifiers,
+                        precise_scroll_delta: delta.pixels.map(|pixels| PreciseScrollDelta {
+                            x: if is_horizontal { pixels } else { 0.0 },
+                            y: if is_horizontal { 0.0 } else { pixels },
+                        }),
+                        scroll_phase: None,
+                        momentum_phase: None,
+                        precise_wheel_lines: None,
+                    };
+                    self.events.dispatch(WindowEvent::MouseEvent(event));
+                }
             }
         }
 
@@ -1381,33 +1359,35 @@ impl WaylandWindowInner {
     }
 
     fn set_text_cursor_position(&mut self, rect: Rect) {
+        if self.text_cursor.replace(rect) == Some(rect) {
+            return;
+        }
         let conn = WaylandConnection::get().unwrap().wayland();
         let state = conn.wayland_state.borrow();
-        let surface = self.surface().clone();
-        let active_surface_id = state.active_surface_id.borrow();
-        let surface_id = surface.id();
+        let surface = self.surface();
+        if let Some(input) = state
+            .text_input
+            .as_ref()
+            .and_then(|text_input| text_input.get_text_input_for_surface(surface))
+        {
+            self.send_text_cursor_rectangle(&input, SurfaceUserData::from_wl(surface));
+            input.commit();
+        }
+    }
 
-        if let Some(active_surface_id) = active_surface_id.as_ref() {
-            if surface_id == active_surface_id.clone() {
-                if self.text_cursor.map(|prior| prior != rect).unwrap_or(true) {
-                    self.text_cursor.replace(rect);
-
-                    let surface_udata = SurfaceUserData::from_wl(&surface);
-                    let factor = surface_udata.surface_data().scale_factor();
-
-                    if let Some(text_input) = &state.text_input {
-                        if let Some(input) = text_input.get_text_input_for_surface(&surface) {
-                            input.set_cursor_rectangle(
-                                rect.min_x() as i32 / factor,
-                                rect.min_y() as i32 / factor,
-                                rect.width() as i32 / factor,
-                                rect.height() as i32 / factor,
-                            );
-                            input.commit();
-                        }
-                    }
-                }
-            }
+    pub(super) fn send_text_cursor_rectangle(
+        &self,
+        input: &ZwpTextInputV3,
+        surface: &SurfaceUserData,
+    ) {
+        if let Some(rect) = self.text_cursor {
+            let factor = surface.surface_data().scale_factor();
+            input.set_cursor_rectangle(
+                rect.min_x() as i32 / factor,
+                rect.min_y() as i32 / factor,
+                rect.width() as i32 / factor,
+                rect.height() as i32 / factor,
+            );
         }
     }
 
@@ -1575,7 +1555,6 @@ impl WaylandWindowInner {
         mapper.update_modifier_state(0, 0, 0, 0);
         self.key_repeat.take();
         self.events.dispatch(WindowEvent::FocusChanged(focused));
-        self.text_cursor.take();
     }
 
     pub(crate) fn appearance_changed(&mut self, appearance: Appearance) {

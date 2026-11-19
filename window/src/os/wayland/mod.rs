@@ -13,5 +13,6 @@ mod drag_and_drop;
 mod data_device;
 mod keyboard;
 mod pointer;
+mod scroll;
 mod seat;
 mod state;

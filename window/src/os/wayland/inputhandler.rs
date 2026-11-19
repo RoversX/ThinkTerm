@@ -1,12 +1,10 @@
 //! Implements zwp_text_input_v3 for handling IME
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use smithay_client_toolkit::globals::GlobalData;
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::{BindError, GlobalList};
-use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Dispatch, Proxy, QueueHandle};
@@ -19,24 +17,18 @@ use wezterm_input_types::{KeyCode, KeyEvent, KeyboardLedStatus, Modifiers};
 use crate::{DeadKeyStatus, WindowEvent};
 
 use super::state::WaylandState;
+use super::window::SurfaceUserData;
 
-#[derive(Clone, Default, Debug)]
+#[derive(Default)]
 struct PendingState {
+    surface: Option<WlSurface>,
     pre_edit: Option<String>,
     commit: Option<String>,
 }
 
 pub(super) struct TextInputState {
     text_input_manager: ZwpTextInputManagerV3,
-    inner: Mutex<Inner>,
-}
-
-#[derive(Debug, Default)]
-struct Inner {
     input_by_seat: HashMap<ObjectId, ZwpTextInputV3>,
-    keyboard_to_seat: HashMap<ObjectId, ObjectId>,
-    surface_to_keyboard: HashMap<ObjectId, ObjectId>,
-    pending_state: HashMap<ObjectId, PendingState>,
 }
 
 impl TextInputState {
@@ -47,76 +39,32 @@ impl TextInputState {
         let text_input_manager = globals.bind(queue_handle, 1..=1, GlobalData)?;
         Ok(Self {
             text_input_manager,
-            inner: Mutex::new(Inner::default()),
+            input_by_seat: HashMap::new(),
         })
     }
 
-    pub fn get_text_input_for_keyboard(&self, keyboard: &WlKeyboard) -> Option<ZwpTextInputV3> {
-        let inner = self.inner.lock().unwrap();
-        let keyboard_id = keyboard.id();
-        let seat_id = inner.keyboard_to_seat.get(&keyboard_id)?;
-        inner.input_by_seat.get(&seat_id).cloned()
-    }
-
     pub(super) fn get_text_input_for_surface(&self, surface: &WlSurface) -> Option<ZwpTextInputV3> {
-        let inner = self.inner.lock().unwrap();
-        let surface_id = surface.id();
-        let keyboard_id = inner.surface_to_keyboard.get(&surface_id)?;
-        let seat_id = inner.keyboard_to_seat.get(&keyboard_id)?;
-        inner.input_by_seat.get(&seat_id).cloned()
+        self.input_by_seat
+            .values()
+            .find(|input| {
+                input.data::<TextInputData>().is_some_and(|data| {
+                    data.pending.lock().unwrap().surface.as_ref() == Some(surface)
+                })
+            })
+            .cloned()
     }
 
-    fn get_text_input_for_seat(
-        &self,
-        seat: &WlSeat,
-        qh: &QueueHandle<WaylandState>,
-    ) -> Option<ZwpTextInputV3> {
-        let mgr = &self.text_input_manager;
-        let mut inner = self.inner.lock().unwrap();
-        let seat_id = seat.id();
-        let input = inner.input_by_seat.entry(seat_id).or_insert_with(|| {
-            let input = mgr.get_text_input(seat, &qh, TextInputData::default());
-            input.into()
-        });
-        Some(input.clone())
-    }
-
-    pub(super) fn advise_surface(&self, surface: &WlSurface, keyboard: &WlKeyboard) {
-        let surface_id = surface.id();
-        let keyboard_id = keyboard.id();
-        self.inner
-            .lock()
-            .unwrap()
-            .surface_to_keyboard
-            .insert(surface_id, keyboard_id);
-    }
-
-    pub(super) fn advise_seat(
-        &self,
-        seat: &WlSeat,
-        keyboard: &WlKeyboard,
-        qh: &QueueHandle<WaylandState>,
-    ) {
-        self.get_text_input_for_seat(seat, qh);
-        let keyboard_id = keyboard.id();
-        let seat_id = seat.id();
-        self.inner
-            .lock()
-            .unwrap()
-            .keyboard_to_seat
-            .insert(keyboard_id, seat_id);
+    pub(super) fn advise_seat(&mut self, seat: &WlSeat, qh: &QueueHandle<WaylandState>) {
+        let manager = &self.text_input_manager;
+        self.input_by_seat
+            .entry(seat.id())
+            .or_insert_with(|| manager.get_text_input(seat, qh, TextInputData::default()));
     }
 
     /// Workaround for <https://gitlab.gnome.org/GNOME/gnome-shell/-/issues/4776>
     /// If we make sure to disable things before we close the app,
     /// mutter is less likely to get in a bad state
     pub fn shutdown(&self) {
-        self.inner.lock().unwrap().disable_all();
-    }
-}
-
-impl Inner {
-    fn disable_all(&mut self) {
         for input in self.input_by_seat.values() {
             input.disable();
             input.commit();
@@ -126,12 +74,8 @@ impl Inner {
 
 #[derive(Default)]
 pub(super) struct TextInputData {
-    // XXX: inner could probably be moved here
-    _inner: Mutex<TextInputDataInner>,
+    pending: Mutex<PendingState>,
 }
-
-#[derive(Default)]
-pub(super) struct TextInputDataInner {}
 
 impl Dispatch<ZwpTextInputManagerV3, GlobalData, WaylandState> for TextInputState {
     fn event(
@@ -152,35 +96,63 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
         state: &mut WaylandState,
         input: &ZwpTextInputV3,
         event: <ZwpTextInputV3 as Proxy>::Event,
-        _data: &TextInputData,
+        data: &TextInputData,
         _conn: &wayland_client::Connection,
         _qhandle: &QueueHandle<WaylandState>,
     ) {
         log::trace!("ZwpTextInputEvent: {event:?}");
-        let mut pending_state = {
-            let text_input = state.text_input.as_mut().unwrap();
-            let mut inner = text_input.inner.lock().unwrap();
-            inner.pending_state.entry(input.id()).or_default().clone()
-        };
-
         match event {
+            // enter establishes a new text-input focus interval. Requests
+            // before it may have been ignored, even with keyboard focus.
+            TextInputEvent::Enter { surface } => {
+                *data.pending.lock().unwrap() = PendingState {
+                    surface: Some(surface.clone()),
+                    ..PendingState::default()
+                };
+                input.enable();
+                if let Some(surface_data) = SurfaceUserData::try_from_wl(&surface) {
+                    if let Some(window) = state.window_by_id(surface_data.window_id) {
+                        window
+                            .borrow()
+                            .send_text_cursor_rectangle(input, surface_data);
+                    }
+                }
+                input.commit();
+            }
+            TextInputEvent::Leave { surface } => {
+                *data.pending.lock().unwrap() = PendingState::default();
+                state.dispatch_text_input_event(
+                    &surface,
+                    WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None),
+                );
+            }
             TextInputEvent::PreeditString {
                 text,
                 cursor_begin: _,
                 cursor_end: _,
             } => {
-                pending_state.pre_edit = text;
+                data.pending.lock().unwrap().pre_edit = text;
             }
             TextInputEvent::CommitString { text } => {
-                pending_state.commit = text;
-                state.dispatch_to_focused_window(WindowEvent::AdviseDeadKeyStatus(
-                    DeadKeyStatus::None,
-                ));
+                data.pending.lock().unwrap().commit = text;
             }
             TextInputEvent::Done { serial } => {
                 *state.last_serial.borrow_mut() = serial;
-                if let Some(text) = pending_state.commit.take() {
-                    state.dispatch_to_focused_window(WindowEvent::KeyEvent(KeyEvent {
+                let (surface, commit, pre_edit) = {
+                    let mut pending = data.pending.lock().unwrap();
+                    (
+                        pending.surface.clone(),
+                        pending.commit.take(),
+                        pending.pre_edit.take(),
+                    )
+                };
+                let Some(surface) = surface else { return };
+                if let Some(text) = commit {
+                    state.dispatch_text_input_event(
+                        &surface,
+                        WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None),
+                    );
+                    state.dispatch_text_input_event(&surface, WindowEvent::KeyEvent(KeyEvent {
                         key: KeyCode::composed(&text),
                         modifiers: Modifiers::NONE,
                         leds: KeyboardLedStatus::empty(),
@@ -189,35 +161,24 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
                         raw: None,
                     }));
                 }
-                let status = if let Some(text) = pending_state.pre_edit.take() {
+                let status = if let Some(text) = pre_edit {
                     DeadKeyStatus::Composing(text)
                 } else {
                     DeadKeyStatus::None
                 };
-                state.dispatch_to_focused_window(WindowEvent::AdviseDeadKeyStatus(status));
+                state.dispatch_text_input_event(&surface, WindowEvent::AdviseDeadKeyStatus(status));
             }
             _ => {}
         }
-
-        state
-            .text_input
-            .as_ref()
-            .unwrap()
-            .inner
-            .lock()
-            .unwrap()
-            .pending_state
-            .insert(input.id(), pending_state);
     }
 }
 
 impl WaylandState {
-    fn dispatch_to_focused_window(&self, event: WindowEvent) {
-        if let Some(&window_id) = self.keyboard_window_id.borrow().as_ref() {
-            if let Some(win) = self.window_by_id(window_id) {
-                let mut inner = win.borrow_mut();
-                inner.events.dispatch(event);
-            }
+    fn dispatch_text_input_event(&self, surface: &WlSurface, event: WindowEvent) {
+        if let Some(win) = SurfaceUserData::try_from_wl(surface)
+            .and_then(|surface| self.window_by_id(surface.window_id))
+        {
+            win.borrow_mut().events.dispatch(event);
         }
     }
 }
