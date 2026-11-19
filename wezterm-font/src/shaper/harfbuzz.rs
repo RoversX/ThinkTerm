@@ -76,6 +76,27 @@ struct FontPair {
     last_fruitless: Cell<Instant>,
 }
 
+/// Keep combining sequences intact when a system fallback owns only part
+/// of the run. Returned byte offsets still refer to the original text.
+fn assigned_runs<'a>(
+    text: &'a str,
+    mut offset: usize,
+    assigned: &'a rangeset::RangeSet<u32>,
+) -> impl Iterator<Item = (Range<usize>, bool)> + 'a {
+    let mut graphemes = Graphemes::new(text)
+        .map(|g| (g.len(), g.chars().any(|c| assigned.contains(c as u32))))
+        .peekable();
+    std::iter::from_fn(move || {
+        let (len, allowed) = graphemes.next()?;
+        let start = offset;
+        offset += len;
+        while let Some((len, _)) = graphemes.next_if(|(_, next)| *next == allowed) {
+            offset += len;
+        }
+        Some((start..offset, allowed))
+    })
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct MetricsKey {
     font_idx: usize,
@@ -185,6 +206,21 @@ fn presentation_of(handle: &ParsedFont) -> Presentation {
 }
 
 impl HarfbuzzShaper {
+    pub(crate) fn extend_fallback_coverage(
+        &mut self,
+        index: FallbackIdx,
+        chars: &rangeset::RangeSet<u32>,
+    ) {
+        self.handles[index]
+            .system_fallback_for
+            .as_mut()
+            .unwrap()
+            .add_set(chars);
+        self.missing[index]
+            .get_mut()
+            .retain(|c| !chars.contains(*c as u32));
+    }
+
     pub fn new(config: &ConfigHandle, handles: &[ParsedFont]) -> anyhow::Result<Self> {
         let lib = ftwrap::Library::new()?;
         let handles = handles.to_vec();
@@ -396,6 +432,43 @@ impl HarfbuzzShaper {
                     continue;
                 }
             }
+            if let Some(assigned) = self
+                .handles
+                .get(font_idx)
+                .filter(|_| !no_more_fallbacks)
+                .and_then(|h| h.system_fallback_for.as_ref())
+            {
+                let mut runs = assigned_runs(&s[range.clone()], range.start, assigned).peekable();
+                if let Some((first, allowed)) = runs.next() {
+                    if runs.peek().is_some() {
+                        let mut runs: Vec<_> =
+                            std::iter::once((first, allowed)).chain(runs).collect();
+                        if direction == Direction::RightToLeft {
+                            runs.reverse();
+                        }
+                        let mut glyphs = Vec::new();
+                        for (span, allowed) in runs {
+                            let next = if allowed { font_idx } else { font_idx + 1 };
+                            glyphs.extend(self.do_shape(
+                                next,
+                                s,
+                                font_size,
+                                dpi,
+                                no_glyphs,
+                                presentation,
+                                direction,
+                                span,
+                                presentation_width,
+                            )?);
+                        }
+                        return Ok(glyphs);
+                    }
+                    if !allowed {
+                        font_idx += 1;
+                        continue;
+                    }
+                }
+            }
             match self.load_fallback(font_idx, dpi).context("load_fallback")? {
                 Some(mut pair) => {
                     let point_size = font_size * self.handles[font_idx].scale.unwrap_or(1.);
@@ -441,7 +514,7 @@ impl HarfbuzzShaper {
                     break;
                 }
                 None => {
-                    for c in s.chars() {
+                    for c in s[range.clone()].chars() {
                         no_glyphs.push(c);
                     }
 
@@ -1460,6 +1533,94 @@ mod test {
             )
             .unwrap();
         (info, no_glyphs)
+    }
+
+    #[test]
+    fn extending_an_installed_fallback_keeps_the_shaper_and_updates_its_assignments(
+    ) -> anyhow::Result<()> {
+        let _turn = crate::harfbuzz_turn();
+        let config = ConfigHandle::default_config();
+        let fonts = crate::FontConfiguration::new(Some(config.clone()), 96)?;
+        let loaded = fonts.terminal_font_uncached(&config, 12.)?;
+        let mut faces = emoji_last();
+        let base = faces.pop().unwrap();
+        let mut fallback = faces.remove(0);
+        let assignment = |c: char| {
+            let mut assigned = rangeset::RangeSet::new();
+            assigned.add(c as u32);
+            Some(Box::new(assigned))
+        };
+        fallback.system_fallback_for = assignment('A');
+        let initial = vec![base, fallback.clone()];
+        *loaded.shaper.borrow_mut() = crate::shaper::new_native_shaper(&config, &initial)?;
+        *loaded.handles.borrow_mut() = initial;
+        let shape = |text: &str| {
+            loaded.shape(
+                text,
+                |_| {},
+                |_| {},
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+        };
+        assert_eq!(shape("A")?[0].font_idx, 1);
+        let original = std::ptr::from_ref(&**loaded.shaper.borrow()).cast::<()>();
+        for c in ['B', 'D'] {
+            fallback.system_fallback_for = assignment(c);
+            loaded
+                .pending_fallback
+                .lock()
+                .unwrap()
+                .push(fallback.clone());
+            assert_eq!(shape(&c.to_string())?[0].font_idx, 1);
+            assert_eq!(
+                original,
+                std::ptr::from_ref(&**loaded.shaper.borrow()).cast::<()>()
+            );
+        }
+        assert_eq!(
+            shape("ABD")?.iter().map(|g| g.font_idx).collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_system_faces_shape_only_their_assigned_graphemes() {
+        let _turn = crate::harfbuzz_turn();
+        let mut faces = emoji_last();
+        // Roboto and JetBrains Mono both contain A and B.
+        for (face, letter) in faces.iter_mut().take(2).zip(['A', 'B']) {
+            face.system_fallback_for
+                .get_or_insert_with(Default::default)
+                .add(letter as u32);
+        }
+        let shaper = HarfbuzzShaper::new(&ConfigHandle::default_config(), &faces).unwrap();
+        for (text, direction, expected) in [
+            ("AB", Direction::LeftToRight, vec![(0, 0), (1, 1)]),
+            ("BA", Direction::LeftToRight, vec![(0, 1), (1, 0)]),
+            ("AB", Direction::RightToLeft, vec![(1, 1), (0, 0)]),
+        ] {
+            let mut missing = vec![];
+            let shaped = shaper
+                .shape(text, 12., 96, &mut missing, None, direction, None, None)
+                .unwrap();
+            assert!(missing.is_empty());
+            assert_eq!(
+                shaped
+                    .iter()
+                    .map(|g| (g.cluster, g.font_idx))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let assigned = faces[0].system_fallback_for.as_ref().unwrap();
+        assert_eq!(
+            assigned_runs("A\u{301}B", 2, assigned).collect::<Vec<_>>(),
+            [(2..5, true), (5..6, false)]
+        );
     }
 
     /// Fallbacks seen without a run's characters are passed over the next

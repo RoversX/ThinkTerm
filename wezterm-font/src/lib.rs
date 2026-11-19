@@ -2,7 +2,7 @@ use crate::db::FontDatabase;
 use crate::locator::{new_locator, FontLocator};
 use crate::parser::ParsedFont;
 use crate::rasterizer::{new_rasterizer, FontRasterizer};
-use crate::shaper::{new_shaper, FontShaper, PresentationWidth};
+use crate::shaper::{harfbuzz::HarfbuzzShaper, new_native_shaper, FontShaper, PresentationWidth};
 use anyhow::{Context, Error};
 use config::{
     configuration, BoldBrightening, ConfigHandle, DisplayPixelGeometry, FontAttributes,
@@ -81,17 +81,34 @@ const FALLBACK_RESOLVE_MEMO_CAP: usize = 512;
 struct FallbackResolveMemo {
     generation: usize,
     entries: HashMap<Vec<char>, Vec<ParsedFont>>,
+    system_entries: HashMap<Vec<char>, Vec<ParsedFont>>,
 }
 
 impl FallbackResolveMemo {
-    fn get(&self, generation: usize, chars: &[char]) -> Option<Vec<ParsedFont>> {
+    fn get(
+        &self,
+        generation: usize,
+        chars: &[char],
+        prefer_system: bool,
+    ) -> Option<Vec<ParsedFont>> {
         if self.generation != generation {
             return None;
         }
-        self.entries.get(chars).cloned()
+        let entries = if prefer_system {
+            &self.system_entries
+        } else {
+            &self.entries
+        };
+        entries.get(chars).cloned()
     }
 
-    fn insert(&mut self, generation: usize, chars: Vec<char>, handles: Vec<ParsedFont>) {
+    fn insert(
+        &mut self,
+        generation: usize,
+        chars: Vec<char>,
+        handles: Vec<ParsedFont>,
+        prefer_system: bool,
+    ) {
         // Async resolves can complete out of order across a config reload;
         // a straggler from an older generation must not clear the newer
         // entries or roll the generation back.
@@ -100,20 +117,39 @@ impl FallbackResolveMemo {
         }
         if generation > self.generation {
             self.entries.clear();
+            self.system_entries.clear();
             self.generation = generation;
-        } else if self.entries.len() >= FALLBACK_RESOLVE_MEMO_CAP
-            && !self.entries.contains_key(&chars)
+        } else if self.entries.len() + self.system_entries.len() >= FALLBACK_RESOLVE_MEMO_CAP
+            && !(if prefer_system {
+                &self.system_entries
+            } else {
+                &self.entries
+            })
+            .contains_key(&chars)
         {
             self.entries.clear();
+            self.system_entries.clear();
         }
-        self.entries.insert(chars, handles);
+        let entries = if prefer_system {
+            &mut self.system_entries
+        } else {
+            &mut self.entries
+        };
+        entries.insert(chars, handles);
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum FallbackChange {
+    Unchanged,
+    ExtendedCoverage,
+    AddedFaces,
 }
 
 pub struct LoadedFont {
     rasterizers: RefCell<HashMap<FallbackIdx, Box<dyn FontRasterizer>>>,
     handles: RefCell<Vec<ParsedFont>>,
-    shaper: RefCell<Box<dyn FontShaper>>,
+    shaper: RefCell<Box<HarfbuzzShaper>>,
     metrics: FontMetrics,
     pixel_geometry: DisplayPixelGeometry,
     font_size: f64,
@@ -153,27 +189,52 @@ impl LoadedFont {
         self.id
     }
 
-    fn insert_fallback_handles(&self, extra_handles: Vec<ParsedFont>) -> anyhow::Result<bool> {
-        let mut loaded = false;
-        {
-            let mut handles = self.handles.borrow_mut();
-            for h in extra_handles {
-                if !handles.iter().any(|existing| *existing == h) {
-                    handles.push(h);
-                    loaded = true;
+    fn insert_fallback_handles(
+        &self,
+        extra_handles: Vec<ParsedFont>,
+    ) -> anyhow::Result<FallbackChange> {
+        let mut handles = self.handles.borrow_mut();
+        let original_len = handles.len();
+        let mut change = FallbackChange::Unchanged;
+        for h in extra_handles {
+            if let Some(chars) = &h.system_fallback_for {
+                if let Some(index) = handles.iter().position(|e| e.handle == h.handle) {
+                    if let Some(assigned) = handles[index].system_fallback_for.as_mut() {
+                        let added = chars.difference(assigned);
+                        if !added.is_empty() {
+                            assigned.add_set(&added);
+                            if index < original_len {
+                                self.shaper
+                                    .borrow_mut()
+                                    .extend_fallback_coverage(index, &added);
+                                change = FallbackChange::ExtendedCoverage;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            } else if handles.contains(&h) {
+                continue;
+            }
+            handles.push(h);
+        }
+        if handles.len() != original_len {
+            if let Some(font_config) = self.font_config.upgrade() {
+                match new_native_shaper(&font_config.config.borrow(), &handles) {
+                    Ok(shaper) => {
+                        *self.shaper.borrow_mut() = shaper;
+                        log::trace!("revised fallback: {:#?}", handles);
+                        return Ok(FallbackChange::AddedFaces);
+                    }
+                    Err(err) => {
+                        handles.truncate(original_len);
+                        return Err(err);
+                    }
                 }
             }
-            if loaded {
-                log::trace!("revised fallback: {:#?}", handles);
-            }
+            handles.truncate(original_len);
         }
-        if loaded {
-            if let Some(font_config) = self.font_config.upgrade() {
-                *self.shaper.borrow_mut() =
-                    new_shaper(&*font_config.config.borrow(), &self.handles.borrow())?;
-            }
-        }
-        Ok(loaded)
+        Ok(change)
     }
 
     pub fn blocking_shape(
@@ -253,8 +314,9 @@ impl LoadedFont {
                 let mut pending = self.pending_fallback.lock().unwrap();
                 if !pending.is_empty() {
                     match self.insert_fallback_handles(pending.split_off(0)) {
-                        Ok(true) => return Err(ClearShapeCache {})?,
-                        Ok(false) => {}
+                        Ok(FallbackChange::AddedFaces) => return Err(ClearShapeCache {})?,
+                        // The completion callback already evicts runs containing the resolved characters.
+                        Ok(FallbackChange::ExtendedCoverage | FallbackChange::Unchanged) => {}
                         Err(err) => {
                             log::error!("Error adding fallback: {:#}", err);
                         }
@@ -292,7 +354,7 @@ impl LoadedFont {
                     let memo = FALLBACK_RESOLVE_MEMO
                         .lock()
                         .unwrap()
-                        .get(generation, &no_glyphs);
+                        .get(generation, &no_glyphs, font_config.config.borrow().fontconfig_prefer_system_fallback);
                     if let Some(handles) = memo {
                         consulted_memo = true;
                         let inserted = if handles.is_empty() {
@@ -300,8 +362,8 @@ impl LoadedFont {
                         } else {
                             self.insert_fallback_handles(handles).unwrap_or_else(|err| {
                                 log::error!("Error adding memoized fallback: {:#}", err);
-                                false
-                            })
+                                FallbackChange::Unchanged
+                            }) != FallbackChange::Unchanged
                         };
                         if inserted {
                             continue;
@@ -418,7 +480,10 @@ impl FallbackResolveInfo {
             fallback_str.escape_unicode()
         );
 
-        match self.locator.locate_fallback_for_codepoints(&self.no_glyphs) {
+        match self
+            .locator
+            .locate_fallback_with_config(&self.no_glyphs, &self.config)
+        {
             Ok(ref mut handles) => extra_handles.append(handles),
             Err(err) => log::error!(
                 "Error: {:#} while resolving fallback for {} from font-locator",
@@ -464,14 +529,19 @@ impl FallbackResolveInfo {
         );
 
         if wanted.len() > 1 && self.config.sort_fallback_fonts_by_coverage {
-            // Sort by ascending coverage
-            extra_handles.sort_by_cached_key(|p| {
+            // Fontconfig has already selected the preferred face for each
+            // assigned character. Rank the remaining candidates by coverage.
+            let system = extra_handles
+                .iter()
+                .take_while(|p| p.system_fallback_for.is_some())
+                .count();
+            extra_handles[system..].sort_by_cached_key(|p| {
                 p.coverage_intersection(&wanted)
                     .map(|r| r.len())
                     .unwrap_or(0)
             });
             // Re-arrange to descending coverage
-            extra_handles.reverse();
+            extra_handles[system..].reverse();
             log::trace!(
                 "Fallback fonts that match {} after sorting are: {:#?}",
                 fallback_str.escape_unicode(),
@@ -498,12 +568,18 @@ impl FallbackResolveInfo {
             self.config.generation(),
             memo_glyphs.clone(),
             extra_handles.clone(),
+            self.config.fontconfig_prefer_system_fallback,
         );
 
         if !extra_handles.is_empty() {
             let mut pending = self.pending.lock().unwrap();
             pending.append(&mut extra_handles);
-            (self.completion)(&memo_glyphs);
+            drop(pending);
+            let mut resolved = memo_glyphs;
+            if !wanted.is_empty() {
+                resolved.retain(|c| !wanted.contains(*c as u32));
+            }
+            (self.completion)(&resolved);
         }
 
         if !wanted.is_empty() {
@@ -825,7 +901,7 @@ impl FontConfigInner {
         let attributes = text_style.font_with_fallback();
         let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
 
-        let shaper = new_shaper(config, &handles)?;
+        let shaper = new_native_shaper(config, &handles)?;
 
         let metrics = shaper.metrics(font_size, dpi).with_context(|| {
             format!(
@@ -1029,7 +1105,7 @@ impl FontConfigInner {
         style: &TextStyle,
         config: &ConfigHandle,
         pixel_size: u16,
-    ) -> anyhow::Result<(Box<dyn FontShaper>, Vec<ParsedFont>)> {
+    ) -> anyhow::Result<(Box<HarfbuzzShaper>, Vec<ParsedFont>)> {
         let attributes = style.font_with_fallback();
 
         let (handles, loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
@@ -1082,7 +1158,7 @@ impl FontConfigInner {
             }
         }
 
-        Ok((new_shaper(&*config, &handles)?, handles))
+        Ok((new_native_shaper(config, &handles)?, handles))
     }
 
     /// Given a text style, load (with caching) the font that best
@@ -1507,33 +1583,60 @@ mod fallback_memo_test {
     use super::*;
 
     #[test]
-    fn memo_is_scoped_to_one_generation_and_bounded() {
+    fn fallback_policies_do_not_share_answers_at_the_same_generation() {
         let mut memo = FallbackResolveMemo::default();
-        memo.insert(1, vec!['a'], vec![]);
-        assert!(memo.get(1, &['a']).is_some());
-        assert!(memo.get(2, &['a']).is_none(), "other generations must miss");
-
-        memo.insert(2, vec!['b'], vec![]);
-        assert!(
-            memo.get(1, &['a']).is_none(),
-            "a new generation drops the old one's entries"
-        );
-        assert!(memo.get(2, &['b']).is_some());
-
-        memo.insert(1, vec!['c'], vec![]);
-        assert!(
-            memo.get(2, &['b']).is_some(),
-            "a straggler from an older generation must not clear newer entries"
-        );
-        assert!(memo.get(1, &['c']).is_none());
-        assert!(memo.get(2, &['c']).is_none());
+        memo.insert(1, vec!['中'], vec![], false);
+        assert!(memo.get(1, &['中'], false).is_some());
+        assert!(memo.get(1, &['中'], true).is_none());
+        memo.insert(1, vec!['中'], vec![], true);
+        assert!(memo.get(1, &['中'], true).is_some());
+        assert!(memo.get(1, &['中'], false).is_some());
 
         for n in 0..FALLBACK_RESOLVE_MEMO_CAP as u32 {
-            memo.insert(2, vec![char::from_u32(0x4e00 + n).unwrap()], vec![]);
+            memo.insert(
+                1,
+                vec![char::from_u32(0x4e01 + n).unwrap()],
+                vec![],
+                n % 2 == 0,
+            );
+            assert!(memo.entries.len() + memo.system_entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
+        }
+        memo.insert(2, vec!['新'], vec![], false);
+        assert!(memo.system_entries.is_empty());
+        assert!(memo.get(2, &['中'], false).is_none());
+    }
+
+    #[test]
+    fn memo_is_scoped_to_one_generation_and_bounded() {
+        let mut memo = FallbackResolveMemo::default();
+        memo.insert(1, vec!['a'], vec![], false);
+        assert!(memo.get(1, &['a'], false).is_some());
+        assert!(
+            memo.get(2, &['a'], false).is_none(),
+            "other generations must miss"
+        );
+
+        memo.insert(2, vec!['b'], vec![], false);
+        assert!(
+            memo.get(1, &['a'], false).is_none(),
+            "a new generation drops the old one's entries"
+        );
+        assert!(memo.get(2, &['b'], false).is_some());
+
+        memo.insert(1, vec!['c'], vec![], false);
+        assert!(
+            memo.get(2, &['b'], false).is_some(),
+            "a straggler from an older generation must not clear newer entries"
+        );
+        assert!(memo.get(1, &['c'], false).is_none());
+        assert!(memo.get(2, &['c'], false).is_none());
+
+        for n in 0..FALLBACK_RESOLVE_MEMO_CAP as u32 {
+            memo.insert(2, vec![char::from_u32(0x4e00 + n).unwrap()], vec![], false);
         }
         assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
-        memo.insert(2, vec!['z'], vec![]);
-        assert!(memo.get(2, &['z']).is_some());
+        memo.insert(2, vec!['z'], vec![], false);
+        assert!(memo.get(2, &['z'], false).is_some());
         assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
     }
 }

@@ -28,6 +28,9 @@ pub struct ParsedFont {
     style: FontStyle,
     cap_height: Option<f64>,
     pub handle: FontDataHandle,
+    /// Characters for which the opt-in Fontconfig lookup chose this face.
+    /// Its physical cmap may also cover characters that prefer another face.
+    pub(crate) system_fallback_for: Option<Box<RangeSet<u32>>>,
     coverage: Mutex<RangeSet<u32>>,
     pub synthesize_italic: bool,
     pub synthesize_bold: bool,
@@ -79,6 +82,7 @@ impl Clone for ParsedFont {
             synthesize_dim: self.synthesize_dim,
             assume_emoji_presentation: self.assume_emoji_presentation,
             handle: self.handle.clone(),
+            system_fallback_for: self.system_fallback_for.clone(),
             cap_height: self.cap_height,
             coverage: Mutex::new(self.coverage.lock().unwrap().clone()),
             pixel_sizes: self.pixel_sizes.clone(),
@@ -521,6 +525,7 @@ impl ParsedFont {
             is_built_in_fallback: false,
             assume_emoji_presentation,
             handle,
+            system_fallback_for: None,
             coverage: Mutex::new(RangeSet::new()),
             cap_height,
             pixel_sizes,
@@ -538,6 +543,9 @@ impl ParsedFont {
     /// Computes the codepoint coverage for this font entry if we haven't
     /// already done so.
     pub fn coverage_intersection(&self, wanted: &RangeSet<u32>) -> anyhow::Result<RangeSet<u32>> {
+        if let Some(assigned) = &self.system_fallback_for {
+            return Ok(wanted.intersection(assigned));
+        }
         let mut cov = self.coverage.lock().unwrap();
         if cov.is_empty() {
             let t = std::time::Instant::now();

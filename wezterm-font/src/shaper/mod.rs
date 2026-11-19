@@ -12,6 +12,13 @@ pub fn new_shaper(
     config: &config::ConfigHandle,
     handles: &[ParsedFont],
 ) -> anyhow::Result<Box<dyn FontShaper>> {
+    Ok(new_native_shaper(config, handles)?)
+}
+
+pub(crate) fn new_native_shaper(
+    config: &config::ConfigHandle,
+    handles: &[ParsedFont],
+) -> anyhow::Result<Box<harfbuzz::HarfbuzzShaper>> {
     match config.font_shaper {
         FontShaperSelection::Harfbuzz => {
             Ok(Box::new(harfbuzz::HarfbuzzShaper::new(config, handles)?))

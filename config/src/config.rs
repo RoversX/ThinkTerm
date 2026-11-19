@@ -886,6 +886,11 @@ pub struct Config {
     #[dynamic(default)]
     pub search_font_dirs_for_fallback: bool,
 
+    /// Opt in to fontconfig's language-aware fallback order. Off preserves
+    /// the existing font selection on Linux and other fontconfig platforms.
+    #[dynamic(default)]
+    pub fontconfig_prefer_system_fallback: bool,
+
     #[dynamic(default)]
     pub use_cap_height_to_scale_fallback_fonts: bool,
 

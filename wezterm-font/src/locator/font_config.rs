@@ -269,6 +269,18 @@ impl FontLocator for FontConfigFontLocator {
         Ok(fonts)
     }
 
+    fn locate_fallback_with_config(
+        &self,
+        codepoints: &[char],
+        config: &config::ConfigHandle,
+    ) -> anyhow::Result<Vec<ParsedFont>> {
+        if config.fontconfig_prefer_system_fallback {
+            self.locate_system_fallback_for_codepoints(codepoints)
+        } else {
+            self.locate_fallback_for_codepoints(codepoints)
+        }
+    }
+
     fn enumerate_all_fonts(&self) -> anyhow::Result<Vec<ParsedFont>> {
         let mut fonts = vec![];
         let pattern = FontPattern::new()?;
@@ -322,5 +334,98 @@ fn to_fc_weight(w: FontWeight) -> std::os::raw::c_int {
         fcwrap::FC_WEIGHT_BLACK
     } else {
         fcwrap::FC_WEIGHT_EXTRABLACK
+    }
+}
+
+impl FontConfigFontLocator {
+    fn locate_system_fallback_for_codepoints(
+        &self,
+        codepoints: &[char],
+    ) -> anyhow::Result<Vec<ParsedFont>> {
+        log::trace!("locate_fallback_for_codepoints: {:?}", codepoints);
+        let mut fonts: Vec<ParsedFont> = vec![];
+
+        // Fontconfig rules can depend on the requested character. Ask for
+        // its winner even when an earlier character's font also covers it.
+        for &c in codepoints {
+            let mut charset = CharSet::new()?;
+            charset.add(c)?;
+
+            // Respect fontconfig's family and language preferences rather
+            // than taking the first font in cache order that covers the glyph.
+            let mut pattern = FontPattern::new()?;
+            pattern.family("monospace")?;
+            pattern.add_charset(&charset)?;
+            pattern.add_integer("weight", 80)?;
+            pattern.add_integer("slant", 0)?;
+            pattern.config_substitute(fcwrap::MatchKind::Pattern)?;
+            // Fontconfig supplies the default language from FC_LANG or the locale.
+            pattern.default_substitute();
+
+            let mut select = |pat: &FontPattern| -> anyhow::Result<bool> {
+                if pat.charset_intersect_count(&charset)? == 0 {
+                    return Ok(false);
+                }
+                let Ok(file) = pat.get_file() else {
+                    return Ok(false);
+                };
+                let source = FontDataSource::OnDisk(file.into());
+                let index = pat.get_integer("index")?.try_into()?;
+                if let Some(font) = fonts
+                    .iter_mut()
+                    .find(|f| f.handle.source == source && f.handle.index == index)
+                {
+                    font.system_fallback_for
+                        .get_or_insert_with(Default::default)
+                        .add(c as u32);
+                    return Ok(true);
+                }
+                let handle = FontDataHandle {
+                    source,
+                    index,
+                    variation: 0,
+                    origin: FontOrigin::FontConfig,
+                    coverage: pat.get_charset().ok().map(|set| set.to_range_set()),
+                };
+                let Ok(mut font) = ParsedFont::from_locator(&handle) else {
+                    return Ok(false);
+                };
+                font.system_fallback_for
+                    .get_or_insert_with(Default::default)
+                    .add(c as u32);
+                fonts.push(font);
+                Ok(true)
+            };
+
+            let mut pushed = false;
+            for pat in pattern
+                .sort(true)
+                .context("pattern.sort with charset")?
+                .iter()
+            {
+                if select(&pat)? {
+                    pushed = true;
+                    break;
+                }
+            }
+
+            if !pushed {
+                // A fontconfig that trimmed everything (an empty or broken
+                // cache) still has an unsorted answer; take that over none.
+                let mut plain = FontPattern::new()?;
+                plain.add_charset(&charset)?;
+                for pat in plain
+                    .list()
+                    .context("pattern.list with no spacing constraint")?
+                    .iter()
+                {
+                    if select(&pat)? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(fonts)
     }
 }

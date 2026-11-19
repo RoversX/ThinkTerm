@@ -217,6 +217,14 @@ pub trait FontLocator {
         &self,
         codepoints: &[char],
     ) -> anyhow::Result<Vec<ParsedFont>>;
+
+    fn locate_fallback_with_config(
+        &self,
+        codepoints: &[char],
+        _config: &config::ConfigHandle,
+    ) -> anyhow::Result<Vec<ParsedFont>> {
+        self.locate_fallback_for_codepoints(codepoints)
+    }
 }
 
 pub fn new_locator(locator: FontLocatorSelection) -> Arc<dyn FontLocator + Send + Sync> {
