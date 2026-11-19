@@ -166,7 +166,17 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     let core: Core
     /// The host this screen shows; edited in place from the failure card.
-    @Published var host: Host?
+    @Published var host: Host? {
+        didSet {
+            if oldValue?.autoConnect != host?.autoConnect { applyAutoReconnect() }
+        }
+    }
+
+    var autoReconnect: Bool { (host?.autoConnect ?? true) && settings.autoReconnect }
+
+    private func applyAutoReconnect() {
+        core.setSetting(key: "auto-reconnect", value: autoReconnect ? "true" : "false")
+    }
     struct HostKeyChallenge: Identifiable {
         let id: String
         let hostname: String
@@ -257,7 +267,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         settings.$language.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
         // A face is shaped at connect time: the connection is made again.
         settings.$fontFamily.dropFirst().removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
-            guard let self, self.connection.hasPrefix("pane ") else { return }
+            guard let self, self.host?.autoConnect != false, self.connection.hasPrefix("pane ") else { return }
             self.disconnect()
             self.connect()
         }.store(in: &subscriptions)
@@ -390,6 +400,23 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         UserDefaults.standard.set(id, forKey: "client.id")
         return id
     }()
+
+    func applyHostEdit(_ saved: Host, credentialsChanged: Bool, connectOnSave: Bool) {
+        let changed = host?.hostname != saved.hostname || host?.port != saved.port
+            || host?.user != saved.user || host?.auth != saved.auth
+            || host?.remoteCommand != saved.remoteCommand || host?.knownHost != saved.knownHost
+            || credentialsChanged
+        let needsRetry: Bool
+        switch ConnectionPhase(status: connection) {
+        case .failed, .disconnected: needsRetry = true
+        case nil: needsRetry = reconnecting && !autoReconnect
+        default: needsRetry = false
+        }
+        let redial = changed ? (isConnected || connectOnSave) : (connectOnSave && needsRetry)
+        if changed { disconnect() }
+        host = saved
+        if saved.autoConnect && redial { connect() }
+    }
 
     /// Connect to the model's host with the secret from the Keychain.
     func connect() {
@@ -732,7 +759,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         let contrast: Double = ["3": 3, "45": 4.5, "7": 7][settings.contrast] ?? 0
         core.setSetting(key: "min-contrast", value: String(contrast))
         core.setSetting(key: "resize-mode", value: settings.resizeMode == "release" ? "\"release\"" : "\"live\"")
-        core.setSetting(key: "auto-reconnect", value: settings.autoReconnect ? "true" : "false")
+        applyAutoReconnect()
         core.setSetting(key: "pane-bars", value: settings.paneBars ? "true" : "false")
         // The core's own menus and messages follow the app's language.
         core.setSetting(key: "language", value: "\"\(L10n.currentTag)\"")
@@ -1076,7 +1103,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         endBackgroundTask()
         if pausedForBackground {
             pausedForBackground = false
-            connect()
+            if host?.autoConnect != false { connect() }
         } else {
             // What the wait cut is found out now, and what was already
             // down is tried again at once.

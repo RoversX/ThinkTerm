@@ -27,6 +27,7 @@ struct Host: Codable, Identifiable, Hashable {
     /// The public half of a key the app generated or could read, so it
     /// can be shown and copied to the host's authorized_keys.
     var publicKey: String?
+    var autoConnect = true
     var lastConnected: Date?
     /// The picture the host wears, by the desktop's name for it
     /// (`Host.icons`); empty is the server.
@@ -42,7 +43,7 @@ struct Host: Codable, Identifiable, Hashable {
 
     // Fields added later are absent from hosts saved before them.
     private enum Keys: String, CodingKey {
-        case id, name, hostname, port, user, auth, knownHost, remoteCommand, group, publicKey, lastConnected, icon
+        case id, name, hostname, port, user, auth, knownHost, remoteCommand, group, publicKey, lastConnected, icon, autoConnect
     }
 
     init(from decoder: Decoder) throws {
@@ -57,6 +58,7 @@ struct Host: Codable, Identifiable, Hashable {
         remoteCommand = try c.decodeIfPresent(String.self, forKey: .remoteCommand) ?? ""
         group = try c.decodeIfPresent(String.self, forKey: .group) ?? ""
         publicKey = try c.decodeIfPresent(String.self, forKey: .publicKey)
+        autoConnect = try c.decodeIfPresent(Bool.self, forKey: .autoConnect) ?? true
         lastConnected = try c.decodeIfPresent(Date.self, forKey: .lastConnected)
         icon = try c.decodeIfPresent(String.self, forKey: .icon) ?? ""
     }

@@ -50,7 +50,19 @@ class TerminalModel(
     val settings = AppSettings.get(context)
 
     /// The host this screen shows; edited in place from the failure card.
-    var host by mutableStateOf(host)
+    private var currentHost by mutableStateOf(host)
+    var host: Host
+        get() = currentHost
+        set(value) {
+            val changed = currentHost.autoConnect != value.autoConnect
+            currentHost = value
+            if (changed) applyAutoReconnect()
+        }
+    val autoReconnect: Boolean get() = currentHost.autoConnect && settings.autoReconnect
+
+    private fun applyAutoReconnect() {
+        core.setSetting("auto-reconnect", autoReconnect.toString())
+    }
     data class HostKeyChallenge(val requestId: String, val endpoint: Host, val fingerprint: String)
     var pendingHostKey by mutableStateOf<HostKeyChallenge?>(null)
         private set
@@ -264,7 +276,7 @@ class TerminalModel(
         // A face is shaped at connect time: the connection is made again.
         if (settings.fontFamily != appliedFamily) {
             appliedFamily = settings.fontFamily
-            if (connection.startsWith("pane ")) {
+            if (host.autoConnect && connection.startsWith("pane ")) {
                 disconnect()
                 connect()
             }
@@ -331,6 +343,19 @@ class TerminalModel(
         }
     }
 
+    fun applyHostEdit(saved: Host, credentialsChanged: Boolean, connectOnSave: Boolean) {
+        val changed = !host.sameSshConnection(saved) || credentialsChanged
+        val needsRetry = when (ConnectionPhase.of(connection)) {
+            is ConnectionPhase.Failed, ConnectionPhase.Disconnected -> true
+            null -> reconnecting && !autoReconnect
+            else -> false
+        }
+        val redial = if (changed) isConnected || connectOnSave else connectOnSave && needsRetry
+        if (changed) disconnect()
+        host = saved
+        if (saved.autoConnect && redial) connect()
+    }
+
     fun connect() {
         pausedForBackground = false
         clearHostKeyRequest()
@@ -385,9 +410,11 @@ class TerminalModel(
         pendingHostKey = null
     }
 
+    private fun currentHostKeyEndpoint(requestId: String): Host? =
+        requestedHost?.takeIf { activeRequestId == requestId && host.knownHost == null && host.sameSshConnection(it) }
+
     fun approveHostKey(challenge: HostKeyChallenge) {
-        if (activeRequestId != challenge.requestId || requestedHost != challenge.endpoint ||
-            host != challenge.endpoint || host.knownHost != null) return
+        if (currentHostKeyEndpoint(challenge.requestId)?.sameSshConnection(challenge.endpoint) != true) return
         if (host.id != Host.PROBE_ID) store.rememberHostKey(host.id, challenge.fingerprint)
         host = host.copy(knownHost = challenge.fingerprint)
         connect()
@@ -439,7 +466,7 @@ class TerminalModel(
         // user disconnected stays so.
         if (pausedForBackground) {
             pausedForBackground = false
-            connect()
+            if (host.autoConnect) connect()
         } else {
             checkConnection()
         }
@@ -865,7 +892,7 @@ class TerminalModel(
         val contrast = when (settings.contrast) { "3" -> 3.0; "45" -> 4.5; "7" -> 7.0; else -> 0.0 }
         core.setSetting("min-contrast", contrast.toString())
         core.setSetting("resize-mode", if (settings.resizeMode == "release") "\"release\"" else "\"live\"")
-        core.setSetting("auto-reconnect", settings.autoReconnect.toString())
+        applyAutoReconnect()
         core.setSetting("pane-bars", settings.paneBars.toString())
         // The core's own menus and messages follow the app's language.
         core.setSetting("language", "\"${L10n.currentTag(settings.language)}\"")
@@ -943,10 +970,8 @@ class TerminalModel(
 
         override fun onHostKeyRequired(requestId: String, fingerprint: String) {
             main.post {
-                val endpoint = requestedHost
-                if (requestId == activeRequestId && endpoint != null && host == endpoint && host.knownHost == null) {
-                    pendingHostKey = HostKeyChallenge(requestId, endpoint, fingerprint)
-                }
+                val endpoint = currentHostKeyEndpoint(requestId) ?: return@post
+                pendingHostKey = HostKeyChallenge(requestId, endpoint, fingerprint)
             }
         }
 

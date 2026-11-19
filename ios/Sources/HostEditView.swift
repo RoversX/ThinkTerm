@@ -18,6 +18,7 @@ struct HostEditView: View {
     @State private var passphrase = ""
     @State private var hasStoredSecret = false
     @State private var showKeyText = false
+    @State private var forgottenHostKey: String?
     @State private var showAdvanced = false
     @State private var importing = false
     @State private var importError: String?
@@ -60,10 +61,7 @@ struct HostEditView: View {
                         ToolbarItem(placement: .cancellationAction) { Button(tr("cancel")) { dismiss() } }
                         ToolbarItem(placement: .confirmationAction) {
                             Button(tr("save")) {
-                                var edited = edited()
-                                // A key forgotten in the form goes with the save.
-                                if host.knownHost == nil { edited.knownHost = nil }
-                                save(edited, secret, passphrase.isEmpty ? nil : passphrase)
+                                save(edited(), secret, passphrase.isEmpty ? nil : passphrase)
                                 dismiss()
                             }
                             .fontWeight(.semibold)
@@ -173,7 +171,7 @@ struct HostEditView: View {
     private static func sameEdits(_ a: Host, _ b: Host) -> Bool {
         a.name == b.name && a.hostname == b.hostname && a.port == b.port && a.user == b.user
             && a.auth == b.auth && a.remoteCommand == b.remoteCommand && a.group == b.group
-            && a.publicKey == b.publicKey && a.icon == b.icon
+            && a.publicKey == b.publicKey && a.icon == b.icon && a.autoConnect == b.autoConnect
     }
 
     /// The edit onto the host as the store has it now: the key a
@@ -188,7 +186,11 @@ struct HostEditView: View {
         edited.remoteCommand = host.remoteCommand
         edited.group = host.group
         edited.publicKey = host.publicKey
+        edited.autoConnect = host.autoConnect
         edited.icon = host.icon
+        if let forgottenHostKey, edited.knownHost == forgottenHostKey {
+            edited.knownHost = nil
+        }
         return edited
     }
 
@@ -228,6 +230,7 @@ struct HostEditView: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
             }
+            Toggle(tr("host.autoconnect"), isOn: $host.autoConnect)
         }
     }
 
@@ -367,6 +370,7 @@ struct HostEditView: View {
                     .padding(.vertical, 4)
                     if page == nil {
                         Button(role: .destructive) {
+                            forgottenHostKey = known
                             host.knownHost = nil
                         } label: {
                             Label(tr("forgetkey"), systemImage: "xmark.shield")
@@ -494,7 +498,7 @@ private struct HostHeroSession: View {
     @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
-        let state = SessionState(model, autoReconnect: settings.autoReconnect)
+        let state = SessionState(model, autoReconnect: model.autoReconnect)
         HostStatusPill(state: state)
         HostActions(host: host, state: state) { model.disconnect() }
     }

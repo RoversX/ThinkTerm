@@ -599,8 +599,8 @@ struct TerminalScreen: View {
                 if let passphrase { Keychain.save(passphrase, account: edited.id.uuidString + ".passphrase") }
                 model.store?.upsert(edited)
                 // As stored: a new address drops the old pin.
-                model.host = model.store?.hosts.first { $0.id == edited.id } ?? edited
-                model.connect()
+                let saved = model.store?.hosts.first { $0.id == edited.id } ?? edited
+                model.applyHostEdit(saved, credentialsChanged: !secret.isEmpty || passphrase != nil, connectOnSave: true)
             }
         }
         .onAppear {
@@ -611,7 +611,7 @@ struct TerminalScreen: View {
             // itself (auto-reconnect off) is dialled again: coming to it --
             // the host page's Connect, a thread of it -- is the tap that
             // asks for it.
-            if !TerminalModel.automated, !model.isConnected || (model.reconnecting && !settings.autoReconnect) {
+            if !TerminalModel.automated, !model.isConnected || (model.reconnecting && !model.autoReconnect) {
                 model.connect()
             }
             #if DEBUG
@@ -1120,7 +1120,7 @@ struct TerminalScreen: View {
             if showLog {
                 logView
             }
-            if model.reconnecting && !settings.autoReconnect && ConnectionPhase(status: model.connection) == nil {
+            if model.reconnecting && !model.autoReconnect && ConnectionPhase(status: model.connection) == nil {
                 // Asked not to redial: the card offers it instead.
                 ConnectionCard(phase: .disconnected, hostName: hostName, canEdit: model.host != nil) { action in
                     switch action {
@@ -1339,7 +1339,7 @@ struct TerminalScreen: View {
             || connection.hasPrefix("failed") || connection.contains("reconnect")
         // The App's word stays up once the connection is lost; it is on
         // its way back only where it redials by itself.
-        let redialing = model.reconnecting && settings.autoReconnect
+        let redialing = model.reconnecting && model.autoReconnect
         let turning = !model.copied
             && (redialing || connection.hasPrefix("connecting") || connection.contains("reconnect"))
         // Lost with nothing redialing it warns too, though the status

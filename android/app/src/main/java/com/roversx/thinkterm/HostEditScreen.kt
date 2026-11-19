@@ -114,6 +114,7 @@ fun HostEditScreen(
 ) {
     val context = LocalContext.current
     var draft by remember { mutableStateOf(host) }
+    var forgottenHostKey by remember { mutableStateOf<String?>(null) }
     var portText by remember { mutableStateOf(host.port.toString()) }
     var secret by remember { mutableStateOf("") }
     var passphrase by remember { mutableStateOf("") }
@@ -182,9 +183,11 @@ fun HostEditScreen(
             user = draft.user,
             auth = draft.auth,
             remoteCommand = draft.remoteCommand,
+            knownHost = now.knownHost?.takeUnless { it == forgottenHostKey },
             group = draft.group,
             publicKey = draft.publicKey,
             icon = draft.icon,
+            autoConnect = draft.autoConnect,
         )
     }
 
@@ -223,9 +226,7 @@ fun HostEditScreen(
                 GlassTextButton(tr("save"), bold = true, enabled = changed && canSave) { keep() }
             } else {
                 GlassTextButton(tr("save"), bold = true, enabled = canSave) {
-                    // A key forgotten in the form goes with the save.
-                    val edited = edited().let { if (draft.knownHost == null) it.copy(knownHost = null) else it }
-                    onSave(edited, secret, passphrase.ifEmpty { null })
+                    onSave(edited(), secret, passphrase.ifEmpty { null })
                 }
             }
         },
@@ -256,6 +257,7 @@ fun HostEditScreen(
                 draft = draft.copy(port = portText.toIntOrNull()?.takeIf { it in 1..65535 } ?: 22)
             }, placeholder = "22", keyboard = KeyboardType.Number)
             FieldRow(tr("f.user"), draft.user, { draft = draft.copy(user = it.trim()) }, placeholder = "root")
+            SwitchRow(tr("host.autoconnect"), draft.autoConnect) { draft = draft.copy(autoConnect = it) }
         }
 
         Group(tr("f.group"), footer = tr("f.groupfoot")) {
@@ -352,7 +354,10 @@ fun HostEditScreen(
                         }
                     }
                     if (page == null) {
-                        GroupRow(onClick = { draft = draft.copy(knownHost = null) }) {
+                        GroupRow(onClick = {
+                            forgottenHostKey = known
+                            draft = draft.copy(knownHost = null)
+                        }) {
                             DesktopIcon("shield-off", size = 18.dp, tint = colors.destructive)
                             RowTitle(tr("forgetkey"), color = colors.destructive)
                         }
@@ -505,7 +510,7 @@ private fun clipboardText(context: Context): String? {
 private fun sameEdits(a: Host, b: Host): Boolean =
     a.name == b.name && a.hostname == b.hostname && a.port == b.port && a.user == b.user &&
         a.auth == b.auth && a.remoteCommand == b.remoteCommand && a.group == b.group &&
-        a.publicKey == b.publicKey && a.icon == b.icon
+        a.publicKey == b.publicKey && a.icon == b.icon && a.autoConnect == b.autoConnect
 
 /// The desktop's host pictures, the one the host wears picked out; the
 /// first is the one a host with none chosen wears.

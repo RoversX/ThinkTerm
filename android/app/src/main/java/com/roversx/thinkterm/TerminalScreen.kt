@@ -190,7 +190,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     // the tap that asks for it.
     LaunchedEffect(model) {
         model.enterScreen()
-        if (!model.isConnected || (model.reconnecting && !model.settings.autoReconnect)) model.connect()
+        if (!model.isConnected || (model.reconnecting && !model.autoReconnect)) model.connect()
     }
     // Leaving takes the picture, not the connection: the frame loop
     // rests, the surface goes with the view, the socket stays.
@@ -606,9 +606,9 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                             host = h,
                             onSave = { edited, secret, passphrase ->
                                 // As stored: a new address drops the old pin.
-                                model.host = store.saveEdit(edited, secret, passphrase)
+                                val saved = store.saveEdit(edited, secret, passphrase)
+                                model.applyHostEdit(saved, secret.isNotEmpty() || passphrase != null, connectOnSave = true)
                                 editingHost = null
-                                model.connect()
                             },
                             onCancel = { editingHost = null },
                         )
@@ -942,7 +942,7 @@ private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean, on
         )
     }
     val phase = ConnectionPhase.of(model.connection)
-    if (model.reconnecting && !settings.autoReconnect && phase == null) {
+    if (model.reconnecting && !model.autoReconnect && phase == null) {
         // Asked not to redial: the card offers it instead.
         ConnectionCard(ConnectionPhase.Disconnected, model.host.display, canEdit = model.host.id != Host.PROBE_ID) { action ->
             when (action) {
@@ -1130,7 +1130,7 @@ private fun StatusCapsule(model: TerminalModel, modifier: Modifier = Modifier) {
     val showing = text.isNotEmpty() || c.startsWith("connecting") || c.startsWith("disconnected") || c.startsWith("failed") || c.contains("reconnect")
     // The App's word stays up once the connection is lost; it is on its
     // way back only where it redials by itself.
-    val redialing = model.reconnecting && model.settings.autoReconnect
+    val redialing = model.reconnecting && model.autoReconnect
     val turning = !model.copied && (redialing || c.startsWith("connecting") || c.contains("reconnect"))
     // Lost with nothing redialing it warns too, though the status still
     // names the pane.

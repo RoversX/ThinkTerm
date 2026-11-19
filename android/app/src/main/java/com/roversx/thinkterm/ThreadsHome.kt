@@ -115,13 +115,11 @@ fun ThreadsHome(
 
     fun model(host: Host) = Sessions.get(context, store, host)
 
-    // A host this phone has connected to before has its key approved and
-    // its secret kept: it is connected to without being asked, so its
-    // threads are in the list. One never connected to is left for a tap.
+    // Populate threads on arrival for known hosts that allow automatic connections.
     LaunchedEffect(Unit) {
         for (host in entries) {
             if (Sessions.existing(host.id) != null) continue
-            if (host.id != Host.PROBE_ID && host.lastConnected == null) continue
+            if (!host.autoConnect || (host.id != Host.PROBE_ID && host.lastConnected == null)) continue
             model(host).connect()
         }
     }
@@ -381,9 +379,9 @@ private fun ConnectedHost(
     // The App keeps the pane's status while its connection is lost. With
     // the setting off nothing redials it: not ready, not on its way, and
     // the way back is a tap.
-    val lost = model.reconnecting && !model.settings.autoReconnect
+    val lost = model.reconnecting && !model.autoReconnect
     val ready = model.connection.startsWith("pane ") && !lost
-    val redialing = model.reconnecting && model.settings.autoReconnect
+    val redialing = model.reconnecting && model.autoReconnect
     val connecting = !lost && (redialing || (model.isConnected && !ready) || model.connection.contains("reconnect"))
     val dot = when {
         ready -> Color(0xFF34C759)

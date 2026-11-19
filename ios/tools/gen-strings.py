@@ -47,6 +47,7 @@ EXTRA = {
     "none": ["None", "无", "なし", "Aucun", "Keine"],
     "optional": ["Optional", "可选", "任意", "Facultatif", "Optional"],
     # hosts
+    "host.autoconnect": ["Connect automatically", "自动连接", "自動接続", "Connexion automatique", "Automatisch verbinden"],
     "hosts.nomatch.q": [
         "No hosts match “%@”.",
         "没有匹配“%@”的主机。",

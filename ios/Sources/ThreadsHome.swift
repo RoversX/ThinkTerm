@@ -96,12 +96,10 @@ struct ThreadsHome: View {
         sessions.model(for: store.hosts.first { $0.id == id }, store: store)
     }
 
-    /// A host this phone has connected to before has its key approved and
-    /// its secret kept: it is connected to without being asked, so its
-    /// threads are in the list. One never connected to is left for a tap.
+    /// Populate threads on arrival for known hosts that allow automatic connections.
     private func connectKnownHosts() {
         for entry in entries where sessions.existing(entry.id) == nil {
-            guard entry.host == nil || entry.host?.lastConnected != nil else { continue }
+            if let host = entry.host, !host.autoConnect || host.lastConnected == nil { continue }
             model(entry.id).connect()
         }
     }
@@ -397,7 +395,7 @@ private struct Connected: View {
     /// The App keeps the pane's status while its connection is lost. With
     /// the setting off nothing redials it: not ready, not on its way, and
     /// the way back is a tap.
-    private var lost: Bool { model.reconnecting && !settings.autoReconnect }
+    private var lost: Bool { model.reconnecting && !model.autoReconnect }
 
     /// Attached to the server: its threads are there to list. The core
     /// says which pane it shows once it is.
@@ -405,7 +403,7 @@ private struct Connected: View {
 
     /// On the way there: dialling, or connected and attaching.
     private var connecting: Bool {
-        !lost && ((model.reconnecting && settings.autoReconnect) || (model.isConnected && !ready) || model.connection.contains("reconnect"))
+        !lost && ((model.reconnecting && model.autoReconnect) || (model.isConnected && !ready) || model.connection.contains("reconnect"))
     }
 
     private var dot: Color {

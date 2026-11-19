@@ -517,7 +517,7 @@ private fun PushRow(title: String, value: String, swatch: Color? = null, onClick
 }
 
 @Composable
-private fun SwitchRow(title: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+internal fun SwitchRow(title: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     GroupRow(onClick = { onChange(!checked) }) {
         RowTitle(title)
         IosSwitch(checked, onChange)

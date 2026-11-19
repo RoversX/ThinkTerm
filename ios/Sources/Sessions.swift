@@ -26,7 +26,10 @@ final class Sessions: ObservableObject {
     /// the old one: it asks for the key the host has now.
     func forgetHostKey(_ id: UUID, store: HostStore) {
         store.forgetHostKey(for: id)
-        existing(id)?.host?.knownHost = nil
+        if let model = existing(id), var saved = model.host {
+            saved.knownHost = nil
+            model.applyHostEdit(saved, credentialsChanged: false, connectOnSave: false)
+        }
     }
 
     func close(_ id: UUID) {
@@ -170,7 +173,7 @@ struct SessionDot: View {
     var ring = Color(.secondarySystemGroupedBackground)
 
     var body: some View {
-        if let color = SessionState(model, autoReconnect: settings.autoReconnect).dot {
+        if let color = SessionState(model, autoReconnect: model.autoReconnect).dot {
             Circle()
                 .fill(color)
                 .frame(width: 12, height: 12)

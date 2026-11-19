@@ -36,7 +36,13 @@ data class Host(
     /// The picture the host wears, by the desktop's name for it
     /// (`Host.ICONS`); empty is the server.
     val icon: String = "",
+    val autoConnect: Boolean = true,
 ) {
+    fun sameSshConnection(other: Host): Boolean =
+        id == other.id && hostname == other.hostname && port == other.port &&
+            user == other.user && auth == other.auth && remoteCommand == other.remoteCommand &&
+            knownHost == other.knownHost
+
     val display: String get() = if (name.isNotEmpty()) name else "$user@$hostname:$port"
     /// The headline of a row: `display` would repeat the address below it
     /// when the host has no name.
@@ -205,6 +211,7 @@ class HostStore(context: Context) {
                     .put("publicKey", h.publicKey ?: JSONObject.NULL)
                     .put("lastConnected", h.lastConnected ?: JSONObject.NULL)
                     .put("icon", h.icon)
+                    .put("autoConnect", h.autoConnect)
             )
         }
         prefs.edit().putString(KEY, arr.toString()).apply()
@@ -229,6 +236,7 @@ class HostStore(context: Context) {
                     publicKey = o.stringOrNull("publicKey"),
                     lastConnected = if (o.isNull("lastConnected")) null else o.optLong("lastConnected"),
                     icon = o.optString("icon"),
+                    autoConnect = o.optBoolean("autoConnect", true),
                 )
             }
         } catch (e: Throwable) {

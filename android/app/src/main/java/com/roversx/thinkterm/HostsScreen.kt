@@ -162,25 +162,16 @@ fun HostsScreen(
 /// one: it asks for the key the host has now.
 internal fun forgetHostKey(store: HostStore, id: String) {
     store.forgetHostKey(id)
-    Sessions.existing(id)?.let { model -> model.host = model.host.copy(knownHost = null) }
+    Sessions.existing(id)?.let { model ->
+        model.applyHostEdit(model.host.copy(knownHost = null), credentialsChanged = false, connectOnSave = false)
+    }
 }
 
 /// Keeps a host as edited or added; a session open on it takes the edit:
 /// another address, login or key is a connection made again.
 private fun keepHost(store: HostStore, host: Host, secret: String, passphrase: String?) {
-    val before = store.hosts.firstOrNull { it.id == host.id }
     val saved = store.saveEdit(host, secret, passphrase)
-    Sessions.existing(host.id)?.let { model ->
-        model.host = saved
-        val reached = before == null || before.hostname != saved.hostname ||
-            before.port != saved.port || before.user != saved.user ||
-            before.auth != saved.auth || before.remoteCommand != saved.remoteCommand ||
-            secret.isNotEmpty() || passphrase != null
-        if (reached && model.isConnected) {
-            model.disconnect()
-            model.connect()
-        }
-    }
+    Sessions.existing(host.id)?.applyHostEdit(saved, secret.isNotEmpty() || passphrase != null, connectOnSave = false)
 }
 
 /// The hosts themselves: searched, grouped, each a row that opens its page.
@@ -317,7 +308,7 @@ internal enum class SessionState {
 
     companion object {
         fun of(model: TerminalModel): SessionState = when {
-            model.reconnecting -> if (model.settings.autoReconnect) CONNECTING else LOST
+            model.reconnecting -> if (model.autoReconnect) CONNECTING else LOST
             model.connection.startsWith("pane ") -> CONNECTED
             model.isConnected -> CONNECTING
             else -> NONE

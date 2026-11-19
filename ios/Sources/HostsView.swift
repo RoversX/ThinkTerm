@@ -170,18 +170,9 @@ struct HostsView: View {
     private func keep(_ host: Host, secret: String, passphrase: String?) {
         if !secret.isEmpty { Keychain.save(secret, account: host.id.uuidString) }
         if let passphrase { Keychain.save(passphrase, account: host.id.uuidString + ".passphrase") }
-        let before = store.hosts.first { $0.id == host.id }
         store.upsert(host)
         if let model = sessions.existing(host.id), let saved = store.hosts.first(where: { $0.id == host.id }) {
-            model.host = saved
-            let reached = before.map {
-                $0.hostname != saved.hostname || $0.port != saved.port || $0.user != saved.user
-                    || $0.auth != saved.auth || $0.remoteCommand != saved.remoteCommand
-            } ?? true
-            if (reached || !secret.isEmpty || passphrase != nil), model.isConnected {
-                model.disconnect()
-                model.connect()
-            }
+            model.applyHostEdit(saved, credentialsChanged: !secret.isEmpty || passphrase != nil, connectOnSave: false)
         }
     }
 
