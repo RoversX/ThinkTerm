@@ -8389,6 +8389,23 @@ impl WorkspaceThreadStore {
                 }
             }
             for project in projects {
+                // A row this device adopted for a plain workspace of the
+                // server -- its own `default` and the like (see
+                // `adopt_orphan_remote_thread_windows`) -- describes the
+                // server's windows back to the server. Publishing it would
+                // ring the server's own screens with rows naming its own
+                // workspaces; it stays this device's bookkeeping. A project
+                // holding nothing else stays home with its rows.
+                let threads_are_all_local_bookkeeping = !project.threads.is_empty()
+                    && project.threads.iter().all(|thread| {
+                        thread
+                            .materialized_workspace_name
+                            .as_deref()
+                            .is_some_and(is_server_plain_workspace)
+                    });
+                if threads_are_all_local_bookkeeping {
+                    continue;
+                }
                 live_projects.insert(project.id.as_str());
                 let known_project = last_known.project(&project.id);
                 match known_project {
@@ -8445,6 +8462,16 @@ impl WorkspaceThreadStore {
                     }
                 }
                 for thread in &project.threads {
+                    // The same bookkeeping rule as the project above: a row
+                    // adopted for a plain workspace of the server is not
+                    // the server's structure, even beside real threads.
+                    if thread
+                        .materialized_workspace_name
+                        .as_deref()
+                        .is_some_and(is_server_plain_workspace)
+                    {
+                        continue;
+                    }
                     live_threads.insert(thread.id.as_str());
                     let Some(known) = last_known.thread(&thread.id) else {
                         ops.push(codec::TreeOp::CreateThread {
@@ -11591,6 +11618,21 @@ pub(crate) fn is_thread_workspace_name(workspace: &str) -> bool {
     parse_thread_workspace_name(workspace).is_some()
 }
 
+/// Whether `workspace` holds a connected server's windows without a
+/// ThinkTerm thread owning it: the server's own `default`, or any plain
+/// name its windows were started under -- a CLI `spawn`, an older version.
+/// Every namespace this app defines for itself begins with `thinkterm:`
+/// (threads) or `thinkterm-` (pages, share views), and a handoff's parking
+/// spots begin with `dead-session:`; none of those qualifies. Adopting a
+/// row for a plain workspace is what makes those windows reachable on this
+/// device (see `adopt_orphan_remote_thread_windows`).
+pub fn is_server_plain_workspace(workspace: &str) -> bool {
+    !workspace.is_empty()
+        && !workspace.starts_with("thinkterm:")
+        && !workspace.starts_with("thinkterm-")
+        && !workspace.starts_with(DEAD_SESSION_WORKSPACE_PREFIX)
+}
+
 /// Rebuild sidebar records for live mux windows of this Space's client
 /// domain whose thread workspace has no local record. The remote mux server
 /// is the source of truth for a mux-domain Space: when the local store lost
@@ -11612,6 +11654,14 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
 
     // Gather candidates outside the store lock.
     let mut candidates: Vec<(String, String, String, Option<String>)> = Vec::new();
+    // One row per plain workspace the server's windows live in without a
+    // ThinkTerm thread owning it -- the server's own `default`, a CLI
+    // `spawn`, an older version's names. Today they are mirrored for the
+    // protocol and then refused a row, which leaves a server's working
+    // terminals invisible on this device; a row in the Space's mux-domain
+    // project makes them reachable, and its materialized workspace routes
+    // clicks to the mirror.
+    let mut plain_workspaces: Vec<String> = Vec::new();
     for window_id in mux.iter_windows() {
         let Some(window) = mux.get_window(window_id) else {
             continue;
@@ -11620,6 +11670,12 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
             continue;
         }
         let workspace = window.get_workspace().to_string();
+        if is_server_plain_workspace(&workspace) {
+            if !plain_workspaces.contains(&workspace) {
+                plain_workspaces.push(workspace);
+            }
+            continue;
+        }
         let Some((project_id, thread_id)) = parse_thread_workspace_name(&workspace) else {
             continue;
         };
@@ -11635,7 +11691,7 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
         });
         candidates.push((project_id, thread_id, workspace, cwd));
     }
-    if candidates.is_empty() {
+    if candidates.is_empty() && plain_workspaces.is_empty() {
         return false;
     }
 
@@ -11754,6 +11810,49 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                 changed = true;
             }
         }
+    }
+
+    for workspace in plain_workspaces {
+        let workspace_known = store.projects.iter().any(|project| {
+            project.threads.iter().any(|thread| {
+                thread.materialized_workspace_name.as_deref() == Some(workspace.as_str())
+                    || workspace_name_for_thread(&project.id, &thread.id) == workspace
+            })
+        });
+        if workspace_known {
+            continue;
+        }
+        if !store
+            .projects
+            .iter()
+            .any(|project| project.id == mux_project_id)
+        {
+            store.projects.push(Project {
+                id: mux_project_id.clone(),
+                space_id: space_id.to_string(),
+                name: mux_project_name.clone(),
+                path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
+                threads: vec![],
+                active_thread_id: None,
+                threads_collapsed: false,
+                active_note_path: None,
+                archived_at: None,
+            });
+        }
+        let project = store
+            .projects
+            .iter_mut()
+            .find(|project| project.id == mux_project_id)
+            .expect("mux domain project was just ensured");
+        // Named after the workspace it stands for, and deliberately not
+        // published to the server: the row describes the server's own
+        // windows back to it (see `reconcile_ops_for_scope`). Deleting it
+        // ends those windows, exactly as deleting a remote thread ends its
+        // session.
+        let thread =
+            WorkspaceThread::new(mux_project_id.clone(), workspace.clone(), Some(workspace));
+        project.threads.push(thread);
+        changed = true;
     }
     if changed {
         store.ensure_unique_thread_names();
@@ -12901,6 +13000,97 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(
             op,
             codec::TreeOp::CreateSpace { space_id, .. } if *space_id == plan.space_id
+        )));
+    }
+
+    #[test]
+    fn server_plain_workspaces_are_the_plain_names_and_no_pages() {
+        assert!(is_server_plain_workspace("default"));
+        assert!(is_server_plain_workspace("wezterm"));
+        assert!(!is_server_plain_workspace("thinkterm:p1:thread-1"));
+        assert!(!is_server_plain_workspace("thinkterm:rp1:rt1"));
+        assert!(!is_server_plain_workspace("thinkterm-connecting:server"));
+        assert!(!is_server_plain_workspace("thinkterm-share-view:alice"));
+        assert!(!is_server_plain_workspace("thinkterm-open-elsewhere:1"));
+        assert!(!is_server_plain_workspace("dead-session:3:default"));
+        assert!(!is_server_plain_workspace(""));
+    }
+
+    /// A row adopted for a plain workspace of the server stays this device's
+    /// bookkeeping: the server's own screens must not be told about rows
+    /// that describe their own windows back to them.
+    #[test]
+    fn adopted_plain_workspace_rows_are_not_published() {
+        let mut store = test_store();
+        let space_id = store.create_space_record_for_domain(
+            "Server D".to_string(),
+            Some("server-d".to_string()),
+        );
+
+        let live = WorkspaceThread::new(
+            "project-mixed".to_string(),
+            "main".to_string(),
+            None,
+        );
+        let live_id = live.id.clone();
+        let live_workspace = format!("thinkterm:project-mixed:{live_id}");
+        let live = WorkspaceThread {
+            materialized_workspace_name: Some(live_workspace),
+            ..live
+        };
+        let plain = WorkspaceThread::new(
+            "project-mixed".to_string(),
+            "default".to_string(),
+            Some("default".to_string()),
+        );
+        let plain_id = plain.id.clone();
+        store.projects.push(Project {
+            id: "project-mixed".to_string(),
+            space_id: space_id.clone(),
+            name: "Server D".to_string(),
+            path: PathBuf::from("wezterm-mux://server-d"),
+            threads: vec![live, plain],
+            active_thread_id: None,
+            threads_collapsed: false,
+            active_note_path: None,
+            archived_at: None,
+        });
+
+        // A project holding nothing but adopted rows stays home entirely.
+        let plain_only = WorkspaceThread::new(
+            "project-plain".to_string(),
+            "cli".to_string(),
+            Some("cli".to_string()),
+        );
+        let plain_only_id = plain_only.id.clone();
+        store.projects.push(Project {
+            id: "project-plain".to_string(),
+            space_id: space_id.clone(),
+            name: "CLI".to_string(),
+            path: PathBuf::from("wezterm-mux://server-d"),
+            threads: vec![plain_only],
+            active_thread_id: None,
+            threads_collapsed: false,
+            active_note_path: None,
+            archived_at: None,
+        });
+
+        let ops = store.reconcile_ops_for_domain("server-d", &codec::ThinkTermTree::default());
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateThread { thread_id, .. } if *thread_id == live_id
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateThread { thread_id, .. } if *thread_id == plain_id
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateProject { project_id, .. } if *project_id == "project-plain"
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateThread { thread_id, .. } if *thread_id == plain_only_id
         )));
     }
 
