@@ -348,7 +348,7 @@ struct RemoteTerminalPasteTarget {
     target: workspace_threads::RemoteFilesTarget,
     source_key: String,
     connection_key: String,
-    config: config::SshDomain,
+    config: mux::ssh::SshConnectionConfig,
     destination: String,
 }
 
@@ -14731,13 +14731,14 @@ impl crate::TermWindow {
 
     pub(crate) fn ssh_config_for_remote_files_target(
         target: &workspace_threads::RemoteFilesTarget,
-    ) -> Result<config::SshDomain, String> {
-        let mut domain = Self::ssh_config_for_remote_files_source(target)?;
-        domain
+    ) -> Result<mux::ssh::SshConnectionConfig, String> {
+        let mut connection = Self::ssh_config_for_remote_files_source(target)?;
+        connection
+            .domain
             .ssh_option
             .entry("serveraliveinterval".to_string())
             .or_insert_with(|| Self::REMOTE_FILES_KEEPALIVE_SECS.to_string());
-        Ok(domain)
+        Ok(connection)
     }
 
     /// Whether the Files panel connects by itself to the machine `target`
@@ -14761,18 +14762,10 @@ impl crate::TermWindow {
 
     fn ssh_config_for_remote_files_source(
         target: &workspace_threads::RemoteFilesTarget,
-    ) -> Result<config::SshDomain, String> {
+    ) -> Result<mux::ssh::SshConnectionConfig, String> {
         match &target.source {
             workspace_threads::RemoteFilesSource::SshHost(host_id) => {
-                let spec = crate::ssh_hosts::host_spec(host_id)
-                    .ok_or_else(|| format!("SSH host {host_id} is unavailable"))?;
-                let mut domain = crate::ssh_hosts::build_ssh_domain(&spec);
-                domain.stored_password = spec
-                    .password
-                    .as_deref()
-                    .map(crate::secret::reveal)
-                    .filter(|password| !password.is_empty());
-                Ok(domain)
+                crate::ssh_hosts::files_connection(host_id).map_err(|err| format!("{err:#}"))
             }
             workspace_threads::RemoteFilesSource::ClientDomain(domain_name) => {
                 let domain = Mux::get()
@@ -14783,7 +14776,7 @@ impl crate::TermWindow {
                     .ok_or_else(|| {
                         "Remote Files supports only SSH-backed mux domains".to_string()
                     })?;
-                client.ssh_domain_config().ok_or_else(|| {
+                client.ssh_connection_config().ok_or_else(|| {
                     "Remote Files does not support Unix or TLS mux domains".to_string()
                 })
             }

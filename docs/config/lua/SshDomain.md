@@ -132,3 +132,90 @@ example](pane/get_metadata.md).
 If you prefer to have the information overlaid on the content area, then
 you can set `overlay_lag_indicator = true`, but note that I'd like to
 remove that functionality in the future.
+
+{{since('nightly')}}
+
+### Reaching a host through a jump host
+
+A host that can only be reached through another one, such as a bastion or a
+VPS in front of a private network, can be reached the way `ssh -J` reaches
+it. The connection goes to the jump host first, which opens a TCP connection
+on to `remote_address` and only passes the bytes along. The SSH session with
+the host itself runs end to end through it, so the jump host never sees what
+goes over it, and it needs nothing but an `sshd` that allows TCP forwarding
+(OpenSSH's `AllowTcpForwarding`, on by default). Everything an SSH domain
+does then works as if the host were reached directly: multiplexing, the Files
+panel, installing or updating ThinkTerm on the host.
+
+`ProxyJump` in your `~/.ssh/config` is followed, and so is `proxyjump` in
+`ssh_option`:
+
+```lua
+config.ssh_domains = {
+  {
+    name = 'inside',
+    -- The host's address as the jump host reaches it
+    remote_address = '10.0.0.5',
+    username = 'me',
+    ssh_option = {
+      -- One or more [user@]host[:port], separated by commas and gone
+      -- through in order. Each is looked up in ~/.ssh/config like any host.
+      proxyjump = 'me@bastion.example.com:22',
+    },
+  },
+}
+```
+
+`jump_hosts` says the same, with each jump host's own settings:
+
+```lua
+config.ssh_domains = {
+  {
+    name = 'inside',
+    remote_address = '10.0.0.5',
+    username = 'me',
+    jump_hosts = {
+      {
+        remote_address = 'bastion.example.com:22',
+        username = 'me',
+        ssh_option = { identityfile = '/home/me/.ssh/bastion_ed25519' },
+      },
+    },
+  },
+}
+```
+
+* Each host is signed in to in turn. Host key questions and password prompts
+  name the jump host they come from, and a password stored for one host is
+  never sent to another.
+* With `jump_hosts`, or `proxyjump`, the host's own `proxycommand` is not
+  used; the first jump host's own `proxycommand` or `ProxyJump` still is.
+* On the Remote Hosts page, a saved host's **Jump host** setting does this
+  with another saved host.
+* Mosh cannot go through a jump host: it reaches the host itself over UDP.
+
+### Replacing the command run on the remote host
+
+`override_proxy_command` replaces the `thinkterm cli --prefer-mux proxy`
+command that a multiplexing SSH domain runs on the remote host to reach its
+mux server. It is run by the remote host's shell, without a pty, and has to
+pass the mux protocol through its standard input and output.
+
+One use is a host that only the remote host can sign in to: here
+`relay.example.com` holds a key for `10.0.0.5`, and this machine needs none.
+
+```lua
+config.ssh_domains = {
+  {
+    name = 'inside-via-relay',
+    remote_address = 'relay.example.com',
+    username = 'me',
+    override_proxy_command = "ssh -T -o BatchMode=yes me@10.0.0.5 "
+      .. "'~/.local/bin/thinkterm cli --prefer-mux proxy'",
+  },
+}
+```
+
+Only the multiplexing connection goes on to `10.0.0.5` that way: the Files
+panel and installing ThinkTerm work with `relay.example.com` itself. Where
+this machine can sign in to the host, a jump host (above) is the better fit.

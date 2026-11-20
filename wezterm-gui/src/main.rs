@@ -28,7 +28,7 @@ use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
 pub(crate) use wezterm_client::domain::AttachRetryOutcome;
-use wezterm_client::domain::{is_fatal_attach_error, ClientDomain, ClientDomainConfig};
+use wezterm_client::domain::{is_fatal_attach_error, ClientDomain};
 use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::FontConfiguration;
 use wezterm_gui_subcommands::*;
@@ -520,7 +520,7 @@ pub(crate) fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn
         crate::ssh_hosts::SshNetwork::System => name.to_string(),
         crate::ssh_hosts::SshNetwork::Tailnet => crate::ssh_hosts::connect_domain_name(&entry.spec),
     };
-    Ok(add_ssh_host_client_domain(&entry.spec, domain_name))
+    add_ssh_host_client_domain(&entry.spec, domain_name)
 }
 
 /// The ThinkTerm Connect domain of the saved host `host_id`. The id picks
@@ -533,7 +533,7 @@ pub(crate) fn connect_domain_for_ssh_host_id(host_id: &str) -> anyhow::Result<Ar
         .find(|entry| entry.id == host_id)
         .ok_or_else(|| anyhow!("no saved SSH host {host_id}"))?;
     let domain_name = crate::ssh_hosts::connect_domain_name(&entry.spec);
-    Ok(add_ssh_host_client_domain(&entry.spec, domain_name))
+    add_ssh_host_client_domain(&entry.spec, domain_name)
 }
 
 /// Rebuild a saved host's Connect domain from its record after an edit: a
@@ -552,57 +552,50 @@ pub(crate) fn refresh_connect_domain_for_ssh_host(spec: &crate::ssh_hosts::SshHo
     let Some(client) = domain.downcast_ref::<ClientDomain>() else {
         return;
     };
-    let wanted = ssh_host_client_domain_config(spec, name.clone());
+    let wanted = match ssh_host_client_domain_config(spec, name.clone()) {
+        Ok(wanted) => wanted,
+        Err(err) => {
+            log::warn!("not rebuilding the Connect domain {name}: {err:#}");
+            return;
+        }
+    };
+    if client.ssh_connection_config().is_some_and(|current| {
+        crate::ssh_hosts::same_dialing(&current.domain, &wanted.domain)
+            && current.passwords == wanted.passwords
+    }) {
+        return;
+    }
     if domain.state() != mux::domain::DomainState::Detached
         || client.is_attaching()
         || client.is_attach_retrying()
     {
-        // In use, the domain is left as it is, but for the password it
-        // signs in with: a reconnect that stopped because the server
-        // refused the old one would send that one again when asked to go
-        // on, and nothing short of a detach would get the new one to it.
-        let password_alone = client.ssh_domain_config().is_some_and(|mut built| {
-            let changed = built.stored_password != wanted.stored_password;
-            built.stored_password = wanted.stored_password.clone();
-            changed && crate::ssh_hosts::same_dialing(&built, &wanted)
-        });
-        if password_alone {
-            client.set_stored_password(wanted.stored_password);
-        }
-        return;
-    }
-    let current = client
-        .ssh_domain_config()
-        .is_some_and(|built| crate::ssh_hosts::same_dialing(&built, &wanted));
-    if !current {
-        add_ssh_host_client_domain(spec, name);
+        client.set_ssh_connection_for_next_attach(wanted);
+    } else {
+        let domain: Arc<dyn Domain> = Arc::new(ClientDomain::with_ssh_connection(wanted));
+        Mux::get().add_domain(&domain);
     }
 }
 
-/// What a saved host's Connect domain is built with.
+/// What a saved host's Connect domain is built with: the way there, through
+/// any jump hosts, and the passwords kept for each.
 fn ssh_host_client_domain_config(
     spec: &crate::ssh_hosts::SshHostSpec,
     domain_name: String,
-) -> SshDomain {
-    let mut dom = crate::ssh_hosts::build_ssh_domain(spec);
-    dom.name = domain_name;
-    dom.multiplexing = SshMultiplexing::WezTerm;
-    dom.stored_password = spec
-        .password
-        .as_deref()
-        .map(crate::secret::reveal)
-        .filter(|p| !p.is_empty());
-    dom
+) -> anyhow::Result<mux::ssh::SshConnectionConfig> {
+    let mut connection = crate::ssh_hosts::ssh_connection(spec)?;
+    connection.domain.name = domain_name;
+    connection.domain.multiplexing = SshMultiplexing::WezTerm;
+    Ok(connection)
 }
 
 fn add_ssh_host_client_domain(
     spec: &crate::ssh_hosts::SshHostSpec,
     domain_name: String,
-) -> Arc<dyn Domain> {
-    let dom = ssh_host_client_domain_config(spec, domain_name);
-    let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(ClientDomainConfig::Ssh(dom)));
+) -> anyhow::Result<Arc<dyn Domain>> {
+    let dom = ssh_host_client_domain_config(spec, domain_name)?;
+    let domain: Arc<dyn Domain> = Arc::new(ClientDomain::with_ssh_connection(dom));
     Mux::get().add_domain(&domain);
-    domain
+    Ok(domain)
 }
 
 async fn current_gui_terminal_size(

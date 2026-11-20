@@ -597,7 +597,7 @@ pub(crate) enum ContentViewResponse {
 /// One entry of the Remote Hosts page's card menu. Lives here rather than in
 /// the page because the window is what dispatches it: a native menu reports
 /// back to the window, not to the view that asked for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteHostCommand {
     Connect,
     Edit,
@@ -606,6 +606,9 @@ pub(crate) enum RemoteHostCommand {
     /// The icon picked in the form's icon menu, for the host the form edits
     /// (an empty id: the new one it is making).
     SetIcon(crate::ssh_hosts::HostIcon),
+    /// The jump host picked in the form's jump host menu, by id, for the
+    /// host the form edits as `SetIcon`'s is; none to connect directly.
+    SetJumpHost(Option<crate::ssh_hosts::SshHostId>),
 }
 
 pub(crate) trait ContentView {

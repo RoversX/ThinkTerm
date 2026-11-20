@@ -200,7 +200,7 @@ pub(crate) struct Reach {
     machine: String,
     source_key: String,
     connection_key: String,
-    config: config::SshDomain,
+    config: mux::ssh::SshConnectionConfig,
 }
 
 impl Shown {
@@ -1237,7 +1237,7 @@ impl TermWindow {
         let source_key = RemoteFilesState::source_key(&target.source);
         let connection_key = remote_connection_key(&source_key, &config);
         Ok(Reach {
-            host: host_name(&config.remote_address),
+            host: host_name(&config.domain.remote_address),
             machine: machine_word(&connection_key),
             source_key,
             connection_key,

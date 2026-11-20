@@ -47,7 +47,7 @@ impl Default for Shell {
     }
 }
 
-#[derive(Default, Debug, Clone, FromDynamic, ToDynamic)]
+#[derive(Default, Clone, FromDynamic, ToDynamic)]
 pub struct SshDomain {
     /// The name of this specific domain.  Must be unique amongst
     /// all types of domain in the configuration file.
@@ -107,12 +107,103 @@ pub struct SshDomain {
     #[dynamic(default)]
     pub stored_password: Option<String>,
 
+    /// Hosts to go through on the way to `remote_address`, nearest first,
+    /// as the `ProxyJump` ssh option does: each is reached through the one
+    /// before it, and only passes the connection on. Set when the domain
+    /// is built from a ThinkTerm SSH host entry reached through another;
+    /// in lua config, `ssh_option = { proxyjump = "user@host" }` does the
+    /// same. When set, the `proxyjump` and `proxycommand` options for this
+    /// host itself are not used.
+    #[dynamic(default)]
+    pub jump_hosts: Vec<SshJumpHost>,
+
     pub default_prog: Option<Vec<String>>,
 
     #[dynamic(default)]
     pub assume_shell: Shell,
 }
 impl_lua_conversion_dynamic!(SshDomain);
+
+/// A stored password as configuration is shown, in logs among other
+/// places: whether there is one, never what it is.
+fn redacted(password: &Option<String>) -> Option<&'static str> {
+    password.as_ref().map(|_| "<redacted>")
+}
+
+impl std::fmt::Debug for SshDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("SshDomain")
+            .field("name", &self.name)
+            .field("remote_address", &self.remote_address)
+            .field("no_agent_auth", &self.no_agent_auth)
+            .field("username", &self.username)
+            .field("connect_automatically", &self.connect_automatically)
+            .field("timeout", &self.timeout)
+            .field("local_echo_threshold_ms", &self.local_echo_threshold_ms)
+            .field("overlay_lag_indicator", &self.overlay_lag_indicator)
+            .field("remote_wezterm_path", &self.remote_wezterm_path)
+            .field("override_proxy_command", &self.override_proxy_command)
+            .field("ssh_backend", &self.ssh_backend)
+            .field("multiplexing", &self.multiplexing)
+            .field("ssh_option", &self.ssh_option)
+            .field("stored_password", &redacted(&self.stored_password))
+            .field("jump_hosts", &self.jump_hosts)
+            .field("default_prog", &self.default_prog)
+            .field("assume_shell", &self.assume_shell)
+            .finish()
+    }
+}
+
+/// A host an SSH domain is reached through: see `SshDomain::jump_hosts`.
+#[derive(Default, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub struct SshJumpHost {
+    /// identifies the host:port pair of the jump host.
+    pub remote_address: String,
+
+    /// The username to sign in to the jump host with
+    pub username: Option<String>,
+
+    /// ssh_config option values for the jump host. `proxycommand` is used
+    /// only for the first jump host: the others are reached through it.
+    #[dynamic(default)]
+    pub ssh_option: HashMap<String, String>,
+
+    /// Like `SshDomain::stored_password`, for the jump host's own password
+    /// prompts. A password kept for one host is never sent to another.
+    #[dynamic(default)]
+    pub stored_password: Option<String>,
+}
+
+impl std::fmt::Debug for SshJumpHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("SshJumpHost")
+            .field("remote_address", &self.remote_address)
+            .field("username", &self.username)
+            .field("ssh_option", &self.ssh_option)
+            .field("stored_password", &redacted(&self.stored_password))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn stored_passwords_never_show() {
+        let dom = SshDomain {
+            stored_password: Some("host secret".to_string()),
+            jump_hosts: vec![SshJumpHost {
+                stored_password: Some("jump secret".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shown = format!("{dom:?}");
+        assert!(!shown.contains("secret"), "{}", shown);
+        assert!(shown.contains("<redacted>"), "{}", shown);
+    }
+}
 
 impl SshDomain {
     pub fn default_domains() -> Vec<Self> {

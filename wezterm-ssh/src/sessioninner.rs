@@ -3,9 +3,11 @@ use crate::channelwrap::ChannelWrap;
 use crate::config::ConfigMap;
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
+use crate::jump::JumpHop;
 use crate::pty::*;
 use crate::session::{
-    Exec, ExecResult, SessionEvent, SessionRequest, SessionShutdown, SignalChannel,
+    DirectTcpip, Exec, ExecResult, Session, SessionEvent, SessionRequest, SessionShutdown,
+    SignalChannel,
 };
 use crate::sessionwrap::SessionWrap;
 use crate::sftp::dir::{Dir, DirId, DirRequest};
@@ -46,6 +48,13 @@ pub(crate) struct ChannelInfo {
     pub channel: ChannelWrap,
     pub exit: Option<Sender<ExitStatus>>,
     pub exited: bool,
+    /// A direct-tcpip channel, whose two descriptors are the one socket:
+    /// see `SessionInner::direct_tcpip`. Each way ends by itself, as a TCP
+    /// connection's do.
+    pub tunnel: bool,
+    /// A tunnel's near end has written all it will: once what it wrote has
+    /// gone on, the far end is told so.
+    pub local_eof: bool,
     pub descriptors: [DescriptorState; 3],
 }
 
@@ -67,6 +76,9 @@ pub(crate) struct SessionInner {
     pub keep_alive: Option<Duration>,
     pub shutdown: Arc<SessionShutdown>,
     pub authentication: Arc<OnceLock<AuthenticationInfo>>,
+    /// What to connect over instead of dialing: the channel a jump host
+    /// opened to this one. Taken by the first attempt.
+    pub transport: Option<Socket>,
 }
 
 impl Drop for SessionInner {
@@ -423,14 +435,52 @@ impl SessionInner {
     /// With other addresses for the host (see `crate::addresses`), also
     /// gives back the one that answered, and leaves out those in
     /// `not_this_host`: other addresses found serving some other machine.
+    ///
+    /// A host reached through jump hosts (see `crate::jump`) is connected
+    /// to through them, and neither dialed nor proxied: what these options
+    /// say is for whichever hop is reached first.
     fn connect_to_host(
-        &self,
+        &mut self,
         hostname: &str,
         port: u16,
         verbose: bool,
         not_this_host: &[(String, u16)],
-    ) -> anyhow::Result<(Socket, Option<KillOnDropChild>, Option<(String, u16)>)> {
+    ) -> anyhow::Result<(Socket, Option<TransportGuard>, Option<(String, u16)>)> {
         self.shutdown.check()?;
+        if let Some(transport) = self.transport.take() {
+            return Ok((transport, None, None));
+        }
+        let hops = crate::jump::hops_for(&self.config)?;
+        if !hops.is_empty() {
+            // Over the embedded tailnet alone means all the way there, and
+            // only the first hop is dialed: each one after it is reached
+            // through the one before, over that one's own network. Seen to
+            // for the whole way before anything is dialed.
+            let kept_to_tailnet = |config: &ConfigMap| {
+                config.get(crate::through::NETWORK).map(String::as_str) == Some("tailnet")
+            };
+            if kept_to_tailnet(&self.config) {
+                anyhow::bail!(
+                    "{hostname} is to be reached over the built-in tailnet, which no jump host \
+                     on the way would keep to; reach it directly, or over the system network"
+                );
+            }
+            if let Some((index, hop)) = hops
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, hop)| kept_to_tailnet(hop))
+            {
+                anyhow::bail!(
+                    "jump host {} is to be reached over the built-in tailnet, which the jump \
+                     host before it would not keep to",
+                    JumpHop::new(index, hop)
+                );
+            }
+            let (socket, chain, reached) =
+                self.connect_through(hops, hostname, port, not_this_host)?;
+            return Ok((socket, Some(TransportGuard::Jumps(chain)), reached));
+        }
         let dialer = crate::addresses::Dialer::from_config(&self.config)?;
         match self.config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
@@ -472,14 +522,18 @@ impl SessionInner {
                         _ => a.into_raw_fd(),
                     };
 
-                    return Ok((Socket::from_raw_fd(dest), Some(child), None));
+                    return Ok((
+                        Socket::from_raw_fd(dest),
+                        Some(TransportGuard::ProxyCommand(child)),
+                        None,
+                    ));
                 }
                 #[cfg(windows)]
                 unsafe {
                     use std::os::windows::io::{FromRawSocket, IntoRawSocket};
                     return Ok((
                         Socket::from_raw_socket(a.into_raw_socket()),
-                        Some(child),
+                        Some(TransportGuard::ProxyCommand(child)),
                         None,
                     ));
                 }
@@ -519,6 +573,172 @@ impl SessionInner {
         })?;
         self.shutdown.check()?;
         Ok((sock, None, None))
+    }
+
+    /// The connection to the host through `hops`, nearest first: a session
+    /// to each, and through each a channel to the next, the last one's to
+    /// the host. What a hop asks while it signs in is passed on as this
+    /// session's own prompts, marked with the hop asking.
+    /// The connection to the host through `hops`, nearest first: a session
+    /// to each, and through each a channel to the next, the last one's to
+    /// the host. What a hop asks while it signs in is passed on as this
+    /// session's own prompts, marked with the hop asking. The address that
+    /// answered comes back as `connect_to_host`'s does: the host's other
+    /// addresses (see `crate::addresses`), but those in `not_this_host`,
+    /// are tried through the last hop in turn.
+    fn connect_through(
+        &self,
+        hops: Vec<ConfigMap>,
+        hostname: &str,
+        port: u16,
+        not_this_host: &[(String, u16)],
+    ) -> anyhow::Result<(Socket, JumpChain, Option<(String, u16)>)> {
+        let hops: Vec<ConfigMap> = hops
+            .into_iter()
+            .map(|mut config| {
+                crate::jump::inherit(&self.config, &mut config);
+                config
+            })
+            .collect();
+        let mut chain = JumpChain { sessions: vec![] };
+        for index in 0..hops.len() {
+            self.reach_hop(&hops, index, &mut chain)?;
+        }
+
+        let last = hops.len() - 1;
+        let hop = JumpHop::new(last, &hops[last]);
+        let mut candidates = crate::addresses::candidates(&self.config, hostname, port);
+        candidates.retain(|address| !not_this_host.contains(address));
+        if candidates.is_empty() {
+            anyhow::bail!("no address of {hostname} is left to try");
+        }
+        let several = candidates.len() > 1;
+        let limit = connect_timeout(&self.config);
+        let mut failures = vec![];
+        let mut candidates = candidates.into_iter().peekable();
+        while let Some((host, port)) = candidates.next() {
+            self.shutdown.check()?;
+            self.send_event(SessionEvent::Banner(Some(format!(
+                "Signed in to {hop}; connecting through it to {host}:{port}"
+            ))))?;
+            let session = chain.sessions.last().expect("a session to the last hop");
+            match open_onward(session, &host, port, limit) {
+                Ok(Some(socket)) => {
+                    let reached = several.then(|| (host, port));
+                    return Ok((socket, chain, reached));
+                }
+                Ok(None) => {
+                    failures.push(format!(
+                        "{host}:{port}: no connection within {:?}",
+                        limit.unwrap_or_default()
+                    ));
+                    // The hop still waits on that one, and would take the
+                    // next only after it: the next goes through a session
+                    // of its own.
+                    if candidates.peek().is_some() {
+                        if let Some(stuck) = chain.sessions.pop() {
+                            stuck.shutdown();
+                        }
+                        self.reach_hop(&hops, last, &mut chain)?;
+                    }
+                }
+                Err(err) => failures.push(format!("{host}:{port}: {err:#}")),
+            }
+        }
+        match failures.as_slice() {
+            [one] => anyhow::bail!("jump host {hop} could not connect to {one}"),
+            all => anyhow::bail!(
+                "jump host {hop} could not connect to any address: {}",
+                all.join("; ")
+            ),
+        }
+    }
+
+    /// Signs in to hop `index` and keeps its session on `chain`: dialed for
+    /// the first, through a channel the hop before it opens for the others.
+    fn reach_hop(
+        &self,
+        hops: &[ConfigMap],
+        index: usize,
+        chain: &mut JumpChain,
+    ) -> anyhow::Result<()> {
+        let config = hops[index].clone();
+        let hop = JumpHop::new(index, &config);
+        let (session, events) = match index {
+            0 => Session::connect(config)?,
+            _ => {
+                let before = JumpHop::new(index - 1, &hops[index - 1]);
+                let host = config.get("hostname").cloned().unwrap_or_default();
+                let port = match config.get("port") {
+                    Some(port) => port
+                        .parse::<u16>()
+                        .with_context(|| format!("port of jump host {index}"))?,
+                    None => 22,
+                };
+                self.send_event(SessionEvent::Banner(Some(format!(
+                    "Signed in to {before}; connecting through it to {host}:{port}"
+                ))))?;
+                let previous = chain.sessions.last().expect("the hop before is kept");
+                let limit = connect_timeout(&config);
+                let socket = open_onward(previous, &host, port, limit)
+                    .with_context(|| {
+                        format!("jump host {before} could not connect to {host}:{port}")
+                    })?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "jump host {before} could not connect to {host}:{port}: no connection \
+                             within {:?}",
+                            limit.unwrap_or_default()
+                        )
+                    })?;
+                Session::connect_over(config, socket)?
+            }
+        };
+        self.shutdown.link(session.shutdown_handle());
+        chain.sessions.push(session);
+        self.relay_hop_events(&hop, &events)
+    }
+
+    /// Passes on what `hop` says and asks while it signs in, until it has.
+    fn relay_hop_events(
+        &self,
+        hop: &JumpHop,
+        events: &Receiver<SessionEvent>,
+    ) -> anyhow::Result<()> {
+        loop {
+            let Ok(event) = smol::block_on(events.recv()) else {
+                self.shutdown.check()?;
+                anyhow::bail!("the connection to jump host {hop} ended while signing in");
+            };
+            let event = match event {
+                SessionEvent::Authenticated => return Ok(()),
+                SessionEvent::Error(err) => anyhow::bail!("jump host {hop}: {err}"),
+                SessionEvent::AuthenticationRefused(err) => {
+                    return Err(
+                        crate::auth::AnswerRefused(format!("jump host {hop}: {err}")).into(),
+                    )
+                }
+                SessionEvent::Authenticate(mut auth) => {
+                    auth.jump.get_or_insert_with(|| hop.clone());
+                    SessionEvent::Authenticate(auth)
+                }
+                SessionEvent::HostVerify(mut verify) => {
+                    verify.jump.get_or_insert_with(|| hop.clone());
+                    SessionEvent::HostVerify(verify)
+                }
+                event @ (SessionEvent::Banner(_) | SessionEvent::HostVerificationFailed(_)) => {
+                    event
+                }
+            };
+            self.send_event(event)?;
+        }
+    }
+
+    /// Unlike `tx_event.try_send`, waits for room: a hop's events come on
+    /// top of this session's own, and none may be dropped.
+    fn send_event(&self, event: SessionEvent) -> anyhow::Result<()> {
+        smol::block_on(self.tx_event.send(event))
+            .map_err(|_| anyhow!("nobody is waiting on this connection any more"))
     }
 
     /// An other address answered as some other machine: say so, and the
@@ -652,8 +872,10 @@ impl SessionInner {
                                 // with the stdin buffer full (libssh is
                                 // not taking writes yet), a readable pipe
                                 // woke poll at once for nothing, and the
-                                // loop took itself for a busy loop.
-                                if state.buf.len() < state.buf.capacity() {
+                                // loop took itself for a busy loop. A
+                                // tunnel's near end that has ended stays
+                                // readable, for nothing more.
+                                if !info.local_eof && state.buf.len() < state.buf.capacity() {
                                     POLLIN
                                 } else {
                                     0
@@ -696,6 +918,14 @@ impl SessionInner {
                         // There's data we can read into the buffer
                         match read_into_buf(fd, &mut state.buf) {
                             Ok(progress) => made_progress |= progress,
+                            Err(err) if info.tunnel => {
+                                // Ended its writing: the far end hears so
+                                // once what it wrote has gone (`tick_io`),
+                                // and may go on answering.
+                                log::trace!("channel {channel_id}: the near end ended: {:#}", err);
+                                info.local_eof = true;
+                                made_progress = true;
+                            }
                             Err(err) => {
                                 log::debug!(
                                     "error reading from channel {channel_id} stdin pipe: {:#}",
@@ -817,6 +1047,13 @@ impl SessionInner {
                     }
                 }
             }
+            if chan.local_eof && stdin.fd.is_some() && stdin.buf.is_empty() {
+                if let Err(err) = chan.channel.send_eof() {
+                    log::trace!("channel {id}: telling the far end it ended: {:#}", err);
+                }
+                stdin.fd.take();
+                made_progress = true;
+            }
 
             for (idx, out) in chan
                 .descriptors
@@ -856,7 +1093,13 @@ impl SessionInner {
                                     idx,
                                     err
                                 );
-                                out.fd.take();
+                                if let Some(fd) = out.fd.take() {
+                                    // The far end is done writing: the near
+                                    // end reads its end, and may go on.
+                                    if chan.tunnel {
+                                        shut_down_writes(&fd);
+                                    }
+                                }
                                 made_progress = true;
                             } else {
                                 log::trace!(
@@ -871,6 +1114,19 @@ impl SessionInner {
                         }
                     }
                 }
+            }
+
+            // The far end's way has ended once all it sent has gone on.
+            if chan.tunnel
+                && chan.descriptors[1].fd.is_some()
+                && chan.descriptors[1].buf.is_empty()
+                && chan.channel.reached_eof(0)
+            {
+                log::trace!("channel {id}: the far end ended");
+                if let Some(fd) = chan.descriptors[1].fd.take() {
+                    shut_down_writes(&fd);
+                }
+                made_progress = true;
             }
 
             if chan
@@ -932,6 +1188,9 @@ impl SessionInner {
                     }
                     SessionRequest::Exec(exec, reply) => {
                         dispatch(reply, || self.exec(sess, exec), "exec")
+                    }
+                    SessionRequest::DirectTcpip(req, reply) => {
+                        dispatch(reply, || self.direct_tcpip(sess, req), "direct_tcpip")
                     }
                     SessionRequest::SignalChannel(info) => {
                         if let Err(err) = self.signal_channel(&info) {
@@ -1171,6 +1430,8 @@ impl SessionInner {
                 channel,
                 exit: None,
                 exited: false,
+                tunnel: false,
+                local_eof: false,
                 descriptors: [
                     DescriptorState {
                         fd: Some(read_from_agent),
@@ -1270,6 +1531,8 @@ impl SessionInner {
             channel,
             exit: Some(exit_tx),
             exited: false,
+            tunnel: false,
+            local_eof: false,
             descriptors: [
                 DescriptorState {
                     fd: Some(read_from_stdin),
@@ -1289,6 +1552,46 @@ impl SessionInner {
         self.channels.insert(channel_id, info);
 
         Ok(result)
+    }
+
+    /// A direct-tcpip channel to `req`'s host and port, carried to and from
+    /// one end of a socket pair, as an agent's connection is; the other end
+    /// is given back, to connect a session over.
+    fn direct_tcpip(&mut self, sess: &mut SessionWrap, req: DirectTcpip) -> anyhow::Result<Socket> {
+        let channel = sess
+            .open_direct_tcpip(&req.host, req.port)
+            .with_context(|| format!("opening a channel to {}:{}", req.host, req.port))?;
+        let (mut ours, theirs) = socketpair()?;
+        ours.set_non_blocking(true)?;
+        let write_to_ours = ours.try_clone()?;
+        let channel_id = self.next_channel_id;
+        self.next_channel_id += 1;
+        self.channels.insert(
+            channel_id,
+            ChannelInfo {
+                channel_id,
+                channel,
+                exit: None,
+                exited: false,
+                tunnel: true,
+                local_eof: false,
+                descriptors: [
+                    DescriptorState {
+                        fd: Some(ours),
+                        buf: VecDeque::with_capacity(CHANNEL_BUFFER),
+                    },
+                    DescriptorState {
+                        fd: Some(write_to_ours),
+                        buf: VecDeque::with_capacity(CHANNEL_BUFFER),
+                    },
+                    DescriptorState {
+                        fd: None,
+                        buf: VecDeque::with_capacity(CHANNEL_BUFFER),
+                    },
+                ],
+            },
+        );
+        Ok(into_socket(theirs))
     }
 
     /// Open a handle to a file.
@@ -1425,8 +1728,90 @@ where
     Ok(true)
 }
 
+/// A host's ConnectTimeout, which bounds a connection through a jump host
+/// as it bounds one dialed directly.
+fn connect_timeout(config: &ConfigMap) -> Option<Duration> {
+    config
+        .get("connecttimeout")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
+/// The connection `session` opens to `host:port`, or None when it took
+/// longer than `limit`: the jump host would otherwise wait as long as its
+/// own TCP connect does. Its session goes with the attempt then, as the
+/// chain it is on ends.
+fn open_onward(
+    session: &Session,
+    host: &str,
+    port: u16,
+    limit: Option<Duration>,
+) -> anyhow::Result<Option<Socket>> {
+    let open = async { session.open_direct_tcpip(host, port).await.map(Some) };
+    match limit {
+        None => smol::block_on(open),
+        Some(limit) => smol::block_on(smol::future::or(open, async {
+            smol::Timer::after(limit).await;
+            Ok(None)
+        })),
+    }
+}
+
+/// Ends the writing half of the socket `fd` is: its reader sees the end of
+/// what it is sent, while it may still write back.
+fn shut_down_writes(fd: &FileDescriptor) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::shutdown(fd.as_raw_fd(), libc::SHUT_WR);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = socket2::SockRef::from(fd).shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// What keeps a session's connection up besides its socket. Only held,
+/// for what dropping it does.
+#[allow(dead_code)]
+pub(crate) enum TransportGuard {
+    ProxyCommand(KillOnDropChild),
+    Jumps(JumpChain),
+}
+
+/// The sessions to the jump hosts a session is reached through, nearest
+/// first. Each carries the next one's connection, the last the session's
+/// own; when the session goes, so do they.
+pub(crate) struct JumpChain {
+    sessions: Vec<Session>,
+}
+
+impl Drop for JumpChain {
+    fn drop(&mut self) {
+        for session in self.sessions.iter().rev() {
+            session.shutdown();
+        }
+    }
+}
+
+fn into_socket(fd: FileDescriptor) -> Socket {
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        Socket::from_raw_fd(fd.into_raw_fd())
+    }
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+        Socket::from_raw_socket(fd.into_raw_socket())
+    }
+}
+
 /// A little helper to ensure the Child process is killed on Drop.
-struct KillOnDropChild(std::process::Child);
+pub(crate) struct KillOnDropChild(std::process::Child);
 
 impl Drop for KillOnDropChild {
     fn drop(&mut self) {

@@ -14,6 +14,10 @@ pub struct AuthenticationEvent {
     pub username: String,
     pub instructions: String,
     pub prompts: Vec<AuthenticationPrompt>,
+    /// The jump host asking, for a host reached through others; `None`
+    /// when it is the host itself. What is kept for one host is no answer
+    /// for another: a password sent to the wrong one is given away.
+    pub jump: Option<crate::jump::JumpHop>,
     pub(crate) reply: Sender<Vec<String>>,
 }
 
@@ -125,6 +129,7 @@ impl crate::sessioninner::SessionInner {
                                     ),
                                     echo: false,
                                 }],
+                                jump: None,
                                 reply,
                             }))
                             .context("sending Authenticate request to user")?;
@@ -186,6 +191,7 @@ impl crate::sessioninner::SessionInner {
                     },
                     echo,
                 }],
+                jump: None,
                 reply,
             }))
             .map_err(|_| {
@@ -257,6 +263,7 @@ impl crate::sessioninner::SessionInner {
                                             echo: p.echo,
                                         })
                                         .collect(),
+                                    jump: None,
                                     reply,
                                 }))
                                 .context("sending Authenticate request to user")?;
@@ -291,6 +298,7 @@ impl crate::sessioninner::SessionInner {
                             prompt: "Password: ".to_string(),
                             echo: false,
                         }],
+                        jump: None,
                         reply,
                     }))
                     .context("sending Authenticate request to user")?;
@@ -372,6 +380,7 @@ impl crate::sessioninner::SessionInner {
                             prompt: format!("Password for {}@{}: ", user, host),
                             echo: false,
                         }],
+                        jump: None,
                         reply,
                     }))
                     .context("sending Authenticate request to user")?;
@@ -418,6 +427,7 @@ impl crate::sessioninner::SessionInner {
                                         echo: p.echo,
                                     })
                                     .collect(),
+                                jump: None,
                                 reply,
                             },
                         )) {

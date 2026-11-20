@@ -162,6 +162,7 @@ fn test_inner(root: &Path) -> (SessionInner, Receiver<SessionEvent>) {
             keep_alive: None,
             shutdown: Arc::new(SessionShutdown::default()),
             authentication: Arc::new(OnceLock::new()),
+            transport: None,
         },
         events,
     )

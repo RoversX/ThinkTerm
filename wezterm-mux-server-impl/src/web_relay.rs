@@ -306,11 +306,55 @@ struct Kept {
     /// The person said yes to installing ThinkTerm there.
     #[serde(default)]
     install: bool,
-    /// The `user@host:port` these answers were given for. An alias in
-    /// `~/.ssh/config` can be pointed somewhere else later; what was kept
-    /// for the old address is not used for the new one.
+    /// Digest of the resolved SSH route where these answers were supplied.
+    /// Older records lack this binding and require a fresh sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    address: Option<String>,
+    route: Option<String>,
+    /// The desktop catalog owns this password. Keep only the route where
+    /// the relay first took it, independently of answers saved by a browser.
+    #[serde(default, skip_serializing_if = "DesktopPasswordRoute::is_new")]
+    desktop_route: DesktopPasswordRoute,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DesktopPasswordRoute {
+    #[default]
+    New,
+    Unbound,
+    Bound(String),
+}
+
+impl DesktopPasswordRoute {
+    fn is_new(&self) -> bool {
+        matches!(self, Self::New)
+    }
+}
+
+impl Kept {
+    fn accepts_desktop_password(&self, route: &str) -> bool {
+        match &self.desktop_route {
+            DesktopPasswordRoute::Bound(original) => original == route,
+            DesktopPasswordRoute::New => self.route.as_deref() == Some(route),
+            DesktopPasswordRoute::Unbound => false,
+        }
+    }
+
+    fn bind_to(&mut self, route: Option<String>) {
+        if route.is_none() || self.route != route {
+            if self.desktop_route.is_new() {
+                if let Some(previous) = &self.route {
+                    self.desktop_route = DesktopPasswordRoute::Bound(previous.clone());
+                } else if self.password.is_some() || self.passphrase.is_some() || self.install {
+                    self.desktop_route = DesktopPasswordRoute::Unbound;
+                }
+            }
+            self.password = None;
+            self.passphrase = None;
+            self.install = false;
+        }
+        self.route = route;
+    }
 }
 
 /// Its own file, never the desktop's catalog: a desktop running on this
@@ -403,8 +447,6 @@ struct Machine {
     id: String,
     source: Source,
     spec: SshHostSpec,
-    /// Where it leads now, as `user@host:port`; see `Kept::address`.
-    address: String,
     kept: Kept,
 }
 
@@ -426,14 +468,36 @@ impl Machine {
         }
     }
 
+    /// Check the exact config handed to Session::connect. Keep any newly
+    /// supplied answers under that route throughout this session.
+    fn bind_attempt(&mut self, config: &wezterm_ssh::ConfigMap) {
+        let route = route_id(config);
+        if route.is_none() || self.kept.route != route {
+            self.spec.password = None;
+        }
+        self.kept.bind_to(route);
+    }
+
     /// The password kept for it here, else the desktop's.
     fn password(&self) -> Option<String> {
-        self.kept
-            .password
-            .as_deref()
-            .or(self.spec.password.as_deref())
-            .map(thinkterm_core::secret::reveal)
-            .filter(|p| !p.is_empty())
+        let stored = if let Some(password) = self.kept.password.as_deref() {
+            password
+        } else {
+            let password = self.spec.password.as_deref()?;
+            let route = self.kept.route.as_deref()?;
+            if !matches!(&self.kept.desktop_route, DesktopPasswordRoute::Bound(original) if original == route)
+            {
+                // Concurrent first opens must agree before either offers the password.
+                let mut allowed = false;
+                change_kept(|file| allowed = pin_desktop_route(file, &self.id, route)).ok()?;
+                if !allowed {
+                    return None;
+                }
+            }
+            password
+        };
+        let password = thinkterm_core::secret::reveal(stored);
+        (!password.is_empty()).then_some(password)
     }
 
     fn passphrase(&self) -> Option<String> {
@@ -445,48 +509,62 @@ impl Machine {
     }
 }
 
-/// What is kept for a machine at `address`: nothing of what was kept for
-/// the same name at another address.
-fn kept_for(kept: &KeptFile, id: &str, address: &str) -> Kept {
-    match kept.machines.iter().find(|k| k.id == id) {
-        Some(k) if k.address.as_deref().map_or(true, |a| a == address) => k.clone(),
-        Some(k) => Kept {
-            id: id.to_string(),
-            host: k.host.clone(),
-            ..Kept::default()
-        },
-        None => Kept {
-            id: id.to_string(),
-            ..Kept::default()
-        },
+fn pin_desktop_route(file: &mut KeptFile, id: &str, route: &str) -> bool {
+    if let Some(entry) = file.machines.iter().find(|entry| entry.id == id) {
+        if !entry.accepts_desktop_password(route) {
+            return false;
+        }
     }
+    kept_entry(file, id).desktop_route = DesktopPasswordRoute::Bound(route.to_owned());
+    true
 }
 
-/// Every machine the page may open: added from a browser, the desktop's
-/// catalog, and `~/.ssh/config`, by name. `address_of` says where an
-/// `~/.ssh/config` alias leads now.
-fn machines_from(
-    kept: &KeptFile,
-    saved: Vec<SshHostEntry>,
-    system: Vec<SshHostEntry>,
-    address_of: impl Fn(&SshHostSpec) -> String,
-) -> Vec<Machine> {
-    let mut machines: Vec<Machine> = kept
+/// A stable fingerprint of the mux password binding. Hash each field with
+/// its length so proxy commands and their arguments stay out of the store.
+fn route_id(config: &wezterm_ssh::ConfigMap) -> Option<String> {
+    let mut digest = Sha256::new();
+    for field in mux::ssh::way_of(config)? {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    Some(hex::encode(digest.finalize()))
+}
+
+fn machine_route(spec: &SshHostSpec, hosts: &[SshHostEntry]) -> Option<String> {
+    let domain = thinkterm_core::ssh_hosts::build_ssh_domain_among(spec, hosts).ok()?;
+    route_id(&mux::ssh::ssh_domain_to_ssh_config(&domain).ok()?)
+}
+
+/// Every machine the page may open, with the answers kept for its current route.
+fn machines_from(kept: &KeptFile, hosts: &[SshHostEntry]) -> Vec<Machine> {
+    let machine = |id: &str, source, spec: &SshHostSpec| {
+        let route = machine_route(spec, hosts);
+        let previous = kept.machines.iter().find(|k| k.id == id);
+        let mut spec = spec.clone();
+        if !route
+            .as_deref()
+            .is_some_and(|r| previous.is_none_or(|entry| entry.accepts_desktop_password(r)))
+        {
+            spec.password = None;
+        }
+        let mut entry = previous.cloned().unwrap_or_else(|| Kept {
+            id: id.to_string(),
+            ..Kept::default()
+        });
+        entry.bind_to(route);
+        Machine {
+            id: id.to_string(),
+            source,
+            spec,
+            kept: entry,
+        }
+    };
+    let mut machines: Vec<_> = kept
         .machines
         .iter()
-        .filter_map(|k| {
-            let spec = k.host.clone()?;
-            let address = thinkterm_core::ssh_hosts::endpoint(&spec);
-            Some(Machine {
-                id: k.id.clone(),
-                source: Source::Web,
-                kept: kept_for(kept, &k.id, &address),
-                address,
-                spec,
-            })
-        })
+        .filter_map(|k| Some(machine(&k.id, Source::Web, k.host.as_ref()?)))
         .collect();
-    for entry in saved.into_iter().chain(system) {
+    for entry in hosts {
         if machines.iter().any(|m| m.id == entry.id) {
             continue;
         }
@@ -494,17 +572,7 @@ fn machines_from(
             SshHostSource::ThinkTerm => Source::Saved,
             SshHostSource::System => Source::SshConfig,
         };
-        let address = match source {
-            Source::SshConfig => address_of(&entry.spec),
-            _ => thinkterm_core::ssh_hosts::endpoint(&entry.spec),
-        };
-        machines.push(Machine {
-            kept: kept_for(kept, &entry.id, &address),
-            address,
-            source,
-            id: entry.id,
-            spec: entry.spec,
-        });
+        machines.push(machine(&entry.id, source, &entry.spec));
     }
     machines.sort_by(|a, b| {
         a.spec
@@ -515,18 +583,17 @@ fn machines_from(
     machines
 }
 
-/// Where an `~/.ssh/config` alias leads, as ssh itself would resolve it.
-fn resolved_address(spec: &SshHostSpec) -> String {
-    let dom = thinkterm_core::ssh_hosts::build_ssh_domain(spec);
-    match mux::ssh::ssh_domain_to_ssh_config(&dom) {
-        Ok(config) => format!(
-            "{}@{}:{}",
-            config.get("user").map(String::as_str).unwrap_or(""),
-            config.get("hostname").map(String::as_str).unwrap_or(&spec.host),
-            config.get("port").map(String::as_str).unwrap_or("22"),
-        ),
-        Err(_) => thinkterm_core::ssh_hosts::endpoint(spec),
+/// The ssh domain of a machine's host, through the jump hosts its record
+/// names, as the saved hosts have them now. Without their passwords: a
+/// jump host asks the page for its own.
+fn machine_ssh_domain(spec: &SshHostSpec) -> anyhow::Result<config::SshDomain> {
+    if spec.jump_host.is_none() {
+        return Ok(thinkterm_core::ssh_hosts::build_ssh_domain(spec));
     }
+    let hosts = thinkterm_core::ssh_hosts::list_all_hosts()?;
+    Ok(thinkterm_core::ssh_hosts::build_ssh_domain_among(
+        spec, &hosts,
+    )?)
 }
 
 fn machines() -> Vec<Machine> {
@@ -536,7 +603,7 @@ fn machines() -> Vec<Machine> {
             log::warn!("nothing kept for the web relay is used: the store is unreadable");
             KeptFile::default()
         });
-    let saved = thinkterm_core::ssh_hosts::list_saved_hosts().unwrap_or_else(|_| {
+    let mut saved = thinkterm_core::ssh_hosts::list_saved_hosts().unwrap_or_else(|_| {
         log::warn!("the desktop's host catalog is unreadable");
         vec![]
     });
@@ -544,7 +611,8 @@ fn machines() -> Vec<Machine> {
         log::warn!("the ssh config is unreadable");
         vec![]
     });
-    machines_from(&kept, saved, system, resolved_address)
+    saved.extend(system);
+    machines_from(&kept, &saved)
 }
 
 fn machines_reply(enabled: bool) -> Reply {
@@ -693,15 +761,20 @@ fn new_machine_spec(new: &NewMachine) -> anyhow::Result<(String, SshHostSpec)> {
 fn save_machine(new: NewMachine) -> anyhow::Result<String> {
     let (id, spec) = new_machine_spec(&new)?;
     let password = match new.password.as_deref().filter(|p| !p.is_empty()) {
-        Some(password) => Some(thinkterm_core::secret::encrypt(password)?),
+        Some(password) => {
+            let route =
+                machine_route(&spec, &[]).context("cannot bind the password to the SSH route")?;
+            Some((route, thinkterm_core::secret::encrypt(password)?))
+        }
         None => None,
     };
     let saved_id = id.clone();
     change_kept(move |file| {
         let entry = kept_entry(file, &id);
         entry.host = Some(spec);
-        if password.is_some() {
-            entry.password = password;
+        if let Some((route, password)) = password {
+            entry.bind_to(Some(route));
+            entry.password = Some(password);
         }
     })?;
     Ok(saved_id)
@@ -710,7 +783,23 @@ fn save_machine(new: NewMachine) -> anyhow::Result<String> {
 /// A machine added from a browser goes; for any other, what was kept for
 /// it (its password, the go-ahead to install) does.
 fn forget_machine(id: &str) -> anyhow::Result<()> {
-    change_kept(|file| file.machines.retain(|k| k.id != id))
+    change_kept(|file| {
+        file.machines.retain_mut(|entry| {
+            if entry.id != id {
+                return true;
+            }
+            if entry.host.is_some() || id.starts_with("system-ssh-") {
+                return false;
+            }
+            // Forget the browser's answers. The desktop still holds its
+            // password, so its existing binding must survive.
+            entry.bind_to(None);
+            if entry.desktop_route.is_new() {
+                entry.desktop_route = DesktopPasswordRoute::Unbound;
+            }
+            true
+        })
+    })
 }
 
 /// Which kept answer a hidden prompt takes.
@@ -733,18 +822,15 @@ fn secret_kind(prompt: &str) -> Option<Secret> {
     }
 }
 
-/// Keep something for `machine`, with the address it was given for.
+/// Save answers against the authenticated session's route, even if the
+/// SSH files or saved hosts change while the page is open.
 fn remember(machine: &Machine, what: &'static str, change: impl FnOnce(&mut Kept)) {
-    let address = machine.address.clone();
+    let Some(route) = &machine.kept.route else {
+        return;
+    };
     if change_kept(|file| {
         let entry = kept_entry(file, &machine.id);
-        if entry.address.as_deref().is_some_and(|a| a != address) {
-            // Kept for another address: none of it belongs to this one.
-            entry.password = None;
-            entry.passphrase = None;
-            entry.install = false;
-        }
-        entry.address = Some(address);
+        entry.bind_to(Some(route.clone()));
         change(entry);
     })
     .is_err()
@@ -1401,9 +1487,9 @@ fn relay_agent() -> Option<String> {
 
 /// Open the ssh session, answering what can be answered from what is kept
 /// and asking the page the rest.
-fn authenticate(machine: &Machine, page: &Page) -> Result<Session, Failure> {
+fn authenticate(machine: &mut Machine, page: &Page) -> Result<Session, Failure> {
     page.attempt.check().map_err(Failure::failed)?;
-    let dom = thinkterm_core::ssh_hosts::build_ssh_domain(&machine.spec);
+    let dom = machine_ssh_domain(&machine.spec).map_err(Failure::failed)?;
     let mut config = mux::ssh::ssh_domain_to_ssh_config(&dom).map_err(Failure::failed)?;
     // This server scrubs SSH_AUTH_SOCK from its own environment, and ssh
     // here only finds an agent through it: name the one its panes get, as
@@ -1414,6 +1500,7 @@ fn authenticate(machine: &Machine, page: &Page) -> Result<Session, Failure> {
         }
     }
     // Each kept answer once: one that is refused is asked for again.
+    machine.bind_attempt(&config);
     let mut kept_password = machine.password();
     let mut kept_passphrase = machine.passphrase();
     // What the person typed and asked to keep, the latest of each kind:
@@ -1440,7 +1527,11 @@ fn authenticate(machine: &Machine, page: &Page) -> Result<Session, Failure> {
                 }
             }
             SessionEvent::HostVerify(verify) => {
-                let ok = page.agrees(AskKind::HostKey, &verify.message);
+                let message = match &verify.jump {
+                    Some(hop) => format!("Jump host {hop}:\n{}", verify.message),
+                    None => verify.message.clone(),
+                };
+                let ok = page.agrees(AskKind::HostKey, &message);
                 // Answered either way, so ssh is never left waiting.
                 smol::block_on(verify.answer(ok)).map_err(Failure::failed)?;
                 if !ok {
@@ -1459,6 +1550,13 @@ fn authenticate(machine: &Machine, page: &Page) -> Result<Session, Failure> {
                     }
                     detail.push_str(&auth.username);
                 }
+                // What is kept is the machine's own: a jump host the ssh
+                // config puts on the way is never sent it, and what is typed
+                // for one is not kept as the machine's.
+                let on_the_way = auth.jump.is_some();
+                if let Some(hop) = &auth.jump {
+                    detail = format!("jump host {hop}\n{detail}").trim_end().to_string();
+                }
                 let mut answers = vec![];
                 for prompt in &auth.prompts {
                     let secret = if prompt.echo {
@@ -1467,6 +1565,7 @@ fn authenticate(machine: &Machine, page: &Page) -> Result<Session, Failure> {
                         secret_kind(&prompt.prompt)
                     };
                     let kept = match secret {
+                        _ if on_the_way => None,
                         Some(Secret::Password) => kept_password.take(),
                         Some(Secret::Passphrase) => kept_passphrase.take(),
                         None => None,
@@ -1477,14 +1576,16 @@ fn authenticate(machine: &Machine, page: &Page) -> Result<Session, Failure> {
                     }
                     let kind = if prompt.echo {
                         AskKind::Text
-                    } else if secret.is_some() {
+                    } else if secret.is_some() && !on_the_way {
                         AskKind::Password
                     } else {
+                        // A jump host's is not kept (see above): the page
+                        // offers no Remember for it.
                         AskKind::Secret
                     };
                     match page.ask(kind, &clean_prompt(&prompt.prompt), &detail) {
                         Some((value, remember)) => {
-                            if let Some(secret) = secret {
+                            if let Some(secret) = secret.filter(|_| !on_the_way) {
                                 typed.retain(|(kind, _)| *kind != secret);
                                 if remember {
                                     typed.push((secret, value.clone()));
@@ -2130,7 +2231,7 @@ fn plan(
 /// minutes over one, and the lock keeps every other page off the host
 /// meanwhile. Under the lock the host is looked at again -- another page
 /// may have finished an install since -- before anything is changed.
-fn reach(machine: &Machine, page: &Page) -> Result<Reached, Failure> {
+fn reach(machine: &mut Machine, page: &Page) -> Result<Reached, Failure> {
     page.step(Step::Connecting);
     let session = authenticate(machine, page)?;
     let mut consent = Consent {
@@ -2325,12 +2426,36 @@ fn plain_ssh_domain(machine: &Machine) -> Option<String> {
         // By id: a bare host name could be an alias's domain above.
         _ => format!("SSH:{}", machine.id),
     };
-    if mux.get_domain_by_name(&name).is_some() {
+    let registered = mux.get_domain_by_name(&name);
+    // An alias's is `update_mux_domains`'s to keep up, from ~/.ssh/config.
+    if registered.is_some() && matches!(machine.source, Source::SshConfig) {
         return Some(name);
     }
-    let mut dom = thinkterm_core::ssh_hosts::build_ssh_domain(&machine.spec);
+    let mut dom = match machine_ssh_domain(&machine.spec) {
+        Ok(dom) => dom,
+        Err(err) => {
+            log::warn!("web relay: no plain ssh domain for {}: {err:#}", machine.id);
+            return None;
+        }
+    };
     dom.name = name.clone();
     dom.multiplexing = SshMultiplexing::None;
+    // The one registered, while it goes the way the machine is reached now:
+    // a jump host picked or set in its options may have changed, or moved,
+    // under the same name.
+    let current = registered
+        .as_ref()
+        .and_then(|domain| domain.downcast_ref::<RemoteSshDomain>())
+        .is_some_and(|domain| {
+            let built = domain.ssh_domain();
+            built.remote_address == dom.remote_address
+                && built.username == dom.username
+                && built.ssh_option == dom.ssh_option
+                && built.jump_hosts == dom.jump_hosts
+        });
+    if current {
+        return Some(name);
+    }
     // No password: a domain holds it in plain text for as long as this
     // server runs, Forget or not. The pane asks for one when it is needed.
     match RemoteSshDomain::with_ssh_domain(&dom) {
@@ -2553,7 +2678,8 @@ where
                     answers,
                     next_ask: std::cell::Cell::new(1),
                 };
-                let reached = reach(&machine, &page).map_err(|mut failure| {
+                let mut machine = machine;
+                let reached = reach(&mut machine, &page).map_err(|mut failure| {
                     // A step that ran out of time is why, whatever the
                     // work hit after it: a closed channel, or a question
                     // that reads as dismissed but went unanswered.
@@ -3439,14 +3565,14 @@ mod tests {
                     id: "system-ssh-a".into(),
                     password: Some("enc:v1:x".into()),
                     install: true,
-                    address: Some("user@server-a.example:22".into()),
+                    route: machine_route(&spec("server-a", "server-a"), &[]),
                     ..Kept::default()
                 },
                 Kept {
                     id: "system-ssh-moved".into(),
                     password: Some("enc:v1:y".into()),
                     install: true,
-                    address: Some("user@old.example:22".into()),
+                    route: machine_route(&spec("moved", "old.example"), &[]),
                     ..Kept::default()
                 },
             ],
@@ -3469,10 +3595,9 @@ mod tests {
             source: SshHostSource::ThinkTerm,
             spec: spec("Build", "build.example"),
         }];
-        let list = machines_from(&kept, saved, system, |spec| match spec.host.as_str() {
-            "server-a" => "user@server-a.example:22".to_string(),
-            _ => "user@new.example:22".to_string(),
-        });
+        let mut hosts = saved;
+        hosts.extend(system);
+        let list = machines_from(&kept, &hosts);
         let labels: Vec<_> = list.iter().map(|m| m.spec.label.as_str()).collect();
         assert_eq!(labels, ["Build", "devbox", "moved", "server-a"]);
         let moved = list.iter().find(|m| m.id == "system-ssh-moved").unwrap();
@@ -3490,6 +3615,95 @@ mod tests {
         let web = list.iter().find(|m| m.id == "web-1").unwrap();
         assert_eq!(web.source, Source::Web);
         assert!(!web.view().password);
+    }
+
+    #[test]
+    fn remembered_answers_follow_the_authenticated_route() {
+        let saved = |id: &str, host: &str| SshHostEntry {
+            id: id.into(),
+            source: SshHostSource::ThinkTerm,
+            spec: spec(id, host),
+        };
+        let mut target = saved("target", "private.invalid");
+        target.spec.jump_host = Some("relay".into());
+        target.spec.password = Some("desktop password".into());
+        let mut hosts = vec![target, saved("relay", "east.invalid")];
+        let original = machine_route(&hosts[0].spec, &hosts).unwrap();
+        let kept = KeptFile {
+            version: 1,
+            machines: vec![Kept {
+                id: "target".into(),
+                route: Some(original.clone()),
+                desktop_route: DesktopPasswordRoute::Bound(original.clone()),
+                password: Some("browser password".into()),
+                passphrase: Some("key passphrase".into()),
+                install: true,
+                ..Default::default()
+            }],
+        };
+        let target_from = |hosts: &[SshHostEntry]| {
+            machines_from(&kept, hosts)
+                .into_iter()
+                .find(|m| m.id == "target")
+                .unwrap()
+        };
+        let attempt = |hosts: &[SshHostEntry]| {
+            let dom =
+                thinkterm_core::ssh_hosts::build_ssh_domain_among(&hosts[0].spec, hosts).unwrap();
+            mux::ssh::ssh_domain_to_ssh_config(&dom).unwrap()
+        };
+        let mut listed = target_from(&hosts);
+        listed.bind_attempt(&attempt(&hosts));
+        assert_eq!(listed.password().as_deref(), Some("browser password"));
+        assert_eq!(listed.passphrase().as_deref(), Some("key passphrase"));
+        assert!(listed.kept.install);
+
+        hosts[1].spec.host = "west.invalid".into();
+        let mut relisted = target_from(&hosts);
+        relisted.bind_attempt(&attempt(&hosts));
+        assert_eq!(relisted.password(), None);
+        assert!(relisted.kept.password.is_none());
+        assert!(relisted.kept.passphrase.is_none());
+        assert!(!relisted.kept.install);
+
+        // A change after listing must also clear the desktop fallback for this attempt.
+        listed.bind_attempt(&attempt(&hosts));
+        assert_eq!(listed.password(), None);
+        assert_eq!(listed.passphrase(), None);
+        assert!(!listed.kept.install);
+        assert_ne!(listed.kept.route.as_ref(), Some(&original));
+        assert_eq!(listed.kept.route, relisted.kept.route);
+    }
+
+    #[test]
+    fn a_desktop_only_password_remains_bound_across_web_opens() {
+        let mut file = KeptFile::default();
+        assert!(pin_desktop_route(&mut file, "saved", "route-a"));
+        let mut reopened: KeptFile =
+            serde_json::from_slice(&serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(pin_desktop_route(&mut reopened, "saved", "route-a"));
+        assert!(!pin_desktop_route(&mut reopened, "saved", "route-b"));
+        // Remembering another browser answer cannot authorize the desktop
+        // password on that other route.
+        kept_entry(&mut reopened, "saved").bind_to(Some("route-b".into()));
+        assert!(!pin_desktop_route(&mut reopened, "saved", "route-b"));
+        let existing = kept_entry(&mut reopened, "consent-only");
+        existing.route = Some("route-a".into());
+        existing.install = true;
+        assert!(pin_desktop_route(&mut reopened, "consent-only", "route-a"));
+    }
+
+    #[test]
+    fn legacy_web_credentials_require_a_new_binding() {
+        let mut legacy: Kept = serde_json::from_value(serde_json::json!({
+            "id": "web-a", "address": "user@host.invalid:22", "password": "old",
+            "passphrase": "old", "install": true, "host": {"label": "Host", "host": "host.invalid"}
+        }))
+        .unwrap();
+        legacy.bind_to(machine_route(legacy.host.as_ref().unwrap(), &[]));
+        assert!(legacy.host.is_some() && legacy.route.is_some());
+        assert_eq!(legacy.desktop_route, DesktopPasswordRoute::Unbound);
+        assert!(legacy.password.is_none() && legacy.passphrase.is_none() && !legacy.install);
     }
 
     #[test]

@@ -363,6 +363,8 @@ impl crate::sessioninner::SessionInner {
             channel,
             exit: Some(exit_tx),
             exited: false,
+            tunnel: false,
+            local_eof: false,
             descriptors: [
                 DescriptorState {
                     fd: Some(read_from_stdin),

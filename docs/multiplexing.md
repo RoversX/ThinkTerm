@@ -76,6 +76,14 @@ $ wezterm cli spawn --domain-name SSHMUX:my.server
 
 To customize this functionality, see the example for [wezterm.default_ssh_domains()](config/lua/wezterm/default_ssh_domains.md)
 
+{{since('nightly')}}
+
+A host that is only reachable through another one is reached through it as
+`ssh -J` does: `ProxyJump` in `~/.ssh/config` is followed, and an SSH domain
+can name its jump hosts itself. The jump host only passes the connection on;
+the sessions stay on the host. See [Reaching a host through a jump
+host](config/lua/SshDomain.md#reaching-a-host-through-a-jump-host).
+
 ## Unix Domains
 
 A connection to a multiplexer made via a unix socket is referred to

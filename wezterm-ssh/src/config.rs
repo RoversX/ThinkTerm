@@ -58,16 +58,19 @@ impl Pattern {
     /// Returns true if hostname matches the
     /// condition specified by a list of patterns
     fn match_group(hostname: &str, patterns: &[Self]) -> bool {
+        // A negation that matches rules the name out whatever else in the
+        // list matches it, before or after (ssh_config(5)): `Host * !gw`
+        // is every host but gw. Otherwise any match lets it in.
+        let mut matched = false;
         for pat in patterns {
             if pat.match_text(hostname) {
-                // We got a definitive name match.
-                // If it was an exlusion then we've been told
-                // that this doesn't really match, otherwise
-                // we got one that we were looking for
-                return !pat.negated;
+                if pat.negated {
+                    return false;
+                }
+                matched = true;
             }
         }
-        false
+        matched
     }
 }
 
@@ -344,6 +347,17 @@ impl ParsedConfigFile {
                 }
 
                 fn add_option(options: &mut ConfigMap, k: String, v: &str) {
+                    // Of ProxyCommand and ProxyJump, the first in the stanza
+                    // keeps the other from taking effect: decided here, as
+                    // the map does not keep the order they came in.
+                    let rival = match k.as_str() {
+                        "proxycommand" => Some("proxyjump"),
+                        "proxyjump" => Some("proxycommand"),
+                        _ => None,
+                    };
+                    if rival.is_some_and(|rival| options.contains_key(rival)) {
+                        return;
+                    }
                     // first option wins in ssh_config, except for identityfile
                     // which explicitly allows multiple entries to combine together
                     let is_identity_file = k == "identityfile";
@@ -381,7 +395,7 @@ impl ParsedConfigFile {
         let mut needs_reparse = false;
 
         for (k, v) in &self.options {
-            target.entry(k.to_string()).or_insert_with(|| v.to_string());
+            insert_obtained(target, k, v);
         }
         for group in &self.groups {
             if group.context != Context::FirstPass {
@@ -389,13 +403,31 @@ impl ParsedConfigFile {
             }
             if group.is_match(hostname, user, local_user, context) {
                 for (k, v) in &group.options {
-                    target.entry(k.to_string()).or_insert_with(|| v.to_string());
+                    insert_obtained(target, k, v);
                 }
             }
         }
 
         needs_reparse
     }
+}
+
+/// Puts an option found in a config file into `target`, unless an earlier
+/// value of it is there already: the first obtained value is the one used.
+/// ProxyCommand and ProxyJump go together that way too: whichever is
+/// obtained first keeps the other from taking effect (ssh_config(5)).
+fn insert_obtained(target: &mut ConfigMap, key: &str, value: &str) {
+    let rival = match key {
+        "proxycommand" => Some("proxyjump"),
+        "proxyjump" => Some("proxycommand"),
+        _ => None,
+    };
+    if rival.is_some_and(|rival| target.contains_key(rival)) {
+        return;
+    }
+    target
+        .entry(key.to_string())
+        .or_insert_with(|| value.to_string());
 }
 
 /// A context for resolving configuration values.
@@ -464,6 +496,16 @@ impl Config {
 
     /// Convenience method for adding the ~/.ssh/config and system-wide
     /// `/etc/ssh/config` files to the list of configs
+    /// This context for another host than the one its options were set for:
+    /// the same files and environment, none of the overrides (see
+    /// [`Config::set_option`]), which, as on ssh's command line, were for
+    /// that host alone.
+    pub(crate) fn for_another_host(&self) -> Self {
+        let mut config = self.clone();
+        config.options.clear();
+        config
+    }
+
     pub fn add_default_config_files(&mut self) {
         if let Some(home) = dirs_next::home_dir() {
             self.add_config_file(home.join(".ssh").join("config"));
@@ -514,7 +556,13 @@ impl Config {
     pub fn for_host<H: AsRef<str>>(&self, host: H) -> ConfigMap {
         let host = host.as_ref();
         let local_user = self.resolve_local_user();
-        let target_user = &local_user;
+        // The user signed in as, where it was given ahead of the files, as
+        // `ssh -l` gives it: `Match user` is about that one.
+        let target_user = &self
+            .options
+            .get("user")
+            .cloned()
+            .unwrap_or_else(|| local_user.clone());
 
         let mut result = self.options.clone();
         let mut needs_reparse = false;
@@ -550,7 +598,14 @@ impl Config {
             .or_insert_with(|| host.to_string());
         token_map.insert("%h".to_string(), result["hostname"].to_string());
         token_map.insert("%n".to_string(), host.to_string());
-        token_map.insert("%r".to_string(), target_user.to_string());
+        // %r is the remote user name: a `User` the files give counts.
+        token_map.insert(
+            "%r".to_string(),
+            result
+                .get("user")
+                .cloned()
+                .unwrap_or_else(|| target_user.to_string()),
+        );
         token_map.insert(
             "%p".to_string(),
             result

@@ -11,7 +11,7 @@ use portable_pty::cmdbuilder::CommandBuilder;
 use portable_pty::{ChildKiller, ExitStatus, MasterPty, PtySize};
 use smol::channel::{bounded, Receiver as AsyncReceiver};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufWriter, Read, Write};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,7 @@ use termwiz::surface::{Change, LineAttribute};
 use termwiz::terminal::{ScreenSize, Terminal, TerminalWaker};
 use thiserror::Error;
 use wezterm_ssh::{
-    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
+    ConfigMap, HostVerificationFailed, JumpHop, Session, SessionEvent, SshChildProcess, SshPty,
 };
 use wezterm_term::TerminalSize;
 
@@ -78,7 +78,277 @@ pub fn ssh_connect_with_ui(
     ssh_config: wezterm_ssh::ConfigMap,
     ui: &mut ConnectionUI,
 ) -> anyhow::Result<Session> {
-    ssh_connect_with_ui_and_password(ssh_config, ui, None)
+    ssh_connect_with_ui_and_password(ssh_config, ui, StoredPasswords::default())
+}
+
+/// The passwords kept for a host and for the jump hosts on its way (see
+/// `SshDomain::jump_hosts`), to answer their password prompts with. Each
+/// answers only its own host: a password sent to another host is given
+/// away to it.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct StoredPasswords {
+    /// The host's own.
+    pub host: Option<String>,
+    /// The way there they are kept for, all of it (see `way_of`). `None`
+    /// where it could not be worked out: no way is the same as that.
+    pub way: Option<Vec<String>>,
+    /// The jump hosts', in the order of the domain's `jump_hosts`.
+    pub jumps: Vec<JumpPassword>,
+}
+
+/// A jump host's stored password, with the way it is for: where the jump
+/// host at that place on the way resolves to (see `resolved_way`). Asked
+/// by any other, it is not given.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct JumpPassword {
+    pub route: String,
+    pub password: Option<String>,
+}
+
+/// `user@hostname:port` a host's resolved configuration reaches: where a
+/// password kept for it would go, whatever its address was written as --
+/// HostName and Port, from the ssh config files or set for it, count.
+fn resolved_endpoint(config: &ConfigMap) -> String {
+    let get = |key: &str| config.get(key).map(String::as_str).unwrap_or("");
+    format!("{}@{}:{}", get("user"), get("hostname"), get("port"))
+}
+
+/// Where a connection made with `config` goes, and how: the hosts it
+/// signs in to, nearest first -- each jump host, then the host it is for
+/// -- as `user@hostname:port`, and the command or network the first of
+/// them is dialed through. The same name can lead to another machine
+/// another way, so passwords kept for one way go on no other. `None`
+/// where `config` does not say: a ProxyJump not yet resolved names hosts
+/// still to be looked up.
+pub fn way_of(config: &ConfigMap) -> Option<Vec<String>> {
+    let hops = wezterm_ssh::jump_hosts(config).ok()?;
+    if hops.is_empty() && wezterm_ssh::has_jump_hosts(config) {
+        return None;
+    }
+    let dialed = hops.first().unwrap_or(config);
+    let get = |key: &str| dialed.get(key).map(String::as_str);
+    let mut way = vec![
+        format!("network {}", get(wezterm_ssh::NETWORK).unwrap_or("system")),
+        format!("proxycommand {}", get("proxycommand").unwrap_or("none")),
+    ];
+    way.extend(hops.iter().map(resolved_endpoint));
+    way.push(resolved_endpoint(config));
+    Some(way)
+}
+
+/// A domain and the route its passwords were supplied for. Keep them together
+/// across retries and when handing a connection to another consumer.
+#[derive(Clone, Debug)]
+pub struct SshConnectionConfig {
+    pub domain: SshDomain,
+    pub passwords: StoredPasswords,
+}
+
+impl SshConnectionConfig {
+    pub fn new(domain: SshDomain) -> Self {
+        let passwords = StoredPasswords::of(&domain);
+        Self { domain, passwords }
+    }
+
+    pub fn resolve_attempt(&self) -> anyhow::Result<(ConfigMap, StoredPasswords)> {
+        let config = ssh_domain_to_ssh_config(&self.domain)?;
+        let passwords = self.passwords.clone().for_attempt(&config);
+        Ok((config, passwords))
+    }
+
+    /// An edit supplies only the passwords whose values changed. Keep an
+    /// unchanged secret only if it was already authorized for this route.
+    pub fn update(&mut self, domain: SshDomain, mut passwords: StoredPasswords) {
+        let same_route = self.passwords.same_way(&passwords);
+        let previous = |candidate: &String| {
+            self.domain.stored_password.as_ref() == Some(candidate)
+                || self
+                    .domain
+                    .jump_hosts
+                    .iter()
+                    .any(|hop| hop.stored_password.as_ref() == Some(candidate))
+        };
+        let retain =
+            |value: &mut Option<String>, old: Option<&String>, allowed: Option<&String>| {
+                if let Some(candidate) = value.as_ref() {
+                    if (same_route && Some(candidate) == old && allowed != Some(candidate))
+                        || (!same_route && previous(candidate))
+                    {
+                        *value = None;
+                    }
+                }
+            };
+        retain(
+            &mut passwords.host,
+            self.domain.stored_password.as_ref(),
+            self.passwords.host.as_ref(),
+        );
+        for (i, jump) in passwords.jumps.iter_mut().enumerate() {
+            retain(
+                &mut jump.password,
+                self.domain
+                    .jump_hosts
+                    .get(i)
+                    .and_then(|hop| hop.stored_password.as_ref()),
+                self.passwords
+                    .jumps
+                    .get(i)
+                    .and_then(|hop| hop.password.as_ref()),
+            );
+        }
+        *self = Self { domain, passwords };
+    }
+}
+
+/// A jump host's place among those its domain names, and where it
+/// resolves to, as its tag (`wezterm_ssh::JUMP_TAG`) says.
+fn read_tag(tag: &str) -> Option<(usize, &str)> {
+    let (index, route) = tag.split_once('/')?;
+    Some((index.parse().ok()?, route))
+}
+
+/// What passwords kept for `dom` are bound to: the way there, as
+/// `ssh_domain_to_ssh_config` resolves it now (see `way_of`), and where
+/// each jump host `dom` names resolves to (see `resolved_endpoint`), as
+/// the tags of its prompts say. A domain that does not resolve is
+/// reached no way at all.
+fn resolved_way(dom: &SshDomain) -> (Option<Vec<String>>, Vec<String>) {
+    let mut routes = vec![String::new(); dom.jump_hosts.len()];
+    // Whichever backend dials it, the way is the same.
+    let Ok(config) = dialing_config(dom, "") else {
+        return (None, routes);
+    };
+    for hop in wezterm_ssh::jump_hosts(&config).unwrap_or_default() {
+        let tag = hop.get(wezterm_ssh::JUMP_TAG).and_then(|tag| read_tag(tag));
+        if let Some((index, route)) = tag {
+            if let Some(slot) = routes.get_mut(index) {
+                *slot = route.to_string();
+            }
+        }
+    }
+    (way_of(&config), routes)
+}
+
+impl std::fmt::Debug for StoredPasswords {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let redacted = |password: &Option<String>| password.as_ref().map(|_| "<redacted>");
+        f.debug_struct("StoredPasswords")
+            .field("host", &redacted(&self.host))
+            .field("way", &self.way)
+            .field(
+                "jumps",
+                &self
+                    .jumps
+                    .iter()
+                    .map(|jump| (jump.route.as_str(), redacted(&jump.password)))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl StoredPasswords {
+    /// Those `dom` keeps.
+    pub fn of(dom: &SshDomain) -> Self {
+        Self::with_host(dom, dom.stored_password.clone())
+    }
+
+    /// Those `dom` keeps for its jump hosts, with `host` for the host.
+    pub fn with_host(dom: &SshDomain, host: Option<String>) -> Self {
+        let (way, jump_routes) = resolved_way(dom);
+        Self {
+            host,
+            way,
+            jumps: dom
+                .jump_hosts
+                .iter()
+                .zip(jump_routes)
+                .map(|(jump, route)| JumpPassword {
+                    route,
+                    password: jump.stored_password.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether `other` are kept for the same way there, all of it (see
+    /// `way_of`), with the same jump hosts named at each place.
+    pub fn same_way(&self, other: &StoredPasswords) -> bool {
+        self.way.is_some()
+            && self.way == other.way
+            && self
+                .jumps
+                .iter()
+                .map(|jump| &jump.route)
+                .eq(other.jumps.iter().map(|jump| &jump.route))
+    }
+
+    /// Takes `new` in place of these where they are kept for the same way
+    /// there, and says whether it did: a session given passwords kept for
+    /// another host would send them to the one it goes to.
+    pub fn replace_if_same_way(&mut self, new: StoredPasswords) -> bool {
+        if !self.same_way(&new) {
+            return false;
+        }
+        *self = new;
+        true
+    }
+
+    /// These, for a connection attempt made with `config`, as it was
+    /// resolved for that attempt: all of them where it goes the way they
+    /// were kept for, else none. A session reconnects with the ssh config
+    /// files as they are then, and a name in them may lead to another
+    /// host by then, or through another.
+    pub fn for_attempt(self, config: &ConfigMap) -> Self {
+        if self.way.is_some() && self.way == way_of(config) {
+            return self;
+        }
+        if self.host.is_some() || self.jumps.iter().any(|jump| jump.password.is_some()) {
+            log::warn!(
+                "not answering any prompt with a stored password: {} is reached \
+                 another way than when they were given",
+                resolved_endpoint(config)
+            );
+        }
+        Self::default()
+    }
+
+    /// The one kept for whoever asks: the host itself, or `jump`. A jump
+    /// host the domain does not name itself (one the ssh config put on the
+    /// way) has none, and nor does one at a place on the way where these
+    /// were kept for another: passwords and a way there that came apart --
+    /// one set up anew while a session went on the old way -- give none.
+    pub fn for_prompt(&self, jump: Option<&JumpHop>) -> Option<&str> {
+        match jump {
+            None => self.host.as_deref(),
+            Some(hop) => {
+                let (index, route) = read_tag(hop.tag.as_deref()?)?;
+                let kept = self.jumps.get(index)?;
+                if kept.route.is_empty() || kept.route != route {
+                    return None;
+                }
+                kept.password.as_deref()
+            }
+        }
+    }
+}
+
+/// Who a prompt is from, to keep count of what each host was sent: `None`
+/// for the host itself, else the jump host's place on the way.
+fn asker(jump: Option<&JumpHop>) -> Option<usize> {
+    jump.map(|hop| hop.index)
+}
+
+/// `user@host:port` of each jump host `ssh_config` goes through.
+fn jump_host_names(ssh_config: &ConfigMap) -> Vec<String> {
+    wezterm_ssh::jump_hosts(ssh_config)
+        .unwrap_or_default()
+        .iter()
+        .map(|hop| {
+            let get = |key: &str| hop.get(key).map(String::as_str).unwrap_or("");
+            format!("{}@{}:{}", get("user"), get("hostname"), get("port"))
+        })
+        .collect()
 }
 
 /// How long one wait for the server may last while connecting: for the
@@ -89,38 +359,54 @@ pub fn ssh_connect_with_ui(
 const SERVER_SILENCE_LIMIT: Duration = Duration::from_secs(120);
 
 /// Like [`ssh_connect_with_ui`], but auto-answers password (non-echo) auth
-/// prompts with a stored password, if any. At most twice: servers commonly
-/// issue a second prompt (e.g. `password` then `keyboard-interactive`, or a
-/// retry), and a single-shot answer left the second one to an interactive
-/// prompt that a headless reconnect cannot serve. A wrong stored password
-/// still falls back to interactive entry after those attempts, where the
-/// server asks again; where it ends the sign-in instead, the error is
+/// prompts with a stored password, if any: each host's with its own (see
+/// [`StoredPasswords`]), and only where `ssh_config` goes the way they
+/// were kept for (see [`StoredPasswords::for_attempt`]). At most twice for
+/// each: servers commonly issue a
+/// second prompt (e.g. `password` then `keyboard-interactive`, or a retry),
+/// and a single-shot answer left the second one to an interactive prompt
+/// that a headless reconnect cannot serve. A wrong stored password still
+/// falls back to interactive entry after those attempts, where the server
+/// asks again; where it ends the sign-in instead, the error is
 /// [`StoredPasswordRefused`].
 pub fn ssh_connect_with_ui_and_password(
     ssh_config: wezterm_ssh::ConfigMap,
     ui: &mut ConnectionUI,
-    password: Option<String>,
+    passwords: StoredPasswords,
 ) -> anyhow::Result<Session> {
-    ssh_connect_with_silence_limit(ssh_config, ui, password, SERVER_SILENCE_LIMIT)
+    ssh_connect_with_silence_limit(ssh_config, ui, passwords, SERVER_SILENCE_LIMIT)
 }
 
 fn ssh_connect_with_silence_limit(
     ssh_config: wezterm_ssh::ConfigMap,
     ui: &mut ConnectionUI,
-    password: Option<String>,
+    passwords: StoredPasswords,
     silence_limit: Duration,
 ) -> anyhow::Result<Session> {
+    let passwords = passwords.for_attempt(&ssh_config);
     let cloned_ui = ui.clone();
     cloned_ui.run_and_log_error(move || {
-        let mut password_answers_left = if password.is_some() { 2usize } else { 0 };
-        // Whose answers the server has had: the stored password's, the
+        // How many prompts each host's stored password has answered.
+        let mut stored_answers: HashMap<Option<usize>, usize> = HashMap::new();
+        // Whose answers each host has had: the stored password's, the
         // user's, or both.
-        let mut stored_password_sent = false;
-        let mut user_was_asked = false;
+        let mut stored_password_sent: HashSet<Option<usize>> = HashSet::new();
+        let mut user_was_asked: HashSet<Option<usize>> = HashSet::new();
+        // The host signing in: the last one to ask anything.
+        let mut asking: Option<usize> = None;
         let remote_address = ssh_config
             .get("hostname")
             .expect("ssh config to always set hostname");
-        ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
+        let through = jump_host_names(&ssh_config);
+        if through.is_empty() {
+            ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
+        } else {
+            ui.output_str(&format!(
+                "Connecting to {} through {} using SSH\n",
+                remote_address,
+                through.join(", then ")
+            ));
+        }
         let (session, events) = Session::connect(ssh_config.clone())?;
 
         loop {
@@ -149,6 +435,11 @@ fn ssh_connect_with_silence_limit(
                     }
                 }
                 SessionEvent::HostVerify(verify) => {
+                    if let Some(hop) = &verify.jump {
+                        ui.output_str(&format!(
+                            "Jump host {hop}, on the way to {remote_address}:\n"
+                        ));
+                    }
                     ui.output_str(&format!("{}\n", verify.message));
                     let answer = ui.input("Enter [y/n]> ");
                     let ok = matches!(answer.as_deref(), Ok("y" | "Y" | "yes" | "YES"));
@@ -164,12 +455,20 @@ fn ssh_connect_with_silence_limit(
                     }
                 }
                 SessionEvent::Authenticate(auth) => {
+                    let who = asker(auth.jump.as_ref());
+                    asking = who;
+                    if let Some(hop) = &auth.jump {
+                        ui.output_str(&format!(
+                            "Jump host {hop}, on the way to {remote_address}:\n"
+                        ));
+                    }
                     if !auth.username.is_empty() {
                         ui.output_str(&format!("Authentication for {}\n", auth.username));
                     }
                     if !auth.instructions.is_empty() {
                         ui.output_str(&format!("{}\n", auth.instructions));
                     }
+                    let stored = passwords.for_prompt(auth.jump.as_ref());
                     let mut answers = vec![];
                     for prompt in &auth.prompts {
                         let mut prompt_lines = prompt.prompt.split('\n').collect::<Vec<_>>();
@@ -177,18 +476,17 @@ fn ssh_connect_with_silence_limit(
                         for line in &prompt_lines {
                             ui.output_str(&format!("{}\n", line));
                         }
+                        let answered = stored_answers.entry(who).or_default();
                         let res = if prompt.echo {
-                            user_was_asked = true;
+                            user_was_asked.insert(who);
                             ui.input(editor_prompt)
-                        } else if password_answers_left > 0 {
-                            password_answers_left -= 1;
-                            stored_password_sent = true;
+                        } else if let Some(stored) = stored.filter(|_| *answered < 2) {
+                            *answered += 1;
+                            stored_password_sent.insert(who);
                             ui.output_str(&format!("{editor_prompt} (using stored password)\n"));
-                            Ok(password
-                                .clone()
-                                .expect("password present when answers remain"))
+                            Ok(stored.to_string())
                         } else {
-                            user_was_asked = true;
+                            user_was_asked.insert(who);
                             ui.password(editor_prompt)
                         };
                         if let Ok(line) = res {
@@ -212,7 +510,11 @@ fn ssh_connect_with_silence_limit(
                     anyhow::bail!("Error: {}", err);
                 }
                 SessionEvent::AuthenticationRefused(err) => {
-                    return Err(refused_sign_in(err, stored_password_sent, user_was_asked));
+                    return Err(refused_sign_in(
+                        err,
+                        stored_password_sent.contains(&asking),
+                        user_was_asked.contains(&asking),
+                    ));
                 }
                 SessionEvent::Authenticated => return Ok(session),
             }
@@ -297,58 +599,155 @@ pub enum SshConnectionStatus {
 
 pub struct RemoteSshDomain {
     session: Mutex<Option<Session>>,
-    dom: SshDomain,
+    connection: SshConnectionConfig,
     id: DomainId,
     name: String,
-    /// Optional stored password used to auto-answer the first password prompt.
-    password: Option<String>,
     /// Shared, updated by the connection thread so the GUI can poll progress.
     connection_status: Arc<Mutex<SshConnectionStatus>>,
 }
 
+/// What ssh connects to `ssh_dom`'s host with: what the ssh config files
+/// say for it, with `ssh_dom`'s settings over that, and the jump hosts it
+/// is reached through (see `wezterm_ssh::jump_hosts`): those `ssh_dom`
+/// names, else those its `proxyjump` option does.
 pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
+    let backend = match ssh_dom
+        .ssh_backend
+        .unwrap_or_else(|| config::configuration().ssh_backend)
+    {
+        SshBackend::Ssh2 => "ssh2",
+        SshBackend::LibSsh => "libssh",
+    };
+    let config = dialing_config(ssh_dom, backend)?;
+    if let Some("true") = config.get("wezterm_ssh_verbose").map(|s| s.as_str()) {
+        log::info!("Using ssh config: {config:#?}");
+    }
+    Ok(config)
+}
+
+/// [`ssh_domain_to_ssh_config`], with `backend` to connect with.
+fn dialing_config(ssh_dom: &SshDomain, backend: &str) -> anyhow::Result<ConfigMap> {
     let mut ssh_config = wezterm_ssh::Config::new();
     ssh_config.add_default_config_files();
 
-    let (remote_host_name, port) = {
-        let parts: Vec<&str> = ssh_dom.remote_address.split(':').collect();
-
-        if parts.len() == 2 {
-            (parts[0], Some(parts[1].parse::<u16>()?))
-        } else {
-            (ssh_dom.remote_address.as_str(), None)
-        }
-    };
-
-    let mut ssh_config = ssh_config.for_host(&remote_host_name);
-    ssh_config.insert(
-        "wezterm_ssh_backend".to_string(),
-        match ssh_dom
-            .ssh_backend
-            .unwrap_or_else(|| config::configuration().ssh_backend)
-        {
-            SshBackend::Ssh2 => "ssh2",
-            SshBackend::LibSsh => "libssh",
-        }
-        .to_string(),
-    );
-    for (k, v) in &ssh_dom.ssh_option {
-        ssh_config.insert(k.to_string(), v.to_string());
+    let mut config = host_ssh_config(
+        &ssh_config,
+        &ssh_dom.remote_address,
+        ssh_dom.username.as_deref(),
+        &ssh_dom.ssh_option,
+        backend,
+    )?;
+    if ssh_dom.no_agent_auth {
+        config.insert("identitiesonly".to_string(), "yes".to_string());
     }
 
-    if let Some(username) = &ssh_dom.username {
-        ssh_config.insert("user".to_string(), username.to_string());
+    if ssh_dom.jump_hosts.is_empty() {
+        ssh_config.resolve_jump_hosts(&mut config)?;
+    } else {
+        // The domain's own way there; what the ssh config says for the
+        // host does not count.
+        config.remove("proxyjump");
+        config.remove("proxycommand");
+        let mut chain = vec![];
+        for (index, jump) in ssh_dom.jump_hosts.iter().enumerate() {
+            let mut hop = host_ssh_config(
+                &ssh_config,
+                &jump.remote_address,
+                jump.username.as_deref(),
+                &jump.ssh_option,
+                backend,
+            )?;
+            // Its place, and where it resolves to: a password is given to
+            // its prompts only where it was kept for that same endpoint.
+            hop.insert(
+                wezterm_ssh::JUMP_TAG.to_string(),
+                format!("{index}/{}", resolved_endpoint(&hop)),
+            );
+            if index == 0 {
+                // The first is reached as its own configuration says,
+                // through any jump hosts of its own.
+                ssh_config.resolve_jump_hosts(&mut hop)?;
+                chain.extend(wezterm_ssh::take_jump_hosts(&mut hop)?);
+            }
+            chain.push(hop);
+        }
+        if chain.len() > wezterm_ssh::MAX_JUMP_HOSTS {
+            bail!(
+                "{} is reached through more than {} jump hosts",
+                ssh_dom.remote_address,
+                wezterm_ssh::MAX_JUMP_HOSTS
+            );
+        }
+        wezterm_ssh::set_jump_hosts(&mut config, &chain);
+    }
+    Ok(config)
+}
+
+/// The host and port of `host`, `host:port`, `[v6]` or `[v6]:port`; an
+/// IPv6 address written without brackets has no port.
+fn split_remote_address(address: &str) -> anyhow::Result<(&str, Option<u16>)> {
+    if let Some(rest) = address.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow!("{address:?} has an unclosed '['"))?;
+        return match after {
+            "" => Ok((host, None)),
+            after => {
+                let port = after
+                    .strip_prefix(':')
+                    .ok_or_else(|| anyhow!("{address:?} has more than a port after ']'"))?;
+                Ok((host, Some(port.parse::<u16>()?)))
+            }
+        };
+    }
+    match address.split_once(':') {
+        Some((host, port)) if !port.contains(':') => Ok((host, Some(port.parse::<u16>()?))),
+        _ => Ok((address, None)),
+    }
+}
+
+/// One host's ssh configuration: what the ssh config files say for it,
+/// with what is set here over that.
+fn host_ssh_config(
+    ssh_config: &wezterm_ssh::Config,
+    remote_address: &str,
+    username: Option<&str>,
+    ssh_option: &HashMap<String, String>,
+    backend: &str,
+) -> anyhow::Result<ConfigMap> {
+    let (remote_host_name, port) = split_remote_address(remote_address)?;
+
+    // The user and port given here are in place before the options that
+    // name them (`%p` in a ProxyCommand) are expanded, as on ssh's command
+    // line; they are put in again below, over `ssh_option`.
+    let mut resolver = ssh_config.clone();
+    if let Some(username) = username {
+        resolver.set_option("user", username);
     }
     if let Some(port) = port {
-        ssh_config.insert("port".to_string(), port.to_string());
+        resolver.set_option("port", port.to_string());
     }
-    if ssh_dom.no_agent_auth {
-        ssh_config.insert("identitiesonly".to_string(), "yes".to_string());
+    let mut config = resolver.for_host(remote_host_name);
+    config.insert("wezterm_ssh_backend".to_string(), backend.to_string());
+    for (k, v) in ssh_option {
+        config.insert(k.to_string(), v.to_string());
     }
-    if let Some("true") = ssh_config.get("wezterm_ssh_verbose").map(|s| s.as_str()) {
-        log::info!("Using ssh config: {ssh_config:#?}");
+    // Of the two ways to say how a host is reached, one set here wins
+    // over the other from the ssh config files.
+    let set_here = |key: &str| ssh_option.contains_key(key);
+    if set_here("proxycommand") && !set_here("proxyjump") {
+        config.remove("proxyjump");
+    } else if set_here("proxyjump") && !set_here("proxycommand") {
+        config.remove("proxycommand");
     }
-    Ok(ssh_config)
+
+    if let Some(username) = username {
+        config.insert("user".to_string(), username.to_string());
+    }
+    if let Some(port) = port {
+        config.insert("port".to_string(), port.to_string());
+    }
+    Ok(config)
 }
 
 /// Parse the `ID=` value out of `/etc/os-release` contents (e.g. "ubuntu").
@@ -376,15 +775,28 @@ impl RemoteSshDomain {
         dom: &SshDomain,
         password: Option<String>,
     ) -> anyhow::Result<Self> {
-        let id = alloc_domain_id();
-        Ok(Self {
-            id,
-            name: dom.name.clone(),
+        let mut domain = dom.clone();
+        domain.stored_password = password;
+        Ok(Self::with_connection(SshConnectionConfig::new(domain)))
+    }
+
+    pub fn with_connection(connection: SshConnectionConfig) -> Self {
+        Self {
+            id: alloc_domain_id(),
+            name: connection.domain.name.clone(),
             session: Mutex::new(None),
-            dom: dom.clone(),
-            password,
+            connection,
             connection_status: Arc::new(Mutex::new(SshConnectionStatus::Connecting)),
-        })
+        }
+    }
+
+    /// What this domain dials: the host, its settings and its jump hosts.
+    pub fn ssh_domain(&self) -> &SshDomain {
+        &self.connection.domain
+    }
+
+    pub fn ssh_connection_config(&self) -> &SshConnectionConfig {
+        &self.connection
     }
 
     /// Current connection lifecycle status; the GUI polls this while a
@@ -448,13 +860,16 @@ impl RemoteSshDomain {
     }
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
-        ssh_domain_to_ssh_config(&self.dom)
+        ssh_domain_to_ssh_config(self.ssh_domain())
     }
 
-    fn prepare_connection_attempt(&self) -> anyhow::Result<ConfigMap> {
-        let ssh_config = self.ssh_config().context("obtain ssh config")?;
+    fn prepare_connection_attempt(&self) -> anyhow::Result<(ConfigMap, StoredPasswords)> {
+        let attempt = self
+            .connection
+            .resolve_attempt()
+            .context("obtain ssh config")?;
         self.set_connection_status(SshConnectionStatus::Connecting);
-        Ok(ssh_config)
+        Ok(attempt)
     }
 
     fn build_command(
@@ -466,10 +881,10 @@ impl RemoteSshDomain {
         let config = config::configuration();
         let cmd = match command {
             Some(mut cmd) => {
-                config.apply_cmd_defaults(&mut cmd, self.dom.default_prog.as_ref(), None);
+                config.apply_cmd_defaults(&mut cmd, self.ssh_domain().default_prog.as_ref(), None);
                 cmd
             }
-            None => config.build_prog(None, self.dom.default_prog.as_ref(), None)?,
+            None => config.build_prog(None, self.ssh_domain().default_prog.as_ref(), None)?,
         };
         let mut env: HashMap<String, String> = cmd
             .iter_extra_env_as_str()
@@ -528,7 +943,11 @@ impl RemoteSshDomain {
             Ok(cd_cmd + &shell_words::join(env_cmd) + " " + &cmd)
         }
 
-        let command_line = match (cmd.is_default_prog(), self.dom.assume_shell, command_dir) {
+        let command_line = match (
+            cmd.is_default_prog(),
+            self.ssh_domain().assume_shell,
+            command_dir,
+        ) {
             (_, Shell::Posix, dir) => Some(build_env_command(dir, &cmd, &env)?),
             (true, _, _) => None,
             (false, _, _) => Some(cmd.as_unix_command_line()?),
@@ -542,10 +961,9 @@ impl RemoteSshDomain {
         command_line: Option<String>,
         env: HashMap<String, String>,
         size: TerminalSize,
-        password: Option<String>,
     ) -> anyhow::Result<StartNewSessionResult> {
-        let (session, events) = match Session::connect(self.prepare_connection_attempt()?)
-            .context("connect to ssh server")
+        let (ssh_config, passwords) = self.prepare_connection_attempt()?;
+        let (session, events) = match Session::connect(ssh_config).context("connect to ssh server")
         {
             Ok(result) => result,
             Err(err) => {
@@ -623,7 +1041,7 @@ impl RemoteSshDomain {
                 size,
                 command_line,
                 env,
-                password,
+                passwords,
                 Arc::clone(&thread_status),
             ) {
                 *thread_status.lock().unwrap() = SshConnectionStatus::Failed(format!("{:#}", err));
@@ -656,9 +1074,12 @@ fn connect_ssh_session(
     size: Arc<Mutex<TerminalSize>>,
     command_line: Option<String>,
     env: HashMap<String, String>,
-    mut password: Option<String>,
+    passwords: StoredPasswords,
     status: Arc<Mutex<SshConnectionStatus>>,
 ) -> anyhow::Result<()> {
+    // Whose stored password has been sent: each host's goes once (see
+    // below). `None` is the host itself, else a jump host's place.
+    let mut stored_sent: HashSet<Option<usize>> = HashSet::new();
     let set_status = |next: SshConnectionStatus| {
         *status.lock().unwrap() = next;
     };
@@ -831,6 +1252,9 @@ fn connect_ssh_session(
             SessionEvent::HostVerify(verify) => {
                 // Handshake succeeded; we're now interacting with the daemon.
                 set_status(SshConnectionStatus::Authenticating);
+                if let Some(hop) = &verify.jump {
+                    shim.output_line(&format!("Jump host {hop}:"))?;
+                }
                 shim.output_line(&verify.message)?;
                 let mut editor = LineEditor::new(&mut shim);
                 let mut host = PasswordPromptHost::default();
@@ -848,6 +1272,10 @@ fn connect_ssh_session(
             }
             SessionEvent::Authenticate(auth) => {
                 set_status(SshConnectionStatus::Authenticating);
+                let who = asker(auth.jump.as_ref());
+                if let Some(hop) = &auth.jump {
+                    shim.output_line(&format!("Jump host {hop}:"))?;
+                }
                 if !auth.username.is_empty() {
                     shim.output_line(&format!("Authentication for {}", auth.username))?;
                 }
@@ -861,14 +1289,15 @@ fn connect_ssh_session(
                     for line in &prompt_lines {
                         shim.output_line(line)?;
                     }
-                    // Auto-answer the first password (non-echo) prompt with a
-                    // stored password, if any. Only once: a wrong stored
-                    // password then falls back to interactive entry so the user
-                    // can correct it instead of looping.
-                    if !prompt.echo {
-                        if let Some(stored) = password.take() {
+                    // Auto-answer the host's first password (non-echo)
+                    // prompt with its stored password, if any. Only once: a
+                    // wrong stored password then falls back to interactive
+                    // entry so the user can correct it instead of looping.
+                    if !prompt.echo && !stored_sent.contains(&who) {
+                        if let Some(stored) = passwords.for_prompt(auth.jump.as_ref()) {
+                            stored_sent.insert(who);
                             shim.output_line(editor_prompt)?;
-                            answers.push(stored);
+                            answers.push(stored.to_string());
                             continue;
                         }
                     }
@@ -992,8 +1421,7 @@ impl Domain for RemoteSshDomain {
                     {
                         // Session died (perhaps they closed the initial tab?)
                         // So we'll try making a new one
-                        self.start_new_session(command_line, env, size, self.password.clone())
-                            .await?
+                        self.start_new_session(command_line, env, size).await?
                     } else {
                         log::error!("{err:#?}");
                         return Err(err);
@@ -1001,8 +1429,7 @@ impl Domain for RemoteSshDomain {
                 }
             }
         } else {
-            self.start_new_session(command_line, env, size, self.password.clone())
-                .await?
+            self.start_new_session(command_line, env, size).await?
         };
 
         // Wrap up the pty etc. in a LocalPane.  That allows for
@@ -1418,6 +1845,68 @@ mod tests {
     }
 
     #[test]
+    fn editing_one_password_cannot_rebind_another() {
+        let mut raw = SshDomain {
+            remote_address: "private.invalid".into(),
+            stored_password: Some("original host".into()),
+            jump_hosts: vec![config::SshJumpHost {
+                remote_address: "relay.invalid".into(),
+                stored_password: Some("original hop".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut connection = SshConnectionConfig::new(raw.clone());
+        raw.jump_hosts[0].remote_address = "relay.invalid:2200".into();
+        connection.update(raw.clone(), StoredPasswords::of(&raw));
+        assert!(
+            connection.passwords.host.is_none() && connection.passwords.jumps[0].password.is_none()
+        );
+        raw.jump_hosts[0].stored_password = Some("new hop".into());
+        connection.update(raw.clone(), StoredPasswords::of(&raw));
+        let (_, passwords) = connection.resolve_attempt().unwrap();
+        assert_eq!(passwords.host, None);
+        assert_eq!(passwords.jumps[0].password.as_deref(), Some("new hop"));
+        raw.stored_password = Some("new host".into());
+        connection.update(raw.clone(), StoredPasswords::of(&raw));
+        assert_eq!(connection.passwords.host.as_deref(), Some("new host"));
+        assert_eq!(
+            connection.passwords.jumps[0].password.as_deref(),
+            Some("new hop")
+        );
+    }
+
+    #[test]
+    fn plain_ssh_keeps_the_password_binding_across_session_attempts() {
+        let mut domain = RemoteSshDomain::with_ssh_domain_and_password(
+            &SshDomain {
+                remote_address: "private.invalid:2222".into(),
+                jump_hosts: vec![config::SshJumpHost {
+                    remote_address: "relay.invalid".into(),
+                    stored_password: Some("jump secret".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Some("host secret".into()),
+        )
+        .unwrap();
+        let (_, before) = domain.prepare_connection_attempt().unwrap();
+        assert_eq!(before.for_prompt(None), Some("host secret"));
+        assert!(before.jumps[0].password.is_some());
+
+        // Simulate the alias resolving to another server for the next session.
+        domain
+            .connection
+            .domain
+            .ssh_option
+            .insert("hostname".into(), "other.invalid".into());
+        let (config, after) = domain.prepare_connection_attempt().unwrap();
+        assert_eq!(config["hostname"], "other.invalid");
+        assert_eq!(after, StoredPasswords::default());
+    }
+
+    #[test]
     fn only_a_stored_password_sent_alone_is_refused_for_good() {
         let refused = |stored, asked| {
             refused_sign_in("password auth status: Denied".to_string(), stored, asked)
@@ -1434,6 +1923,411 @@ mod tests {
             assert!(err.downcast_ref::<StoredPasswordRefused>().is_none());
             assert_eq!(err.to_string(), "Error: password auth status: Denied");
         }
+    }
+
+    #[test]
+    fn stored_passwords_answer_only_their_own_host() {
+        let dom = SshDomain {
+            remote_address: "a.invalid".to_string(),
+            stored_password: Some("host secret".to_string()),
+            jump_hosts: vec![
+                config::SshJumpHost {
+                    remote_address: "b.invalid".to_string(),
+                    stored_password: Some("jump secret".to_string()),
+                    ..Default::default()
+                },
+                config::SshJumpHost {
+                    remote_address: "c.invalid".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let passwords = StoredPasswords::of(&dom);
+        let hop = |index: usize, tag: Option<String>| JumpHop {
+            index,
+            name: "someone@somewhere:22".to_string(),
+            tag,
+        };
+        let tag = |index: usize| Some(format!("{index}/{}", resolved_way(&dom).1[index]));
+        assert_eq!(passwords.for_prompt(None), Some("host secret"));
+        assert_eq!(
+            passwords.for_prompt(Some(&hop(0, tag(0)))),
+            Some("jump secret")
+        );
+        assert_eq!(passwords.for_prompt(Some(&hop(1, tag(1)))), None);
+        // A jump host the ssh config put on the way has none, least of all
+        // the host's own.
+        assert_eq!(passwords.for_prompt(Some(&hop(0, None))), None);
+        assert!(!format!("{passwords:?}").contains("secret"));
+
+        // A session still going the old way -- through another host at the
+        // same place -- is given nothing kept for the new way.
+        let mut moved = dom.clone();
+        moved.jump_hosts[0].remote_address = "x.invalid".to_string();
+        moved.jump_hosts[0].stored_password = Some("x secret".to_string());
+        let new_way = StoredPasswords::of(&moved);
+        assert_eq!(new_way.for_prompt(Some(&hop(0, tag(0)))), None);
+        let moved_tag = Some(format!("0/{}", resolved_way(&moved).1[0]));
+        assert_eq!(
+            new_way.for_prompt(Some(&hop(0, moved_tag))),
+            Some("x secret")
+        );
+    }
+
+    #[test]
+    fn passwords_are_bound_to_where_the_options_lead() {
+        let base = SshDomain {
+            name: "same label".to_string(),
+            remote_address: "c.invalid".to_string(),
+            username: Some("me".to_string()),
+            stored_password: Some("host secret".to_string()),
+            jump_hosts: vec![config::SshJumpHost {
+                remote_address: "b.invalid".to_string(),
+                username: Some("me".to_string()),
+                stored_password: Some("jump secret".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let held = StoredPasswords::of(&base);
+        assert!(held.same_way(&StoredPasswords::of(&base)));
+        let changes: [(&str, fn(&mut SshDomain)); 7] = [
+            ("the host's HostName", |dom| {
+                dom.ssh_option
+                    .insert("hostname".into(), "elsewhere.invalid".into());
+            }),
+            ("the host's Port", |dom| {
+                dom.ssh_option.insert("port".into(), "2200".into());
+            }),
+            ("a jump host's HostName", |dom| {
+                dom.jump_hosts[0]
+                    .ssh_option
+                    .insert("hostname".into(), "elsewhere.invalid".into());
+            }),
+            ("a jump host's Port", |dom| {
+                dom.jump_hosts[0]
+                    .ssh_option
+                    .insert("port".into(), "2200".into());
+            }),
+            ("the jump hosts the first is reached through", |dom| {
+                dom.jump_hosts[0]
+                    .ssh_option
+                    .insert("proxyjump".into(), "me@gateway.invalid".into());
+            }),
+            ("the command the first jump host is reached by", |dom| {
+                dom.jump_hosts[0]
+                    .ssh_option
+                    .insert("proxycommand".into(), "nc gateway.invalid %p".into());
+            }),
+            ("the network the first jump host is reached over", |dom| {
+                dom.jump_hosts[0]
+                    .ssh_option
+                    .insert(wezterm_ssh::NETWORK.into(), "tailnet".into());
+            }),
+        ];
+        for (what, change) in changes {
+            let mut moved = base.clone();
+            change(&mut moved);
+            assert!(
+                !held.same_way(&StoredPasswords::of(&moved)),
+                "passwords kept before {} changed went the new way",
+                what
+            );
+        }
+    }
+
+    #[test]
+    fn passwords_are_bound_to_the_way_the_options_say_too() {
+        // A host reached through jump hosts its own options name, or by a
+        // command: none of them named among its jump hosts.
+        let reached = |option: &str, value: &str| SshDomain {
+            name: "same label".to_string(),
+            remote_address: "c.invalid".to_string(),
+            username: Some("me".to_string()),
+            ssh_option: HashMap::from([(option.to_string(), value.to_string())]),
+            stored_password: Some("host secret".to_string()),
+            ..Default::default()
+        };
+        let moves = [
+            ("proxyjump", "me@gateway-a.invalid", "me@gateway-b.invalid"),
+            (
+                "proxyjump",
+                "me@gateway-a.invalid",
+                "me@gateway-a.invalid:2200",
+            ),
+            (
+                "proxyjump",
+                "me@gateway-a.invalid",
+                "me@gateway-a.invalid,me@inner.invalid",
+            ),
+            (
+                "proxycommand",
+                "nc gateway-a.invalid %p",
+                "nc gateway-b.invalid %p",
+            ),
+            (wezterm_ssh::NETWORK, "system", "tailnet"),
+        ];
+        for (option, before, after) in moves {
+            let held = StoredPasswords::of(&reached(option, before));
+            assert!(held.way.is_some());
+            assert!(held.same_way(&StoredPasswords::of(&reached(option, before))));
+            let mut taken = held.clone();
+            assert!(
+                !taken.replace_if_same_way(StoredPasswords::of(&reached(option, after))),
+                "passwords kept for {} {} were taken for {}",
+                option,
+                before,
+                after
+            );
+            assert_eq!(taken, held);
+        }
+    }
+
+    #[test]
+    fn an_attempt_that_goes_another_way_is_given_no_password() {
+        let dom = SshDomain {
+            remote_address: "c.invalid".to_string(),
+            username: Some("me".to_string()),
+            ssh_backend: Some(SshBackend::LibSsh),
+            stored_password: Some("host secret".to_string()),
+            jump_hosts: vec![config::SshJumpHost {
+                remote_address: "b.invalid".to_string(),
+                username: Some("me".to_string()),
+                stored_password: Some("jump secret".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let kept = StoredPasswords::of(&dom);
+        let attempt = ssh_domain_to_ssh_config(&dom).unwrap();
+        let jump_prompt = JumpHop {
+            index: 0,
+            name: "me@b.invalid:22".to_string(),
+            tag: wezterm_ssh::jump_hosts(&attempt).unwrap()[0]
+                .get(wezterm_ssh::JUMP_TAG)
+                .cloned(),
+        };
+        // Going the way they were kept for, it is given them all.
+        let given = kept.clone().for_attempt(&attempt);
+        assert_eq!(given, kept);
+        assert_eq!(given.for_prompt(None), Some("host secret"));
+        assert_eq!(given.for_prompt(Some(&jump_prompt)), Some("jump secret"));
+
+        // The ssh config files, read anew for a reconnect, have the same
+        // names lead somewhere else, or another way.
+        fn hops(config: &mut ConfigMap, change: impl FnOnce(&mut Vec<ConfigMap>)) {
+            let mut hops = wezterm_ssh::jump_hosts(config).unwrap();
+            change(&mut hops);
+            wezterm_ssh::set_jump_hosts(config, &hops);
+        }
+        let moves: [(&str, fn(&mut ConfigMap)); 7] = [
+            ("the host's HostName", |config| {
+                config.insert("hostname".into(), "elsewhere.invalid".into());
+            }),
+            ("the host's User", |config| {
+                config.insert("user".into(), "someone-else".into());
+            }),
+            ("the host's Port", |config| {
+                config.insert("port".into(), "2200".into());
+            }),
+            ("the jump host's HostName", |config| {
+                hops(config, |hops| {
+                    hops[0].insert("hostname".into(), "elsewhere.invalid".into());
+                })
+            }),
+            ("a jump host put before it", |config| {
+                hops(config, |hops| {
+                    let mut gateway = hops[0].clone();
+                    gateway.remove(wezterm_ssh::JUMP_TAG);
+                    gateway.insert("hostname".into(), "gateway.invalid".into());
+                    hops.insert(0, gateway);
+                })
+            }),
+            ("the command the first is reached by", |config| {
+                hops(config, |hops| {
+                    hops[0].insert("proxycommand".into(), "nc gateway.invalid %p".into());
+                })
+            }),
+            ("the network the first is reached over", |config| {
+                hops(config, |hops| {
+                    hops[0].insert(wezterm_ssh::NETWORK.into(), "tailnet".into());
+                })
+            }),
+        ];
+        for (what, change) in moves {
+            let mut moved = attempt.clone();
+            change(&mut moved);
+            let given = kept.clone().for_attempt(&moved);
+            assert_eq!(given.for_prompt(None), None, "{what} moved");
+            assert_eq!(given.for_prompt(Some(&jump_prompt)), None, "{what} moved");
+        }
+
+        // Reached directly, by a command or over a network of its own.
+        let direct = SshDomain {
+            jump_hosts: vec![],
+            ssh_option: HashMap::from([(
+                "proxycommand".to_string(),
+                "nc gateway-a.invalid %p".to_string(),
+            )]),
+            ..dom.clone()
+        };
+        let kept = StoredPasswords::of(&direct);
+        let attempt = ssh_domain_to_ssh_config(&direct).unwrap();
+        assert_eq!(
+            kept.clone().for_attempt(&attempt).for_prompt(None),
+            Some("host secret")
+        );
+        for (option, value) in [
+            ("proxycommand", "nc gateway-b.invalid %p"),
+            (wezterm_ssh::NETWORK, "tailnet"),
+            // A ProxyJump not resolved names hosts still to be looked up.
+            ("proxyjump", "me@gateway.invalid"),
+        ] {
+            let mut moved = attempt.clone();
+            moved.insert(option.to_string(), value.to_string());
+            let given = kept.clone().for_attempt(&moved);
+            assert_eq!(given.for_prompt(None), None, "{option} {value}");
+        }
+
+        // Kept for a way that could not be worked out, they go no way.
+        let nowhere = StoredPasswords {
+            way: None,
+            ..kept.clone()
+        };
+        assert!(!nowhere.same_way(&nowhere.clone()));
+        assert_eq!(nowhere.for_attempt(&attempt).for_prompt(None), None);
+    }
+
+    #[test]
+    fn passwords_kept_for_another_host_are_not_taken() {
+        let dom = |address: &str, password: &str| SshDomain {
+            name: "same label".to_string(),
+            remote_address: address.to_string(),
+            stored_password: Some(password.to_string()),
+            ..Default::default()
+        };
+        let mut held = StoredPasswords::of(&dom("old.invalid", "old secret"));
+        // The host moved under the same name, and was given a password: the
+        // session still reaching the old one is not given it.
+        let moved = StoredPasswords::of(&dom("new.invalid", "new secret"));
+        assert!(!held.same_way(&moved));
+        assert!(!held.replace_if_same_way(moved));
+        assert_eq!(held.for_prompt(None), Some("old secret"));
+        // Its own host given another password: that one is taken.
+        assert!(held.replace_if_same_way(StoredPasswords::of(&dom("old.invalid", "newer"))));
+        assert_eq!(held.for_prompt(None), Some("newer"));
+    }
+
+    #[test]
+    fn a_domain_reached_through_jump_hosts_carries_them_in_its_config() {
+        let dom = SshDomain {
+            name: "c".to_string(),
+            remote_address: "c.invalid:2200".to_string(),
+            username: Some("cuser".to_string()),
+            ssh_backend: Some(SshBackend::LibSsh),
+            ssh_option: HashMap::from([("proxycommand".to_string(), "nc %h %p".to_string())]),
+            stored_password: Some("host secret".to_string()),
+            jump_hosts: vec![
+                config::SshJumpHost {
+                    remote_address: "b.invalid:2222".to_string(),
+                    username: Some("buser".to_string()),
+                    ssh_option: HashMap::from([(
+                        "identityfile".to_string(),
+                        "/keys/b".to_string(),
+                    )]),
+                    stored_password: Some("jump secret".to_string()),
+                },
+                config::SshJumpHost {
+                    remote_address: "d.invalid".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let config = ssh_domain_to_ssh_config(&dom).unwrap();
+        assert_eq!(config["hostname"], "c.invalid");
+        assert_eq!(config["port"], "2200");
+        assert_eq!(config["user"], "cuser");
+        // Reached through its jump hosts, not by a command of its own.
+        assert!(!config.contains_key("proxycommand"));
+
+        let hops = wezterm_ssh::jump_hosts(&config).unwrap();
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0]["hostname"], "b.invalid");
+        assert_eq!(hops[0]["port"], "2222");
+        assert_eq!(hops[0]["user"], "buser");
+        assert_eq!(hops[0]["identityfile"], "/keys/b");
+        assert_eq!(hops[0][wezterm_ssh::JUMP_TAG], "0/buser@b.invalid:2222");
+        assert_eq!(
+            format!("0/{}", resolved_way(&dom).1[0]),
+            hops[0][wezterm_ssh::JUMP_TAG],
+            "a prompt's tag and the password kept for it name one endpoint"
+        );
+        assert_eq!(hops[1]["hostname"], "d.invalid");
+        assert!(hops[1][wezterm_ssh::JUMP_TAG].starts_with("1/"));
+        assert!(hops[1][wezterm_ssh::JUMP_TAG].ends_with("@d.invalid:22"));
+        assert_eq!(hops[1]["wezterm_ssh_backend"], "libssh");
+
+        // The config gets logged; the passwords stay out of it.
+        assert!(!config.values().any(|value| value.contains("secret")));
+    }
+
+    #[test]
+    fn remote_addresses_split_as_written_ipv6_too() {
+        assert_eq!(split_remote_address("host").unwrap(), ("host", None));
+        assert_eq!(
+            split_remote_address("host:2222").unwrap(),
+            ("host", Some(2222))
+        );
+        assert_eq!(
+            split_remote_address("[2001:db8::7]:2222").unwrap(),
+            ("2001:db8::7", Some(2222))
+        );
+        assert_eq!(
+            split_remote_address("[2001:db8::7]").unwrap(),
+            ("2001:db8::7", None)
+        );
+        assert_eq!(
+            split_remote_address("2001:db8::7").unwrap(),
+            ("2001:db8::7", None)
+        );
+        assert!(split_remote_address("[2001:db8::7").is_err());
+        assert!(split_remote_address("host:port").is_err());
+    }
+
+    #[test]
+    fn a_proxy_command_reaches_the_port_the_domain_names() {
+        let mut config = wezterm_ssh::Config::new();
+        config.add_config_string("Host c.invalid\n    ProxyCommand nc %h %p\n");
+        let host = host_ssh_config(
+            &config,
+            "c.invalid:2200",
+            Some("me"),
+            &HashMap::new(),
+            "libssh",
+        )
+        .unwrap();
+        assert_eq!(host["proxycommand"], "nc c.invalid 2200");
+        assert_eq!(host["port"], "2200");
+        assert_eq!(host["user"], "me");
+    }
+
+    #[test]
+    fn a_way_there_set_for_the_domain_beats_the_other_from_ssh_config() {
+        let mut config = wezterm_ssh::Config::new();
+        config.add_config_string("Host c.invalid\n    ProxyJump b.invalid\n");
+        let options = HashMap::from([("proxycommand".to_string(), "nc %h %p".to_string())]);
+        let with_command = host_ssh_config(&config, "c.invalid", None, &options, "libssh").unwrap();
+        assert_eq!(with_command["proxycommand"], "nc %h %p");
+        assert!(!with_command.contains_key("proxyjump"));
+
+        let mut config = wezterm_ssh::Config::new();
+        config.add_config_string("Host c.invalid\n    ProxyCommand nc %h %p\n");
+        let options = HashMap::from([("proxyjump".to_string(), "b.invalid".to_string())]);
+        let with_jump = host_ssh_config(&config, "c.invalid", None, &options, "libssh").unwrap();
+        assert_eq!(with_jump["proxyjump"], "b.invalid");
+        assert!(!with_jump.contains_key("proxycommand"));
     }
 
     #[test]
@@ -1475,7 +2369,7 @@ mod tests {
         let err = match ssh_connect_with_silence_limit(
             ssh_config,
             &mut ui,
-            None,
+            StoredPasswords::default(),
             Duration::from_millis(500),
         ) {
             Ok(_) => panic!("a server that never answers cannot have let us in"),

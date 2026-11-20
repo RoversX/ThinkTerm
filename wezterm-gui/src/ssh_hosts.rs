@@ -11,7 +11,7 @@ use config::SshDomain;
 use filedescriptor::FileDescriptor;
 use mux::domain::Domain;
 use mux::shell_integration::{NotConnected, ShellIntegrationOutcome, UnwritableStartupFile};
-use mux::ssh::RemoteSshDomain;
+use mux::ssh::{RemoteSshDomain, SshConnectionConfig, StoredPasswords};
 use mux::Mux;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,8 @@ fn store_version() -> u32 {
 }
 
 lazy_static::lazy_static! {
+    /// Saved record IDs own their password bindings. Multiple sources can share a mux domain name.
+    static ref SSH_CONNECTIONS: Mutex<HashMap<SshHostId, SshConnectionConfig>> = Mutex::new(HashMap::new());
     static ref SSH_HOST_STORE: Mutex<Option<SshHostStore>> = Mutex::new(None);
     /// Renames saved while connected under the old name, as (old name, new
     /// name): the host's Spaces stay with that connection while it lasts
@@ -199,7 +201,11 @@ pub fn try_create_host(spec: SshHostSpec) -> Result<SshHostId> {
         bail!("a saved host already uses {}", endpoint(&spec));
     }
     let (host_id, spec) = upsert_host(spec)?;
-    register_ssh_domain(&spec)?;
+    // Saved either way: a jump host that cannot be followed is told when
+    // the host is connected to (`ensure_ssh_domain_registered`).
+    if let Err(err) = register_ssh_domain(&spec) {
+        log::warn!("saved {:?}, but not its ssh domain: {err:#}", spec.label);
+    }
     Ok(host_id)
 }
 
@@ -263,24 +269,49 @@ pub fn try_update_host(host_id: &str, mut spec: SshHostSpec) -> Result<Option<Ss
     let reached_as_before = same_ssh_domain(&record.spec, &spec);
     record.id = new_id.clone();
     record.spec = spec;
+    repoint_jump_hosts(&mut store.hosts, host_id, &new_id);
     save_ssh_host_store(&store)?;
     let spec = store
         .hosts
         .iter()
         .find(|record| record.id == new_id)
         .map(|record| record.spec.clone());
+    if new_id != host_id {
+        let mut connections = SSH_CONNECTIONS.lock();
+        if let Some(connection) = connections.remove(host_id) {
+            connections.insert(new_id.clone(), connection);
+        }
+    }
     drop(store);
     if let Some(spec) = spec {
         // Reached the way it was, the host has its domain already: the mux
         // keeps every domain it is given, so another would only show up
         // beside it, in the command palette for one.
-        if reached_as_before {
-            ensure_ssh_domain_registered(&spec)?;
+        // Saved either way: a jump host that cannot be followed is told when
+        // the host is connected to (`ensure_ssh_domain_registered`).
+        let registered = if reached_as_before {
+            ensure_ssh_domain_registered(&spec).map(|_| ())
         } else {
-            register_ssh_domain(&spec)?;
+            register_ssh_domain(&spec)
+        };
+        if let Err(err) = registered {
+            log::warn!("saved {:?}, but not its ssh domain: {err:#}", spec.label);
         }
     }
     Ok(Some(new_id))
+}
+
+/// The host keyed `from` keyed anew as `to`: it is still the one the hosts
+/// reached through it name as their jump host.
+fn repoint_jump_hosts(records: &mut [SshHostRecord], from: &str, to: &str) {
+    if from == to {
+        return;
+    }
+    for record in records {
+        if record.spec.jump_host.as_deref() == Some(from) {
+            record.spec.jump_host = Some(to.to_string());
+        }
+    }
 }
 
 /// What connections found on the host is the record's to keep, not the copy
@@ -304,12 +335,32 @@ pub fn try_remove_host(host_id: &str) -> Result<bool> {
         return Ok(false);
     }
     let mut store = host_store()?;
+    // Not while other hosts are reached through it: they would be left
+    // going nowhere, their domains still going through it until a restart.
+    let entries = store
+        .hosts
+        .iter()
+        .map(|record| SshHostEntry {
+            id: record.id.clone(),
+            source: SshHostSource::ThinkTerm,
+            spec: record.spec.clone(),
+        })
+        .collect::<Vec<_>>();
+    let through = hosts_through(host_id, &entries);
+    if !through.is_empty() {
+        let labels = through
+            .iter()
+            .map(|entry| entry.spec.label.as_str())
+            .collect::<Vec<_>>();
+        bail!("{} connect through this host", labels.join(", "));
+    }
     let before = store.hosts.len();
     store.hosts.retain(|record| record.id != host_id);
     if store.hosts.len() == before {
         return Ok(false);
     }
     save_ssh_host_store(&store)?;
+    SSH_CONNECTIONS.lock().remove(host_id);
     Ok(true)
 }
 
@@ -516,6 +567,15 @@ fn check_mosh_network(spec: &SshHostSpec) -> Result<()> {
     if spec.network == SshNetwork::Tailnet {
         bail!(crate::i18n::tr("ssh-error-tailnet-mosh"));
     }
+    // mosh-client reaches the host itself over UDP: no jump host carries
+    // it, whether picked here or named by the ssh config or the host's own
+    // options.
+    let through = spec.jump_host.is_some()
+        || mux::ssh::ssh_domain_to_ssh_config(&thinkterm_core::ssh_hosts::build_ssh_domain(spec))
+            .is_ok_and(|config| wezterm_ssh::has_jump_hosts(&config));
+    if through {
+        bail!(crate::i18n::tr("ssh-error-jump-mosh"));
+    }
     Ok(())
 }
 
@@ -573,7 +633,8 @@ fn read_fd_to_string(mut fd: FileDescriptor) -> std::io::Result<String> {
 }
 
 async fn connect_mosh_bootstrap_session(spec: &SshHostSpec) -> Result<(Session, String)> {
-    let dom = build_ssh_domain(spec);
+    // No jump hosts: Mosh has none (see `check_mosh_network`).
+    let dom = thinkterm_core::ssh_hosts::build_ssh_domain(spec);
     let mut ssh_config = mux::ssh::ssh_domain_to_ssh_config(&dom).context("build SSH config")?;
     // mosh-client goes to the host's own address over UDP, so the
     // bootstrap that starts mosh-server there must not land elsewhere.
@@ -599,6 +660,11 @@ async fn connect_mosh_bootstrap_session(spec: &SshHostSpec) -> Result<(Session, 
                 );
             }
             SessionEvent::Authenticate(auth) => {
+                // A jump host the ssh config puts on the way asks for its
+                // own password, never this host's.
+                if let Some(hop) = &auth.jump {
+                    bail!("SSH authentication for jump host {hop} requires an interactive prompt");
+                }
                 let mut answers = vec![];
                 for prompt in &auth.prompts {
                     if prompt.echo {
@@ -671,27 +737,121 @@ pub fn ssh_domain_name(spec: &SshHostSpec) -> String {
     thinkterm_core::ssh_hosts::ssh_domain_name(spec)
 }
 
-/// Translate a stored host spec into a `config::SshDomain`.
-pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
-    thinkterm_core::ssh_hosts::build_ssh_domain(spec)
+/// Translate a stored host spec into a `config::SshDomain`: with the jump
+/// hosts on its way, as the saved hosts have them now, and their stored
+/// passwords. Not while the host store is held: it is read here.
+pub fn build_ssh_domain(spec: &SshHostSpec) -> Result<SshDomain> {
+    build_ssh_domain_among(spec, &list_all_hosts())
+}
+
+/// [`build_ssh_domain`] with the hosts its jump hosts are found among.
+pub fn build_ssh_domain_among(spec: &SshHostSpec, hosts: &[SshHostEntry]) -> Result<SshDomain> {
+    let chain = thinkterm_core::ssh_hosts::jump_chain(spec, hosts)?;
+    let mut dom = thinkterm_core::ssh_hosts::build_ssh_domain_among(spec, hosts)?;
+    for (jump, entry) in dom.jump_hosts.iter_mut().zip(chain) {
+        jump.stored_password = revealed_password(&entry.spec);
+    }
+    Ok(dom)
+}
+
+/// Resolve the selected record and retain the binding from when its passwords
+/// were supplied. System aliases have no catalog credentials of their own.
+fn connection_among(spec: &SshHostSpec, hosts: &[SshHostEntry]) -> Result<SshConnectionConfig> {
+    let chain = thinkterm_core::ssh_hosts::jump_chain(spec, hosts)?;
+    let mut connections = SSH_CONNECTIONS.lock();
+    let mut capture = |spec: &SshHostSpec, id: Option<&str>| -> Result<SshConnectionConfig> {
+        let mut domain = build_ssh_domain_among(spec, hosts)?;
+        domain.stored_password = revealed_password(spec);
+        let Some(id) = id else {
+            return Ok(SshConnectionConfig::new(domain));
+        };
+        match connections.entry(id.to_owned()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                Ok(entry.insert(SshConnectionConfig::new(domain)).clone())
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let captured = entry.get_mut();
+                if !same_dialing(&captured.domain, &domain) {
+                    let passwords = StoredPasswords::of(&domain);
+                    captured.update(domain, passwords);
+                }
+                Ok(captured.clone())
+            }
+        }
+    };
+    let owners = chain
+        .iter()
+        .map(|hop| {
+            capture(
+                &hop.spec,
+                (hop.source == SshHostSource::ThinkTerm).then_some(hop.id.as_str()),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let id = hosts
+        .iter()
+        .find(|entry| entry.source == SshHostSource::ThinkTerm && &entry.spec == spec)
+        .map(|entry| entry.id.as_str());
+    let mut connection = capture(spec, id)?;
+    // A newly selected jump takes its password from another record. Its own
+    // captured route must match the prefix of this route that reaches it.
+    let passwords = &mut connection.passwords;
+    let way = passwords.way.as_deref().unwrap_or_default();
+    let first = way.len().saturating_sub(passwords.jumps.len());
+    for (index, (jump, owner)) in passwords.jumps.iter_mut().zip(owners).enumerate() {
+        if owner.passwords.way.is_none()
+            || owner.passwords.way.as_deref() != way.get(..first + index)
+            || jump.password != owner.passwords.host
+        {
+            jump.password = None;
+        }
+    }
+    Ok(connection)
+}
+
+pub(crate) fn ssh_connection(spec: &SshHostSpec) -> Result<SshConnectionConfig> {
+    connection_among(spec, &list_all_hosts())
+}
+
+pub(crate) fn files_connection(host_id: &str) -> Result<SshConnectionConfig> {
+    files_connection_among(host_id, &list_all_hosts())
+}
+
+fn files_connection_among(host_id: &str, hosts: &[SshHostEntry]) -> Result<SshConnectionConfig> {
+    let entry = hosts
+        .iter()
+        .find(|entry| entry.id == host_id)
+        .with_context(|| format!("SSH host {host_id} is unavailable"))?;
+    if entry.source == SshHostSource::System {
+        return Ok(SshConnectionConfig::new(
+            thinkterm_core::ssh_hosts::build_ssh_domain(&entry.spec),
+        ));
+    }
+    connection_among(&entry.spec, hosts)
+}
+
+/// The host's stored password, in the clear, if it has one.
+pub fn revealed_password(spec: &SshHostSpec) -> Option<String> {
+    spec.password
+        .as_deref()
+        .map(crate::secret::reveal)
+        .filter(|p| !p.is_empty())
 }
 
 fn register_ssh_domain(spec: &SshHostSpec) -> Result<()> {
-    let dom = build_ssh_domain(spec);
-    let password = spec
-        .password
-        .as_deref()
-        .map(crate::secret::reveal)
-        .filter(|p| !p.is_empty());
-    let domain: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain_and_password(
-        &dom, password,
-    )?);
+    register_ssh_domain_among(spec, &list_all_hosts())
+}
+
+fn register_ssh_domain_among(spec: &SshHostSpec, hosts: &[SshHostEntry]) -> Result<()> {
+    let connection = connection_among(spec, hosts)?;
+    let domain: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_connection(connection));
     Mux::get().add_domain(&domain);
     Ok(())
 }
 
 /// Whether two domains made from a host dial it the same way: everything
-/// `build_ssh_domain` takes from the host's record, and its password.
+/// `build_ssh_domain` takes from the host's record, and its password, and
+/// the same of every jump host on its way.
 pub fn same_dialing(a: &SshDomain, b: &SshDomain) -> bool {
     a.name == b.name
         && a.remote_address == b.remote_address
@@ -699,13 +859,67 @@ pub fn same_dialing(a: &SshDomain, b: &SshDomain) -> bool {
         && a.multiplexing == b.multiplexing
         && a.ssh_option == b.ssh_option
         && a.stored_password == b.stored_password
+        && a.jump_hosts == b.jump_hosts
 }
 
 /// Whether `a` and `b` make the same ssh domain. Most of a host's record --
 /// how its shell is set up, whether its OS is detected, Mosh -- goes into
-/// none of its domains.
+/// none of its domains. Compared by record alone, as the host store may be
+/// held: a jump host changing is seen to by `rebuild_domains_through`.
 fn same_ssh_domain(a: &SshHostSpec, b: &SshHostSpec) -> bool {
-    same_dialing(&build_ssh_domain(a), &build_ssh_domain(b)) && a.password == b.password
+    use thinkterm_core::ssh_hosts::build_ssh_domain as of_record;
+    same_dialing(&of_record(a), &of_record(b))
+        && a.password == b.password
+        && a.jump_host == b.jump_host
+}
+
+/// The hosts whose way goes through the host `id`, as `hosts` has them.
+pub fn hosts_through(id: &str, hosts: &[SshHostEntry]) -> Vec<SshHostEntry> {
+    hosts
+        .iter()
+        .filter(|entry| entry.id != id)
+        .filter(|entry| thinkterm_core::ssh_hosts::goes_through(&entry.spec, id, hosts))
+        .cloned()
+        .collect()
+}
+
+/// Gives the hosts reached through the host `id` their ssh domains built
+/// anew: what they were built with of it -- its address, user, key or
+/// password -- may have changed. Their ThinkTerm Connect domains are the
+/// caller's to see to (see `refresh_connect_domain_for_ssh_host`).
+pub fn rebuild_domains_through(id: &str) -> Vec<SshHostEntry> {
+    let hosts = list_all_hosts();
+    let through = hosts_through(id, &hosts);
+    for entry in &through {
+        if let Err(err) = refresh_ssh_domain_among(&entry.spec, &hosts) {
+            log::warn!(
+                "failed to rebuild the ssh domain of {:?}: {err:#}",
+                entry.spec.label
+            );
+        }
+    }
+    through
+}
+
+/// Registers the host's ssh domain anew, but only where the one registered
+/// does not dial it the way it is set up now: the mux keeps every domain it
+/// is given, so one more for nothing only shows up beside it.
+fn refresh_ssh_domain_among(spec: &SshHostSpec, hosts: &[SshHostEntry]) -> Result<()> {
+    let wanted = connection_among(spec, hosts)?;
+    let current = Mux::get().get_domain_by_name(&ssh_domain_name(spec));
+    let as_wanted = current
+        .as_ref()
+        .and_then(|domain| domain.downcast_ref::<RemoteSshDomain>())
+        .is_some_and(|domain| {
+            same_dialing(domain.ssh_domain(), &wanted.domain)
+                && domain.ssh_connection_config().passwords == wanted.passwords
+        });
+    if as_wanted {
+        return Ok(());
+    }
+    let domain: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_connection(wanted));
+    Mux::get().add_domain(&domain);
+    Ok(())
 }
 
 /// Ensure the host's SSH domain is registered with the mux, building and adding
@@ -714,8 +928,12 @@ fn same_ssh_domain(a: &SshHostSpec, b: &SshHostSpec) -> bool {
 /// cheap and does not block on the network.
 pub fn ensure_ssh_domain_registered(spec: &SshHostSpec) -> Result<String> {
     let name = ssh_domain_name(spec);
-    let mux = Mux::get();
-    if mux.get_domain_by_name(&name).is_none() {
+    if spec.jump_host.is_some() {
+        // The way there as the saved hosts have it now: one registered
+        // before a jump host on it changed, or went, would still go the old
+        // way. A way that cannot be followed is said here, before a spawn.
+        refresh_ssh_domain_among(spec, &list_all_hosts())?;
+    } else if Mux::get().get_domain_by_name(&name).is_none() {
         register_ssh_domain(spec)?;
     }
     Ok(name)
@@ -725,12 +943,21 @@ pub fn ensure_ssh_domain_registered(spec: &SshHostSpec) -> Result<String> {
 /// that re-activating a previously-connected remote session (whose saved layout
 /// references the domain by name) works without re-opening the host manager.
 pub fn register_saved_hosts() {
-    for entry in list_all_hosts() {
-        if let Err(err) = ensure_ssh_domain_registered(&entry.spec) {
-            log::warn!(
+    let hosts = list_all_hosts();
+    let mux = Mux::get();
+    for entry in &hosts {
+        match connection_among(&entry.spec, &hosts) {
+            Ok(connection) => {
+                if mux.get_domain_by_name(&connection.domain.name).is_none() {
+                    let domain: Arc<dyn Domain> =
+                        Arc::new(RemoteSshDomain::with_connection(connection));
+                    mux.add_domain(&domain);
+                }
+            }
+            Err(err) => log::warn!(
                 "failed to register saved SSH host {:?}: {err:#}",
                 entry.spec.label
-            );
+            ),
         }
     }
 }
@@ -1122,6 +1349,7 @@ fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
                 shell_integration_failure: None,
                 files_auto_connect: false,
                 icon: None,
+                jump_host: None,
             };
             out.push(SshHostEntry {
                 id: system_host_id(&alias),
@@ -1235,6 +1463,78 @@ fn system_host_id(alias: &str) -> SshHostId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selecting_a_jump_cannot_reauthorize_its_old_password() {
+        let entry = |id: &str| SshHostEntry {
+            id: id.into(),
+            source: SshHostSource::ThinkTerm,
+            spec: serde_json::from_value(
+                serde_json::json!({"label": id, "host": format!("{id}.invalid")}),
+            )
+            .unwrap(),
+        };
+        let mut relay = entry("binding-relay");
+        relay.spec.password = Some("original jump".into());
+        let mut target = entry("binding-target");
+        target.spec.jump_host = Some(relay.id.clone());
+        let mut hosts = [relay, target];
+        assert!(files_connection_among("binding-relay", &hosts)
+            .unwrap()
+            .passwords
+            .host
+            .is_some());
+        hosts[0]
+            .spec
+            .ssh_options
+            .insert("hostname".into(), "moved.invalid".into());
+        let target = files_connection_among("binding-target", &hosts).unwrap();
+        assert!(target.resolve_attempt().unwrap().1.jumps[0]
+            .password
+            .is_none());
+        hosts[0].spec.password = Some("replacement jump".into());
+        let target = files_connection_among("binding-target", &hosts).unwrap();
+        assert_eq!(
+            target.resolve_attempt().unwrap().1.jumps[0]
+                .password
+                .as_deref(),
+            Some("replacement jump")
+        );
+        let mut connections = SSH_CONNECTIONS.lock();
+        connections.remove("binding-relay");
+        connections.remove("binding-target");
+    }
+
+    #[test]
+    fn files_use_the_selected_record_when_two_sources_share_an_endpoint() {
+        let entry = |id: &str, source, hostname: &str| {
+            let mut spec: SshHostSpec = serde_json::from_value(serde_json::json!({
+                "label": "same", "host": "shared-alias.invalid"
+            }))
+            .unwrap();
+            spec.ssh_options.insert("hostname".into(), hostname.into());
+            SshHostEntry {
+                id: id.into(),
+                source,
+                spec,
+            }
+        };
+        let mut saved = entry("files-saved", SshHostSource::ThinkTerm, "saved.invalid");
+        saved.spec.password = Some("saved password".into());
+        let system = entry("files-system", SshHostSource::System, "system.invalid");
+        let hosts = [saved, system];
+        let saved = files_connection_among("files-saved", &hosts).unwrap();
+        let system = files_connection_among("files-system", &hosts).unwrap();
+        assert_eq!(saved.domain.name, system.domain.name);
+        assert_eq!(
+            saved.resolve_attempt().unwrap().1.for_prompt(None),
+            Some("saved password")
+        );
+        let (resolved, passwords) = system.resolve_attempt().unwrap();
+        assert_eq!(resolved["hostname"], "system.invalid");
+        assert_eq!(passwords.for_prompt(None), None);
+        SSH_CONNECTIONS.lock().remove("files-saved");
+    }
 
     #[test]
     fn the_same_address_on_two_networks_has_distinct_records_and_domains() {
@@ -1422,6 +1722,25 @@ mod tests {
     }
 
     #[test]
+    fn a_jump_host_keyed_anew_is_still_the_one_its_hosts_go_through() {
+        let record = |id: &str, jump_host: Option<&str>| SshHostRecord {
+            id: id.into(),
+            spec: SshHostSpec {
+                jump_host: jump_host.map(str::to_string),
+                ..spec_with_options(HashMap::new())
+            },
+        };
+        let mut records = vec![
+            record("edge-new", None),
+            record("inside", Some("edge-old")),
+            record("other", Some("elsewhere")),
+        ];
+        repoint_jump_hosts(&mut records, "edge-old", "edge-new");
+        assert_eq!(records[1].spec.jump_host.as_deref(), Some("edge-new"));
+        assert_eq!(records[2].spec.jump_host.as_deref(), Some("elsewhere"));
+    }
+
+    #[test]
     fn system_hosts_preserve_ssh_config_alias_as_remote_address() {
         let entries = parse_system_ssh_config_str(
             r#"
@@ -1606,12 +1925,13 @@ Host prod *.internal
             shell_integration_failure: None,
             files_auto_connect: false,
             icon: None,
+            jump_host: None,
         }
     }
 
     #[test]
     fn build_ssh_domain_injects_default_connect_timeout() {
-        let dom = build_ssh_domain(&spec_with_options(HashMap::new()));
+        let dom = thinkterm_core::ssh_hosts::build_ssh_domain(&spec_with_options(HashMap::new()));
         assert_eq!(
             dom.ssh_option.get("connecttimeout").map(String::as_str),
             Some("10"),
@@ -1624,7 +1944,7 @@ Host prod *.internal
         let mut options = HashMap::new();
         // User-provided key with mixed case; build_ssh_domain lowercases it.
         options.insert("ConnectTimeout".to_string(), "3".to_string());
-        let dom = build_ssh_domain(&spec_with_options(options));
+        let dom = thinkterm_core::ssh_hosts::build_ssh_domain(&spec_with_options(options));
         assert_eq!(
             dom.ssh_option.get("connecttimeout").map(String::as_str),
             Some("3"),

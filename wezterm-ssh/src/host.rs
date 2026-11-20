@@ -13,6 +13,9 @@ pub struct HostVerificationFailed {
 #[derive(Debug)]
 pub struct HostVerificationEvent {
     pub message: String,
+    /// The jump host whose key this is, for a host reached through others;
+    /// `None` when it is the host's own.
+    pub jump: Option<crate::jump::JumpHop>,
     pub(crate) reply: Sender<bool>,
 }
 
@@ -49,6 +52,7 @@ impl crate::sessioninner::SessionInner {
                                     Trust and continue connecting?",
                             hostname, port, key
                         ),
+                        jump: None,
                         reply,
                     }))
                     .context("sending HostVerify request to user")?;
@@ -200,6 +204,7 @@ impl crate::sessioninner::SessionInner {
                                 Trust and continue connecting?",
                                 remote_address, key_type, fingerprint
                             ),
+                            jump: None,
                             reply,
                         }))
                         .context("sending HostVerify request to user")?;

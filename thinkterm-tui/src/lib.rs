@@ -741,19 +741,34 @@ fn all_client_domain_configs(
                 .iter()
                 .map(|domain| domain.name().to_string())
                 .collect::<HashSet<_>>();
-            for entry in entries {
+            let revealed = |spec: &thinkterm_core::ssh_hosts::SshHostSpec| {
+                spec.password
+                    .as_deref()
+                    .map(thinkterm_core::secret::reveal)
+                    .filter(|password| !password.is_empty())
+            };
+            for entry in &entries {
                 if !entry.spec.multiplexing || entry.spec.use_mosh {
                     continue;
                 }
-                let mut ssh = thinkterm_core::ssh_hosts::build_ssh_domain(&entry.spec);
+                // Reached through the jump hosts its record names, each
+                // with its own stored password.
+                let (mut ssh, chain) = match (
+                    thinkterm_core::ssh_hosts::build_ssh_domain_among(&entry.spec, &entries),
+                    thinkterm_core::ssh_hosts::jump_chain(&entry.spec, &entries),
+                ) {
+                    (Ok(ssh), Ok(chain)) => (ssh, chain),
+                    (Err(err), _) | (_, Err(err)) => {
+                        log::warn!("skipping saved SSH host {:?}: {err}", entry.spec.label);
+                        continue;
+                    }
+                };
+                for (jump, via) in ssh.jump_hosts.iter_mut().zip(chain) {
+                    jump.stored_password = revealed(&via.spec);
+                }
                 ssh.name = entry.spec.label.clone();
                 ssh.multiplexing = SshMultiplexing::WezTerm;
-                ssh.stored_password = entry
-                    .spec
-                    .password
-                    .as_deref()
-                    .map(thinkterm_core::secret::reveal)
-                    .filter(|password| !password.is_empty());
+                ssh.stored_password = revealed(&entry.spec);
                 if existing.insert(ssh.name.clone()) {
                     domains.push(ClientDomainConfig::Ssh(ssh));
                 }

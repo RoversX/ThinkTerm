@@ -11,6 +11,7 @@ mod config;
 mod dirwrap;
 mod filewrap;
 mod host;
+mod jump;
 mod pty;
 mod session;
 mod sessioninner;
@@ -24,6 +25,10 @@ pub use auth::*;
 pub use authentication::{AuthenticationBackend, AuthenticationInfo, AuthenticationMethod};
 pub use config::*;
 pub use host::*;
+pub use jump::{
+    has_jump_hosts, jump_hosts, parse_proxy_jump, set_jump_hosts, take_jump_hosts, JumpHop,
+    JumpSpec, JUMP_TAG, MAX_JUMP_HOSTS,
+};
 pub use pty::*;
 pub use session::*;
 pub use sftp::error::*;

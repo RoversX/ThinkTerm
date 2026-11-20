@@ -1,7 +1,7 @@
 //! Shared SSH host catalog and mux-domain translation.
 
 use anyhow::{Context, Result};
-use config::{SshDomain, SshMultiplexing};
+use config::{SshDomain, SshJumpHost, SshMultiplexing};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -163,6 +163,14 @@ pub struct SshHostSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub icon: Option<HostIcon>,
+    /// The host this one is reached through, by its id (see
+    /// [`SshHostEntry::id`]), as ssh's ProxyJump: that host is signed in to
+    /// first and connects on to this one, only passing the connection
+    /// along. It is itself reached as it is set up, through a jump host of
+    /// its own if it has one. `host` is this host's address as the jump
+    /// host sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<SshHostId>,
 }
 
 /// Why setting a host's shell integration up failed.
@@ -303,6 +311,7 @@ pub fn parse_system_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     shell_integration_failure: None,
                     files_auto_connect: false,
                     icon: None,
+                    jump_host: None,
                 },
             });
         }
@@ -439,6 +448,8 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
     SshDomain {
         name: ssh_domain_name(spec),
         remote_address: match spec.port {
+            // An IPv6 address keeps its own colons apart from the port's.
+            Some(port) if spec.host.contains(':') => format!("[{}]:{port}", spec.host),
             Some(port) => format!("{}:{port}", spec.host),
             None => spec.host.clone(),
         },
@@ -455,9 +466,224 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
     }
 }
 
+/// The most hosts a way to a host may go through: wezterm-ssh's
+/// `MAX_JUMP_HOSTS`.
+pub const MAX_JUMP_HOSTS: usize = 8;
+
+/// Why the way to a host through its jump hosts cannot be followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JumpHostError {
+    /// A jump host on the way to `host` is no longer among the hosts.
+    Missing { host: String },
+    /// The jump hosts on the way to `host` lead back to one already on it.
+    Loop { host: String },
+    /// The way to `host` goes through more than [`MAX_JUMP_HOSTS`].
+    TooLong { host: String },
+}
+
+impl std::fmt::Display for JumpHostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Missing { host } => write!(
+                f,
+                "{host} is reached through a jump host that is no longer saved"
+            ),
+            Self::Loop { host } => write!(
+                f,
+                "the jump hosts on the way to {host} lead back to one already on the way"
+            ),
+            Self::TooLong { host } => write!(
+                f,
+                "the way to {host} goes through more than {MAX_JUMP_HOSTS} jump hosts"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for JumpHostError {}
+
+/// The hosts `spec` is reached through, looked up in `hosts`, nearest
+/// first: its jump host's own jump host comes before it, and so on.
+pub fn jump_chain<'a>(
+    spec: &SshHostSpec,
+    hosts: &'a [SshHostEntry],
+) -> std::result::Result<Vec<&'a SshHostEntry>, JumpHostError> {
+    let mut chain: Vec<&SshHostEntry> = vec![];
+    let mut next = spec.jump_host.as_ref();
+    while let Some(id) = next {
+        let entry =
+            hosts
+                .iter()
+                .find(|entry| &entry.id == id)
+                .ok_or_else(|| JumpHostError::Missing {
+                    host: spec.label.clone(),
+                })?;
+        if chain.iter().any(|seen| seen.id == entry.id) {
+            return Err(JumpHostError::Loop {
+                host: spec.label.clone(),
+            });
+        }
+        if chain.len() == MAX_JUMP_HOSTS {
+            return Err(JumpHostError::TooLong {
+                host: spec.label.clone(),
+            });
+        }
+        chain.push(entry);
+        next = entry.spec.jump_host.as_ref();
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Whether the way to `spec` goes through the host `id`, as far as it can
+/// be followed: a host missing on the way ends it there, and so does one
+/// met a second time, a circle that does not pass `id`.
+pub fn goes_through(spec: &SshHostSpec, id: &str, hosts: &[SshHostEntry]) -> bool {
+    let mut seen: Vec<&str> = vec![];
+    let mut next = spec.jump_host.as_deref();
+    while let Some(at) = next {
+        if at == id {
+            return true;
+        }
+        if seen.contains(&at) {
+            return false;
+        }
+        seen.push(at);
+        next = hosts
+            .iter()
+            .find(|entry| entry.id == at)
+            .and_then(|entry| entry.spec.jump_host.as_deref());
+    }
+    false
+}
+
+/// [`build_ssh_domain`] for a host that may be reached through others:
+/// with the jump hosts on its way (see [`jump_chain`]), each as its own
+/// record has it. Their passwords are left out, as the host's own is.
+pub fn build_ssh_domain_among(
+    spec: &SshHostSpec,
+    hosts: &[SshHostEntry],
+) -> std::result::Result<SshDomain, JumpHostError> {
+    let mut dom = build_ssh_domain(spec);
+    dom.jump_hosts = jump_chain(spec, hosts)?
+        .into_iter()
+        .map(|entry| {
+            let hop = build_ssh_domain(&entry.spec);
+            SshJumpHost {
+                remote_address: hop.remote_address,
+                username: hop.username,
+                ssh_option: hop.ssh_option,
+                stored_password: None,
+            }
+        })
+        .collect();
+    Ok(dom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(id: &str, host: &str, jump_host: Option<&str>) -> SshHostEntry {
+        let mut spec: SshHostSpec = serde_json::from_value(serde_json::json!({
+            "label": id, "host": host, "username": format!("{id}-user")
+        }))
+        .unwrap();
+        spec.jump_host = jump_host.map(str::to_string);
+        SshHostEntry {
+            id: id.to_string(),
+            source: SshHostSource::ThinkTerm,
+            spec,
+        }
+    }
+
+    #[test]
+    fn the_jump_host_limit_is_the_connections() {
+        assert_eq!(MAX_JUMP_HOSTS, wezterm_ssh::MAX_JUMP_HOSTS);
+    }
+
+    #[test]
+    fn a_host_is_reached_through_its_jump_hosts_nearest_first() {
+        let hosts = vec![
+            entry("edge", "edge.example", None),
+            entry("relay", "relay.example", Some("edge")),
+            entry("inside", "10.0.0.5", Some("relay")),
+        ];
+        let chain = jump_chain(&hosts[2].spec, &hosts).unwrap();
+        let ids: Vec<_> = chain.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, ["edge", "relay"]);
+        assert!(goes_through(&hosts[2].spec, "edge", &hosts));
+        assert!(!goes_through(&hosts[1].spec, "inside", &hosts));
+
+        let mut hosts = hosts;
+        hosts[1].spec.network = SshNetwork::Tailnet;
+        hosts[1].spec.port = Some(2222);
+        let dom = build_ssh_domain_among(&hosts[2].spec, &hosts).unwrap();
+        assert_eq!(dom.remote_address, "10.0.0.5");
+        assert_eq!(dom.jump_hosts.len(), 2);
+        assert_eq!(dom.jump_hosts[0].remote_address, "edge.example");
+        assert_eq!(dom.jump_hosts[0].username.as_deref(), Some("edge-user"));
+        assert_eq!(dom.jump_hosts[1].remote_address, "relay.example:2222");
+        assert_eq!(dom.jump_hosts[1].ssh_option[NETWORK_OPTION], "tailnet");
+        assert!(dom
+            .jump_hosts
+            .iter()
+            .all(|hop| hop.stored_password.is_none()));
+
+        // A host with none is reached as it always was.
+        let direct = build_ssh_domain_among(&hosts[0].spec, &hosts).unwrap();
+        assert!(direct.jump_hosts.is_empty());
+    }
+
+    #[test]
+    fn a_way_that_cannot_be_followed_says_why() {
+        let hosts = vec![
+            entry("a", "a.example", Some("b")),
+            entry("b", "b.example", Some("a")),
+            entry("orphan", "c.example", Some("gone")),
+        ];
+        assert!(matches!(
+            jump_chain(&hosts[0].spec, &hosts),
+            Err(JumpHostError::Loop { .. })
+        ));
+        assert!(goes_through(&hosts[0].spec, "a", &hosts));
+        // A way broken further on is still followed as far as it goes.
+        let broken = vec![
+            entry("near", "near.example", Some("far")),
+            entry("far", "far.example", Some("deleted")),
+        ];
+        assert!(goes_through(&broken[0].spec, "far", &broken));
+        assert!(goes_through(&broken[0].spec, "deleted", &broken));
+        assert!(!goes_through(&broken[0].spec, "elsewhere", &broken));
+        // A circle elsewhere names no host it does not pass.
+        assert!(!goes_through(&hosts[0].spec, "orphan", &hosts));
+
+        let mut v6 = hosts[0].spec.clone();
+        v6.host = "2001:db8::7".to_string();
+        v6.port = Some(2222);
+        assert_eq!(build_ssh_domain(&v6).remote_address, "[2001:db8::7]:2222");
+        let err = jump_chain(&hosts[2].spec, &hosts).unwrap_err();
+        assert_eq!(
+            err,
+            JumpHostError::Missing {
+                host: "orphan".into()
+            }
+        );
+        assert!(err.to_string().contains("no longer saved"), "{err}");
+    }
+
+    #[test]
+    fn a_jump_host_is_kept_by_id_and_left_out_when_there_is_none() {
+        let spec: SshHostSpec =
+            serde_json::from_str(r#"{"label":"inside","host":"10.0.0.5"}"#).unwrap();
+        assert_eq!(spec.jump_host, None);
+        assert!(!serde_json::to_string(&spec).unwrap().contains("jump_host"));
+        let mut spec = spec;
+        spec.jump_host = Some("ssh-1234".into());
+        let saved = serde_json::to_string(&spec).unwrap();
+        assert!(saved.contains(r#""jump_host":"ssh-1234""#), "{}", saved);
+        assert_eq!(serde_json::from_str::<SshHostSpec>(&saved).unwrap(), spec);
+    }
 
     #[test]
     fn a_saved_host_selects_one_network_for_all_its_addresses() {
@@ -595,6 +821,7 @@ mod tests {
             shell_integration_failure: None,
             files_auto_connect: false,
             icon: None,
+            jump_host: None,
         };
         assert_eq!(ssh_domain_name(&spec), "ssh:root@example.test");
         assert_eq!(build_ssh_domain(&spec).remote_address, "example.test:22");

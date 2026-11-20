@@ -13,7 +13,7 @@ use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::{Domain, DomainId};
 use mux::pane::PaneId;
-use mux::ssh::ssh_connect_with_ui_and_password;
+use mux::ssh::{ssh_connect_with_ui_and_password, StoredPasswords};
 use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
@@ -194,13 +194,23 @@ pub struct Client {
     fatal_connection_error: Arc<Mutex<Option<String>>>,
     connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
     plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
-    stored_password: Arc<Mutex<Option<String>>>,
+    stored_passwords: Arc<Mutex<StoredPasswords>>,
 }
 
 impl Client {
-    /// Have the next connection attempt sign in with `password`.
-    pub fn set_stored_password(&self, password: Option<String>) {
-        *self.stored_password.lock().unwrap() = password;
+    /// Have the next connection attempt sign in with `passwords`: the
+    /// host's own and its jump hosts'.
+    pub fn set_stored_passwords(&self, passwords: StoredPasswords) {
+        // Only those kept for the way this session goes: it sends them to
+        // the hosts it reaches, whatever they were kept for.
+        if !self
+            .stored_passwords
+            .lock()
+            .unwrap()
+            .replace_if_same_way(passwords)
+        {
+            log::warn!("not giving a session passwords kept for another way there");
+        }
     }
 
     pub fn connection_phase(&self) -> ClientConnectionPhase {
@@ -1633,9 +1643,10 @@ struct Reconnectable {
     /// for plugin frames alone (`plugin_link`): as of the last connect, and
     /// none where there is no way to open one.
     plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
-    /// The password kept for an ssh host, as of now: the host can be given
-    /// another while this is between tries, and the next try is to use it.
-    stored_password: Arc<Mutex<Option<String>>>,
+    /// The passwords kept for an ssh host and its jump hosts, as of now: a
+    /// host can be given another while this is between tries, and the next
+    /// try is to use it.
+    stored_passwords: Arc<Mutex<StoredPasswords>>,
 }
 
 struct ConnectTransport {
@@ -1885,13 +1896,13 @@ impl Write for SshStream {
 }
 
 impl Reconnectable {
-    fn new(config: ClientDomainConfig, stream: Option<Box<dyn AsyncReadAndWrite>>) -> Self {
-        let stored_password = match &config {
-            ClientDomainConfig::Ssh(ssh) => ssh.stored_password.clone(),
-            ClientDomainConfig::Unix(_) | ClientDomainConfig::Tls(_) => None,
-        };
+    fn new(
+        config: ClientDomainConfig,
+        stream: Option<Box<dyn AsyncReadAndWrite>>,
+        stored_passwords: StoredPasswords,
+    ) -> Self {
         Self {
-            stored_password: Arc::new(Mutex::new(stored_password)),
+            stored_passwords: Arc::new(Mutex::new(stored_passwords)),
             config,
             stream,
             tls_creds: None,
@@ -1901,8 +1912,8 @@ impl Reconnectable {
         }
     }
 
-    fn stored_password(&self) -> Option<String> {
-        self.stored_password.lock().unwrap().clone()
+    fn stored_passwords(&self) -> StoredPasswords {
+        self.stored_passwords.lock().unwrap().clone()
     }
 
     fn tls_creds_path(&self) -> anyhow::Result<PathBuf> {
@@ -2062,7 +2073,8 @@ impl Reconnectable {
                     && thinkterm_reverse_access::protocol::display_text(source, 256) == *source
             });
 
-        let sess = ssh_connect_with_ui_and_password(ssh_config, ui, self.stored_password())?;
+        // As they stand now: see `Client::set_stored_passwords`.
+        let sess = ssh_connect_with_ui_and_password(ssh_config, ui, self.stored_passwords())?;
         // A host with no mux binary would answer the proxy only with
         // "command not found" and a closed stream. Asked first, that case is
         // told apart, and the attach can offer to install ThinkTerm. Only the
@@ -2288,7 +2300,8 @@ impl Reconnectable {
                     ssh_config.insert("port".to_string(), port.to_string());
                 }
 
-                let sess = ssh_connect_with_ui_and_password(ssh_config, ui, None)?;
+                let sess =
+                    ssh_connect_with_ui_and_password(ssh_config, ui, StoredPasswords::default())?;
 
                 let creds = ui.run_and_log_error(|| {
                     // The `tlscreds` command will start the server if needed and then
@@ -2512,7 +2525,7 @@ impl Client {
     fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
         let connect_transport = Arc::clone(&reconnectable.connect_transport);
         let plugin_way = Arc::clone(&reconnectable.plugin_way);
-        let stored_password = Arc::clone(&reconnectable.stored_password);
+        let stored_passwords = Arc::clone(&reconnectable.stored_passwords);
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
@@ -2993,7 +3006,7 @@ impl Client {
             fatal_connection_error,
             connect_transport,
             plugin_way,
-            stored_password,
+            stored_passwords,
         }
     }
 
@@ -3238,8 +3251,11 @@ impl Client {
         ui: &mut ConnectionUI,
         no_auto_start: bool,
     ) -> anyhow::Result<Self> {
-        let mut reconnectable =
-            Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
+        let mut reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(unix_dom.clone()),
+            None,
+            StoredPasswords::default(),
+        );
         reconnectable.connect(initial, ui, no_auto_start)?;
         Ok(Self::new(local_domain_id, reconnectable))
     }
@@ -3269,8 +3285,11 @@ impl Client {
         stream.set_read_timeout(Some(unix_dom.read_timeout))?;
         stream.set_write_timeout(Some(unix_dom.write_timeout))?;
         let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(stream)?);
-        let mut reconnectable =
-            Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), Some(stream));
+        let mut reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(unix_dom.clone()),
+            Some(stream),
+            StoredPasswords::default(),
+        );
         reconnectable.incoming_payload_limit = payload_limit;
         Ok(Self::new(None, reconnectable))
     }
@@ -3280,8 +3299,11 @@ impl Client {
         tls_client: &TlsDomainClient,
         ui: &mut ConnectionUI,
     ) -> anyhow::Result<Self> {
-        let mut reconnectable =
-            Reconnectable::new(ClientDomainConfig::Tls(tls_client.clone()), None);
+        let mut reconnectable = Reconnectable::new(
+            ClientDomainConfig::Tls(tls_client.clone()),
+            None,
+            StoredPasswords::default(),
+        );
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
         Ok(Self::new(Some(local_domain_id), reconnectable))
@@ -3292,7 +3314,17 @@ impl Client {
         ssh_dom: &SshDomain,
         ui: &mut ConnectionUI,
     ) -> anyhow::Result<Self> {
-        let mut reconnectable = Reconnectable::new(ClientDomainConfig::Ssh(ssh_dom.clone()), None);
+        Self::new_ssh_with_passwords(local_domain_id, ssh_dom, StoredPasswords::of(ssh_dom), ui)
+    }
+
+    pub(crate) fn new_ssh_with_passwords(
+        local_domain_id: DomainId,
+        ssh_dom: &SshDomain,
+        passwords: StoredPasswords,
+        ui: &mut ConnectionUI,
+    ) -> anyhow::Result<Self> {
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Ssh(ssh_dom.clone()), None, passwords);
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
         Ok(Self::new(Some(local_domain_id), reconnectable))
@@ -3566,7 +3598,7 @@ fn outage_clock_after_session(
 mod tests {
     use super::{
         is_auth_cancelled, is_stored_password_refused, outage_clock_after_session, split_host_port,
-        Reconnectable,
+        Reconnectable, StoredPasswords,
     };
     use crate::domain::ClientDomainConfig;
     use std::time::{Duration, Instant};
@@ -3704,29 +3736,65 @@ mod tests {
 
     #[test]
     fn a_password_given_later_is_the_one_the_next_sign_in_uses() {
-        let reconnectable = Reconnectable::new(
-            ClientDomainConfig::Ssh(config::SshDomain {
-                stored_password: Some("example-old".to_string()),
+        let dom = config::SshDomain {
+            remote_address: "example.invalid:2222".to_string(),
+            username: Some("me".to_string()),
+            stored_password: Some("example-old".to_string()),
+            jump_hosts: vec![config::SshJumpHost {
+                remote_address: "jump.invalid:22".to_string(),
+                username: Some("me".to_string()),
+                stored_password: Some("jump-old".to_string()),
                 ..Default::default()
-            }),
+            }],
+            ..Default::default()
+        };
+        let reconnectable = Reconnectable::new(
+            ClientDomainConfig::Ssh(dom.clone()),
             None,
+            StoredPasswords::of(&dom),
         );
-        assert_eq!(
-            reconnectable.stored_password().as_deref(),
-            Some("example-old")
-        );
-        // What `Client::set_stored_password` does, from the other end.
-        *reconnectable.stored_password.lock().unwrap() = Some("example-new".to_string());
-        assert_eq!(
-            reconnectable.stored_password().as_deref(),
-            Some("example-new")
-        );
+        let held = reconnectable.stored_passwords();
+        assert_eq!(held, StoredPasswords::of(&dom));
+        assert_eq!(held.host.as_deref(), Some("example-old"));
+        assert_eq!(held.jumps[0].route, "me@jump.invalid:22");
+        assert_eq!(held.jumps[0].password.as_deref(), Some("jump-old"));
+
+        // What `Client::set_stored_passwords` does, from the other end.
+        let mut newer = dom.clone();
+        newer.stored_password = Some("example-new".to_string());
+        newer.jump_hosts[0].stored_password = Some("jump-new".to_string());
+        let new = StoredPasswords::of(&newer);
+        assert!(reconnectable
+            .stored_passwords
+            .lock()
+            .unwrap()
+            .replace_if_same_way(new.clone()));
+        assert_eq!(reconnectable.stored_passwords(), new);
+
+        // Kept for another host, or for the same one reached another way,
+        // they are not taken.
+        let mut elsewhere = newer.clone();
+        elsewhere.remote_address = "elsewhere.invalid:2222".to_string();
+        let mut other_gateway = newer.clone();
+        other_gateway.jump_hosts.clear();
+        other_gateway
+            .ssh_option
+            .insert("proxyjump".to_string(), "me@gateway.invalid".to_string());
+        for other in [elsewhere, other_gateway] {
+            assert!(!reconnectable
+                .stored_passwords
+                .lock()
+                .unwrap()
+                .replace_if_same_way(StoredPasswords::of(&other)));
+            assert_eq!(reconnectable.stored_passwords(), new);
+        }
 
         let no_password = Reconnectable::new(
             ClientDomainConfig::Unix(config::UnixDomain::default()),
             None,
+            StoredPasswords::default(),
         );
-        assert_eq!(no_password.stored_password(), None);
+        assert_eq!(no_password.stored_passwords(), StoredPasswords::default());
     }
 
     #[test]
@@ -3734,6 +3802,7 @@ mod tests {
         let plain = Reconnectable::new(
             ClientDomainConfig::Unix(config::UnixDomain::default()),
             None,
+            StoredPasswords::default(),
         );
         let mut plain = plain;
         assert!(!plain.reconnectable());
@@ -3746,6 +3815,7 @@ mod tests {
                 ..Default::default()
             }),
             None,
+            StoredPasswords::default(),
         );
         assert!(host.reconnectable());
         assert!(host.reconnect_on_eof());
@@ -3917,6 +3987,7 @@ mod connection_regression_tests {
             Reconnectable::new(
                 ClientDomainConfig::Unix(UnixDomain::default()),
                 Some(Box::new(client)),
+                StoredPasswords::default(),
             ),
             peer,
         )

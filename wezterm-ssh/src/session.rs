@@ -73,6 +73,7 @@ pub(crate) enum SessionRequest {
     NewPty(NewPty, Sender<anyhow::Result<(SshPty, SshChildProcess)>>),
     ResizePty(ResizePty, Option<Sender<anyhow::Result<()>>>),
     Exec(Exec, Sender<anyhow::Result<ExecResult>>),
+    DirectTcpip(DirectTcpip, Sender<anyhow::Result<Socket>>),
     Sftp(SftpRequest),
     SignalChannel(SignalChannel),
     SessionDropped,
@@ -90,6 +91,12 @@ pub(crate) struct Exec {
     pub env: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DirectTcpip {
+    pub host: String,
+    pub port: u16,
+}
+
 #[derive(Clone)]
 pub struct Session {
     tx: SessionSender,
@@ -103,6 +110,10 @@ pub struct Session {
 pub(crate) struct SessionShutdown {
     stopped: AtomicBool,
     socket: Mutex<Option<Socket>>,
+    /// The sessions to the jump hosts this one is reached through: with
+    /// this one gone they carry nothing, and one still signing in would
+    /// otherwise keep this one's caller waiting for nothing.
+    linked: Mutex<Vec<Arc<SessionShutdown>>>,
 }
 
 impl SessionShutdown {
@@ -127,6 +138,21 @@ impl SessionShutdown {
         self.stopped.store(true, Ordering::Release);
         if let Some(socket) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = socket.shutdown(Shutdown::Both);
+        }
+        let linked = std::mem::take(&mut *self.linked.lock().unwrap_or_else(|e| e.into_inner()));
+        for other in linked {
+            other.stop();
+        }
+    }
+
+    /// Stops `other` along with this one, or at once if this one has been.
+    pub(crate) fn link(&self, other: Arc<SessionShutdown>) {
+        let mut linked = self.linked.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(Ordering::Acquire) {
+            drop(linked);
+            other.stop();
+        } else {
+            linked.push(other);
         }
     }
 
@@ -160,7 +186,31 @@ impl Session {
     }
 
     pub fn connect(config: ConfigMap) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
-        let (tx_event, rx_event) = bounded(8);
+        Self::start(config, None)
+    }
+
+    /// Like [`Session::connect`], over `transport` rather than a connection
+    /// of its own: one a jump host carries to the host.
+    pub(crate) fn connect_over(
+        config: ConfigMap,
+        transport: Socket,
+    ) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
+        Self::start(config, Some(transport))
+    }
+
+    pub(crate) fn shutdown_handle(&self) -> Arc<SessionShutdown> {
+        Arc::clone(&self.shutdown)
+    }
+
+    fn start(
+        config: ConfigMap,
+        transport: Option<Socket>,
+    ) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
+        // Room for what a sign-in says unasked -- banners, mostly -- before
+        // whoever connects starts reading: a session reached through jump
+        // hosts passes theirs on too, up to `MAX_JUMP_HOSTS` sessions' worth,
+        // and one sent with no room left would end the sign-in.
+        let (tx_event, rx_event) = bounded(64);
         let (tx_req, rx_req) = bounded(8);
         let (mut sender_write, mut sender_read) = socketpair()?;
         sender_write.set_non_blocking(true)?;
@@ -200,6 +250,7 @@ impl Session {
             keep_alive,
             shutdown: Arc::clone(&shutdown),
             authentication: Arc::clone(&authentication),
+            transport,
         };
         std::thread::spawn(move || inner.run());
         Ok((
@@ -257,6 +308,25 @@ impl Session {
         let mut exec = rx.recv().await??;
         exec.child.tx.replace(self.tx.clone());
         Ok(exec)
+    }
+
+    /// Has the server open a TCP connection to `host:port` for us, as
+    /// `ssh -W` does: a direct-tcpip channel, given back as a socket that
+    /// passes along what is written to it and what comes back. It is how a
+    /// jump host carries the connection to the host beyond it.
+    pub async fn open_direct_tcpip(&self, host: &str, port: u16) -> anyhow::Result<Socket> {
+        let (reply, rx) = bounded(1);
+        self.tx
+            .send(SessionRequest::DirectTcpip(
+                DirectTcpip {
+                    host: host.to_string(),
+                    port,
+                },
+                reply,
+            ))
+            .await
+            .map_err(|_| DeadSession)?;
+        rx.recv().await?
     }
 
     /// Creates a new reference to the sftp channel for filesystem operations

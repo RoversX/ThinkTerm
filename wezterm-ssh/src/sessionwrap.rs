@@ -120,6 +120,28 @@ impl SessionWrap {
         }
     }
 
+    /// A direct-tcpip channel: the server connects to `host:port` and the
+    /// channel carries that connection.
+    pub fn open_direct_tcpip(&self, host: &str, port: u16) -> anyhow::Result<ChannelWrap> {
+        // Where the connection comes from is only for the server's logs;
+        // this is what libssh2 tells it when not told otherwise.
+        const ORIGIN: (&str, u16) = ("127.0.0.1", 22);
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(sess) => {
+                let channel = sess.sess.channel_direct_tcpip(host, port, Some(ORIGIN))?;
+                Ok(ChannelWrap::Ssh2(channel))
+            }
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(sess) => {
+                let channel = sess.sess.new_channel()?;
+                channel.open_forward(host, port, ORIGIN.0, ORIGIN.1)?;
+                Ok(ChannelWrap::LibSsh(channel))
+            }
+        }
+    }
+
     pub fn accept_agent_forward(&mut self) -> Option<ChannelWrap> {
         match self {
             // Unimplemented for now, an error message was printed earlier when the user tries to

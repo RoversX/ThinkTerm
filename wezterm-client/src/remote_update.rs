@@ -65,6 +65,15 @@ pub fn offer_remote_update(
     ui: &ConnectionUI,
     err: &IncompatibleVersionError,
 ) -> anyhow::Result<RemoteUpdateOutcome> {
+    offer_remote_update_with_passwords(ssh_dom, mux::ssh::StoredPasswords::of(ssh_dom), ui, err)
+}
+
+pub(crate) fn offer_remote_update_with_passwords(
+    ssh_dom: &SshDomain,
+    passwords: mux::ssh::StoredPasswords,
+    ui: &ConnectionUI,
+    err: &IncompatibleVersionError,
+) -> anyhow::Result<RemoteUpdateOutcome> {
     let local = thinkterm_update::running_release_version();
     let host = ssh_dom.remote_address.clone();
 
@@ -113,12 +122,9 @@ pub fn offer_remote_update(
     // that has no GUI to start.
     let ssh_config = mux::ssh::ssh_domain_to_ssh_config(ssh_dom)?;
     let mut ui_for_auth = ui.clone();
-    let session = mux::ssh::ssh_connect_with_ui_and_password(
-        ssh_config,
-        &mut ui_for_auth,
-        ssh_dom.stored_password.clone(),
-    )
-    .with_context(|| format!("opening an ssh session to {host} for the update"))?;
+    let session =
+        mux::ssh::ssh_connect_with_ui_and_password(ssh_config, &mut ui_for_auth, passwords)
+            .with_context(|| format!("opening an ssh session to {host} for the update"))?;
     let manifest = run_capture(&session, VARIANT_READ).unwrap_or_default();
     let host_probe = run_capture(&session, HOST_PROBE).unwrap_or_default();
     let gui_probe = run_capture(&session, GUI_PROBE).unwrap_or_default();
@@ -296,6 +302,14 @@ pub fn offer_remote_install(
     ssh_dom: &SshDomain,
     ui: &ConnectionUI,
 ) -> anyhow::Result<RemoteInstallOutcome> {
+    offer_remote_install_with_passwords(ssh_dom, mux::ssh::StoredPasswords::of(ssh_dom), ui)
+}
+
+pub(crate) fn offer_remote_install_with_passwords(
+    ssh_dom: &SshDomain,
+    passwords: mux::ssh::StoredPasswords,
+    ui: &ConnectionUI,
+) -> anyhow::Result<RemoteInstallOutcome> {
     let local = thinkterm_update::running_release_version();
     let host = ssh_dom.remote_address.clone();
     let variant = "server";
@@ -357,12 +371,9 @@ pub fn offer_remote_install(
 
     let ssh_config = mux::ssh::ssh_domain_to_ssh_config(ssh_dom)?;
     let mut ui_for_auth = ui.clone();
-    let session = mux::ssh::ssh_connect_with_ui_and_password(
-        ssh_config,
-        &mut ui_for_auth,
-        ssh_dom.stored_password.clone(),
-    )
-    .with_context(|| format!("opening an ssh session to {host} for the install"))?;
+    let session =
+        mux::ssh::ssh_connect_with_ui_and_password(ssh_config, &mut ui_for_auth, passwords)
+            .with_context(|| format!("opening an ssh session to {host} for the install"))?;
     if let Some(reason) = host_cannot_take_a_release(&session, variant) {
         ui.output_str(&format!(
             "{reason}, so the release build of {local} cannot be installed on {host}.\n{}\n",

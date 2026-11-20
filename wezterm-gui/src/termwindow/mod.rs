@@ -9839,26 +9839,43 @@ impl TermWindow {
                 true,
             ));
             items.push(ContextMenuItem::Separator);
-            // Deleting a host takes its threads and its mirrored Spaces with
-            // it and cannot be undone, so it asks first.
-            let confirm = self.context_menu_application_item_with_icon(
-                crate::i18n::tr("ssh-menu-delete-confirm"),
-                ContextMenuIcon::Delete,
-                ContextMenuApplicationAction::RemoteHost {
-                    host_id,
-                    command: RemoteHostCommand::Delete,
-                },
-                true,
-            );
+            // A host others are reached through is not deleted under them:
+            // the menu says which, and offers no way to.
+            let through =
+                crate::ssh_hosts::hosts_through(&host_id, &crate::ssh_hosts::list_all_hosts())
+                    .into_iter()
+                    .map(|entry| entry.spec.label)
+                    .collect::<Vec<_>>();
+            let contents = if through.is_empty() {
+                // Deleting a host takes its threads and its mirrored Spaces
+                // with it and cannot be undone, so it asks first.
+                let confirm = self.context_menu_application_item_with_icon(
+                    crate::i18n::tr("ssh-menu-delete-confirm"),
+                    ContextMenuIcon::Delete,
+                    ContextMenuApplicationAction::RemoteHost {
+                        host_id,
+                        command: RemoteHostCommand::Delete,
+                    },
+                    true,
+                );
+                vec![
+                    ContextMenuItem::section_header(crate::i18n::tr("ssh-menu-delete-explain")),
+                    confirm,
+                ]
+            } else {
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("hosts", through.join(", "));
+                vec![ContextMenuItem::section_header(crate::i18n::tr_args(
+                    "ssh-menu-delete-blocked",
+                    &args,
+                ))]
+            };
             let mut args = fluent_bundle::FluentArgs::new();
             args.set("name", label);
             items.push(ContextMenuItem::submenu_with_icon(
                 crate::i18n::tr_args("ssh-menu-delete-named", &args),
                 ContextMenuIcon::Delete,
-                vec![
-                    ContextMenuItem::section_header(crate::i18n::tr("ssh-menu-delete-explain")),
-                    confirm,
-                ],
+                contents,
             ));
         }
         self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
@@ -9897,6 +9914,57 @@ impl TermWindow {
                 .checked(icon == current)
             })
             .collect();
+        self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
+    }
+
+    /// The jump host menu of the Remote Hosts form, at `x`, `y`: connecting
+    /// directly, then each host in `choices` (id, label, icon) that the
+    /// host the form edits can be reached through, `current` ticked.
+    /// `host_id` is the host the form edits, empty for a new one.
+    pub(crate) fn show_remote_host_jump_menu(
+        &mut self,
+        host_id: String,
+        current: Option<crate::ssh_hosts::SshHostId>,
+        choices: Vec<(
+            crate::ssh_hosts::SshHostId,
+            String,
+            Option<crate::ssh_hosts::HostIcon>,
+        )>,
+        x: f32,
+        y: f32,
+    ) {
+        use crate::termwindow::content_view::RemoteHostCommand;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.begin_context_menu_application_actions();
+        let mut items = vec![self
+            .context_menu_application_item(
+                crate::i18n::tr("ssh-jump-host-none"),
+                ContextMenuApplicationAction::RemoteHost {
+                    host_id: host_id.clone(),
+                    command: RemoteHostCommand::SetJumpHost(None),
+                },
+            )
+            .checked(current.is_none())];
+        if !choices.is_empty() {
+            items.push(ContextMenuItem::Separator);
+        }
+        for (id, label, icon) in choices {
+            let checked = current.as_deref() == Some(id.as_str());
+            items.push(
+                self.context_menu_application_item_with_icon(
+                    label,
+                    crate::ssh_hosts::host_menu_icon(icon),
+                    ContextMenuApplicationAction::RemoteHost {
+                        host_id: host_id.clone(),
+                        command: RemoteHostCommand::SetJumpHost(Some(id)),
+                    },
+                    true,
+                )
+                .checked(checked),
+            );
+        }
         self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
     }
 

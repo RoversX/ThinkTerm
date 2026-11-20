@@ -1,5 +1,7 @@
 use crate::workspace_threads::{RemoteFilesSource, RemoteFilesTarget};
+#[cfg(test)]
 use config::SshDomain;
+use mux::ssh::SshConnectionConfig;
 use smol::channel::Sender;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use std::borrow::Cow;
@@ -1109,11 +1111,13 @@ mod listing_tests {
 }
 
 pub(crate) trait RemoteFileConnector: Send + Sync {
-    fn connect(&self, config: SshDomain) -> RemoteFuture<Arc<dyn RemoteFileBackend>>;
+    fn connect(&self, config: SshConnectionConfig) -> RemoteFuture<Arc<dyn RemoteFileBackend>>;
 }
 
-pub(crate) fn remote_connection_key(source_key: &str, config: &SshDomain) -> String {
+pub(crate) fn remote_connection_key(source_key: &str, connection: &SshConnectionConfig) -> String {
     let mut hasher = DefaultHasher::new();
+    connection.passwords.hash(&mut hasher);
+    let config = &connection.domain;
     source_key.hash(&mut hasher);
     config.remote_address.hash(&mut hasher);
     config.username.hash(&mut hasher);
@@ -1122,9 +1126,15 @@ pub(crate) fn remote_connection_key(source_key: &str, config: &SshDomain) -> Str
     let mut options = config.ssh_option.iter().collect::<Vec<_>>();
     options.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
     options.hash(&mut hasher);
-    // Include credentials in the fingerprint without retaining or logging
-    // another copy of the secret.
-    config.stored_password.hash(&mut hasher);
+    // And the way there: through other jump hosts, or the same ones set up
+    // another way, it is another connection.
+    for jump in &config.jump_hosts {
+        jump.remote_address.hash(&mut hasher);
+        jump.username.hash(&mut hasher);
+        let mut options = jump.ssh_option.iter().collect::<Vec<_>>();
+        options.sort();
+        options.hash(&mut hasher);
+    }
     format!("{source_key}:{:016x}", hasher.finish())
 }
 
@@ -1945,38 +1955,48 @@ fn is_sftp_directory_eof(err: &anyhow::Error) -> bool {
 pub(crate) struct SshRemoteFileConnector;
 
 impl RemoteFileConnector for SshRemoteFileConnector {
-    fn connect(&self, config: SshDomain) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
+    fn connect(&self, config: SshConnectionConfig) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
         Box::pin(async move {
-            let ssh_config =
-                mux::ssh::ssh_domain_to_ssh_config(&config).map_err(|err| format!("{err:#}"))?;
+            let (ssh_config, passwords) =
+                config.resolve_attempt().map_err(|err| format!("{err:#}"))?;
             let (session, events) = Session::connect(ssh_config)
                 .map_err(|err| format!("Unable to connect to SSH server: {err:#}"))?;
-            let mut password = config
-                .stored_password
-                .filter(|password| !password.is_empty());
+            let mut stored_sent = std::collections::HashSet::new();
             while let Ok(event) = events.recv().await {
                 match event {
                     SessionEvent::Banner(_) => {}
                     SessionEvent::HostVerify(verify) => {
+                        let on_the_way = match &verify.jump {
+                            Some(hop) => format!(" (jump host {hop})"),
+                            None => String::new(),
+                        };
                         return Err(format!(
-                            "SSH host verification requires interactive confirmation: {}",
+                            "SSH host verification requires interactive confirmation{on_the_way}: {}",
                             verify.message
                         ));
                     }
                     SessionEvent::Authenticate(auth) => {
+                        let who = auth.jump.as_ref().map(|hop| hop.index);
+                        let on_the_way = match &auth.jump {
+                            Some(hop) => format!(" for jump host {hop}"),
+                            None => String::new(),
+                        };
+                        let stored = passwords
+                            .for_prompt(auth.jump.as_ref())
+                            .filter(|password| !password.is_empty());
                         let mut answers = Vec::with_capacity(auth.prompts.len());
                         for prompt in &auth.prompts {
                             if prompt.echo {
-                                return Err(
-                                    "SSH authentication requires an interactive prompt".to_string()
-                                );
+                                return Err(format!(
+                                    "SSH authentication{on_the_way} requires an interactive prompt"
+                                ));
                             }
-                            let Some(stored) = password.take() else {
-                                return Err(
-                                    "SSH authentication requires a saved password".to_string()
-                                );
+                            let Some(stored) = stored.filter(|_| stored_sent.insert(who)) else {
+                                return Err(format!(
+                                    "SSH authentication{on_the_way} requires a saved password"
+                                ));
                             };
-                            answers.push(stored);
+                            answers.push(stored.to_string());
                         }
                         auth.answer(answers).await.map_err(|err| {
                             format!("Unable to answer SSH authentication prompt: {err:#}")
@@ -1992,7 +2012,7 @@ impl RemoteFileConnector for SshRemoteFileConnector {
                         let backend: Arc<dyn RemoteFileBackend> = Arc::new(SftpRemoteFileBackend {
                             sftp: session.sftp(),
                             session: Arc::new(session),
-                            remote_command: config.remote_wezterm_path.clone(),
+                            remote_command: config.domain.remote_wezterm_path.clone(),
                         });
                         return Ok(backend);
                     }
@@ -2108,7 +2128,7 @@ impl RemoteConnectionManager {
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         key: String,
-        config: SshDomain,
+        config: SshConnectionConfig,
         allow_connect: bool,
     ) -> Result<RemoteConnectionLease, RemoteAcquireError> {
         enum Pending {
@@ -3292,6 +3312,10 @@ impl RemoteFilesState {
 
 #[cfg(test)]
 mod tests {
+    fn test_connection() -> SshConnectionConfig {
+        SshConnectionConfig::new(SshDomain::default())
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -3584,7 +3608,7 @@ mod tests {
         );
         let key = "host".to_string();
 
-        let lease = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+        let lease = smol::block_on(manager.acquire(key.clone(), test_connection(), true))
             .expect("first acquire");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // A fresh connection is not probed; it was just built.
@@ -3595,7 +3619,7 @@ mod tests {
 
         // Panel reopened. The cached entry is probed, found dead, and replaced
         // — the caller still gets a usable lease on the first try.
-        let lease = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+        let lease = smol::block_on(manager.acquire(key.clone(), test_connection(), true))
             .expect("acquire must transparently redial");
         assert_eq!(
             probes.load(Ordering::SeqCst),
@@ -3605,7 +3629,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2, "must have redialled");
 
         // Still leased, so the next acquire skips the probe entirely.
-        let second = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+        let second = smol::block_on(manager.acquire(key.clone(), test_connection(), true))
             .expect("concurrent acquire");
         assert_eq!(
             probes.load(Ordering::SeqCst),
@@ -3667,7 +3691,10 @@ mod tests {
     }
 
     impl RemoteFileConnector for GatedProbeConnector {
-        fn connect(&self, _config: SshDomain) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
+        fn connect(
+            &self,
+            _config: SshConnectionConfig,
+        ) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
             let backend = GatedProbeBackend {
                 probes: Arc::clone(&self.probes),
                 gate: self.gate.clone(),
@@ -3695,7 +3722,7 @@ mod tests {
 
         smol::block_on(async {
             let lease = manager
-                .acquire(key.clone(), SshDomain::default(), true)
+                .acquire(key.clone(), test_connection(), true)
                 .await
                 .expect("first acquire");
             drop(lease); // idle: the next acquire must probe
@@ -3703,7 +3730,7 @@ mod tests {
             let prober = {
                 let manager = Arc::clone(&manager);
                 let key = key.clone();
-                smol::spawn(async move { manager.acquire(key, SshDomain::default(), true).await })
+                smol::spawn(async move { manager.acquire(key, test_connection(), true).await })
             };
             while probes.load(Ordering::SeqCst) == 0 {
                 smol::Timer::after(Duration::from_millis(1)).await;
@@ -3714,7 +3741,7 @@ mod tests {
                 let manager = Arc::clone(&manager);
                 let key = key.clone();
                 smol::spawn(async move {
-                    let lease = manager.acquire(key, SshDomain::default(), true).await;
+                    let lease = manager.acquire(key, test_connection(), true).await;
                     let _ = done_tx.send(()).await;
                     lease
                 })
@@ -3785,13 +3812,13 @@ mod tests {
         );
         let key = "host".to_string();
 
-        let lease = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+        let lease = smol::block_on(manager.acquire(key.clone(), test_connection(), true))
             .expect("first acquire");
         drop(lease);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Still cached: a plain reconnect reuses the session without dialling.
-        let reused = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+        let reused = smol::block_on(manager.acquire(key.clone(), test_connection(), true))
             .expect("cached acquire");
         drop(reused);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -3799,7 +3826,7 @@ mod tests {
         // Startup failed on that cached session, so it is thrown away and the
         // next attempt dials a fresh one instead of replaying the failure.
         manager.invalidate(&key);
-        let fresh = smol::block_on(manager.acquire(key.clone(), SshDomain::default(), true))
+        let fresh = smol::block_on(manager.acquire(key.clone(), test_connection(), true))
             .expect("acquire after invalidation");
         drop(fresh);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -3808,7 +3835,7 @@ mod tests {
         // that there is nothing to resume once the entry is gone.
         manager.invalidate(&key);
         assert!(matches!(
-            smol::block_on(manager.acquire(key, SshDomain::default(), false)),
+            smol::block_on(manager.acquire(key, test_connection(), false)),
             Err(RemoteAcquireError::NotConnected)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -4602,7 +4629,10 @@ mod tests {
     }
 
     impl RemoteFileConnector for DyingConnector {
-        fn connect(&self, _config: SshDomain) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
+        fn connect(
+            &self,
+            _config: SshConnectionConfig,
+        ) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
             let nth = self.calls.fetch_add(1, Ordering::SeqCst);
             let alive = Arc::new(AtomicBool::new(nth > 0));
             if nth == 0 {
@@ -4617,7 +4647,10 @@ mod tests {
     }
 
     impl RemoteFileConnector for FakeConnector {
-        fn connect(&self, _config: SshDomain) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
+        fn connect(
+            &self,
+            _config: SshConnectionConfig,
+        ) -> RemoteFuture<Arc<dyn RemoteFileBackend>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(Arc::new(FakeBackend) as Arc<dyn RemoteFileBackend>) })
         }
@@ -4681,8 +4714,8 @@ mod tests {
         );
         let (first, second) = smol::block_on(async {
             futures::future::join(
-                manager.acquire("source".to_string(), SshDomain::default(), true),
-                manager.acquire("source".to_string(), SshDomain::default(), true),
+                manager.acquire("source".to_string(), test_connection(), true),
+                manager.acquire("source".to_string(), test_connection(), true),
             )
             .await
         });
@@ -4747,13 +4780,12 @@ mod tests {
             }),
             Duration::from_secs(30),
         );
-        let old = smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
-            .unwrap();
+        let old =
+            smol::block_on(manager.acquire("source".to_string(), test_connection(), true)).unwrap();
         let old_id = old.connection_id;
         manager.invalidate("source");
         let replacement =
-            smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
-                .unwrap();
+            smol::block_on(manager.acquire("source".to_string(), test_connection(), true)).unwrap();
         assert_ne!(old_id, replacement.connection_id);
         drop(old);
         let inner = manager.inner.lock().unwrap();
@@ -4774,19 +4806,16 @@ mod tests {
             Duration::from_secs(30),
         );
         let first =
-            smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
-                .unwrap();
+            smol::block_on(manager.acquire("source".to_string(), test_connection(), true)).unwrap();
         let shared =
-            smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
-                .unwrap();
+            smol::block_on(manager.acquire("source".to_string(), test_connection(), true)).unwrap();
         assert!(first.is_same_connection(&shared), "one pooled session");
 
         // What a caller that dialled for itself sees after the pooled session
         // was replaced: the lease it is holding is NOT the live one.
         manager.invalidate("source");
         let redialled =
-            smol::block_on(manager.acquire("source".to_string(), SshDomain::default(), true))
-                .unwrap();
+            smol::block_on(manager.acquire("source".to_string(), test_connection(), true)).unwrap();
         assert!(!first.is_same_connection(&redialled));
 
         // The key half, which the pool cannot produce on its own: changed host
@@ -4804,24 +4833,80 @@ mod tests {
 
     #[test]
     fn connection_key_changes_with_endpoint_options_and_credentials() {
+        let key = |domain: &SshDomain| {
+            remote_connection_key("source", &SshConnectionConfig::new(domain.clone()))
+        };
         let mut first = SshDomain::default();
         first.remote_address = "host:22".to_string();
         first.username = Some("alice".to_string());
-        let base = remote_connection_key("source", &first);
+        let base = key(&first);
 
         let mut changed_host = first.clone();
         changed_host.remote_address = "other:22".to_string();
-        assert_ne!(base, remote_connection_key("source", &changed_host));
+        assert_ne!(base, key(&changed_host));
 
         let mut changed_option = first.clone();
         changed_option
             .ssh_option
             .insert("proxycommand".to_string(), "ssh jump".to_string());
-        assert_ne!(base, remote_connection_key("source", &changed_option));
+        assert_ne!(base, key(&changed_option));
 
-        let mut changed_password = first;
+        let mut changed_password = first.clone();
         changed_password.stored_password = Some("secret".to_string());
-        assert_ne!(base, remote_connection_key("source", &changed_password));
+        assert_ne!(base, key(&changed_password));
+
+        let mut through = first;
+        through.jump_hosts.push(config::SshJumpHost {
+            remote_address: "bastion:22".to_string(),
+            ..Default::default()
+        });
+        let through_key = key(&through);
+        assert_ne!(base, through_key);
+        let mut through_elsewhere = through.clone();
+        through_elsewhere.jump_hosts[0].remote_address = "relay:22".to_string();
+        assert_ne!(through_key, key(&through_elsewhere));
+        let mut new_jump_password = through;
+        new_jump_password.jump_hosts[0].stored_password = Some("secret".to_string());
+        assert_ne!(through_key, key(&new_jump_password));
+    }
+
+    #[test]
+    fn files_carry_the_password_binding_from_the_source_domain_to_the_dial() {
+        let source = mux::ssh::RemoteSshDomain::with_ssh_domain_and_password(
+            &SshDomain {
+                remote_address: "source.invalid".into(),
+                ..Default::default()
+            },
+            Some("source password".into()),
+        )
+        .unwrap();
+        let mut connection = source.ssh_connection_config().clone();
+        connection
+            .domain
+            .ssh_option
+            .insert("serveraliveinterval".into(), "30".into());
+        assert_eq!(
+            connection.resolve_attempt().unwrap().1.for_prompt(None),
+            Some("source password")
+        );
+
+        connection
+            .domain
+            .ssh_option
+            .insert("proxyjump".into(), "other.invalid".into());
+        assert_eq!(
+            connection.resolve_attempt().unwrap().1.for_prompt(None),
+            None
+        );
+        let mut newly_bound = connection.clone();
+        newly_bound.passwords = mux::ssh::StoredPasswords::with_host(
+            &newly_bound.domain,
+            Some("source password".into()),
+        );
+        assert_ne!(
+            remote_connection_key("source", &connection),
+            remote_connection_key("source", &newly_bound)
+        );
     }
 
     /// Exactly the reported repro: connect, close the sidebar, reopen, connect

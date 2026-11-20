@@ -210,6 +210,13 @@ impl SshdConfig {
         );
     }
 
+    /// Have the server set `name` to `value` for what it runs, so a test
+    /// can tell which server ran a command.
+    pub fn set_env(&mut self, name: &str, value: &str) {
+        self.0
+            .insert("SetEnv".to_string(), vec![format!("{name}={value}")]);
+    }
+
     fn yes_value(yes: bool) -> Vec<String> {
         vec![Self::yes_string(yes)]
     }
@@ -410,6 +417,77 @@ impl Sshd {
     }
 }
 
+impl Sshd {
+    /// What a client connecting to this server goes with, given what
+    /// `config` says for the host: its own identity, an agent with no keys,
+    /// and a known hosts file of its own, so that nothing of the person's
+    /// running the tests comes into it.
+    pub fn client_config(&self, config: &Config) -> wezterm_ssh::ConfigMap {
+        let mut config = config.for_host("localhost");
+        config.insert("port".to_string(), self.port.to_string());
+        config.insert("wezterm_ssh_verbose".to_string(), "true".to_string());
+
+        // If libssh-rs is not loaded (but ssh2 is), then we use ssh2 as the backend
+        #[cfg(not(feature = "libssh-rs"))]
+        config.insert("wezterm_ssh_backend".to_string(), "ssh2".to_string());
+
+        config.insert(
+            "identityagent".to_string(),
+            format!("{}", self.agent_sock.display()),
+        );
+
+        config.insert("user".to_string(), USERNAME.to_string());
+        config.insert("identitiesonly".to_string(), "yes".to_string());
+        config.insert(
+            "pubkeyacceptedtypes".to_string(),
+            // Ensure that we have ssh-rsa in the list, as debian9
+            // seems unhappy without it
+            "ssh-rsa,ssh-ed25519,\
+                  rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp521,\
+                  ecdsa-sha2-nistp384,ecdsa-sha2-nistp256"
+                .to_string(),
+        );
+        config.insert(
+            "identityfile".to_string(),
+            self.tmp
+                .child("id_rsa")
+                .path()
+                .to_str()
+                .expect("Failed to get string path for id_rsa")
+                .to_string(),
+        );
+        config.insert(
+            "userknownhostsfile".to_string(),
+            self.tmp
+                .child("known_hosts")
+                .path()
+                .to_str()
+                .expect("Failed to get string path for known_hosts")
+                .to_string(),
+        );
+        config
+    }
+
+    /// An ssh_config `Host` entry that reaches this server as `alias`,
+    /// with what [`Sshd::client_config`] sets.
+    pub fn host_entry(&self, alias: &str) -> String {
+        let config = self.client_config(&Config::new());
+        let mut entry = format!("Host {alias}\n    HostName 127.0.0.1\n");
+        for (option, key) in [
+            ("Port", "port"),
+            ("User", "user"),
+            ("IdentityFile", "identityfile"),
+            ("IdentityAgent", "identityagent"),
+            ("IdentitiesOnly", "identitiesonly"),
+            ("UserKnownHostsFile", "userknownhostsfile"),
+            ("PubkeyAcceptedTypes", "pubkeyacceptedtypes"),
+        ] {
+            entry.push_str(&format!("    {option} {}\n", config[key]));
+        }
+        entry
+    }
+}
+
 impl Drop for Sshd {
     /// Kills server upon drop
     fn drop(&mut self) {
@@ -448,8 +526,6 @@ impl std::ops::DerefMut for SessionWithSshd {
 #[fixture]
 /// Stand up an sshd instance and then connect to it and perform authentication
 pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> SessionWithSshd {
-    let port = sshd.port;
-
     // Do not add the default config files; they take the config of the
     // user that is running the tests which can vary wildly and have
     // inappropriate configuration that disrupts the tests.
@@ -457,48 +533,7 @@ pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> Se
 
     // Load our config to point to ourselves, using current sshd instance's port,
     // generated identity file, and host file
-    let mut config = config.for_host("localhost");
-    config.insert("port".to_string(), port.to_string());
-    config.insert("wezterm_ssh_verbose".to_string(), "true".to_string());
-
-    // If libssh-rs is not loaded (but ssh2 is), then we use ssh2 as the backend
-    #[cfg(not(feature = "libssh-rs"))]
-    config.insert("wezterm_ssh_backend".to_string(), "ssh2".to_string());
-
-    config.insert(
-        "identityagent".to_string(),
-        format!("{}", sshd.agent_sock.display()),
-    );
-
-    config.insert("user".to_string(), USERNAME.to_string());
-    config.insert("identitiesonly".to_string(), "yes".to_string());
-    config.insert(
-        "pubkeyacceptedtypes".to_string(),
-        // Ensure that we have ssh-rsa in the list, as debian9
-        // seems unhappy without it
-        "ssh-rsa,ssh-ed25519,\
-                  rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp521,\
-                  ecdsa-sha2-nistp384,ecdsa-sha2-nistp256"
-            .to_string(),
-    );
-    config.insert(
-        "identityfile".to_string(),
-        sshd.tmp
-            .child("id_rsa")
-            .path()
-            .to_str()
-            .expect("Failed to get string path for id_rsa")
-            .to_string(),
-    );
-    config.insert(
-        "userknownhostsfile".to_string(),
-        sshd.tmp
-            .child("known_hosts")
-            .path()
-            .to_str()
-            .expect("Failed to get string path for known_hosts")
-            .to_string(),
-    );
+    let config = sshd.client_config(&config);
 
     // Perform our actual connection
     let (session, events) = Session::connect(config.clone()).expect("Failed to connect to sshd");

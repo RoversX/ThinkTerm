@@ -94,6 +94,34 @@ impl ChannelWrap {
         }
     }
 
+    /// Whether stream `idx` has ended with nothing left in it to read. A
+    /// read tells that for ssh2; libssh, without blocking, reads an end as
+    /// one more "try again", so it is asked here.
+    pub fn reached_eof(&self, idx: usize) -> bool {
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(_) => false,
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(chan) => matches!(
+                chan.poll_timeout(idx == 1, Some(std::time::Duration::ZERO)),
+                Ok(libssh_rs::PollStatus::EndOfFile)
+            ),
+        }
+    }
+
+    /// Tells the far end nothing more is coming this way; what comes back
+    /// still can.
+    pub fn send_eof(&mut self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(chan) => Ok(chan.send_eof()?),
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(chan) => Ok(chan.send_eof()?),
+        }
+    }
+
     pub fn close(&mut self) {
         match self {
             #[cfg(feature = "ssh2")]

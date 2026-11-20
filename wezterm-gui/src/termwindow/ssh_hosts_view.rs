@@ -121,6 +121,10 @@ fn update_saved_host(id: &str, spec: SshHostSpec) -> anyhow::Result<Option<Strin
             ssh_hosts::move_spaces_after_rename(from, to);
         }
         crate::refresh_connect_domain_for_ssh_host(&after);
+        // The hosts reached through it were built with what it had.
+        for through in ssh_hosts::rebuild_domains_through(&saved_id) {
+            crate::refresh_connect_domain_for_ssh_host(&through.spec);
+        }
     }
     Ok(Some(saved_id))
 }
@@ -214,6 +218,8 @@ enum SshViewAction {
     FocusField(usize),
     /// The icon button: a menu of the kinds of machine to show the host as.
     PickIcon,
+    /// The jump host button: a menu of the hosts it can be reached through.
+    PickJumpHost,
     SetNetwork(SshNetwork),
     ToggleDetect,
     /// One of the three ways to reach the host.
@@ -277,7 +283,7 @@ impl HostMode {
 
 /// A choice in a saved host's form, saved as it is clicked (see
 /// `SshHostsView::save_choice`). What is typed waits for Save.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HostChoice {
     Icon(Option<HostIcon>),
     Network(SshNetwork),
@@ -285,12 +291,14 @@ enum HostChoice {
     DetectOs(bool),
     ShellIntegration(bool),
     FilesAutoConnect(bool),
+    /// The host it is reached through, by id; none to connect directly.
+    JumpHost(Option<String>),
 }
 
 impl HostChoice {
     /// Makes the choice on `spec`, as Save makes it from the form.
-    fn apply_to(self, spec: &mut SshHostSpec) {
-        match self {
+    fn apply_to(&self, spec: &mut SshHostSpec) {
+        match *self {
             Self::Icon(icon) => spec.icon = icon,
             Self::Network(network) => spec.network = network,
             Self::Mode(mode) => {
@@ -305,12 +313,13 @@ impl HostChoice {
             Self::DetectOs(on) => spec.detect_os = on,
             Self::ShellIntegration(on) => spec.shell_integration = on,
             Self::FilesAutoConnect(on) => spec.files_auto_connect = on,
+            Self::JumpHost(ref jump_host) => spec.jump_host = jump_host.clone(),
         }
     }
 
     /// Puts back in `form` what `saved` has for the choice: what one that
     /// could not be saved shows instead.
-    fn show_saved(self, saved: &SshHostSpec, form: &mut HostForm) {
+    fn show_saved(&self, saved: &SshHostSpec, form: &mut HostForm) {
         match self {
             Self::Icon(_) => form.icon = saved.icon,
             Self::Network(_) => form.network = saved.network,
@@ -321,6 +330,7 @@ impl HostChoice {
             Self::DetectOs(_) => form.detect_os = saved.detect_os,
             Self::ShellIntegration(_) => form.shell_integration = saved.shell_integration,
             Self::FilesAutoConnect(_) => form.files_auto_connect = saved.files_auto_connect,
+            Self::JumpHost(_) => form.jump_host = saved.jump_host.clone(),
         }
     }
 }
@@ -469,6 +479,8 @@ struct HostForm {
     multiplexing: bool,
     shell_integration: bool,
     files_auto_connect: bool,
+    /// The host it is reached through, by id (see `SshHostSpec::jump_host`).
+    jump_host: Option<String>,
     error: Option<String>,
 }
 
@@ -526,6 +538,8 @@ pub(crate) struct SshHostsView {
     form_area: RectF,
     /// The icon button as last painted: where its menu opens.
     icon_button: RectF,
+    /// The jump host button as last painted: where its menu opens.
+    jump_button: RectF,
     widgets: UiContext<SshViewAction>,
     interaction: InteractionState<SshViewAction>,
     scroll: ScrollState,
@@ -577,6 +591,7 @@ impl SshHostsView {
             form_content_h: 0.0,
             form_area: rect(0.0, 0.0, 0.0, 0.0),
             icon_button: rect(0.0, 0.0, 0.0, 0.0),
+            jump_button: rect(0.0, 0.0, 0.0, 0.0),
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
             scroll: ScrollState::new(),
@@ -759,6 +774,7 @@ impl SshHostsView {
         let multiplexing = spec.multiplexing;
         let shell_integration = spec.shell_integration;
         let files_auto_connect = spec.files_auto_connect;
+        let jump_host = spec.jump_host.clone();
         // Sorted so the rows keep a stable order between opens.
         let mut option_pairs: Vec<(String, String)> = spec
             .ssh_options
@@ -785,6 +801,7 @@ impl SshHostsView {
             multiplexing,
             shell_integration,
             files_auto_connect,
+            jump_host,
             error: None,
         });
         self.focus = Focus::Field(FIELD_HOST);
@@ -811,9 +828,14 @@ impl SshHostsView {
     /// Validate + create/update. On success returns the project id and closes
     /// the form; on error records the message and keeps the form open.
     fn persist_form(&mut self) -> Option<String> {
+        let mut hosts = self.all_hosts();
         let form = self.form.as_mut()?;
         if form.network == SshNetwork::Tailnet && form.use_mosh {
             form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
+            return None;
+        }
+        if let Some(error) = Self::jump_host_conflict(form) {
+            form.error = Some(crate::i18n::tr(error));
             return None;
         }
         let host = form.fields[FIELD_HOST].text().trim().to_string();
@@ -859,6 +881,7 @@ impl SshHostsView {
             shell_integration_failure: None,
             files_auto_connect: false,
             icon: None,
+            jump_host: None,
         });
         spec.label = label;
         spec.host = host;
@@ -891,6 +914,22 @@ impl SshHostsView {
         spec.multiplexing = form.multiplexing;
         spec.shell_integration = form.shell_integration;
         spec.files_auto_connect = form.files_auto_connect;
+        spec.jump_host = form.jump_host.clone();
+        // The menu offers no host that would lead back here; one saved since
+        // could, or one deleted since leaves nothing to go through. Followed
+        // with this host as it is about to be saved, so that a way leading
+        // back to it is seen as one.
+        if let Some(own) = form
+            .editing
+            .as_deref()
+            .and_then(|id| hosts.iter_mut().find(|entry| entry.id == id))
+        {
+            own.spec = spec.clone();
+        }
+        if let Err(err) = thinkterm_core::ssh_hosts::jump_chain(&spec, &hosts) {
+            form.error = Some(ssh_error("ssh-error-jump-host", err.to_string()));
+            return None;
+        }
         let mosh_server_command = form.fields[FIELD_MOSH_SERVER].text().trim();
         if spec.use_mosh && mosh_server_command.is_empty() {
             form.error = Some(crate::i18n::tr("ssh-error-mosh-command"));
@@ -1228,6 +1267,7 @@ impl SshHostsView {
                 ContentViewResponse::Redraw
             }
             SshViewAction::PickIcon => self.icon_menu(),
+            SshViewAction::PickJumpHost => self.jump_host_menu(),
             SshViewAction::SetNetwork(network) => {
                 let tailnet_on = self.tailnet_on;
                 if let Some(form) = self.form.as_mut() {
@@ -1240,6 +1280,10 @@ impl SshHostsView {
                     }
                     if network == SshNetwork::Tailnet && form.use_mosh {
                         form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
+                        return ContentViewResponse::Redraw;
+                    }
+                    if network == SshNetwork::Tailnet && form.jump_host.is_some() {
+                        form.error = Some(crate::i18n::tr("ssh-error-jump-tailnet"));
                         return ContentViewResponse::Redraw;
                     }
                     form.network = network;
@@ -1260,6 +1304,10 @@ impl SshHostsView {
                 if let Some(form) = self.form.as_mut() {
                     if mode == HostMode::Mosh && form.network == SshNetwork::Tailnet {
                         form.error = Some(crate::i18n::tr("ssh-error-mosh-tailnet"));
+                        return ContentViewResponse::Redraw;
+                    }
+                    if mode == HostMode::Mosh && form.jump_host.is_some() {
+                        form.error = Some(crate::i18n::tr("ssh-error-jump-mosh"));
                         return ContentViewResponse::Redraw;
                     }
                     form.error = None;
@@ -1534,6 +1582,7 @@ impl SshHostsView {
             form.shell_integration = spec.shell_integration;
             form.files_auto_connect = spec.files_auto_connect;
             form.icon = spec.icon;
+            form.jump_host = spec.jump_host.clone();
             form.options = spec
                 .ssh_options
                 .iter()
@@ -1562,7 +1611,116 @@ impl SshHostsView {
             RemoteHostCommand::Duplicate => self.duplicate_host(host_id),
             RemoteHostCommand::Delete => self.delete_host(host_id),
             RemoteHostCommand::SetIcon(icon) => self.set_form_icon(host_id, icon),
+            RemoteHostCommand::SetJumpHost(jump_host) => {
+                self.set_form_jump_host(host_id, jump_host)
+            }
         }
+    }
+
+    /// Every host the page knows: those saved here, then those
+    /// `~/.ssh/config` names, as last read.
+    fn all_hosts(&self) -> Vec<SshHostEntry> {
+        let mut hosts = self.saved_hosts.clone();
+        if let Some((_, system)) = &self.system_hosts {
+            hosts.extend(system.iter().cloned());
+        }
+        hosts
+    }
+
+    /// What the host `id`, as a jump host, is called on the page: its
+    /// label, or that it is gone.
+    fn jump_host_label(&self, id: &str) -> String {
+        self.saved_hosts
+            .iter()
+            .chain(self.system_hosts.iter().flat_map(|(_, hosts)| hosts.iter()))
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.spec.label.clone())
+            .unwrap_or_else(|| crate::i18n::tr("ssh-jump-host-missing"))
+    }
+
+    /// Why the form's jump host cannot go with the rest of it, as the id of
+    /// the message saying so: Mosh and the built-in tailnet reach the host
+    /// themselves.
+    fn jump_host_conflict(form: &HostForm) -> Option<&'static str> {
+        form.jump_host.as_ref()?;
+        if form.use_mosh {
+            Some("ssh-error-jump-mosh")
+        } else if form.network == SshNetwork::Tailnet {
+            Some("ssh-error-jump-tailnet")
+        } else {
+            None
+        }
+    }
+
+    /// Every host the one the form edits can be reached through, as (id,
+    /// label, icon): not itself, nor any host reached through it, which
+    /// would lead back.
+    fn jump_host_choices(&self) -> Vec<(String, String, Option<HostIcon>)> {
+        let Some(form) = self.form.as_ref() else {
+            return vec![];
+        };
+        let host_id = form.editing.clone().unwrap_or_default();
+        let hosts = self.all_hosts();
+        hosts
+            .iter()
+            .filter(|entry| entry.id != host_id)
+            .filter(|entry| {
+                host_id.is_empty()
+                    || !thinkterm_core::ssh_hosts::goes_through(&entry.spec, &host_id, &hosts)
+            })
+            .map(|entry| (entry.id.clone(), entry.spec.label.clone(), entry.spec.icon))
+            .collect()
+    }
+
+    /// The jump host button's menu, under the button (see
+    /// `jump_host_choices`).
+    fn jump_host_menu(&mut self) -> ContentViewResponse {
+        let Some(form) = self.form.as_ref() else {
+            return ContentViewResponse::Redraw;
+        };
+        let host_id = form.editing.clone().unwrap_or_default();
+        let current = form.jump_host.clone();
+        let choices = self.jump_host_choices();
+        let (x, y) = (self.jump_button.origin.x, self.jump_button.max_y());
+        ContentViewResponse::Run(Box::new(move |term_window| {
+            term_window.show_remote_host_jump_menu(host_id, current, choices, x, y);
+        }))
+    }
+
+    /// `jump_host`, picked in the jump host menu, on the form for `host_id`
+    /// (empty for a new host) if that form is still the one open.
+    fn set_form_jump_host(
+        &mut self,
+        host_id: &str,
+        jump_host: Option<String>,
+    ) -> ContentViewResponse {
+        let mut hosts = self.all_hosts();
+        let Some(form) = self.form.as_mut() else {
+            return ContentViewResponse::Redraw;
+        };
+        if form.editing.as_deref().unwrap_or("") != host_id {
+            return ContentViewResponse::Redraw;
+        }
+        let previous = std::mem::replace(&mut form.jump_host, jump_host.clone());
+        if let Some(error) = Self::jump_host_conflict(form) {
+            form.jump_host = previous;
+            form.error = Some(crate::i18n::tr(error));
+            return ContentViewResponse::Redraw;
+        }
+        // Saved at once (see `save_choice`): a way leading back to this
+        // host, followed with the choice made, is refused before it is.
+        if let Some(own) = hosts.iter_mut().find(|entry| entry.id == host_id) {
+            own.spec.jump_host = jump_host.clone();
+            let spec = own.spec.clone();
+            if let Err(err) = thinkterm_core::ssh_hosts::jump_chain(&spec, &hosts) {
+                form.jump_host = previous;
+                form.error = Some(ssh_error("ssh-error-jump-host", err.to_string()));
+                return ContentViewResponse::Redraw;
+            }
+        }
+        form.error = None;
+        self.save_choice(HostChoice::JumpHost(jump_host));
+        ContentViewResponse::Redraw
     }
 
     /// The icon button's menu, under the button. The page cannot open a
@@ -2112,8 +2270,14 @@ impl SshHostsView {
     /// Spelled out after the endpoint rather than shown as a corner tag: a
     /// two-word tag next to the title has to be read as a label anyway, and
     /// "connect" as a tag collides with the verb.
-    fn card_subtitle(entry: &SshHostEntry) -> String {
-        let endpoint = ssh_hosts::endpoint(&entry.spec);
+    fn card_subtitle(entry: &SshHostEntry, via: Option<String>) -> String {
+        let mut endpoint = ssh_hosts::endpoint(&entry.spec);
+        if let Some(host) = via {
+            endpoint = format!(
+                "{endpoint}  ·  {}",
+                tr_named("ssh-card-via", &[("host", host)])
+            );
+        }
         // A Connect host says so with its whole card; the endpoint gets the
         // room.
         let mode = match HostMode::of(entry.spec.use_mosh, entry.spec.multiplexing) {
@@ -2889,7 +3053,14 @@ impl SshHostsView {
             font,
             text_x,
             title_y + line_h + line_gap,
-            &Self::card_subtitle(&entry),
+            &Self::card_subtitle(
+                &entry,
+                entry
+                    .spec
+                    .jump_host
+                    .as_deref()
+                    .map(|id| self.jump_host_label(id)),
+            ),
             palette.muted_text,
             text_w,
         )?;
@@ -3892,6 +4063,7 @@ impl SshHostsView {
         let multiplexing = form.multiplexing;
         let shell_integration = form.shell_integration;
         let files_auto_connect = form.files_auto_connect;
+        let jump_host = form.jump_host.as_deref().map(|id| self.jump_host_label(id));
         let advanced_open = form.advanced_open;
         let error = form.error.clone();
         let fields = form.fields.clone();
@@ -4052,10 +4224,33 @@ impl SshHostsView {
             } else {
                 ctx.px(6.0) + caption_h * lock_note.len() as f32
             };
+            // Through a jump host, Host is the address as that host sees it.
+            let jump_note = match &jump_host {
+                None => Vec::new(),
+                Some(host) => {
+                    let note = tr_named("ssh-jump-host-note", &[("host", host.clone())]);
+                    wrap_snippet_text_for_width(&note, 3, false, |segment| {
+                        caption_ctx.measure_text_width(caption_font, segment) / inner.max(1.0)
+                    })
+                }
+            };
+            let jump_note_h = if jump_note.is_empty() {
+                0.0
+            } else {
+                ctx.px(6.0) + caption_h * jump_note.len() as f32
+            };
             let conn_h = Self::inspector_card_height(
                 ctx,
                 section_h,
-                &[field_h, field_h, field_h + lock_note_h, field_h, field_h, field_h],
+                &[
+                    field_h,
+                    field_h,
+                    field_h + lock_note_h,
+                    field_h + jump_note_h,
+                    field_h,
+                    field_h,
+                    field_h,
+                ],
             );
             let mut fy = Self::paint_inspector_card(
                 ctx,
@@ -4154,6 +4349,31 @@ impl SshHostsView {
                 note_y += caption_h;
             }
             fy += field_h + lock_note_h + gap;
+            self.paint_jump_host_row(
+                ctx,
+                &mut body_layers,
+                font,
+                palette,
+                jump_host.as_deref(),
+                x + pad,
+                fy,
+                inner,
+            )?;
+            // Under the button, as the network's note is under its own.
+            let mut note_y = fy + field_h + ctx.px(6.0);
+            for line in &jump_note {
+                caption_ctx.draw_text(
+                    &mut body_layers,
+                    caption_font,
+                    x + pad,
+                    note_y,
+                    line,
+                    palette.muted_text,
+                    inner,
+                )?;
+                note_y += caption_h;
+            }
+            fy += field_h + jump_note_h + gap;
             // Host and Port share a row: a port needs four characters, not a
             // column of its own.
             let port_w = ctx.px(96.0).min(inner * 0.32);
@@ -4800,6 +5020,82 @@ impl SshHostsView {
             button.origin.y + ((button.size.height - line_h) / 2.0).max(0.0),
             &label,
             ink,
+            (arrows_x - ctx.px(8.0) - text_x).max(0.0),
+        )?;
+        Ok(y + Self::field_row_height(ctx))
+    }
+
+    /// The jump host row: its label over a pop-up button naming the host
+    /// the one edited is reached through, `jump_host`, or that it is
+    /// reached directly.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_jump_host_row(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        jump_host: Option<&str>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        let line_h = ctx.metrics.cell_size.height as f32;
+        ctx.draw_text(
+            layers,
+            font,
+            x,
+            y,
+            &crate::i18n::tr("ssh-field-jump-host"),
+            palette.text,
+            width,
+        )?;
+        let action = SshViewAction::PickJumpHost;
+        let state = self.button_state(action);
+        let variant = ButtonVariant::Secondary;
+        let button = rect(x, y + line_h + ctx.px(LABEL_GAP), width, ctx.px(INPUT_H));
+        self.jump_button = button;
+        draw_button(
+            ctx,
+            layers,
+            font,
+            &mut self.widgets,
+            palette,
+            ButtonSpec {
+                label: "",
+                action,
+                rect: button,
+                state,
+                kind: WidgetKind::Button,
+                variant,
+            },
+        )?;
+        // Laid out as the icon row's pop-up button.
+        let (_, _, ink) = variant.colors(state, palette);
+        let size = ctx.px(16.0);
+        let inset = ctx.px(14.0);
+        let icon_y = button.origin.y + (button.size.height - size) / 2.0;
+        let arrows_x = button.max_x() - inset - size;
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronsUpDown,
+            arrows_x,
+            icon_y,
+            size,
+            palette.muted_text,
+        )?;
+        let (label, color) = match jump_host {
+            Some(host) => (host.to_string(), ink),
+            None => (crate::i18n::tr("ssh-jump-host-none"), palette.muted_text),
+        };
+        let text_x = button.origin.x + inset;
+        ctx.draw_text(
+            layers,
+            font,
+            text_x,
+            button.origin.y + ((button.size.height - line_h) / 2.0).max(0.0),
+            &label,
+            color,
             (arrows_x - ctx.px(8.0) - text_x).max(0.0),
         )?;
         Ok(y + Self::field_row_height(ctx))
@@ -6319,6 +6615,7 @@ mod tests {
             shell_integration_failure: None,
             files_auto_connect: false,
             icon: None,
+            jump_host: None,
         }
     }
 
@@ -6567,6 +6864,113 @@ mod tests {
                 .map(|entry| entry.id.as_str()),
             Some("ssh-devbox")
         );
+    }
+
+    fn jumping(id: &str, jump_host: Option<&str>) -> SshHostEntry {
+        SshHostEntry {
+            id: id.to_string(),
+            source: SshHostSource::ThinkTerm,
+            spec: SshHostSpec {
+                jump_host: jump_host.map(str::to_string),
+                ..spec(id, &format!("{id}.example"))
+            },
+        }
+    }
+
+    #[test]
+    fn the_jump_host_menu_offers_no_host_that_leads_back() {
+        let mut view = SshHostsView::new();
+        view.saved_hosts = vec![
+            jumping("edge", None),
+            jumping("relay", Some("edge")),
+            jumping("inside", Some("relay")),
+            jumping("other", None),
+        ];
+        view.system_hosts = None;
+        view.open_new_form();
+        let offered = |view: &SshHostsView| {
+            view.jump_host_choices()
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect::<Vec<_>>()
+        };
+        // A new host can go through any of them.
+        assert_eq!(offered(&view), ["edge", "relay", "inside", "other"]);
+        // `relay` can go through neither itself nor `inside`, which is
+        // reached through it.
+        view.form.as_mut().unwrap().editing = Some("relay".to_string());
+        assert_eq!(offered(&view), ["edge", "other"]);
+    }
+
+    #[test]
+    fn a_jump_host_goes_with_neither_mosh_nor_the_tailnet() {
+        use super::HostMode;
+        let mut view = SshHostsView::new();
+        view.open_new_form();
+        let jump = |view: &mut SshHostsView, to: Option<&str>| {
+            view.run_host_command("", RemoteHostCommand::SetJumpHost(to.map(str::to_string)));
+        };
+
+        view.apply(super::SshViewAction::SetMode(HostMode::Mosh));
+        jump(&mut view, Some("edge"));
+        let form = view.form.as_ref().unwrap();
+        assert_eq!(form.jump_host, None);
+        assert_eq!(form.error, Some(crate::i18n::tr("ssh-error-jump-mosh")));
+
+        view.apply(super::SshViewAction::SetMode(HostMode::Connect));
+        jump(&mut view, Some("edge"));
+        let form = view.form.as_ref().unwrap();
+        assert_eq!(form.jump_host.as_deref(), Some("edge"));
+        assert_eq!(form.error, None);
+
+        // Reached through a jump host, it can be put on neither.
+        view.apply(super::SshViewAction::SetMode(HostMode::Mosh));
+        let form = view.form.as_ref().unwrap();
+        assert!(!form.use_mosh);
+        assert_eq!(form.error, Some(crate::i18n::tr("ssh-error-jump-mosh")));
+        view.tailnet_on = true;
+        view.apply(super::SshViewAction::SetNetwork(SshNetwork::Tailnet));
+        let form = view.form.as_ref().unwrap();
+        assert_eq!(form.network, SshNetwork::System);
+        assert_eq!(form.error, Some(crate::i18n::tr("ssh-error-jump-tailnet")));
+
+        jump(&mut view, None);
+        view.apply(super::SshViewAction::SetMode(HostMode::Mosh));
+        assert!(view.form.as_ref().unwrap().use_mosh);
+    }
+
+    #[test]
+    fn a_jump_host_that_would_lead_back_is_refused_before_it_is_saved() {
+        let mut view = SshHostsView::new();
+        view.saved_hosts = vec![
+            jumping("a", Some("c")),
+            jumping("c", Some("d")),
+            jumping("d", None),
+        ];
+        view.system_hosts = None;
+        view.open_new_form();
+        view.form.as_mut().unwrap().editing = Some("d".to_string());
+        // d through a would go a -> c -> d -> a ...: refused here, with
+        // nothing saved, rather than at every connection.
+        view.run_host_command("d", RemoteHostCommand::SetJumpHost(Some("a".to_string())));
+        let form = view.form.as_ref().unwrap();
+        assert_eq!(form.jump_host, None);
+        assert!(
+            form.error
+                .as_deref()
+                .is_some_and(|error| error.contains("lead back")),
+            "{:?}",
+            form.error
+        );
+    }
+
+    #[test]
+    fn a_card_says_what_its_host_is_reached_through() {
+        let entry = jumping("inside", Some("edge"));
+        let through = SshHostsView::card_subtitle(&entry, Some("Bastion".to_string()));
+        assert!(through.contains("Bastion"), "{}", through);
+        let direct = SshHostsView::card_subtitle(&jumping("edge", None), None);
+        assert!(!direct.contains("Bastion"), "{}", direct);
     }
 
     #[test]

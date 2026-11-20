@@ -10,6 +10,7 @@ use mux::command_spec::{CommandSpec, CommandSpecExt};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId};
+use mux::ssh::{SshConnectionConfig, StoredPasswords};
 use mux::tab::{SplitRequest, Tab, TabId};
 use mux::window::{Window, WindowId};
 use mux::{Mux, MuxNotification};
@@ -2162,9 +2163,9 @@ pub struct ClientDomain {
     unsent_labels: Mutex<HashMap<PaneId, Option<String>>>,
     label_edits: Mutex<LabelEdits>,
     local_domain_id: DomainId,
-    /// The password kept for an ssh host, where it has been given another
-    /// since `config` was made (see `set_stored_password`).
-    stored_password: Mutex<Option<Option<String>>>,
+    /// The next attach and secondary connections use the credentials captured
+    /// with this configuration. The active client keeps its own binding.
+    ssh: Mutex<Option<SshConnectionConfig>>,
 }
 
 async fn update_remote_workspace(
@@ -2613,6 +2614,18 @@ impl ClientDomain {
     }
 
     pub fn new(config: ClientDomainConfig) -> Self {
+        let ssh = match &config {
+            ClientDomainConfig::Ssh(domain) => Some(SshConnectionConfig::new(domain.clone())),
+            _ => None,
+        };
+        Self::with_config(config, ssh)
+    }
+
+    pub fn with_ssh_connection(ssh: SshConnectionConfig) -> Self {
+        Self::with_config(ClientDomainConfig::Ssh(ssh.domain.clone()), Some(ssh))
+    }
+
+    fn with_config(config: ClientDomainConfig, ssh: Option<SshConnectionConfig>) -> Self {
         let local_domain_id = alloc_domain_id();
         let label = config.label();
         Mux::get().subscribe(move |notif| mux_notify_client_domain(local_domain_id, notif));
@@ -2627,7 +2640,7 @@ impl ClientDomain {
             unsent_labels: Mutex::new(HashMap::new()),
             label_edits: Mutex::new(LabelEdits::default()),
             local_domain_id,
-            stored_password: Mutex::new(None),
+            ssh: Mutex::new(ssh),
         }
     }
 
@@ -2659,25 +2672,54 @@ impl ClientDomain {
     /// The clone keeps `ClientDomain`'s live transport private: consumers
     /// cannot accidentally share the mux Session and stall terminal traffic.
     pub fn ssh_domain_config(&self) -> Option<SshDomain> {
-        match &self.config {
-            ClientDomainConfig::Ssh(ssh) => {
-                let mut ssh = ssh.clone();
-                if let Some(password) = self.stored_password.lock().unwrap().clone() {
-                    ssh.stored_password = password;
-                }
-                Some(ssh)
-            }
-            ClientDomainConfig::Unix(_) | ClientDomainConfig::Tls(_) => None,
+        self.ssh
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|ssh| ssh.domain.clone())
+    }
+
+    pub fn ssh_connection_config(&self) -> Option<SshConnectionConfig> {
+        self.ssh.lock().unwrap().clone()
+    }
+
+    /// Keep a route edit for the next attach. The client already attached
+    /// continues using the configuration and binding it received.
+    pub fn set_ssh_config_for_next_attach(&self, domain: SshDomain) {
+        let mut guard = self.ssh.lock().unwrap();
+        if let Some(ssh) = guard.as_mut() {
+            let passwords = StoredPasswords::of(&domain);
+            ssh.update(domain, passwords);
         }
     }
 
-    /// The host was given another password while this domain is in use.
-    /// Nothing is reconnected for it: the next sign-in uses it, be that a
-    /// reconnect already waiting or a later attach.
-    pub fn set_stored_password(&self, password: Option<String>) {
-        *self.stored_password.lock().unwrap() = Some(password.clone());
+    /// The saved host already captured its credentials before handing them to us.
+    pub fn set_ssh_connection_for_next_attach(&self, connection: SshConnectionConfig) {
+        let mut guard = self.ssh.lock().unwrap();
         if let Some(inner) = self.inner() {
-            inner.client.set_stored_password(password);
+            inner
+                .client
+                .set_stored_passwords(connection.passwords.clone());
+        }
+        *guard = Some(connection);
+    }
+
+    pub fn set_stored_passwords(&self, passwords: StoredPasswords) {
+        let mut guard = self.ssh.lock().unwrap();
+        let Some(ssh) = guard.as_mut() else { return };
+        if !ssh.passwords.same_way(&passwords)
+            && !StoredPasswords::of(&ssh.domain).same_way(&passwords)
+        {
+            return;
+        }
+        let mut domain = ssh.domain.clone();
+        domain.stored_password = passwords.host.clone();
+        for (jump, kept) in domain.jump_hosts.iter_mut().zip(&passwords.jumps) {
+            jump.stored_password = kept.password.clone();
+        }
+        ssh.update(domain, passwords);
+        if let Some(inner) = self.inner() {
+            inner.client.set_stored_passwords(ssh.passwords.clone());
         }
     }
 
@@ -4696,6 +4738,7 @@ impl ClientDomain {
             overlay_lag_indicator,
         ));
         {
+            let ssh = domain.ssh.lock().unwrap();
             let mut guard = domain.inner.lock().unwrap();
             if guard.is_some() {
                 // A concurrent attach already installed an inner. Replacing
@@ -4708,6 +4751,10 @@ impl ClientDomain {
                 return Ok(());
             }
             inner.client.mark_attached()?;
+            if let Some(ssh) = ssh.as_ref() {
+                // A password edit may have arrived during the handshake.
+                inner.client.set_stored_passwords(ssh.passwords.clone());
+            }
             guard.replace(Arc::clone(&inner));
         }
 
@@ -4794,6 +4841,127 @@ mod tests {
             }),
             now,
         );
+    }
+
+    #[test]
+    fn passwords_for_a_new_way_there_reach_only_the_next_attach() {
+        // `ClientDomain::new` subscribes to the process-wide Mux.
+        let _ = promise::spawn::SimpleExecutor::new();
+        mux::Mux::set_mux(&std::sync::Arc::new(mux::Mux::new(None)));
+        let old_way = config::SshDomain {
+            name: "inside".to_string(),
+            remote_address: "inside.invalid".to_string(),
+            jump_hosts: vec![config::SshJumpHost {
+                remote_address: "old-jump.invalid".to_string(),
+                stored_password: Some("old jump secret".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let domain = super::ClientDomain::new(super::ClientDomainConfig::Ssh(old_way.clone()));
+
+        // While connected, the host is given another jump host, and then
+        // that one a password.
+        let mut new_way = old_way.clone();
+        new_way.jump_hosts[0] = config::SshJumpHost {
+            remote_address: "new-jump.invalid".to_string(),
+            ..Default::default()
+        };
+        domain.set_ssh_config_for_next_attach(new_way.clone());
+        let mut with_password = new_way;
+        with_password.jump_hosts[0].stored_password = Some("new jump secret".to_string());
+        domain.set_stored_passwords(mux::ssh::StoredPasswords::of(&with_password));
+
+        // A session still going the old way is given nothing of it...
+        let mut live = mux::ssh::StoredPasswords::of(&old_way);
+        let new_passwords = domain.ssh_connection_config().unwrap().passwords;
+        assert!(!live.replace_if_same_way(new_passwords));
+        // ...and the next attach goes the new way, with that password.
+        let next = domain.ssh_domain_config().unwrap();
+        assert_eq!(next.jump_hosts[0].remote_address, "new-jump.invalid");
+        assert_eq!(
+            next.jump_hosts[0].stored_password.as_deref(),
+            Some("new jump secret")
+        );
+
+        // Attached the new way, the session that is on is given what is
+        // kept for that way from then on.
+        let mut reattached = domain.ssh_connection_config().unwrap().passwords;
+        with_password.jump_hosts[0].stored_password = Some("newer jump secret".to_string());
+        let newer = mux::ssh::StoredPasswords::of(&with_password);
+        assert!(reattached.replace_if_same_way(newer.clone()));
+        domain.set_stored_passwords(newer);
+        assert_eq!(
+            domain.ssh_domain_config().unwrap().jump_hosts[0]
+                .stored_password
+                .as_deref(),
+            Some("newer jump secret")
+        );
+    }
+
+    #[test]
+    fn a_password_for_a_host_moved_under_the_same_name_stays_off_the_old_session() {
+        let _ = promise::spawn::SimpleExecutor::new();
+        mux::Mux::set_mux(&std::sync::Arc::new(mux::Mux::new(None)));
+        let old_host = config::SshDomain {
+            name: "same label".to_string(),
+            remote_address: "old.invalid".to_string(),
+            ..Default::default()
+        };
+        let domain = super::ClientDomain::new(super::ClientDomainConfig::Ssh(old_host.clone()));
+        let mut live = domain.ssh_connection_config().unwrap().passwords;
+
+        // Reached directly, at another address now, under the same name.
+        let mut new_host = old_host;
+        new_host.remote_address = "new.invalid".to_string();
+        domain.set_ssh_config_for_next_attach(new_host.clone());
+        new_host.stored_password = Some("new host secret".to_string());
+        let passwords = mux::ssh::StoredPasswords::of(&new_host);
+        assert!(!live.replace_if_same_way(passwords.clone()));
+        domain.set_stored_passwords(passwords);
+        let next = domain.ssh_domain_config().unwrap();
+        assert_eq!(next.remote_address, "new.invalid");
+        assert_eq!(next.stored_password.as_deref(), Some("new host secret"));
+    }
+
+    #[test]
+    fn attach_retries_keep_the_binding_until_a_new_password_is_supplied() {
+        let _ = promise::spawn::SimpleExecutor::new();
+        mux::Mux::set_mux(&std::sync::Arc::new(mux::Mux::new(None)));
+        let domain = super::ClientDomain::new(super::ClientDomainConfig::Ssh(config::SshDomain {
+            remote_address: "private.invalid".into(),
+            stored_password: Some("original".into()),
+            ..Default::default()
+        }));
+        let initial = domain.ssh_connection_config().unwrap();
+        assert_eq!(
+            initial.resolve_attempt().unwrap().1.for_prompt(None),
+            Some("original")
+        );
+
+        // The next resolution of the same alias gains a bastion during backoff.
+        domain
+            .ssh
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .domain
+            .ssh_option
+            .insert("proxyjump".into(), "other-relay.invalid".into());
+        let retry = domain.ssh_connection_config().unwrap();
+        assert_eq!(retry.passwords, initial.passwords);
+        assert_eq!(retry.resolve_attempt().unwrap().1.for_prompt(None), None);
+
+        let mut edited = retry.domain;
+        edited.stored_password = Some("replacement".into());
+        domain.set_stored_passwords(mux::ssh::StoredPasswords::of(&edited));
+        let updated = domain.ssh_connection_config().unwrap();
+        assert_eq!(
+            updated.resolve_attempt().unwrap().1.for_prompt(None),
+            Some("replacement")
+        );
+        assert!(!initial.passwords.same_way(&updated.passwords));
     }
 
     #[test]
@@ -6534,10 +6702,9 @@ impl ClientDomain {
         ui: ConnectionUI,
     ) -> anyhow::Result<()> {
         let domain_id = self.local_domain_id;
-        let config = match self.ssh_domain_config() {
-            // With the password the host has now.
-            Some(ssh) => ClientDomainConfig::Ssh(ssh),
-            None => self.config.clone(),
+        let (config, passwords) = match self.ssh_connection_config() {
+            Some(ssh) => (ClientDomainConfig::Ssh(ssh.domain), ssh.passwords),
+            None => (self.config.clone(), StoredPasswords::default()),
         };
 
         let activity = mux::activity::Activity::new();
@@ -6547,6 +6714,7 @@ impl ClientDomain {
             let ui = ui.clone();
             async move {
                 let connect = |config: ClientDomainConfig, ui: ConnectionUI| {
+                    let passwords = passwords.clone();
                     spawn_into_new_thread(move || {
                         let mut cloned_ui = ui;
                         match &config {
@@ -6565,7 +6733,7 @@ impl ClientDomain {
                                 Client::new_tls(domain_id, tls, &mut cloned_ui)
                             }
                             ClientDomainConfig::Ssh(ssh) => {
-                                Client::new_ssh(domain_id, ssh, &mut cloned_ui)
+                                Client::new_ssh_with_passwords(domain_id, ssh, passwords, &mut cloned_ui)
                             }
                         }
                     })
@@ -6585,8 +6753,9 @@ impl ClientDomain {
                         let outcome = {
                             let ssh = ssh.clone();
                             let ui = ui.clone();
+                            let passwords = passwords.clone();
                             spawn_into_new_thread(move || {
-                                crate::remote_update::offer_remote_install(&ssh, &ui)
+                                crate::remote_update::offer_remote_install_with_passwords(&ssh, passwords, &ui)
                             })
                             .await
                         };
@@ -6751,8 +6920,9 @@ impl ClientDomain {
                         let ssh = ssh.clone();
                         let ui = ui.clone();
                         let mismatch = mismatch.clone();
+                        let passwords = passwords.clone();
                         spawn_into_new_thread(move || {
-                            crate::remote_update::offer_remote_update(&ssh, &ui, &mismatch)
+                            crate::remote_update::offer_remote_update_with_passwords(&ssh, passwords, &ui, &mismatch)
                         })
                         .await
                     };
