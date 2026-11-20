@@ -2124,6 +2124,14 @@ impl<P: Platform, L: Link> App<P, L> {
             crate::attach::reattach(&link, tab_id, pane_id, size, nav_rows).await
         }
         .await;
+        // Turned off while this attempt was on the wire: whatever came of
+        // it, the page stays lost, as the status line has said since, and a
+        // socket it opened -- one that then failed to reattach too -- is
+        // handed back rather than held for nobody.
+        if !self.inner.borrow().settings.auto_reconnect {
+            link.shutdown();
+            return;
+        }
         match outcome {
             Ok(list) => {
                 self.reconnected();
@@ -6740,14 +6748,21 @@ impl<P: Platform, L: Link> App<P, L> {
             "auto-reconnect" => {
                 if redial {
                     self.reconnect_now();
+                    // An attempt still on the wire from before it was turned
+                    // off is kept rather than started again; the status line
+                    // takes back the "lost" it said meanwhile.
+                    self.show_reconnect_status();
                 } else {
                     let mut inner = self.inner.borrow_mut();
-                    if !inner.settings.auto_reconnect && inner.reconnect_pending {
+                    // Turned off with an attempt to come or on the wire: the
+                    // one waiting its turn is dropped, the one on the wire is
+                    // let go when it ends (`reconnect_attempt`), and the
+                    // status line says the connection is lost from now on.
+                    if !inner.settings.auto_reconnect && (inner.reconnect_pending || inner.reconnect_running) {
                         inner.reconnect_epoch += 1;
                         inner.reconnect_pending = false;
                         drop(inner);
                         self.show_reconnect_status();
-                        return Ok(());
                     }
                 }
                 Self::notify(&self.inner.borrow());
