@@ -744,12 +744,52 @@ mod tests {
             thinkterm_update::install_command("server", "9.9.9"),
             thinkterm_update::takeover_command(),
         ] {
-            let checked = std::process::Command::new("/bin/sh")
-                .args(["-n", "-c", &without_input(&command)])
-                .status()
+            // Read from stdin, never from `-c`: dash, Debian's and Ubuntu's
+            // /bin/sh, runs a `-c` string even under `-n`, and these stop
+            // every mux server of whoever runs the tests (`STOP_COMMAND`),
+            // install a release, and take a server over. No environment
+            // either, so that one run by some other shell finds nothing.
+            use std::io::Write;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-n")
+                .env_clear()
+                .env("PATH", "/nonexistent")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
                 .unwrap();
+            let script = format!("{}\n", without_input(&command));
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let checked = child.wait().unwrap();
             assert!(checked.success(), "does not parse: {}", command);
         }
+    }
+
+    /// The check above only parses: what it checks is never run.
+    #[cfg(unix)]
+    #[test]
+    fn parsing_a_command_does_not_run_it() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let script = format!("{}\n", without_input(&format!("touch '{}'", ran.display())));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!ran.exists(), "`sh -n` ran what it was only to parse");
     }
 
     #[cfg(unix)]
