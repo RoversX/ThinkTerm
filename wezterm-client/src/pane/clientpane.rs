@@ -487,6 +487,14 @@ impl ClientPane {
         self.remote_pane_id
     }
 
+    /// Why input given this pane would not reach the terminal it mirrors
+    /// (see `ClientInner::remote_tab_input_refusal`), or None if it may.
+    /// The pane itself takes such input and lets it go, as a window that
+    /// shows why does.
+    pub fn input_refusal(&self) -> Option<String> {
+        self.client.remote_tab_input_refusal(self.remote_tab_id())
+    }
+
     pub fn remote_tab_id(&self) -> TabId {
         self.remote_tab_id.load(Ordering::Relaxed)
     }

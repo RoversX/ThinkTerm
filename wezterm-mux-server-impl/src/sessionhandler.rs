@@ -1213,6 +1213,9 @@ fn apply_pane_input(
         pane.erase_scrollback(erase_mode);
         return Ok(Pdu::UnitResponse(UnitResponse {}));
     }
+    // Before anything is done for it: refused input claims no viewport and
+    // switches no palette.
+    refuse_input_that_goes_nowhere(pane)?;
     match source.share {
         // A viewer types only while the owner lets it -- asked again now,
         // since the wait for the pane may have outlasted the grant -- and
@@ -1270,6 +1273,24 @@ fn apply_pane_input(
     };
     maybe_push_pane_changes(pane, sender.clone(), Arc::clone(per_pane), input_serial)?;
     Ok(Pdu::UnitResponse(UnitResponse {}))
+}
+
+/// Input for a pane mirrored here from another server's goes there only
+/// while this process may pass it on. Until then the pane takes it and
+/// lets it go -- right for a window, which shows why -- and whoever sent
+/// it from here would never hear. Told instead.
+fn refuse_input_that_goes_nowhere(pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
+    let Some(mirror) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() else {
+        return Ok(());
+    };
+    match mirror.input_refusal() {
+        None => Ok(()),
+        Some(reason) => anyhow::bail!(
+            "pane {} mirrors a terminal on another server, and input to it cannot be \
+             passed on from here: {reason}. Connect to that server directly",
+            pane.pane_id()
+        ),
+    }
 }
 
 fn validate_share_mouse_input(event: &wezterm_term::input::MouseEvent) -> anyhow::Result<()> {

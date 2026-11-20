@@ -1649,6 +1649,56 @@ impl ClientInner {
         self.remote_frontend_gate().obscures_terminal()
     }
 
+    /// Why input for remote tab `remote_tab_id` would not reach the server
+    /// from here now, or None if it may get there: what keeps a
+    /// `ClientPane` from passing it on (its gate), and what
+    /// `prepare_remote_tab_input` would find, without claiming anything.
+    /// For input sent from where nothing shows why it went nowhere: a CLI,
+    /// or a client of this process's own mux server.
+    pub fn remote_tab_input_refusal(&self, remote_tab_id: TabId) -> Option<String> {
+        // The pane's gate holds input back for every server, this machine's
+        // own session host too.
+        let gate = self.remote_frontend_gate();
+        if gate.obscures_terminal() {
+            return Some(match gate.overlay_message() {
+                Some((title, _)) => title,
+                None => "the terminal is not available here".to_string(),
+            });
+        }
+        if self.client.is_local_session_host() {
+            return None;
+        }
+        // As `prepare_remote_tab_input` decides, case for case.
+        let Some(access) = self.remote_access_state() else {
+            return Some("the server has not said yet who may type here".to_string());
+        };
+        match access.mode {
+            codec::FrontendAccessMode::Handoff => {
+                if self.remote_owner_is_self(access.owner.as_ref()) {
+                    None
+                } else {
+                    Some("the terminal is being used on another device".to_string())
+                }
+            }
+            codec::FrontendAccessMode::TmuxLatest => {
+                let owned = self
+                    .remote_viewport_state(remote_tab_id)
+                    .is_some_and(|state| self.remote_owner_is_self(state.owner.as_ref()));
+                let reported = self
+                    .reported_viewports
+                    .lock()
+                    .unwrap()
+                    .contains_key(&remote_tab_id);
+                (!owned && !reported).then(|| {
+                    format!(
+                        "no window here shows remote tab {remote_tab_id}, so it has no size \
+                         to take input at"
+                    )
+                })
+            }
+        }
+    }
+
     pub fn is_local(&self) -> bool {
         self.client.is_local
     }
