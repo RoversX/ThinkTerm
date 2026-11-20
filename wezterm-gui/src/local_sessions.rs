@@ -390,10 +390,15 @@ pub(crate) fn on_host_replaced(domain_id: mux::domain::DomainId) {
             else {
                 continue;
             };
-            let dead_workspace = if old_workspace.starts_with("dead-session:") {
+            let dead_workspace = if old_workspace
+                .starts_with(crate::workspace_threads::DEAD_SESSION_WORKSPACE_PREFIX)
+            {
                 old_workspace
             } else {
-                let dead_workspace = format!("dead-session:{window_id}:{old_workspace}");
+                let dead_workspace = format!(
+                    "{}{window_id}:{old_workspace}",
+                    crate::workspace_threads::DEAD_SESSION_WORKSPACE_PREFIX
+                );
                 mux.move_window_to_workspace_quietly(window_id, &dead_workspace);
                 dead_workspace
             };

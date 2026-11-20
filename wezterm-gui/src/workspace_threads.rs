@@ -5038,13 +5038,16 @@ pub fn delete_thread(thread_id: &str) -> Option<DeletedWorkspaceThread> {
     deleted
 }
 
-pub fn end_workspace_thread_record(thread_id: &str) -> EndWorkspaceThreadResult {
+pub fn end_workspace_thread_record(
+    thread_id: &str,
+    live_workspaces: &[String],
+) -> EndWorkspaceThreadResult {
     let mut store = THREAD_STORE.lock();
     let domain = tree_domain_for_thread(&store, thread_id);
     if !remote_tree_mutation_allowed(domain.as_deref()) {
         return EndWorkspaceThreadResult::Noop;
     }
-    let result = store.end_workspace_thread_record(thread_id);
+    let result = store.end_workspace_thread_record(thread_id, live_workspaces);
     if !matches!(result, EndWorkspaceThreadResult::Noop) {
         persist_locked(&store);
     }
@@ -9388,7 +9391,11 @@ impl WorkspaceThreadStore {
         None
     }
 
-    fn end_workspace_thread_record(&mut self, thread_id: &str) -> EndWorkspaceThreadResult {
+    fn end_workspace_thread_record(
+        &mut self,
+        thread_id: &str,
+        live_workspaces: &[String],
+    ) -> EndWorkspaceThreadResult {
         if let Some(deleted) = self.delete_thread(thread_id) {
             return EndWorkspaceThreadResult::DeletedThread(deleted);
         }
@@ -9402,7 +9409,30 @@ impl WorkspaceThreadStore {
             return EndWorkspaceThreadResult::Noop;
         };
 
-        if !is_remote_project(&self.projects[project_index], &self.spaces) {
+        // A live thread is its project's working terminal: taking it would
+        // empty the project, so it stays and the caller says why. A thread
+        // with no live workspace -- stale after a session-server handoff,
+        // blocked on a deleted project folder, never opened -- is refuse,
+        // and falls through to the removal below exactly as a remote
+        // project's last thread does, seeding a fresh default project when
+        // it was the Space's last one.
+        let thread_is_live = {
+            let project = &self.projects[project_index];
+            project
+                .threads
+                .iter()
+                .find(|session| session.id == thread_id)
+                .map(|session| {
+                    session
+                        .materialized_workspace_name
+                        .clone()
+                        .unwrap_or_else(|| {
+                            workspace_name_for_thread(&project.id, thread_id)
+                        })
+                })
+                .is_some_and(|workspace| live_workspaces.contains(&workspace))
+        };
+        if !is_remote_project(&self.projects[project_index], &self.spaces) && thread_is_live {
             return EndWorkspaceThreadResult::Noop;
         }
 
@@ -11410,6 +11440,11 @@ pub const THREAD_PAGE_WORKSPACE_PREFIX: &str = "thinkterm-open-elsewhere:";
 pub fn is_thread_page_workspace(workspace: &str) -> bool {
     workspace.starts_with(THREAD_PAGE_WORKSPACE_PREFIX)
 }
+
+/// The prefix of the workspaces a session-server handoff parks a replaced
+/// window under (`dead-session:<window>:<workspace>`), before killing it or
+/// re-adopting it. No thread owns one.
+pub const DEAD_SESSION_WORKSPACE_PREFIX: &str = "dead-session:";
 
 /// Whether `workspace` is the mux workspace this thread runs in: its
 /// materialized name once the server has reported one, else the name the
@@ -15717,7 +15752,7 @@ mod tests {
         store.projects.push(project);
         store.set_active_project_for_space(&space_id, "project-1".to_string());
 
-        let result = store.end_workspace_thread_record(&second_id);
+        let result = store.end_workspace_thread_record(&second_id, &[]);
         let EndWorkspaceThreadResult::DeletedThread(deleted) = result else {
             panic!("expected deleted thread result");
         };
@@ -15757,7 +15792,7 @@ mod tests {
         store.projects.push(remote_project);
         store.set_active_project_for_space(&space_id, "ssh-host".to_string());
 
-        let result = store.end_workspace_thread_record(&remote_id);
+        let result = store.end_workspace_thread_record(&remote_id, &[]);
         let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
             panic!("expected removed project result");
         };
@@ -15787,7 +15822,7 @@ mod tests {
         store.projects.push(remote_project);
         store.set_active_project_for_space(&space_id, "ssh-host".to_string());
 
-        let result = store.end_workspace_thread_record(&remote_id);
+        let result = store.end_workspace_thread_record(&remote_id, &[]);
         let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
             panic!("expected removed project result");
         };
@@ -15827,7 +15862,7 @@ mod tests {
         store.projects.push(project);
         store.set_active_project_for_space(&space_id, "project-path".to_string());
 
-        let result = store.end_workspace_thread_record(&thread_id);
+        let result = store.end_workspace_thread_record(&thread_id, &[]);
         let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
             panic!("expected mux-domain project removal");
         };
@@ -15839,10 +15874,15 @@ mod tests {
     }
 
     #[test]
-    fn end_workspace_thread_noops_for_last_local_thread() {
+    fn end_workspace_thread_noops_for_last_live_local_thread() {
         let space_id = default_space_id();
         let mut store = test_store();
-        let thread = WorkspaceThread::new("project-local".to_string(), "main".to_string(), None);
+        let workspace = "thinkterm:project-local:live".to_string();
+        let thread = WorkspaceThread::new(
+            "project-local".to_string(),
+            "main".to_string(),
+            Some(workspace.clone()),
+        );
         let thread_id = thread.id.clone();
         let mut project = test_project(
             "project-local",
@@ -15855,7 +15895,7 @@ mod tests {
         store.set_active_project_for_space(&space_id, "project-local".to_string());
 
         assert_eq!(
-            store.end_workspace_thread_record(&thread_id),
+            store.end_workspace_thread_record(&thread_id, &[workspace]),
             EndWorkspaceThreadResult::Noop
         );
         assert_eq!(store.projects.len(), 1);
@@ -15864,6 +15904,84 @@ mod tests {
             store.active_project_id_for_space(&space_id).as_deref(),
             Some("project-local")
         );
+    }
+
+    /// A thread with no live workspace -- stale after a session-server
+    /// handoff, blocked on a deleted project folder, never opened -- is
+    /// deletable even as the last thread of a local project: the project is
+    /// removed as a remote project's is, seeding a fresh default project
+    /// when it was the Space's last one.
+    #[test]
+    fn end_workspace_thread_removes_dead_last_local_thread_and_seeds() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let workspace = "thinkterm:project-local:stale".to_string();
+        let thread = WorkspaceThread::new(
+            "project-local".to_string(),
+            "main".to_string(),
+            Some(workspace),
+        );
+        let thread_id = thread.id.clone();
+        let mut project = test_project(
+            "project-local",
+            "Home",
+            PathBuf::from("/tmp/gone"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-local".to_string());
+
+        let result = store.end_workspace_thread_record(&thread_id, &[]);
+        let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
+            panic!("expected removed project result");
+        };
+        assert!(removed.was_active);
+        assert!(store
+            .projects
+            .iter()
+            .all(|project| project.id != "project-local"));
+        // The Space keeps a live project: a seeded default one.
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].name, "Home");
+        assert_eq!(store.projects[0].threads.len(), 1);
+        assert_eq!(store.projects[0].threads[0].name, "main");
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some(store.projects[0].id.as_str())
+        );
+    }
+
+    /// The same for a thread that never materialized: no window ever held
+    /// it, so deleting it cannot take a working terminal with it.
+    #[test]
+    fn end_workspace_thread_removes_never_opened_last_local_thread() {
+        let space_id = default_space_id();
+        let mut store = test_store();
+        let thread =
+            WorkspaceThread::new("project-local".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        let mut project = test_project(
+            "project-local",
+            "Home",
+            PathBuf::from("/tmp/home"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, "project-local".to_string());
+
+        let result = store.end_workspace_thread_record(&thread_id, &[]);
+        let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
+            panic!("expected removed project result");
+        };
+        assert!(removed.was_active);
+        assert!(store
+            .projects
+            .iter()
+            .all(|project| project.id != "project-local"));
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].name, "Home");
     }
 
     #[test]

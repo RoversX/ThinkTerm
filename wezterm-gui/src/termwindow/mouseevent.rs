@@ -6410,7 +6410,8 @@ impl super::TermWindow {
         thread_id: &str,
         context: Option<&dyn WindowOps>,
     ) {
-        match crate::workspace_threads::end_workspace_thread_record(thread_id) {
+        let live_workspaces = Mux::get().iter_workspaces();
+        match crate::workspace_threads::end_workspace_thread_record(thread_id, &live_workspaces) {
             crate::workspace_threads::EndWorkspaceThreadResult::DeletedThread(deleted) => {
                 self.finish_deleted_workspace_thread(deleted, context);
             }
@@ -6418,6 +6419,14 @@ impl super::TermWindow {
                 self.finish_removed_project(removed, context);
             }
             crate::workspace_threads::EndWorkspaceThreadResult::Noop => {
+                // A refusal here means the thread is the last live terminal
+                // of its project and taking it would empty the project.
+                // Say so rather than leaving a button that does nothing.
+                wezterm_toast_notification::persistent_toast_notification(
+                    "ThinkTerm",
+                    "This thread is the last live terminal of its project; delete the \
+                     project or the Space to remove it.",
+                );
                 if let Some(context) = context {
                     context.invalidate();
                 }
@@ -10707,7 +10716,26 @@ fn kill_workspace_windows(workspaces: &[String], skip_workspace: Option<&str>) {
         if skip_workspace == Some(workspace.as_str()) {
             continue;
         }
-        for window_id in mux.iter_windows_in_workspace(workspace) {
+        // A session-server handoff parks a replaced window under
+        // `dead-session:<window>:<workspace>` before killing it. One whose
+        // thread is being deleted must go with the others of its workspace,
+        // or it outlives the deleted record as a zombie only the next
+        // handoff can clear.
+        let dead_parked = format!(":{workspace}");
+        let victims: Vec<_> = mux
+            .iter_windows()
+            .into_iter()
+            .filter(|window_id| {
+                mux.get_window(*window_id).is_some_and(|window| {
+                    let name = window.get_workspace();
+                    name == workspace.as_str()
+                        || (name
+                            .starts_with(crate::workspace_threads::DEAD_SESSION_WORKSPACE_PREFIX)
+                            && name.ends_with(&dead_parked))
+                })
+            })
+            .collect();
+        for window_id in victims {
             mux.kill_window(window_id);
         }
     }
