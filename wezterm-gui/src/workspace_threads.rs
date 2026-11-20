@@ -5521,8 +5521,10 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         return;
     }
     // The server answered: from now on its Space here is more than a first
-    // connect's guess.
-    note_server_tree_arrived(domain_name);
+    // connect's guess. A stand-in that first connect invented retires into
+    // the Spaces the tree describes (see `ingest_remote_tree_with`); an
+    // uninitialized tree keeps it as the seed below.
+    let stand_in_to_retire = note_server_tree_arrived(domain_name);
 
     // The first tree of a connection is the only place allowed to invent a
     // Space when the server has none.  Online mutations from the previous
@@ -5628,12 +5630,17 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         // saved host still goes by it: two records for one machine each keep
         // theirs. Only a name nothing goes by any more gives them up.
         let current = std::cell::OnceCell::new();
-        store.ingest_remote_tree_with(domain_name, &tree_for_store, &|other| {
-            remote_domain_is_live(other)
-                || current
-                    .get_or_init(crate::ssh_hosts::connect_domain_names)
-                    .contains(other)
-        })
+        store.ingest_remote_tree_with(
+            domain_name,
+            &tree_for_store,
+            &|other| {
+                remote_domain_is_live(other)
+                    || current
+                        .get_or_init(crate::ssh_hosts::connect_domain_names)
+                        .contains(other)
+            },
+            stand_in_to_retire,
+        )
     };
     // A server can legitimately have no Spaces left — its last one was deleted
     // from here or from another device. A device that is connecting to it
@@ -8331,6 +8338,13 @@ impl WorkspaceThreadStore {
             .spaces
             .iter()
             .filter(|space| Self::space_in_scope(space, scope))
+            // A stand-in a first connect invented is this device's guess
+            // about the server, not the server's word. Publishing it would
+            // put a Space named after the server's own address into its
+            // tree, for every screen attached there to show. It is retired
+            // into the server's first real Space when the tree arrives (see
+            // `ingest_remote_tree_with`), and only then published.
+            .filter(|space| !self.server_space_is_invented(&space.id))
             .collect();
         let space_ids: Vec<SpaceId> = spaces.iter().map(|space| space.id.clone()).collect();
 
@@ -8556,7 +8570,7 @@ impl WorkspaceThreadStore {
     /// hosts: only a live connection keeps its Spaces.
     #[cfg(test)]
     fn ingest_remote_tree(&mut self, domain_name: &str, tree: &codec::ThinkTermTree) -> bool {
-        self.ingest_remote_tree_with(domain_name, tree, &remote_domain_is_live)
+        self.ingest_remote_tree_with(domain_name, tree, &remote_domain_is_live, false)
     }
 
     /// Rebuild this domain's Spaces/Projects/Threads from the server's tree.
@@ -8573,11 +8587,18 @@ impl WorkspaceThreadStore {
     ///
     /// `keeps_its_spaces` says whether another connection name still holds
     /// the Spaces it holds: see `taken_over` below.
+    ///
+    /// `retire_stand_in` is set on the first tree after this device invented
+    /// a stand-in Space for the server (see `ensure_mux_domain_space`): the
+    /// stand-in's rows move into the tree's first Space and the stand-in is
+    /// dropped, so nothing ever publishes a Space named after the address
+    /// the server was reached by.
     fn ingest_remote_tree_with(
         &mut self,
         domain_name: &str,
         tree: &codec::ThinkTermTree,
         keeps_its_spaces: &dyn Fn(&str) -> bool,
+        retire_stand_in: bool,
     ) -> bool {
         // A Space this device holds under another name for the same server
         // -- one nothing goes by any more, such as the name of a host since
@@ -8651,6 +8672,43 @@ impl WorkspaceThreadStore {
                 ok
             })
             .collect();
+
+        // A first connect invents a stand-in Space for the server, named
+        // after the address it was reached by, because a window has to sit
+        // somewhere before the server can be asked anything. The tree now
+        // describes the server's own Spaces: its first takes the stand-in's
+        // rows in, exactly where every later connect lands, and the stand-in
+        // goes. Left alive it would be published ahead of the server's word
+        // and show on the server's own screens as a Space named after its
+        // own address.
+        let mut retired_stand_in: Option<Vec<ProjectId>> = None;
+        if retire_stand_in {
+            if let Some(target_id) = tree_spaces.first().map(|space| space.id.clone()) {
+                if let Some(index) = self.spaces.iter().position(|space| {
+                    space.client_domain.as_deref() == Some(domain_name) && space.id != target_id
+                }) {
+                    let stand_in_id = self.spaces.remove(index).id;
+                    let mut moved = Vec::new();
+                    for project in &mut self.projects {
+                        if project.space_id == stand_in_id {
+                            project.space_id = target_id.clone();
+                            moved.push(project.id.clone());
+                        }
+                    }
+                    self.last_space_per_domain
+                        .insert(domain_name.to_string(), target_id.clone());
+                    if self.last_active_space_id.as_deref() == Some(&stand_in_id) {
+                        self.last_active_space_id = Some(target_id.clone());
+                    }
+                    log::info!(
+                        "{domain_name} described its own Spaces: stand-in {stand_in_id} \
+                         retires into {target_id} with {} project(s)",
+                        moved.len()
+                    );
+                    retired_stand_in = Some(moved);
+                }
+            }
+        }
 
         let owned_space_ids: std::collections::HashSet<SpaceId> = self
             .spaces
@@ -8735,7 +8793,7 @@ impl WorkspaceThreadStore {
             })
             .collect();
 
-        let new_projects: Vec<Project> = tree_projects
+        let mut new_projects: Vec<Project> = tree_projects
             .iter()
             .map(|project| {
                 let view = project_state.get(&project.id);
@@ -8795,6 +8853,17 @@ impl WorkspaceThreadStore {
                 }
             })
             .collect();
+
+        // The stand-in's projects were re-filed into a Space of the server's
+        // own, which this ingest would otherwise drop: they are not the
+        // tree's rows. Spliced in with the tree's, the reconcile that
+        // follows publishes them under that Space, and the next tree
+        // carries them back as the server's word.
+        if let Some(moved) = &retired_stand_in {
+            for project in self.projects.iter().filter(|project| moved.contains(&project.id)) {
+                new_projects.push(project.clone());
+            }
+        }
 
         // Splice the rebuilt block in where the old one started so that the
         // Space menu and sidebar do not reshuffle on every push.
@@ -11727,9 +11796,14 @@ pub fn known_mux_domain_space(domain_name: &str) -> Option<MuxDomainSpacePlan> {
 /// Remember that `domain_name`'s server has sent its tree, which makes it
 /// known (`known_mux_domain_space`). Only a server this device keeps a
 /// Space of is remembered, so the record goes with its Spaces.
-fn note_server_tree_arrived(domain_name: &str) {
+///
+/// Returns whether this was the first tree after a connect invented the
+/// server's stand-in Space, so the caller can retire the stand-in into the
+/// Spaces the tree describes instead.
+fn note_server_tree_arrived(domain_name: &str) -> bool {
     let mut store = THREAD_STORE.lock();
-    if store.invented_server_domains.remove(domain_name) {
+    let stand_in_to_retire = store.invented_server_domains.remove(domain_name);
+    if stand_in_to_retire {
         persist_locked(&store);
     }
     if store.synced_server_domains.contains(domain_name)
@@ -11737,12 +11811,13 @@ fn note_server_tree_arrived(domain_name: &str) {
             .space_ids_for_domains(&[domain_name.to_string()])
             .is_empty()
     {
-        return;
+        return stand_in_to_retire;
     }
     store
         .synced_server_domains
         .insert(domain_name.to_string());
     persist_locked(&store);
+    stand_in_to_retire
 }
 
 /// Show a server Space's folders in `local_space_id` from now on, as when
@@ -12728,6 +12803,70 @@ mod tests {
         store.spaces.retain(|space| space.client_domain.is_none());
         store.normalize_after_load();
         assert!(store.invented_server_domains.is_empty());
+    }
+
+    /// A first connect invents a stand-in Space named after the address the
+    /// server was reached by. The server's own first Space takes its rows in
+    /// when the tree describes one, so no screen attached to the server
+    /// ever sees a Space named after its own address.
+    #[test]
+    fn a_stand_in_retires_into_the_servers_first_space() {
+        let mut store = test_store();
+        let plan = store.ensure_mux_domain_space("192.168.10.5:22");
+        assert!(store.invented_server_domains.contains("192.168.10.5:22"));
+
+        assert!(store.ingest_remote_tree_with(
+            "192.168.10.5:22",
+            &sample_tree(),
+            &|_| false,
+            true
+        ));
+
+        // The stand-in is gone; its project and thread live in the server's
+        // first Space under their own ids, where every later connect lands.
+        assert!(!store.spaces.iter().any(|space| space.id == plan.space_id));
+        let project = store
+            .projects
+            .iter()
+            .find(|project| project.id == plan.project_id)
+            .unwrap();
+        assert_eq!(project.space_id, "space-remote");
+        assert!(project.threads.iter().any(|thread| thread.id == plan.thread_id));
+        assert_eq!(
+            store
+                .last_space_per_domain
+                .get("192.168.10.5:22")
+                .map(String::as_str),
+            Some("space-remote")
+        );
+    }
+
+    /// Nothing of a stand-in is published while the server has not spoken: a
+    /// reconcile in that window must not put its address-named Space into the
+    /// server's tree. Once the tree has arrived the mark is gone, and a
+    /// stand-in kept as the seed of a server that has none publishes.
+    #[test]
+    fn an_invented_stand_in_is_not_published_until_the_server_speaks() {
+        let mut store = test_store();
+        let plan = store.ensure_mux_domain_space("server-c");
+
+        let ops = store.reconcile_ops_for_domain("server-c", &codec::ThinkTermTree::default());
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateSpace { space_id, .. } if *space_id == plan.space_id
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateProject { project_id, .. } if *project_id == plan.project_id
+        )));
+
+        // The tree arrived (here: an empty server seeding from its stand-in).
+        store.invented_server_domains.remove("server-c");
+        let ops = store.reconcile_ops_for_domain("server-c", &codec::ThinkTermTree::default());
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateSpace { space_id, .. } if *space_id == plan.space_id
+        )));
     }
 
     #[test]
@@ -16495,7 +16634,7 @@ mod tests {
         // While that name is connected, its Spaces stay its own.
         assert!(!store.ingest_remote_tree_with("syd", &sample_tree(), &|name| {
             name == "syd-before"
-        }));
+        }, false));
         assert_eq!(held_by(&store), vec![Some("syd-before".to_string())]);
 
         // Once it is not, they come over, rows and this device's place too --
@@ -16503,7 +16642,7 @@ mod tests {
         store
             .last_space_per_domain
             .insert("syd".to_string(), "space-stand-in".to_string());
-        assert!(store.ingest_remote_tree_with("syd", &sample_tree(), &|_| false));
+        assert!(store.ingest_remote_tree_with("syd", &sample_tree(), &|_| false, false));
         assert_eq!(held_by(&store), vec![Some("syd".to_string())]);
         assert!(store
             .projects
@@ -16521,7 +16660,7 @@ mod tests {
             id: local.clone(),
             name: "impostor".to_string(),
         });
-        store.ingest_remote_tree_with("syd", &tree, &|_| false);
+        store.ingest_remote_tree_with("syd", &tree, &|_| false, false);
         let local = store.spaces.iter().find(|space| space.id == local).unwrap();
         assert!(local.client_domain.is_none());
     }
