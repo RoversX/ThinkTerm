@@ -42,14 +42,17 @@ pub(crate) fn test_link() -> SshLink {
             remote_command: String::new(),
             keepalive_secs: 0,
         },
-        Box::new(|| panic!("this test must not open a network connection")),
+        Box::new(|_| panic!("this test must not open a network connection")),
     )
 }
 
 struct Inner {
-    params: SshParams,
-    /// How the network thread reaches the core thread with what arrives.
-    deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>>,
+    /// What each dial is made with; the host key it holds the host to can
+    /// be forgotten between them (`forget_host_key`).
+    params: RefCell<SshParams>,
+    /// How the network thread reaches the core thread with what arrives,
+    /// marked with the dial it is of.
+    deliver: Box<dyn Fn(u64) -> Box<dyn Fn(Net) + Send>>,
     out: RefCell<Option<UnboundedSender<Out>>>,
     serials: RefCell<SerialTable<oneshot::Sender<Pdu>>>,
     pushes: RefCell<Option<Box<dyn FnMut(Pdu)>>>,
@@ -62,13 +65,17 @@ struct Inner {
     inbound: RefCell<Vec<u8>>,
     open: Cell<bool>,
     generation: Cell<u64>,
+    /// The dial whose network thread speaks for this link now. A thread
+    /// of one since shut down or replaced may still be saying goodbye, and
+    /// its close must not end the dial after it.
+    dial: Cell<u64>,
 }
 
 impl SshLink {
     /// `deliver` makes the callback each dial hands the network thread.
-    pub fn new(params: SshParams, deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>>) -> Self {
+    pub fn new(params: SshParams, deliver: Box<dyn Fn(u64) -> Box<dyn Fn(Net) + Send>>) -> Self {
         Self(Rc::new(Inner {
-            params,
+            params: RefCell::new(params),
             deliver,
             out: RefCell::new(None),
             serials: RefCell::new(SerialTable::new()),
@@ -81,6 +88,7 @@ impl SshLink {
             inbound: RefCell::new(Vec::new()),
             open: Cell::new(false),
             generation: Cell::new(0),
+            dial: Cell::new(0),
         }))
     }
 
@@ -88,12 +96,37 @@ impl SshLink {
     /// failed); the core thread feeds the outcome through `opened` and
     /// `closed`.
     pub fn connect(&self) -> LocalFuture<Result<()>> {
-        let (tx, rx) = oneshot::channel();
-        *self.0.connecting.borrow_mut() = Some(tx);
-        let deliver = (self.0.deliver)();
-        let out = ssh::spawn(self.0.params.clone(), deliver);
+        let (dial, rx) = self.begin_dial();
+        let deliver = (self.0.deliver)(dial);
+        let out = ssh::spawn(self.0.params.borrow().clone(), deliver);
         *self.0.out.borrow_mut() = Some(out);
         Box::pin(async move { rx.await.map_err(|_| anyhow!("the dial was abandoned"))? })
+    }
+
+    /// A dial's own part of `connect`, before its network thread: its
+    /// number, and the answer `opened` or `closed` gives it. The transport
+    /// before it is done with, whether or not its thread has said so yet;
+    /// what that thread says from now on is its own.
+    pub(crate) fn begin_dial(&self) -> (u64, oneshot::Receiver<Result<()>>) {
+        let (tx, rx) = oneshot::channel();
+        *self.0.connecting.borrow_mut() = Some(tx);
+        let dial = self.0.dial.get() + 1;
+        self.0.dial.set(dial);
+        self.0.open.set(false);
+        self.0.serials.borrow_mut().drain();
+        (dial, rx)
+    }
+
+    /// Whether `dial` is the one this link speaks through now.
+    pub fn is_dial(&self, dial: u64) -> bool {
+        self.0.dial.get() == dial
+    }
+
+    /// Hold the host to no key on the dials after this one: the next asks
+    /// for the one it has now (`Net::HostKeyRequired`). The connection up
+    /// now stays.
+    pub fn forget_host_key(&self) {
+        self.0.params.borrow_mut().known_host = None;
     }
 
     /// The transport came up.
@@ -381,6 +414,9 @@ impl Link for SshLink {
         if let Some(out) = self.0.out.borrow_mut().take() {
             let _ = out.send(Out::Close);
         }
+        // Its thread's last words come after this, maybe after a dial made
+        // since; they are not that dial's.
+        self.0.dial.set(self.0.dial.get() + 1);
         self.0.open.set(false);
         self.0.serials.borrow_mut().drain();
         // A reconnect task can still hold this link alive. Its dial must

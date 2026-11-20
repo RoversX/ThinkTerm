@@ -344,17 +344,25 @@ class TerminalModel(
         }
     }
 
+    /// A host as edited, onto its session. A changed connection that was up
+    /// is made again on the edit, as is one the terminal's own Save asks
+    /// for; that Save with nothing changed retries one that is down. Each
+    /// is the user's tap or a session they had open, not a connection made
+    /// by itself, so the host's `autoConnect` has no say in it. One lost and
+    /// left for the user's retry is down, though its status still names the
+    /// pane: an edit elsewhere is not that retry.
     fun applyHostEdit(saved: Host, credentialsChanged: Boolean, connectOnSave: Boolean) {
         val changed = !host.sameSshConnection(saved) || credentialsChanged
+        val lost = reconnecting && !autoReconnect
         val needsRetry = when (ConnectionPhase.of(connection)) {
             is ConnectionPhase.Failed, ConnectionPhase.Disconnected -> true
-            null -> reconnecting && !autoReconnect
+            null -> lost
             else -> false
         }
-        val redial = if (changed) isConnected || connectOnSave else connectOnSave && needsRetry
+        val redial = if (changed) (isConnected && !lost) || connectOnSave else connectOnSave && needsRetry
         if (changed) disconnect()
         host = saved
-        if (saved.autoConnect && redial) connect()
+        if (redial) connect()
     }
 
     fun connect() {
@@ -413,6 +421,17 @@ class TerminalModel(
 
     private fun currentHostKeyEndpoint(requestId: String): Host? =
         requestedHost?.takeIf { activeRequestId == requestId && host.knownHost == null && host.sameSshConnection(it) }
+
+    /// The host's pinned key forgotten: the connection up now stays, and
+    /// the next dial -- the core's own redial of this one too -- asks for
+    /// the key the host has now.
+    fun forgetHostKey() {
+        host = host.copy(knownHost = null)
+        // That redial is still this request's, now without its pin: the
+        // question it asks is this one's to put to the user.
+        requestedHost = requestedHost?.copy(knownHost = null)
+        core.forgetHostKey()
+    }
 
     fun approveHostKey(challenge: HostKeyChallenge) {
         if (currentHostKeyEndpoint(challenge.requestId)?.sameSshConnection(challenge.endpoint) != true) return

@@ -79,8 +79,9 @@ pub enum Cmd {
     },
     Disconnect,
     /// From the network thread; `serial` names the link it belongs to,
-    /// so a retiring thread's last words never reach its successor.
-    Net { serial: u64, net: Net },
+    /// so a retiring thread's last words never reach its successor, and
+    /// `dial` the link's dial, so neither do they reach that link's next.
+    Net { serial: u64, dial: u64, net: Net },
     /// The first dial finished.
     Dialed { serial: u64, outcome: Result<(), String> },
     /// The attach handshake finished.
@@ -111,6 +112,8 @@ pub enum Cmd {
     CancelUpload(u64),
     /// `Core::check_connection`.
     CheckConnection,
+    /// `Core::forget_host_key`.
+    ForgetHostKey,
     /// Upload `id` is done: its path goes into the pane it was started
     /// from, if that one is still on show.
     PasteUpload {
@@ -562,7 +565,7 @@ impl State {
                 self.disconnect();
                 self.set_status("disconnected");
             }
-            Cmd::Net { serial, net } => self.on_net(serial, net),
+            Cmd::Net { serial, dial, net } => self.on_net(serial, dial, net),
             Cmd::Dialed { serial, outcome } => self.on_dialed(serial, outcome),
             Cmd::Attached { serial, outcome } => self.on_attached(serial, outcome),
             Cmd::Key {
@@ -658,6 +661,11 @@ impl State {
                         self.stats.inputs_sent += 1;
                         app.paste_into(pane, &text);
                     }
+                }
+            }
+            Cmd::ForgetHostKey => {
+                if let Some(link) = &self.link {
+                    link.forget_host_key();
                 }
             }
             Cmd::CheckConnection => {
@@ -1060,10 +1068,10 @@ impl State {
 
         let tx = self.cmd_tx.clone();
         let serial = self.link_serial;
-        let deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>> = Box::new(move || {
+        let deliver: Box<dyn Fn(u64) -> Box<dyn Fn(Net) + Send>> = Box::new(move |dial| {
             let tx = tx.clone();
             Box::new(move |net| {
-                let _ = tx.send(Cmd::Net { serial, net });
+                let _ = tx.send(Cmd::Net { serial, dial, net });
             })
         });
         let link = SshLink::new(params.ssh.clone(), deliver);
@@ -1178,7 +1186,7 @@ impl State {
         }
     }
 
-    fn on_net(&mut self, serial: u64, net: Net) {
+    fn on_net(&mut self, serial: u64, dial: u64, net: Net) {
         if serial != self.link_serial {
             // A thread of an earlier link, saying its goodbyes: the link
             // it speaks for is gone, and the current one must not hear
@@ -1192,7 +1200,16 @@ impl State {
         let Some(link) = self.link.clone() else {
             return;
         };
+        let earlier = !link.is_dial(dial);
         match net {
+            // A dial of this link's since shut down or replaced: what it
+            // says of its transport is not the current dial's, and its close
+            // would fail the dial now on its way. Its uploads end with it.
+            Net::Connected | Net::Data(_) | Net::HostKeyRequired { .. } if earlier => {}
+            Net::Closed(reason) if earlier => {
+                self.end_unfinished_uploads(&reason);
+                self.notify.on_log(format!("an earlier dial ended: {reason}"));
+            }
             Net::Connected => {
                 link.opened();
                 // A scheme still untold for want of a link goes now.
@@ -2013,5 +2030,26 @@ mod tests {
         assert!(!state.attaching);
         assert!(state.link.is_none());
         assert!(!link.is_open());
+    }
+
+    #[test]
+    fn a_dial_given_up_cannot_fail_the_one_after_it() {
+        let mut state = state();
+        let serial = state.link_serial;
+        let link = crate::link::test_link();
+        let (first, _) = link.begin_dial();
+        link.opened();
+        state.link = Some(link.clone());
+        // The App lets the reconnect go, then dials again on the same link
+        // before the first dial's thread has said goodbye.
+        link.shutdown();
+        let (second, mut answer) = link.begin_dial();
+        state.handle(Cmd::Net { serial, dial: first, net: Net::Connected });
+        state.handle(Cmd::Net { serial, dial: first, net: Net::Closed("let go".into()) });
+        assert!(matches!(answer.try_recv(), Ok(None)), "the second dial still waits for its own");
+        assert!(!link.is_open());
+        // Its own close still ends it.
+        state.handle(Cmd::Net { serial, dial: second, net: Net::Closed("refused".into()) });
+        assert!(matches!(answer.try_recv(), Ok(Some(Err(_)))));
     }
 }

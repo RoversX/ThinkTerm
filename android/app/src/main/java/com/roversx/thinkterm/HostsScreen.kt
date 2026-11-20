@@ -162,9 +162,9 @@ fun HostsScreen(
 /// one: it asks for the key the host has now.
 internal fun forgetHostKey(store: HostStore, id: String) {
     store.forgetHostKey(id)
-    Sessions.existing(id)?.let { model ->
-        model.applyHostEdit(model.host.copy(knownHost = null), credentialsChanged = false, connectOnSave = false)
-    }
+    // Not an edit of the connection: the one up stays, and one down waits
+    // for the user's retry rather than dialling into the key's question.
+    Sessions.existing(id)?.forgetHostKey()
 }
 
 /// Keeps a host as edited or added; a session open on it takes the edit:

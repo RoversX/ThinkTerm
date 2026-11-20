@@ -401,21 +401,29 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         return id
     }()
 
+    /// A host as edited, onto its session. A changed connection that was up
+    /// is made again on the edit, as is one the terminal's own Save asks
+    /// for; that Save with nothing changed retries one that is down. Each
+    /// is the user's tap or a session they had open, not a connection made
+    /// by itself, so the host's `autoConnect` has no say in it. One lost and
+    /// left for the user's retry is down, though its status still names the
+    /// pane: an edit elsewhere is not that retry.
     func applyHostEdit(_ saved: Host, credentialsChanged: Bool, connectOnSave: Bool) {
         let changed = host?.hostname != saved.hostname || host?.port != saved.port
             || host?.user != saved.user || host?.auth != saved.auth
             || host?.remoteCommand != saved.remoteCommand || host?.knownHost != saved.knownHost
             || credentialsChanged
+        let lost = reconnecting && !autoReconnect
         let needsRetry: Bool
         switch ConnectionPhase(status: connection) {
         case .failed, .disconnected: needsRetry = true
-        case nil: needsRetry = reconnecting && !autoReconnect
+        case nil: needsRetry = lost
         default: needsRetry = false
         }
-        let redial = changed ? (isConnected || connectOnSave) : (connectOnSave && needsRetry)
+        let redial = changed ? ((isConnected && !lost) || connectOnSave) : (connectOnSave && needsRetry)
         if changed { disconnect() }
         host = saved
-        if saved.autoConnect && redial { connect() }
+        if redial { connect() }
     }
 
     /// Connect to the model's host with the secret from the Keychain.
@@ -481,6 +489,14 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
 
     func disconnect() { clearHostKeyRequest(); core.disconnect() }
+
+    /// The host's pinned key forgotten: the connection up now stays, and
+    /// the next dial -- the core's own redial of this one too -- asks for
+    /// the key the host has now.
+    func forgetHostKey() {
+        host?.knownHost = nil
+        core.forgetHostKey()
+    }
 
     func approveHostKey(_ challenge: HostKeyChallenge) {
         guard activeRequestID == challenge.id,

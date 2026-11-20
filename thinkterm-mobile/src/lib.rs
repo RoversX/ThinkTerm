@@ -703,6 +703,14 @@ impl Core {
         let _ = self.tx.send(core::Cmd::CheckConnection);
     }
 
+    /// The host's key, pinned as `connect`'s `known_host`, was forgotten:
+    /// the connection up now stays, and the dials it makes again by itself
+    /// ask for the key the host has now (`on_host_key_required`) rather
+    /// than hold it to the old one.
+    pub fn forget_host_key(&self) {
+        let _ = self.tx.send(core::Cmd::ForgetHostKey);
+    }
+
     /// Paste a finished upload's `paste` (`UploadStatus`) into the pane the
     /// upload was started from -- not whichever has the focus now -- if
     /// that pane is still on show; otherwise nothing is pasted.

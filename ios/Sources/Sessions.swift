@@ -26,10 +26,10 @@ final class Sessions: ObservableObject {
     /// the old one: it asks for the key the host has now.
     func forgetHostKey(_ id: UUID, store: HostStore) {
         store.forgetHostKey(for: id)
-        if let model = existing(id), var saved = model.host {
-            saved.knownHost = nil
-            model.applyHostEdit(saved, credentialsChanged: false, connectOnSave: false)
-        }
+        // Not an edit of the connection: the one up stays, and one down
+        // waits for the user's retry rather than dialling into the key's
+        // question.
+        existing(id)?.forgetHostKey()
     }
 
     func close(_ id: UUID) {
