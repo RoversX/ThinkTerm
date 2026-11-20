@@ -5383,10 +5383,12 @@ impl SettingsWindow {
     }
 
     fn commit_focused_input(&mut self) {
-        if self.ui.interaction.focused == Some(SettingsAction::FontFamilyInput)
-            && self.commit_native_terminal_inputs_from_ui()
-        {
-            self.save_and_apply_native_terminal_settings();
+        if self.ui.interaction.focused == Some(SettingsAction::FontFamilyInput) {
+            if let Some(family) = self.commit_native_terminal_inputs_from_ui() {
+                self.save_and_apply_native_terminal_settings(|terminal| {
+                    terminal.font_family = family;
+                });
+            }
         }
         if self.ui.interaction.focused == Some(SettingsAction::RemoteDropDestinationInput) {
             self.commit_remote_drop_destination_from_ui();
@@ -5412,9 +5414,11 @@ impl SettingsWindow {
             .set_text_end(crate::native_settings::remote_drop_destination());
     }
 
-    fn commit_native_terminal_inputs_from_ui(&mut self) -> bool {
+    /// The family typed into the field, when it is not the one this window
+    /// has; `Some(None)` for an emptied field.
+    fn commit_native_terminal_inputs_from_ui(&mut self) -> Option<Option<String>> {
         if !self.ui.font_family_input_dirty {
-            return false;
+            return None;
         }
         self.ui.font_family_input_dirty = false;
 
@@ -5424,11 +5428,7 @@ impl SettingsWindow {
         } else {
             Some(family.to_string())
         };
-        if self.native_settings.terminal.font_family == next {
-            return false;
-        }
-        self.native_settings.terminal.font_family = next;
-        true
+        (self.native_settings.terminal.font_family != next).then_some(next)
     }
 
     fn sync_selected_section_with_search(&mut self) {
@@ -5463,8 +5463,7 @@ impl SettingsWindow {
     fn step_terminal_font_size(&mut self, delta: f64) {
         let value = (self.current_terminal_font_size_value() + delta).clamp(8.0, 48.0);
         self.ui.font_size_input.set_text_end(format!("{value:.1}"));
-        self.native_settings.terminal.font_size = Some(value);
-        self.save_and_apply_native_terminal_settings();
+        self.save_and_apply_native_terminal_settings(|terminal| terminal.font_size = Some(value));
     }
 
     fn reset_terminal_font_size(&mut self) {
@@ -5472,8 +5471,7 @@ impl SettingsWindow {
         self.ui
             .font_size_input
             .set_text_end(format!("{:.1}", config.font_size));
-        self.native_settings.terminal.font_size = None;
-        self.save_and_apply_native_terminal_settings();
+        self.save_and_apply_native_terminal_settings(|terminal| terminal.font_size = None);
     }
 
     fn current_bottom_quote_interval_minutes(&self) -> u32 {
@@ -5916,6 +5914,11 @@ impl SettingsWindow {
     }
 
     fn reload_configured_fonts(&mut self, base: &config::ConfigHandle) -> anyhow::Result<()> {
+        // Which families there are to list depends on the configuration (its
+        // font dirs and locator), not on the family or fallback preference
+        // picked here, which apply under the same generation. Listing every
+        // installed family again is for a reload only.
+        let reloaded = self.fonts.config().generation() != base.generation();
         let config = crate::native_settings::font_fallback_config(&self.native_settings, base);
         self.ui.preview_fonts.clear();
         if let Some(picker) = &mut self.ui.font_picker {
@@ -5923,18 +5926,31 @@ impl SettingsWindow {
         }
         self.ui.stale_glyphs = true;
         self.fonts.config_changed(&config)?;
-        self.invalidate_font_catalog();
+        if reloaded {
+            self.invalidate_font_catalog();
+        }
         self.reload_settings_fonts()
     }
 
-    fn save_and_apply_native_terminal_settings(&mut self) {
-        let family_changed = crate::native_settings::load_shared().terminal.font_family
-            != self.native_settings.terminal.font_family;
-        match crate::native_settings::save(&self.native_settings) {
-            Ok(()) => {
+    /// Made to the latest settings with `update`, not by saving this window's
+    /// copy: the copy can be older than a family picked in another process or
+    /// by hand, and writing it back would put that old family in every window
+    /// -- here, and again on the configuration reload the save is owed.
+    fn save_and_apply_native_terminal_settings(
+        &mut self,
+        edit: impl FnOnce(&mut crate::native_settings::NativeTerminalSettings),
+    ) {
+        let mut family_changed = false;
+        match crate::native_settings::update(|settings| {
+            let before = settings.terminal.font_family.clone();
+            edit(&mut settings.terminal);
+            family_changed = settings.terminal.font_family != before;
+        }) {
+            Ok(saved) => {
+                self.set_native_settings((*saved).clone());
                 if family_changed {
                     crate::native_settings::apply_to_app_with_font_changes(
-                        &self.native_settings,
+                        &saved,
                         crate::native_settings::FontChanges {
                             family: true,
                             ..Default::default()
@@ -6356,16 +6372,22 @@ impl SettingsWindow {
             .fonts
             .set_ui_font_family(settings.chrome.ui_font_family.clone());
         self.native_settings = settings;
-        if terminal_family_changed
-            || (fallback_changed && cfg!(all(unix, not(target_os = "macos"))))
-        {
-            if let Err(err) = self.reload_configured_fonts(&configuration()) {
-                log::warn!("settings window fallback fonts: {err:#}");
-            }
-        }
+        let configured = terminal_family_changed
+            || (fallback_changed && cfg!(all(unix, not(target_os = "macos"))));
+        let reloaded = configured
+            && match self.reload_configured_fonts(&configuration()) {
+                Ok(()) => true,
+                Err(err) => {
+                    log::warn!("settings window fallback fonts: {err:#}");
+                    false
+                }
+            };
         if ui_family_changed {
-            if let Err(error) = self.reload_settings_fonts() {
-                log::warn!("interface font: {error:#}");
+            // Reloading the configured fonts reloads the interface fonts too.
+            if !reloaded {
+                if let Err(error) = self.reload_settings_fonts() {
+                    log::warn!("interface font: {error:#}");
+                }
             }
             self.ui.stale_glyphs = true;
         }
@@ -7372,6 +7394,9 @@ impl SettingsWindow {
                 let mut changed = false;
                 match crate::native_settings::update(|settings| {
                     let option = &mut settings.terminal.fontconfig_prefer_system_fallback;
+                    // Against the latest settings, not this window's copy:
+                    // another process may have set `on` already, and the
+                    // windows have it then.
                     changed = *option != Some(on);
                     *option = Some(on);
                 }) {
