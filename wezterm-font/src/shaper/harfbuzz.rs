@@ -1578,6 +1578,67 @@ mod test {
         Ok(())
     }
 
+    /// A built-in copy found for one emoji under the system policy goes in
+    /// beside a system copy of the same name, and takes only that emoji: one
+    /// shown later still goes to Fontconfig, whatever was shown first.
+    #[test]
+    fn a_fallback_copy_takes_only_the_characters_it_was_found_for() -> anyhow::Result<()> {
+        let _turn = crate::harfbuzz_turn();
+        let config = ConfigHandle::default_config();
+        let fonts = crate::FontConfiguration::new(Some(config.clone()), 96)?;
+        let loaded = fonts.terminal_font_uncached(&config, 12.)?;
+        let mut faces = emoji_last();
+        let mut built_in = faces.pop().unwrap();
+        let base = faces.remove(1);
+        let assignment = |c: char| {
+            let mut assigned = rangeset::RangeSet::new();
+            assigned.add(c as u32);
+            Some(Box::new(assigned))
+        };
+        let mut system = built_in.clone();
+        system.handle.source = crate::locator::FontDataSource::Memory {
+            name: "system Noto Color Emoji".to_string(),
+            data: std::sync::Arc::new(
+                built_in
+                    .handle
+                    .source
+                    .load_data()?
+                    .into_owned()
+                    .into_boxed_slice(),
+            ),
+        };
+        system.system_fallback_for = assignment('😀');
+        assert!(system == built_in, "the copies have the same names");
+        let initial = vec![base, system];
+        *loaded.shaper.borrow_mut() = crate::shaper::new_native_shaper(&config, &initial)?;
+        *loaded.handles.borrow_mut() = initial;
+        let shape = |text: &str| {
+            let (shaped, missing) = shape_with(&loaded.shaper.borrow(), text, None, None);
+            (shaped.first().map(|glyph| glyph.font_idx), missing)
+        };
+
+        built_in.system_fallback_for = assignment('😃');
+        assert!(
+            loaded.insert_fallback_handles(vec![built_in.clone()])?
+                == crate::FallbackChange::AddedFaces
+        );
+        assert!(
+            loaded.insert_fallback_handles(vec![built_in.clone()])?
+                == crate::FallbackChange::Unchanged
+        );
+        assert_eq!(shape("😀"), (Some(1), vec![]));
+        assert_eq!(shape("😃"), (Some(2), vec![]));
+        assert_eq!(shape("😄").1, vec!['😄']);
+
+        built_in.system_fallback_for = assignment('😄');
+        assert!(
+            loaded.insert_fallback_handles(vec![built_in])?
+                == crate::FallbackChange::ExtendedCoverage
+        );
+        assert_eq!(shape("😄"), (Some(2), vec![]));
+        Ok(())
+    }
+
     #[test]
     fn overlapping_system_faces_shape_only_their_assigned_graphemes() {
         let _turn = crate::harfbuzz_turn();

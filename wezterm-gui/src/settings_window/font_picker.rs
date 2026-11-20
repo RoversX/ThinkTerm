@@ -32,7 +32,11 @@ impl FontCatalog {
         if generation != self.generation {
             return Ok(false);
         }
-        self.names = Some(result?);
+        let mut names = result?;
+        // A row names its family by a u16 index (FontPickerChoose); any
+        // family past that range would select the wrong one.
+        names.truncate(usize::from(u16::MAX) + 1);
+        self.names = Some(names);
         Ok(true)
     }
 }

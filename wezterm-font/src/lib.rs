@@ -527,12 +527,27 @@ impl FallbackResolveInfo {
         }
 
         // iteratively reduce to just the fonts that we need
-        extra_handles.retain(|p| match p.coverage_intersection(&wanted) {
+        // Only Fontconfig orders the fallbacks under this option; with
+        // CoreText, GDI or font_dirs alone there is no order to keep to.
+        let prefer_system = self.config.fontconfig_prefer_system_fallback
+            && matches!(
+                self.config.font_locator,
+                config::FontLocatorSelection::FontConfig
+            );
+        extra_handles.retain_mut(|p| match p.coverage_intersection(&wanted) {
             Ok(cov) if cov.is_empty() => false,
             Ok(cov) => {
                 // Remove the matches from the set, so that we avoid
                 // picking up multiple fonts for the same glyphs
                 wanted = wanted.difference(&cov);
+                // Under this policy Fontconfig picks the face for each
+                // character. A face from font_dirs or the built-in set
+                // stands in only for those it was found for here; with its
+                // whole cmap it would take later characters, which then
+                // render differently depending on what was shown first.
+                if prefer_system && p.system_fallback_for.is_none() {
+                    p.system_fallback_for = Some(Box::new(cov));
+                }
                 true
             }
             Err(_) => false,
@@ -1411,7 +1426,8 @@ impl FontConfiguration {
         )
     }
 
-    /// Run off the UI thread. Only names are retained, bounded by the picker.
+    /// Run off the UI thread. Only names are retained, and all of them, so
+    /// that a search can reach every family.
     pub fn font_family_catalog_job(
         &self,
     ) -> impl FnOnce() -> anyhow::Result<Vec<String>> + Send + 'static {
@@ -1426,7 +1442,6 @@ impl FontConfiguration {
             names.retain(|name| !name.is_empty() && !name.starts_with('.'));
             names.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
             names.dedup();
-            names.truncate(4096);
             Ok(names)
         }
     }
@@ -1744,6 +1759,52 @@ mod fallback_memo_test {
         memo.insert(2, vec!['z'], vec![], false);
         assert!(memo.get(2, &['z'], false).is_some());
         assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
+    }
+
+    /// Under the system policy a built-in fallback is assigned only the
+    /// characters it was found for, like the faces Fontconfig chooses. The
+    /// policy is Fontconfig's: with another locator it changes nothing. The
+    /// lookups themselves go through font_dirs alone, whatever the
+    /// configuration names, so the system's fonts play no part.
+    #[test]
+    fn fallbacks_outside_fontconfig_keep_to_their_characters() -> anyhow::Result<()> {
+        use config::FontLocatorSelection::{ConfigDirsOnly, FontConfig};
+        let flamingo = '\u{1f9a9}';
+        for (font_locator, prefer_system, restricted) in [
+            (FontConfig, false, false),
+            (ConfigDirsOnly, true, false),
+            (FontConfig, true, true),
+        ] {
+            let config = ConfigHandle::default_config().adjusted(|cfg| {
+                cfg.font_locator = font_locator;
+                cfg.font_dirs.clear();
+                cfg.fontconfig_prefer_system_fallback = prefer_system;
+            });
+            let pending = Arc::new(Mutex::new(vec![]));
+            FallbackResolveInfo {
+                no_glyphs: vec![flamingo],
+                pending: Arc::clone(&pending),
+                completion: Box::new(|_| {}),
+                font_dirs: Arc::new(FontDatabase::new()),
+                built_in: FontDatabase::shared_built_in()?,
+                locator: new_locator(config::FontLocatorSelection::ConfigDirsOnly),
+                config,
+            }
+            .process();
+            let found = pending.lock().unwrap();
+            assert!(!found.is_empty());
+            for face in found.iter() {
+                assert_eq!(
+                    face.system_fallback_for
+                        .as_deref()
+                        .map(|chars| chars.iter_values().collect::<Vec<_>>()),
+                    restricted.then(|| vec![flamingo as u32]),
+                    "{:?}",
+                    face.names()
+                );
+            }
+        }
+        Ok(())
     }
 }
 
