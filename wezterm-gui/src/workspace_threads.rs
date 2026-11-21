@@ -5677,6 +5677,19 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
             another_name_keeps_its_spaces(attached, remote_domain_is_live(other))
         })
     };
+    // A name never used for this server, opened while another name for it
+    // is up, lands where that one is (`follow_same_server_holder`).
+    if !host
+        && first_of_connection
+        && store.follow_same_server_holder(
+            domain_name,
+            &tree_for_store,
+            &remote_domain_is_live,
+            &remote_server_runtime_id,
+        )
+    {
+        changed = true;
+    }
     // A server can legitimately have no Spaces left — its last one was deleted
     // from here or from another device. A device that is connecting to it
     // right now still needs somewhere on *that server* to land, so build one
@@ -5932,6 +5945,16 @@ fn rehome_orphaned_windows(rehome: Vec<(u64, SpaceId)>) {
                 },
             )));
     }
+}
+
+/// The runtime id the server behind the connection `domain_name` gave in
+/// its handshake, if it has given one. It is new each time that server
+/// starts.
+fn remote_server_runtime_id(domain_name: &str) -> Option<String> {
+    let domain = Mux::try_get()?.get_domain_by_name(domain_name)?;
+    domain
+        .downcast_ref::<wezterm_client::domain::ClientDomain>()?
+        .remote_server_id()
 }
 
 /// Whether the last tree the connection `tree_domain` brought carries a
@@ -7345,6 +7368,65 @@ impl WorkspaceThreadStore {
         }
         self.server_folder_spaces
             .insert(domain, local_space_id.to_string());
+        true
+    }
+
+    /// Where a name with no Space of its own on a server lands, once its
+    /// first tree shows a server that another name, up now, reaches already:
+    /// the Space that name was last on, or failing that the first of the
+    /// tree's Spaces it holds here. That Space is remembered as where this
+    /// name was last, so `space_on_same_server` finds it and the connect
+    /// lands there. Otherwise a host saved again, under another address or
+    /// on the other network, and opened while the first way is up, mints a
+    /// Space of its own, an empty one on the server for every device to
+    /// show. Two names whose servers both gave a runtime id, and gave
+    /// different ones, are two machines, however alike their trees: one
+    /// copied from the other carries the same Space ids. Says whether it
+    /// remembered one.
+    fn follow_same_server_holder(
+        &mut self,
+        domain_name: &str,
+        tree: &codec::ThinkTermTree,
+        is_live: &dyn Fn(&str) -> bool,
+        server_id_of: &dyn Fn(&str) -> Option<String>,
+    ) -> bool {
+        if self.preferred_space_for_domain(domain_name).is_some()
+            || self.space_on_same_server(domain_name, is_live).is_some()
+        {
+            return false;
+        }
+        let this_server = server_id_of(domain_name);
+        let same_server = |holder: &str| {
+            holder != domain_name
+                && is_live(holder)
+                && !matches!(
+                    (this_server.as_deref(), server_id_of(holder).as_deref()),
+                    (Some(this), Some(other)) if this != other
+                )
+        };
+        let held_elsewhere: Vec<(&SpaceId, &str)> = tree
+            .spaces
+            .iter()
+            .filter_map(|known| {
+                let space = self.spaces.iter().find(|space| space.id == known.id)?;
+                let holder = space.client_domain.as_deref()?;
+                same_server(holder).then_some((&space.id, holder))
+            })
+            .collect();
+        let Some(target) = held_elsewhere
+            .iter()
+            .find(|(space_id, holder)| self.last_space_per_domain.get(*holder) == Some(*space_id))
+            .or_else(|| held_elsewhere.first())
+            .map(|(space_id, _)| (*space_id).clone())
+        else {
+            return false;
+        };
+        log::info!(
+            "{domain_name} reaches a server whose Space {target} is held here under another \
+             name, up now: landing there"
+        );
+        self.last_space_per_domain
+            .insert(domain_name.to_string(), target);
         true
     }
 
@@ -16366,6 +16448,102 @@ mod tests {
             }],
             revision: 1,
         }
+    }
+
+    /// `sample_tree`, with the project the server keeps in its Space for
+    /// the threads opened over `domain`, as a connect under that name makes.
+    fn tree_with_server_project(domain: &str) -> codec::ThinkTermTree {
+        let mut tree = sample_tree();
+        let id = remote_project_id_for_space("space-remote", &mux_domain_host_id(domain));
+        tree.projects.push(codec::TtProject {
+            id: id.clone(),
+            space_id: "space-remote".to_string(),
+            name: domain.to_string(),
+            path: format!("wezterm-mux://{domain}"),
+            threads: vec![tree_thread("rt-main", &id, "main")],
+            archived_at: None,
+        });
+        tree
+    }
+
+    /// One machine saved again under a name never used for it, opened while
+    /// its first name is up: once the tree shows which server it is, it
+    /// lands in the Space that name is on instead of minting one.
+    #[test]
+    fn a_name_never_used_for_a_server_lands_where_its_other_name_is() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let tree = tree_with_server_project(lan);
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &tree));
+        store
+            .last_space_per_domain
+            .insert(lan.to_string(), "space-remote".to_string());
+        let live = |name: &str| name == lan;
+        let same_id = |_: &str| Some("server-1".to_string());
+
+        assert!(store.space_on_same_server(tailnet, &live).is_none());
+        assert!(store.follow_same_server_holder(tailnet, &tree, &live, &same_id));
+        assert_eq!(
+            store.space_on_same_server(tailnet, &live).as_deref(),
+            Some("space-remote")
+        );
+
+        // The connect lands there, in the project and on the thread the
+        // server already has, and the Space stays the first name's.
+        let plan = store.ensure_mux_domain_space_with(tailnet, &live);
+        assert_eq!(plan.space_id, "space-remote");
+        assert_eq!(
+            plan.project_id,
+            remote_project_id_for_space("space-remote", &mux_domain_host_id(lan))
+        );
+        assert_eq!(plan.thread_id, "rt-main");
+        let space = store
+            .spaces
+            .iter()
+            .find(|space| space.id == "space-remote")
+            .unwrap();
+        assert_eq!(space.client_domain.as_deref(), Some(lan));
+        assert!(!store.invented_server_domains.contains(tailnet));
+        assert_eq!(
+            store.spaces.len(),
+            remote_test_store(lan).spaces.len(),
+            "no Space was minted"
+        );
+
+        // Settled once, it does not move again.
+        assert!(!store.follow_same_server_holder(tailnet, &tree, &live, &same_id));
+    }
+
+    /// Not when the other name is down (its Spaces come over to this one
+    /// instead), nor when the two servers gave different runtime ids: a
+    /// tree copied from one machine to another carries the same Space ids.
+    #[test]
+    fn only_a_live_name_for_the_same_server_is_followed() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let tree = tree_with_server_project(lan);
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &tree));
+
+        let down = |_: &str| false;
+        let same_id = |_: &str| Some("server-1".to_string());
+        assert!(!store.follow_same_server_holder(tailnet, &tree, &down, &same_id));
+
+        let live = |name: &str| name == lan;
+        let two_machines =
+            |name: &str| Some(if name == lan { "server-1" } else { "server-2" }.to_string());
+        assert!(!store.follow_same_server_holder(tailnet, &tree, &live, &two_machines));
+        assert!(!store.last_space_per_domain.contains_key(tailnet));
+
+        // A connection that has not given an id yet goes by the tree. With
+        // nowhere remembered for the first name, its first Space is it.
+        let not_said = |name: &str| (name == lan).then(|| "server-1".to_string());
+        assert!(store.follow_same_server_holder(tailnet, &tree, &live, &not_said));
+        assert_eq!(
+            store.last_space_per_domain.get(tailnet).map(String::as_str),
+            Some("space-remote")
+        );
     }
 
     #[test]
