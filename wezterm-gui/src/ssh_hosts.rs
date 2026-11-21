@@ -276,12 +276,16 @@ pub fn try_update_host(host_id: &str, mut spec: SshHostSpec) -> Result<Option<Ss
         .iter()
         .find(|record| record.id == new_id)
         .map(|record| record.spec.clone());
-    if new_id != host_id {
-        let mut connections = SSH_CONNECTIONS.lock();
-        if let Some(connection) = connections.remove(host_id) {
-            connections.insert(new_id.clone(), connection);
-        }
-    }
+    let entries = store
+        .hosts
+        .iter()
+        .map(|record| SshHostEntry {
+            id: record.id.clone(),
+            source: SshHostSource::ThinkTerm,
+            spec: record.spec.clone(),
+        })
+        .collect::<Vec<_>>();
+    rebind_saved_passwords(host_id, &new_id, &entries);
     drop(store);
     if let Some(spec) = spec {
         // Reached the way it was, the host has its domain already: the mux
@@ -299,6 +303,22 @@ pub fn try_update_host(host_id: &str, mut spec: SshHostSpec) -> Result<Option<Ss
         }
     }
     Ok(Some(new_id))
+}
+
+/// Saving the host `id`, keyed `old_id` until now, gives its password again,
+/// for the way its record goes now; and so for the hosts reached through it
+/// among `hosts`, whose way goes on through it. Each is bound afresh the next
+/// time it is asked for (`connection_among`), as starting ThinkTerm binds
+/// them all. A binding kept from before the save held the saved password
+/// back from the edited way until a restart, re-saving it included.
+fn rebind_saved_passwords(old_id: &str, id: &str, hosts: &[SshHostEntry]) {
+    let through = hosts_through(id, hosts);
+    let mut connections = SSH_CONNECTIONS.lock();
+    connections.remove(old_id);
+    connections.remove(id);
+    for entry in &through {
+        connections.remove(&entry.id);
+    }
 }
 
 /// The host keyed `from` keyed anew as `to`: it is still the one the hosts
@@ -793,18 +813,19 @@ fn connection_among(spec: &SshHostSpec, hosts: &[SshHostEntry]) -> Result<SshCon
         .find(|entry| entry.source == SshHostSource::ThinkTerm && &entry.spec == spec)
         .map(|entry| entry.id.as_str());
     let mut connection = capture(spec, id)?;
-    // A newly selected jump takes its password from another record. Its own
-    // captured route must match the prefix of this route that reaches it.
+    // A jump host's password is its own record's to give: the one bound to
+    // the way that jump host is reached, where this route reaches it that
+    // way too, and none otherwise. What this host's capture holds for it is
+    // not asked: kept from before the jump host was picked, or held back
+    // for having the value of a password this host had, it is not the jump
+    // host's binding.
     let passwords = &mut connection.passwords;
     let way = passwords.way.as_deref().unwrap_or_default();
     let first = way.len().saturating_sub(passwords.jumps.len());
     for (index, (jump, owner)) in passwords.jumps.iter_mut().zip(owners).enumerate() {
-        if owner.passwords.way.is_none()
-            || owner.passwords.way.as_deref() != way.get(..first + index)
-            || jump.password != owner.passwords.host
-        {
-            jump.password = None;
-        }
+        let reached_alike = owner.passwords.way.is_some()
+            && owner.passwords.way.as_deref() == way.get(..first + index);
+        jump.password = owner.passwords.host.clone().filter(|_| reached_alike);
     }
     Ok(connection)
 }
@@ -1503,6 +1524,117 @@ mod tests {
         let mut connections = SSH_CONNECTIONS.lock();
         connections.remove("binding-relay");
         connections.remove("binding-target");
+    }
+
+    fn saved_entry(id: &str, password: &str) -> SshHostEntry {
+        let mut spec: SshHostSpec = serde_json::from_value(
+            serde_json::json!({"label": id, "host": format!("{id}.invalid")}),
+        )
+        .unwrap();
+        spec.password = Some(password.into());
+        SshHostEntry {
+            id: id.into(),
+            source: SshHostSource::ThinkTerm,
+            spec,
+        }
+    }
+
+    fn passwords_for(id: &str, hosts: &[SshHostEntry]) -> StoredPasswords {
+        files_connection_among(id, hosts)
+            .unwrap()
+            .resolve_attempt()
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn saving_a_host_gives_its_password_again_for_the_way_it_now_goes() {
+        let mut hosts = [
+            saved_entry("rebind-relay", "relay secret"),
+            saved_entry("rebind-target", "target secret"),
+        ];
+        assert_eq!(
+            passwords_for("rebind-target", &hosts).for_prompt(None),
+            Some("target secret")
+        );
+
+        // Given a jump host, it goes another way. Until it is saved so, the
+        // password kept for the way it went is held back.
+        hosts[1].spec.jump_host = Some("rebind-relay".into());
+        assert_eq!(
+            passwords_for("rebind-target", &hosts).for_prompt(None),
+            None
+        );
+
+        // Saved, its own is given again for the way through the jump host,
+        // and the jump host's comes from the jump host's own record.
+        rebind_saved_passwords("rebind-target", "rebind-target", &hosts);
+        let passwords = passwords_for("rebind-target", &hosts);
+        assert_eq!(passwords.for_prompt(None), Some("target secret"));
+        assert_eq!(passwords.jumps[0].password.as_deref(), Some("relay secret"));
+
+        let mut connections = SSH_CONNECTIONS.lock();
+        connections.remove("rebind-relay");
+        connections.remove("rebind-target");
+    }
+
+    #[test]
+    fn a_jump_host_with_the_same_password_as_the_host_behind_it_keeps_it() {
+        let mut hosts = [
+            saved_entry("same-relay", "one secret"),
+            saved_entry("same-target", "one secret"),
+        ];
+        assert!(passwords_for("same-relay", &hosts)
+            .for_prompt(None)
+            .is_some());
+        assert!(passwords_for("same-target", &hosts)
+            .for_prompt(None)
+            .is_some());
+
+        // The host behind it is held back until saved, but the jump host's
+        // is its own record's, bound to the way it is reached: that the
+        // value is one the host behind it had does not take it away.
+        hosts[1].spec.jump_host = Some("same-relay".into());
+        let passwords = passwords_for("same-target", &hosts);
+        assert_eq!(passwords.for_prompt(None), None);
+        assert_eq!(passwords.jumps[0].password.as_deref(), Some("one secret"));
+
+        let mut connections = SSH_CONNECTIONS.lock();
+        connections.remove("same-relay");
+        connections.remove("same-target");
+    }
+
+    #[test]
+    fn saving_a_jump_host_gives_again_the_passwords_of_the_hosts_behind_it() {
+        let mut hosts = [
+            saved_entry("moved-relay", "relay secret"),
+            saved_entry("moved-target", "target secret"),
+        ];
+        hosts[1].spec.jump_host = Some("moved-relay".into());
+        assert_eq!(
+            passwords_for("moved-target", &hosts).for_prompt(None),
+            Some("target secret")
+        );
+
+        // The jump host moves: unsaved, neither password goes the new way.
+        hosts[0]
+            .spec
+            .ssh_options
+            .insert("hostname".into(), "elsewhere.invalid".into());
+        let passwords = passwords_for("moved-target", &hosts);
+        assert_eq!(passwords.for_prompt(None), None);
+        assert_eq!(passwords.jumps[0].password, None);
+
+        // Saved, it gives its own again, and the hosts reached through it
+        // theirs, for the way they go now.
+        rebind_saved_passwords("moved-relay", "moved-relay", &hosts);
+        let passwords = passwords_for("moved-target", &hosts);
+        assert_eq!(passwords.for_prompt(None), Some("target secret"));
+        assert_eq!(passwords.jumps[0].password.as_deref(), Some("relay secret"));
+
+        let mut connections = SSH_CONNECTIONS.lock();
+        connections.remove("moved-relay");
+        connections.remove("moved-target");
     }
 
     #[test]
