@@ -378,6 +378,7 @@ settings-import-preview-custom-colors = Свои цвета
 settings-import-preview-font-table = Настройки шрифта
 sidebar-default-space = По умолчанию
 sidebar-connecting = Подключение…
+sidebar-connecting-attempt = Подключение… ({ $current }/{ $total })
 sidebar-reconnect = Подключиться снова
 sidebar-new-thread = Новая ветка
 sidebar-pinned = Закреплённые

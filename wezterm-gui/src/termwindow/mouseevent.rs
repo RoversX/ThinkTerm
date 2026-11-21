@@ -8071,14 +8071,17 @@ impl super::TermWindow {
                                 ..Default::default()
                             },
                         );
+                        let keep_ui = ui.clone();
+                        let mut page_is_open = page_is_open;
                         // No primary window: none of the server's windows
                         // belongs in the page's.
                         let outcome = crate::attach_domain_with_retry(
                             domain,
                             None,
                             ui,
-                            page_is_open,
+                            move || page_is_open() && !keep_ui.abandoned(),
                             Some(std::time::Duration::from_secs(60)),
+                            Some(wezterm_client::domain::ATTACH_MAX_ATTEMPTS),
                         )
                         .await?;
                         anyhow::Ok(matches!(outcome, crate::AttachRetryOutcome::Attached))
