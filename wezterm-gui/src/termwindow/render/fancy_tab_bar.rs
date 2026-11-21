@@ -42,6 +42,66 @@ impl crate::TermWindow {
         self.fancy_tab_bar.take();
     }
 
+    /// Scroll the window tab row to bring the active tab into view, once for
+    /// each tab opened, closed or switched to: a row the wheel has moved away
+    /// from it stays where it was put until then. A tab wider than the row
+    /// shows its start, where its title is.
+    fn reveal_active_window_tab(&mut self, tab_width: f32, viewport_width: f32, max_scroll: f32) {
+        let Some(position) = self.active_window_tab_position() else {
+            return;
+        };
+        let revealed = (position, self.window_tab_bar_item_count());
+        if self.tab_bar_revealed == Some(revealed) {
+            return;
+        }
+        self.tab_bar_revealed = Some(revealed);
+        let left = position as f32 * (tab_width + self.ui_px(WINDOW_TAB_GAP) as f32);
+        let right = left + tab_width;
+        let target = self.tab_bar_scroll_target;
+        let to = if left < target || tab_width > viewport_width {
+            left
+        } else if right > target + viewport_width {
+            right - viewport_width
+        } else {
+            return;
+        };
+        let to = to.clamp(0.0, max_scroll.max(0.0));
+        if (to - target).abs() > f32::EPSILON {
+            self.tab_bar_scroll_target = to;
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
+    /// Where the active tab is in the window tab row, counted as
+    /// `paint_fancy_tab_bar` places them: the mux tabs, then the content
+    /// views the row shows.
+    fn active_window_tab_position(&self) -> Option<usize> {
+        let cv_active = self.active_content_view_shown_in_tab_bar();
+        let mut position = 0;
+        if !self.active_content_view_is_remote_thread() {
+            for item in self.tab_bar.items() {
+                if let TabBarItem::Tab { active, .. } = item.item {
+                    if active && !cv_active {
+                        return Some(position);
+                    }
+                    position += 1;
+                }
+            }
+        }
+        for content_tab in &self.content_views {
+            if !self.content_view_shown_in_tab_bar(content_tab) {
+                continue;
+            }
+            if self.active_content_view_id == Some(content_tab.id) {
+                return Some(position);
+            }
+            position += 1;
+        }
+        None
+    }
+
     pub fn paint_fancy_tab_bar(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -143,6 +203,7 @@ impl crate::TermWindow {
         }
 
         let max_scroll = self.max_window_tab_scroll_offset();
+        self.reveal_active_window_tab(tab_width as f32, viewport_width as f32, max_scroll);
         let scroll_offset = self.tab_bar_scroll_offset.clamp(0.0, max_scroll.max(0.0));
         let inline_rename_tab_idx = self.inline_window_tab_rename_tab_id().and_then(|tab_id| {
             mux::Mux::get()

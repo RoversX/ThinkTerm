@@ -3288,6 +3288,11 @@ pub struct TermWindow {
     fancy_tab_bar: Option<box_model::ComputedElement>,
     tab_bar_scroll_offset: f32,
     tab_bar_scroll_target: f32,
+    /// The active tab's place in the window tab row, and how many tabs the
+    /// row held, when the row last scrolled it into view: a tab opened or
+    /// switched to is brought into view once, and a row scrolled away from
+    /// it with the wheel then stays where it was put.
+    tab_bar_revealed: Option<(usize, usize)>,
     pane_nav_tab_scroll_offsets: HashMap<PaneId, f32>,
     pane_nav_tab_scroll_targets: HashMap<PaneId, f32>,
     collapsed_pane_layouts: HashMap<PaneStackId, CollapsedPaneLayout>,
@@ -5475,6 +5480,7 @@ impl TermWindow {
             fancy_tab_bar: None,
             tab_bar_scroll_offset: 0.0,
             tab_bar_scroll_target: 0.0,
+            tab_bar_revealed: None,
             pane_nav_tab_scroll_offsets: HashMap::new(),
             pane_nav_tab_scroll_targets: HashMap::new(),
             collapsed_pane_layouts: HashMap::new(),

@@ -745,7 +745,9 @@ impl super::TermWindow {
 
     pub(super) fn max_window_tab_scroll_offset(&self) -> f32 {
         let tab_count = self.window_tab_bar_item_count();
-        if tab_count <= 1 {
+        // One tab scrolls too, when it is set wider than the row: its end,
+        // and the close button there, would be out of reach otherwise.
+        if tab_count == 0 {
             return 0.0;
         }
 
