@@ -324,7 +324,7 @@ fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<Stri
 }
 
 /// Attach `domain`, retrying transient failures with exponential backoff.
-/// `max_attempts` bounds interactive attaches; `None` keeps retrying until
+/// `max_attempts` bounds the connects a person starts; `None` keeps retrying until
 /// `max_total` or `keep_going` stops it. ClientDomain owns the shared retry
 /// engine so generic Domain::attach calls (including mux spawn/split paths)
 /// receive the same behavior. Other domain kinds have no distinct attach
@@ -375,7 +375,9 @@ async fn attach_domain_in_window_with_retry(
         ui.clone(),
         move || Mux::get().get_window(window_id).is_some() && !ui.abandoned(),
         Some(std::time::Duration::from_secs(60)),
-        Some(ATTACH_MAX_ATTEMPTS),
+        // Startup and spawns attach on their own: the time budget, without
+        // the try cap (see ATTACH_MAX_ATTEMPTS).
+        None,
     )
     .await
 }

@@ -329,9 +329,14 @@ struct AttachRetryTiming {
     cancellation_poll: Duration,
 }
 
-/// How many times an interactive attach tries before giving up. Bounded on
-/// purpose: a host with no SSH server refuses instantly, and an unbounded
-/// loop turns that into an invisible, uncancellable spinner.
+/// How many times a connect that a person started tries before giving up:
+/// the Remote Hosts page and `thinkterm connect`, Reconnect, switching into
+/// a disconnected Space, and AttachDomain. Bounded on purpose: a host with
+/// no SSH server refuses instantly, and an unbounded loop turns that into an
+/// invisible, uncancellable spinner. Attaches the program starts on its own
+/// (at login, at startup, or to spawn into a domain) keep their time budget
+/// alone: a network still coming up after a wake, such as a VPN, can take
+/// longer than five quick tries.
 pub const ATTACH_MAX_ATTEMPTS: usize = 5;
 
 /// The attempt number a retry sequence is on, for the progress tab title and
@@ -6798,7 +6803,9 @@ impl Domain for ClientDomain {
                         && !ui.abandoned()
                 },
                 Some(Duration::from_secs(60)),
-                Some(ATTACH_MAX_ATTEMPTS),
+                // Spawns attach on their own: the time budget, without the
+                // try cap (see ATTACH_MAX_ATTEMPTS).
+                None,
             )
             .await?;
         match outcome {
@@ -6834,10 +6841,10 @@ impl Domain for ClientDomain {
 impl ClientDomain {
     /// Attach with one ConnectionUI shared by every attempt. Transient
     /// failures use 1s..10s exponential backoff; fatal failures return
-    /// immediately. `max_attempts` bounds interactive attaches (the GUI
-    /// passes [`ATTACH_MAX_ATTEMPTS`]); `None` keeps retrying until
-    /// `max_total` or `keep_going` stops it, which auto-connect at login
-    /// needs while a VPN is still coming up.
+    /// immediately. `max_attempts` bounds the connects a person starts (the
+    /// GUI passes [`ATTACH_MAX_ATTEMPTS`]); `None` keeps retrying until
+    /// `max_total` or `keep_going` stops it, which attaches at login, at
+    /// startup and for spawns need while a VPN is still coming up.
     pub async fn attach_with_ui_retry(
         &self,
         window_id: Option<WindowId>,
