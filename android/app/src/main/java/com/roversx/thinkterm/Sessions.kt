@@ -18,7 +18,11 @@ object Sessions {
     private val models = mutableStateMapOf<String, TerminalModel>()
 
     fun get(context: Context, store: HostStore, host: Host): TerminalModel =
-        models.getOrPut(host.id) { TerminalModel(context.applicationContext, store, host) }
+        models.getOrPut(host.id) {
+            // As the store has it now: a page's copy may be from before its
+            // key was forgotten there, and would dial with the old one.
+            TerminalModel(context.applicationContext, store, store.hosts.firstOrNull { it.id == host.id } ?: host)
+        }
 
     fun existing(hostId: String): TerminalModel? = models[hostId]
 

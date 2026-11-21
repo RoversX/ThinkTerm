@@ -14,7 +14,10 @@ final class Sessions: ObservableObject {
     func model(for host: Host?, store: HostStore) -> TerminalModel {
         let key = host?.id ?? Self.probeId
         if let model = models[key] { return model }
-        let model = TerminalModel(host: host, store: store)
+        // As the store has it now: a page's copy may be from before its key
+        // was forgotten there, and would dial with the old one.
+        let current = host.map { host in store.hosts.first { $0.id == host.id } ?? host }
+        let model = TerminalModel(host: current, store: store)
         models[key] = model
         return model
     }
