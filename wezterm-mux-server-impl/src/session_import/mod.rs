@@ -149,7 +149,7 @@ fn prepare(request: &thinkterm_import::ImportRequest) -> Result<Prepared> {
         let mut seed_terminal = Terminal::new(
             size,
             seed_config(config::configuration()),
-            "ThinkTerm",
+            config::TERM_PROGRAM,
             config::wezterm_version(),
             Box::new(std::io::sink()),
         );
@@ -163,7 +163,7 @@ fn prepare(request: &thinkterm_import::ImportRequest) -> Result<Prepared> {
         let mut terminal = Terminal::new(
             size,
             Arc::new(config::TermConfig::new()),
-            "ThinkTerm",
+            config::TERM_PROGRAM,
             config::wezterm_version(),
             master.take_writer()?,
         );
