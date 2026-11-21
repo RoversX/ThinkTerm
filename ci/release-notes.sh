@@ -167,6 +167,6 @@ fi
 if apk=$(links_by_arch 'ThinkTerm-android-*.apk'); then
   echo "### Android"
   echo
-  echo "APK (Android 15 or later): $apk — or add the [F-Droid repository](https://github.com/RoversX/fdroid/tree/dist) to get every release as an update. Use it with ThinkTerm $version on the hosts it connects to."
+  echo "APK (Android 13 or later): $apk — or add the [F-Droid repository](https://github.com/RoversX/fdroid/tree/dist) to get every release as an update. Use it with ThinkTerm $version on the hosts it connects to."
   echo
 fi
