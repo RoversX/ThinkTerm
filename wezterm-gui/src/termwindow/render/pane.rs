@@ -1947,9 +1947,15 @@ impl crate::TermWindow {
             None => (raw_title.as_str(), false),
         };
         let chrome = self.chrome();
+        // Filled as the active tab's glass is; `over` mixes in linear light.
+        let ground = self.tab_bar_surface(chrome.header_bg);
         let surface = crate::termwindow::render::paint::drag_ghost_surface(
-            chrome.active_tab_surface(),
-            self.tab_bar_surface(chrome.header_bg),
+            crate::termwindow::ui::glass::GlassEdge::over(chrome.header_bg).fill(
+                chrome.active_tab_surface(),
+                ground,
+                true,
+            ),
+            ground,
         );
         let ui_font = self
             .fonts

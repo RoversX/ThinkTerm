@@ -4899,9 +4899,11 @@ impl crate::TermWindow {
         let width = grip.width;
         let inset = self.ui_px(SIDEBAR_INSET);
         let text_y = height.saturating_sub(ui_cell_height) / 2;
+        // Filled as the selected row's glass is; `over` mixes in linear light.
+        let ground = self.sidebar_surface(chrome.workspace_sidebar_bg);
         let surface = crate::termwindow::render::paint::drag_ghost_surface(
-            chrome.sidebar_row_active_bg,
-            self.sidebar_surface(chrome.workspace_sidebar_bg),
+            GlassEdge::over(ground).fill(chrome.sidebar_row_active_bg, ground, true),
+            ground,
         );
 
         let mux = Mux::get();

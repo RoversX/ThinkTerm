@@ -4105,10 +4105,14 @@ impl crate::TermWindow {
     }
 
     /// Set what a drag carries at `(x, y)`, on a surface of its own with a
-    /// shadow under it, lifted off its list; `lifted` thins the shadow as it
-    /// comes back down. `content` is recorded with the thing's corner at the
-    /// origin: the painters take unsigned pixels, and tabs lay themselves
-    /// out from x = 0. Registers no UIItem (hit-transparent).
+    /// shadow under it, lifted off its list; `lifted` thins the shadow and
+    /// the surface's edge as it comes back down. The surface is glass, as a
+    /// selected tab or sidebar row is (`glass`): what is carried is what is
+    /// in hand, whether or not it was the selected one. High contrast keeps
+    /// `border` under the edge, as those do. `content` is recorded with the
+    /// thing's corner at the origin: the painters take unsigned pixels, and
+    /// tabs lay themselves out from x = 0. Registers no UIItem
+    /// (hit-transparent).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint_drag_ghost(
         &self,
@@ -4126,6 +4130,7 @@ impl crate::TermWindow {
             .layer_for_zindex(crate::termwindow::DRAG_GHOST_ZINDEX)
             .context("drag ghost layer")?;
         let mut layers = layer.quad_allocator();
+        let high_contrast = self.glass_high_contrast();
 
         // The surface first, and in place: the shadow is cut to the window
         // as it is drawn, which it could not be from around the origin.
@@ -4134,14 +4139,23 @@ impl crate::TermWindow {
             0.0,
             0.0,
             0.0,
-            lifted * if self.chrome().is_dark() { 0.5 } else { 0.22 },
+            lifted
+                * if self.chrome().is_dark() {
+                    DRAG_GHOST_SHADOW_DARK
+                } else {
+                    DRAG_GHOST_SHADOW_LIGHT
+                },
         );
         ctx.draw_elevated_surface(
             &mut layers,
             0,
             euclid::rect(x, y, grip.width as f32, grip.height as f32),
             surface,
-            border,
+            if high_contrast {
+                border
+            } else {
+                border.mul_alpha(0.0)
+            },
             shadow,
             radius,
         )
@@ -4154,6 +4168,25 @@ impl crate::TermWindow {
             window.1 as f32,
             &self.dimensions,
         );
+        // The edge, recorded at the origin as the content is and set down
+        // with the surface, as clear as the surface is while it lands. The
+        // surface is solid, so it is its own ground.
+        let solid = LinearRgba::with_components(surface.0, surface.1, surface.2, 1.0);
+        let mut edge = HeapQuadAllocator::default();
+        self.paint_glass_edge(
+            &mut TripleLayerQuadAllocator::Heap(&mut edge),
+            0,
+            euclid::rect(0.0, 0.0, grip.width as f32, grip.height as f32),
+            radius,
+            crate::termwindow::ui::glass::GlassEdge::over(solid),
+            true,
+            high_contrast,
+            solid,
+            solid,
+        )
+        .context("drag ghost edge")?;
+        edge.apply_to_clipped_at(&mut layers, x, y, clip, lifted)
+            .context("drag ghost edge")?;
         content
             .apply_to_clipped_at(&mut layers, x, y, clip, 1.0)
             .context("drag ghost content")
@@ -5969,6 +6002,12 @@ impl crate::TermWindow {
         Ok(())
     }
 }
+
+/// How dark a carried thing's shadow is at its darkest, in a dark chrome and
+/// in a light one, as the alpha of black. Lighter than a plain surface's
+/// would be: its glass edge already marks where it ends.
+const DRAG_GHOST_SHADOW_DARK: f32 = 0.35;
+const DRAG_GHOST_SHADOW_LIGHT: f32 = 0.15;
 
 /// `top` as it looks on `ground`, solid: a ghost goes over anything, and a
 /// see-through window would show that through a surface as its bar paints it.
