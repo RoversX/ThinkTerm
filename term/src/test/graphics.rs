@@ -1927,6 +1927,22 @@ fn kitty_placement_keys(term: &Terminal, alternate: bool) -> std::collections::B
     keys
 }
 
+fn kitty_history_cells(term: &Terminal, alternate: bool) -> usize {
+    let mut cells = 0;
+    term.screen_for_alt(alternate).for_each_phys_line(|_, line| {
+        if line.has_images() {
+            for cell in line.visible_cells() {
+                for image in cell.attrs().image_attachments() {
+                    if image.image_id().is_none() {
+                        cells += 1;
+                    }
+                }
+            }
+        }
+    });
+    cells
+}
+
 fn place_kitty_for_delete(term: &mut Terminal, id: u32, placement: u32, row: usize, col: usize, z: i32) {
     term.advance_bytes(format!("\x1b[{row};{col}H\x1b_Ga=p,i={id},p={placement},c=2,r=2,C=1,z={z}\x1b\\"));
 }
@@ -2003,7 +2019,10 @@ fn kitty_delete_all_preserves_scrollback_inactive_screen_and_unplaced_data() {
     term.advance_bytes("\x1b[24;1H\n\n\n");
     place_kitty_for_delete(&mut term, 1, 2, 4, 1, 0);
     term.advance_bytes("\x1b_Ga=d,d=A\x1b\\");
+    // `d=A` names the placements on the screen; the copy that scrolled
+    // into the scrollback is not one of them and stays as it was.
     assert_eq!(kitty_placement_keys(&term, false), [(1, Some(1))].into());
+    assert!(kitty_history_cells(&term, false) == 0);
     assert!(term.kitty_image_data_for_id(1).is_some());
     assert!(term.kitty_image_data_for_id(2).is_some());
     term.advance_bytes("\x1b[?1049h");
@@ -2014,8 +2033,45 @@ fn kitty_delete_all_preserves_scrollback_inactive_screen_and_unplaced_data() {
     assert!(term.kitty_image_data_for_id(3).is_none());
     term.advance_bytes("\x1b_Ga=d,d=R,x=1,y=2\x1b\\");
     assert!(kitty_placement_keys(&term, false).is_empty());
+    assert!(kitty_history_cells(&term, false) > 0);
     assert_eq!(term.kitty_used_memory(), 0);
 }
+
+#[test]
+fn deleting_an_image_leaves_its_scrollback_history_painted() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut term, 1, 1, 1, 1, 0);
+    // Push the two-row placement off the top of the 24-row screen.
+    term.advance_bytes("\x1b[24;1H\n\n\n");
+    assert!(kitty_history_cells(&term, false) == 0);
+    assert_eq!(kitty_placement_keys(&term, false), [(1, Some(1))].into());
+
+    term.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+
+    assert!(term.kitty_image_data_for_id(1).is_none(), "the id is gone");
+    assert!(
+        kitty_placement_keys(&term, false).is_empty(),
+        "no placement survives"
+    );
+    assert!(
+        kitty_history_cells(&term, false) > 0,
+        "the scrollback copy keeps its pixels"
+    );
+}
+
+#[test]
+fn deleting_a_visible_image_still_takes_it_off_the_screen() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut term, 1, 1, 1, 1, 0);
+    assert!(kitty_history_cells(&term, false) == 0);
+    term.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+    assert!(kitty_placement_keys(&term, false).is_empty());
+    assert!(kitty_history_cells(&term, false) == 0);
+    assert!(term.kitty_image_data_for_id(1).is_none());
+}
+
 
 #[test]
 fn kitty_delete_by_id_finds_reflowed_cells_and_preserves_shared_rows() {

@@ -545,6 +545,24 @@ impl CellAttributes {
         true
     }
 
+    /// Keep matching attachments but strip their kitty identity, turning
+    /// them into scrollback history: they still paint from the pixels the
+    /// cells hold, but can no longer be addressed, replaced or deleted by
+    /// image id.
+    pub fn demote_images_to_history(&mut self, matches: impl Fn(&ImageCell) -> bool) -> bool {
+        if !self.image_attachments().any(&matches) {
+            return false;
+        }
+        self.update_fat(|fat| {
+            fat.update_images(|images| {
+                for image in images.iter_mut().filter(|image| matches(image)) {
+                    **image = image.as_history();
+                }
+            })
+        });
+        true
+    }
+
     /// Rebind one image's attachments without changing their order or geometry.
     pub fn replace_image_data(
         &mut self,
