@@ -5382,6 +5382,29 @@ pub fn move_spaces_to_domain(from: &str, to: &str) {
     }
 }
 
+/// Before the Spaces of `gone` -- names no saved host goes by any more --
+/// are dropped from this device, hand each one's to a name in `saved` that
+/// reaches the same server (`same_server_handovers`), and point the
+/// references into them at it, so that dropping references to `gone`
+/// spares them.
+pub fn hand_spaces_to_same_server(gone: &[String], saved: &std::collections::HashSet<String>) {
+    let known_trees = LAST_KNOWN_REMOTE_TREES.lock().clone();
+    let handovers = THREAD_STORE
+        .lock()
+        .same_server_handovers(gone, saved, &known_trees);
+    if handovers.is_empty() {
+        return;
+    }
+    for (from, to) in &handovers {
+        log::info!("{to} keeps the Spaces {from} held: it reaches the same server");
+        move_spaces_to_domain(from, to);
+    }
+    let mut store = THREAD_STORE.lock();
+    if store.groom_thread_refs() {
+        persist_locked(&store);
+    }
+}
+
 impl WorkspaceThreadStore {
     fn move_spaces_to_domain(&mut self, from: &str, to: &str) -> bool {
         let mut moved = false;
@@ -5427,6 +5450,23 @@ fn remote_domain_is_live(domain_name: &str) -> bool {
                     .downcast_ref::<wezterm_client::domain::ClientDomain>()
                     .is_some_and(|client| client.is_attaching() || client.is_attach_retrying())
         })
+}
+
+/// Whether the connection named `domain_name` is attached: a tree for it
+/// came over it now, rather than being one it sent before, played again.
+fn remote_domain_is_attached(domain_name: &str) -> bool {
+    Mux::try_get()
+        .and_then(|mux| mux.get_domain_by_name(domain_name))
+        .is_some_and(|domain| domain.state() == mux::domain::DomainState::Attached)
+}
+
+/// Whether another name keeps the Spaces it holds when a tree arrives for
+/// this one. Only an attached connection takes any over, and only from a
+/// name that is neither up nor on its way up: a tree played again for one
+/// that is down (`restore_last_authoritative_tree`) must not move Spaces
+/// between two connections that are both down.
+fn another_name_keeps_its_spaces(attached_here: bool, other_live: bool) -> bool {
+    !attached_here || other_live
 }
 
 fn remote_tree_domain_is_attached(domain_name: &str) -> bool {
@@ -5609,6 +5649,8 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
             submit_tree_ops(domain_name.to_string(), ops);
         }
     }
+    // Asked before the store is locked: the mux takes locks of its own.
+    let attached = !host && remote_domain_is_attached(domain_name);
     let mut store = THREAD_STORE.lock();
     // Which Spaces belonged to this server *before* it spoke. Only a window
     // parked on one of these can have been orphaned by this push, and the set
@@ -5624,15 +5666,15 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         };
         store.ingest_host_tree(&tree_for_store, known.as_ref())
     } else {
-        // Another name keeps its Spaces while it is connected, or while a
-        // saved host still goes by it: two records for one machine each keep
-        // theirs. Only a name nothing goes by any more gives them up.
-        let current = std::cell::OnceCell::new();
+        // Another name keeps its Spaces only while it is connected or on its
+        // way to it. One machine saved twice -- on the system network (a LAN,
+        // ZeroTier) and on the embedded tailnet -- has one set of Spaces, and
+        // they go with whichever of the two is up. Kept by the other record
+        // because a saved host still went by its name, they sat offline in
+        // the Space menu while this connection showed their threads: only the
+        // Agents panel led there, and new threads tried the way that was down.
         store.ingest_remote_tree_with(domain_name, &tree_for_store, &|other| {
-            remote_domain_is_live(other)
-                || current
-                    .get_or_init(crate::ssh_hosts::connect_domain_names)
-                    .contains(other)
+            another_name_keeps_its_spaces(attached, remote_domain_is_live(other))
         })
     };
     // A server can legitimately have no Spaces left — its last one was deleted
@@ -5641,19 +5683,27 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
     // before the re-home below has to reach for a fallback and drop the window
     // onto an unrelated local Space. Only on the connection's first tree: a
     // broadcast reaching several attached devices at once would otherwise have
-    // every one of them invent a Space.
-    let minted_space =
-        if !host && first_of_connection && store.preferred_space_for_domain(domain_name).is_none() {
-            let plan = store.ensure_mux_domain_space(domain_name);
-            log::info!(
-                "{domain_name} has no Spaces left; created {}",
-                plan.space_id
-            );
-            changed = true;
-            true
-        } else {
-            false
-        };
+    // every one of them invent a Space. Nor while its Spaces are held through
+    // its other name, up now (`space_on_same_server`): that is where this
+    // connection lands, and each switch of network would add an empty Space
+    // on the server, for every device to show.
+    let minted_space = if !host
+        && first_of_connection
+        && store.preferred_space_for_domain(domain_name).is_none()
+        && store
+            .space_on_same_server(domain_name, &remote_domain_is_live)
+            .is_none()
+    {
+        let plan = store.ensure_mux_domain_space(domain_name);
+        log::info!(
+            "{domain_name} has no Spaces left; created {}",
+            plan.space_id
+        );
+        changed = true;
+        true
+    } else {
+        false
+    };
     if changed {
         persist_locked(&store);
     }
@@ -5836,6 +5886,8 @@ fn orphaned_window_spaces(
 ) -> Vec<(u64, SpaceId)> {
     let fallback = store
         .preferred_space_for_domain(domain_name)
+        // Its Spaces held through its other name, up now: still that server.
+        .or_else(|| store.space_on_same_server(domain_name, &remote_domain_is_live))
         // The server can end up with no Spaces at all — the last one was
         // deleted on another device. A window parked on one of them still has
         // to land somewhere that exists, so fall back to a local Space rather
@@ -6741,6 +6793,88 @@ impl WorkspaceThreadStore {
                     .find(|space| space.client_domain.as_deref() == Some(domain_name))
                     .map(|space| space.id.clone())
             })
+    }
+
+    /// A Space of `domain_name`'s server held through another connection to
+    /// it that is up (`is_live`): the one this name was last on, or one with
+    /// this name's own project in it -- a Space this name held before that
+    /// connection took it over. The same machine saved twice is reached
+    /// under two names, and its Spaces go with whichever was up last; opened
+    /// under the other name meanwhile, the server is already here.
+    fn space_on_same_server(
+        &self,
+        domain_name: &str,
+        is_live: &dyn Fn(&str) -> bool,
+    ) -> Option<SpaceId> {
+        let held_elsewhere = |space: &&Space| {
+            space
+                .client_domain
+                .as_deref()
+                .is_some_and(|holder| holder != domain_name && is_live(holder))
+        };
+        let host = mux_domain_host_id(domain_name);
+        let has_own_project = |space: &&Space| {
+            let own = remote_project_id_for_space(&space.id, &host);
+            self.projects
+                .iter()
+                .any(|project| project.id == own && project.space_id == space.id)
+        };
+        self.last_space_per_domain
+            .get(domain_name)
+            .and_then(|last| self.spaces.iter().find(|space| space.id == *last))
+            .filter(held_elsewhere)
+            .or_else(|| {
+                self.spaces
+                    .iter()
+                    .filter(held_elsewhere)
+                    .find(has_own_project)
+            })
+            .map(|space| space.id.clone())
+    }
+
+    /// For each name in `gone` -- one no saved host goes by any more -- that
+    /// holds Spaces here, a name in `saved` reaching the same server: its
+    /// last tree (`known_trees`) carries one of them, one has its own project
+    /// in it, or it was last on one. The same machine saved twice keeps one
+    /// set of Spaces, under whichever name was up last, so deleting that
+    /// record must hand them to the other rather than drop them from this
+    /// device along with the references into them.
+    fn same_server_handovers(
+        &self,
+        gone: &[String],
+        saved: &std::collections::HashSet<String>,
+        known_trees: &HashMap<String, codec::ThinkTermTree>,
+    ) -> Vec<(String, String)> {
+        let mut candidates: Vec<&String> =
+            saved.iter().filter(|name| !gone.contains(name)).collect();
+        candidates.sort();
+        gone.iter()
+            .filter_map(|from| {
+                let held: Vec<&SpaceId> = self
+                    .spaces
+                    .iter()
+                    .filter(|space| space.client_domain.as_deref() == Some(from.as_str()))
+                    .map(|space| &space.id)
+                    .collect();
+                if held.is_empty() {
+                    return None;
+                }
+                let to = candidates.iter().find(|name| {
+                    let host = mux_domain_host_id(name);
+                    held.iter().any(|space_id| {
+                        known_trees
+                            .get(name.as_str())
+                            .is_some_and(|tree| tree.space(space_id).is_some())
+                            || self.projects.iter().any(|project| {
+                                project.space_id == **space_id
+                                    && project.id == remote_project_id_for_space(space_id, &host)
+                            })
+                            || self.last_space_per_domain.get(name.as_str()) == Some(*space_id)
+                    })
+                })?;
+                Some((from.clone(), (*to).clone()))
+            })
+            .collect()
     }
 
     /// Remember which Space this device is using on a remote server, so the
@@ -8552,8 +8686,8 @@ impl WorkspaceThreadStore {
         ops
     }
 
-    /// `ingest_remote_tree_with` as connecting does it, short of the saved
-    /// hosts: only a live connection keeps its Spaces.
+    /// `ingest_remote_tree_with` as a tree that came over an attached
+    /// connection is taken: only a live connection keeps its Spaces.
     #[cfg(test)]
     fn ingest_remote_tree(&mut self, domain_name: &str, tree: &codec::ThinkTermTree) -> bool {
         self.ingest_remote_tree_with(domain_name, tree, &remote_domain_is_live)
@@ -8581,9 +8715,10 @@ impl WorkspaceThreadStore {
     ) -> bool {
         // A Space this device holds under another name for the same server
         // -- one nothing goes by any more, such as the name of a host since
-        // deleted and saved again -- is this server's all the same. Its
-        // Spaces come over to this name; left behind, they could neither
-        // connect nor show up here.
+        // deleted and saved again, or the same machine's other saved host,
+        // on the other network, while it is not connected -- is this
+        // server's all the same. Its Spaces come over to this name; left
+        // behind, they could neither connect nor show up here.
         let taken_over: Vec<(SpaceId, String)> = tree
             .spaces
             .iter()
@@ -8599,6 +8734,18 @@ impl WorkspaceThreadStore {
                 "{domain_name} takes Space {space_id} over from {other}: the same server, \
                  reached under another name"
             );
+            // What this device keeps per server comes along, as when a host is
+            // renamed (`move_spaces_to_domain`): where its folders show, and
+            // that it has been heard from. Left under the other name, both
+            // were groomed away with its last Space.
+            if let Some(local) = self.server_folder_spaces.get(other).cloned() {
+                self.server_folder_spaces
+                    .entry(domain_name.to_string())
+                    .or_insert(local);
+            }
+            if self.synced_server_domains.contains(other) {
+                self.synced_server_domains.insert(domain_name.to_string());
+            }
         }
         let held = |space: &Space| {
             space.client_domain.as_deref() == Some(domain_name)
@@ -11791,14 +11938,26 @@ impl WorkspaceThreadStore {
     }
 
     fn ensure_mux_domain_space(&mut self, domain_name: &str) -> MuxDomainSpacePlan {
+        self.ensure_mux_domain_space_with(domain_name, &remote_domain_is_live)
+    }
+
+    /// `ensure_mux_domain_space`, with `is_live` saying which other
+    /// connections are up.
+    fn ensure_mux_domain_space_with(
+        &mut self,
+        domain_name: &str,
+        is_live: &dyn Fn(&str) -> bool,
+    ) -> MuxDomainSpacePlan {
         let store = self;
         let label = crate::ssh_hosts::connect_domain_label(domain_name);
 
         // A server can host several Spaces. Land on the one this device was last
-        // using; failing that its first Space; and only create one when we have
+        // using; failing that its first Space; failing that, one of its Spaces
+        // held through its other name, up now; and only create one when we have
         // never connected (or the server told us it has none).
         let space_id = store
             .preferred_space_for_domain(domain_name)
+            .or_else(|| store.space_on_same_server(domain_name, is_live))
             .unwrap_or_else(|| {
                 store.invented_server_domains.insert(domain_name.to_string());
                 store.create_space_record_for_domain(label.clone(), Some(domain_name.to_string()))
@@ -16526,6 +16685,149 @@ mod tests {
         assert!(local.client_domain.is_none());
     }
 
+    /// One machine saved twice, on the system network and on the embedded
+    /// tailnet: both records stay, and its Spaces go with whichever of the
+    /// two is connected rather than staying with the record that had them.
+    #[test]
+    fn a_machine_saved_on_two_networks_shows_its_spaces_on_the_one_connected() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &sample_tree()));
+        let held_by = |store: &WorkspaceThreadStore| {
+            store
+                .spaces
+                .iter()
+                .filter(|space| space.id == "space-remote")
+                .map(|space| space.client_domain.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Reached over the tailnet with the other network down: its rows
+        // come too, so the tailnet's threads open in them.
+        assert!(store.ingest_remote_tree(tailnet, &sample_tree()));
+        assert_eq!(held_by(&store), vec![Some(tailnet.to_string())]);
+        assert!(store
+            .projects
+            .iter()
+            .any(|project| project.id == "rp1" && project.space_id == "space-remote"));
+
+        // The other network coming up meanwhile takes nothing from it...
+        assert!(!store.ingest_remote_tree_with(lan, &sample_tree(), &|name| name == tailnet));
+        assert_eq!(held_by(&store), vec![Some(tailnet.to_string())]);
+
+        // ...and the first tree it gets once the tailnet is down takes them
+        // back. Nothing hands them over at the moment the tailnet drops.
+        assert!(store.ingest_remote_tree(lan, &sample_tree()));
+        assert_eq!(held_by(&store), vec![Some(lan.to_string())]);
+    }
+
+    /// Opened under its other name while the name holding its Spaces is up,
+    /// a machine lands in them: no Space is invented here, and none is sent
+    /// to the server for every device to show. Each switch of network did
+    /// that once the Spaces could move between the two names.
+    #[test]
+    fn opening_a_machine_under_its_other_name_lands_in_its_spaces() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &sample_tree()));
+        assert!(store.remember_space_for_domain("space-remote"));
+        // The tailnet took them over while the other network was down.
+        assert!(store.ingest_remote_tree(tailnet, &sample_tree()));
+        let spaces_before = store.spaces.len();
+
+        let plan = store.ensure_mux_domain_space_with(lan, &|name| name == tailnet);
+        assert_eq!(plan.space_id, "space-remote");
+        assert_eq!(store.spaces.len(), spaces_before);
+        assert!(!store.invented_server_domains.contains(lan));
+
+        // Not remembered, its own project in one still says it was this
+        // name's Space.
+        store.last_space_per_domain.remove(lan);
+        assert_eq!(
+            store
+                .space_on_same_server(lan, &|name| name == tailnet)
+                .as_deref(),
+            Some("space-remote")
+        );
+
+        // With the name holding them down, connecting goes the first way: a
+        // stand-in, until this connection's tree takes them back.
+        assert!(store.space_on_same_server(lan, &|_| false).is_none());
+        // A machine never connected under this name is not taken for it.
+        assert!(store
+            .space_on_same_server("Other Server", &|name| name == tailnet)
+            .is_none());
+    }
+
+    /// Taking a machine's Spaces over brings what this device keeps for its
+    /// server along: where its folders show, and that it has been heard from.
+    /// Left under the old name, both went with its last Space.
+    #[test]
+    fn spaces_taken_over_keep_where_their_folders_show() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &sample_tree()));
+        let local = store.spaces[0].id.clone();
+        store
+            .server_folder_spaces
+            .insert(lan.to_string(), local.clone());
+        store.synced_server_domains.insert(lan.to_string());
+
+        assert!(store.ingest_remote_tree(tailnet, &sample_tree()));
+        store.groom_server_folder_spaces();
+        assert_eq!(store.server_folder_spaces.get(tailnet), Some(&local));
+        assert!(store.synced_server_domains.contains(tailnet));
+    }
+
+    /// Deleting the record that holds a machine's Spaces hands them to its
+    /// other saved name, when something shows that name reaches the same
+    /// server, and the references into them stay.
+    #[test]
+    fn deleting_one_of_two_records_for_a_machine_hands_its_spaces_over() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &sample_tree()));
+        assert!(store.ingest_remote_tree(tailnet, &sample_tree()));
+        let gone = vec![tailnet.to_string()];
+        let saved: std::collections::HashSet<String> = vec![lan.to_string()].into_iter().collect();
+        let handed = vec![(tailnet.to_string(), lan.to_string())];
+
+        // Nothing says the record left reaches that server: dropped, as ever.
+        assert!(store
+            .same_server_handovers(&gone, &saved, &HashMap::new())
+            .is_empty());
+        // Its last tree carried them...
+        let trees: HashMap<String, codec::ThinkTermTree> =
+            vec![(lan.to_string(), sample_tree())].into_iter().collect();
+        assert_eq!(store.same_server_handovers(&gone, &saved, &trees), handed);
+        // ...or it was last on one of them.
+        store
+            .last_space_per_domain
+            .insert(lan.to_string(), "space-remote".to_string());
+        assert_eq!(
+            store.same_server_handovers(&gone, &saved, &HashMap::new()),
+            handed
+        );
+        // A name going as well inherits nothing.
+        let both = vec![tailnet.to_string(), lan.to_string()];
+        assert!(store
+            .same_server_handovers(&both, &saved, &trees)
+            .is_empty());
+
+        // References into them follow the Spaces, so dropping those of the
+        // deleted name spares them.
+        let local = store.spaces[0].id.clone();
+        assert!(store.add_thread_ref(&local, "rt1"));
+        assert!(store.move_spaces_to_domain(tailnet, lan));
+        store.groom_thread_refs();
+        store.purge_refs_for_machines(&gone);
+        assert!(store.holds_thread_ref(&local, "rt1"));
+    }
+
     #[test]
     fn a_host_reached_under_a_new_name_takes_its_spaces_along() {
         let mut store = remote_test_store("syd-before");
@@ -17455,6 +17757,17 @@ mod tests {
             false,
             true
         ));
+    }
+
+    /// A tree played again for a connection that is down takes no Spaces
+    /// from another name, live or not; one that came over an attached
+    /// connection takes them from a name that is not live.
+    #[test]
+    fn a_tree_played_again_while_down_takes_no_spaces() {
+        assert!(another_name_keeps_its_spaces(false, false));
+        assert!(another_name_keeps_its_spaces(false, true));
+        assert!(another_name_keeps_its_spaces(true, true));
+        assert!(!another_name_keeps_its_spaces(true, false));
     }
 
     /// A tree that predates the one we hold is stale news, whichever route it

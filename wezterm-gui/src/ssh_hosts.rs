@@ -1277,6 +1277,9 @@ pub fn forget_spaces_of_deleted_hosts() {
     if unreachable.is_empty() {
         return;
     }
+    // The machine may still be saved under its other name -- the other
+    // network -- which then keeps them.
+    crate::workspace_threads::hand_spaces_to_same_server(&unreachable, &connect_domain_names());
     for space_id in crate::workspace_threads::space_ids_for_domains(&unreachable) {
         match crate::workspace_threads::forget_space_locally(&space_id) {
             Ok(_) => log::info!(

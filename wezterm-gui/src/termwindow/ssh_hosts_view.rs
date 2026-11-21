@@ -1500,21 +1500,26 @@ impl SshHostsView {
         else {
             return ContentViewResponse::Redraw;
         };
-        // Read what this host brought in while the record naming it is still
-        // here. A ThinkTerm Connect host mirrors whole Spaces from its mux
-        // server, and those are keyed by domain name, not by host id -- so
+        // A ThinkTerm Connect host mirrors whole Spaces from its mux server,
+        // and those are keyed by domain name, not by host id -- so
         // `remove_project` below, which matches the host id, never sees them.
         // Left behind they are unreachable: nothing resolves the domain to
         // connect, and every rename or delete is refused because it has to go
         // through a server this device can no longer name.
         let host_domains = ssh_hosts::domain_names_for_host(&entry.spec);
-        let orphaned_spaces = workspace_threads::space_ids_for_domains(&host_domains);
 
         if let Err(err) = ssh_hosts::try_remove_host(host_id) {
             log::error!("failed to delete SSH host {host_id}: {err:#}");
             self.refresh();
             return ContentViewResponse::Redraw;
         }
+        // Unless the machine is still saved under its other name -- the other
+        // network -- which then keeps them, and the references into them.
+        workspace_threads::hand_spaces_to_same_server(
+            &host_domains,
+            &ssh_hosts::connect_domain_names(),
+        );
+        let orphaned_spaces = workspace_threads::space_ids_for_domains(&host_domains);
         let _ = workspace_threads::remove_project(host_id);
         // References into this host's mux Spaces would otherwise linger as
         // permanent grey rows: with the host record gone, nothing can ever
