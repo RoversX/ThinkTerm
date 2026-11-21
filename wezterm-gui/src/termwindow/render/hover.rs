@@ -1,5 +1,6 @@
 //! Hover surfaces: the tag an icon-only button or a cut-short row shows,
-//! and the cards a thread row and an Agents panel row show. One look for
+//! and the cards a thread row, an Agents panel row and a window tab whose
+//! title is cut short show. One look for
 //! all of them, the right-click menu's: its card colours, a hairline border
 //! and the soft two-layer shadow. They appear after a pause; once one has
 //! shown, the next one shows at once, as on the Mac.
@@ -11,6 +12,7 @@
 
 use crate::agent_status::{self, AgentPaneStatus, AgentPanelAction, ShownState};
 use crate::quad::TripleLayerQuadAllocator;
+use crate::tabbar::TabBarItem;
 use crate::termwindow::ui::agent_panel::{
     agent_row_title, agent_state_icon, agent_state_key, agent_title, brand_of, working_subtasks,
     AGENT_PROGRESS_HEIGHT,
@@ -40,6 +42,9 @@ const CARD_WIDTH: f32 = 560.0;
 /// Lines an agent card gives its title and its description.
 const CARD_TITLE_LINES: usize = 2;
 const CARD_MESSAGE_LINES: usize = 4;
+/// Lines a window tab's card gives the title the tab cut; one longer still
+/// fades out at the end of the last.
+const TAB_CARD_TITLE_LINES: usize = 4;
 /// Between a surface and what it describes, and between a card's parts.
 const GAP: f32 = 16.0;
 /// Between a tag's label and its shortcut.
@@ -106,6 +111,12 @@ impl TermWindow {
             };
             let style = self.hover_style()?;
             self.paint_agent_hover_card(&item, agent, &style)?;
+            return Ok(true);
+        }
+        if let Some(title) = self.window_tab_cut_title(&item.item_type) {
+            let title = title.to_string();
+            let style = self.hover_style()?;
+            self.paint_window_tab_hover_card(&item, &title, &style)?;
             return Ok(true);
         }
         let agents = crate::termwindow::thread_card_agents(&item.item_type);
@@ -390,6 +401,109 @@ impl TermWindow {
         let x = (if on_right { right } else { left }).clamp(0.0, (window_w - card_w).max(0.0));
         let y = (item.y as f32).min(window_h - card_h).max(0.0);
         (x, y)
+    }
+
+    /// The whole title of the window tab `item_type` names, when the tab had
+    /// to cut it the last time the row painted: what its card shows. `None`
+    /// for a tab whose title reads in full, and for anything else.
+    pub(crate) fn window_tab_cut_title(&self, item_type: &UIItemType) -> Option<&str> {
+        if !matches!(
+            item_type,
+            UIItemType::TabBar(TabBarItem::Tab { .. } | TabBarItem::ContentView { .. })
+        ) {
+            return None;
+        }
+        self.window_tab_cut_titles
+            .iter()
+            .find(|(item, _)| item == item_type)
+            .map(|(_, title)| title.as_str())
+    }
+
+    /// A window tab's card: the title the tab had no room for, whole, in as
+    /// many lines as it takes up to `TAB_CARD_TITLE_LINES`. Under the tab
+    /// rather than beside it, where its neighbours are, and from its left
+    /// edge, where the title starts. As wide as its text, up to a card's
+    /// width or the tab's, whichever is wider: a wide tab's card wrapping
+    /// its title narrower than the tab would read as less of it.
+    fn paint_window_tab_hover_card(
+        &mut self,
+        item: &UIItem,
+        title: &str,
+        style: &HoverStyle,
+    ) -> anyhow::Result<()> {
+        let window_w = self.dimensions.pixel_width as f32;
+        let window_h = self.dimensions.pixel_height as f32;
+        let CardFrame {
+            pad_x,
+            pad_y,
+            gap,
+            spacing,
+            line,
+            ..
+        } = self.card_frame(style);
+        let edge = gap / 2.0;
+        let widest = self
+            .ui_f32(CARD_WIDTH)
+            .max(item.width as f32)
+            .min(window_w - edge * 2.0);
+        let room = (widest - pad_x * 2.0).max(1.0);
+        let lines = self.wrap_hover_text(
+            &style.strong,
+            &style.strong_metrics,
+            title,
+            room,
+            TAB_CARD_TITLE_LINES,
+        )?;
+        let mut text_w = 0.0f32;
+        for range in &lines {
+            text_w = text_w.max(self.cached_ui_text_advance(
+                &style.strong,
+                &style.strong_metrics,
+                &title[range.clone()],
+            )?);
+        }
+        let text_w = text_w.min(room).ceil();
+        let count = lines.len().max(1);
+        let card_w = text_w + pad_x * 2.0;
+        let card_h = line * count as f32 + spacing * (count - 1) as f32 + pad_y * 2.0;
+        let (x, y) = card_under(
+            (
+                item.x as f32,
+                item.y as f32,
+                item.width as f32,
+                item.height as f32,
+            ),
+            (card_w, card_h),
+            (window_w, window_h),
+            edge,
+        );
+
+        let gl_state = self.render_state.as_ref().context("hover render state")?;
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::TOOLTIP_ZINDEX)
+            .context("tab card layer")?;
+        let mut layers = layer.quad_allocator();
+        self.paint_hover_surface(
+            &mut layers,
+            style,
+            euclid::rect(x, y, card_w, card_h),
+            self.ui_f32(CARD_RADIUS),
+        )?;
+        let mut cy = y + pad_y;
+        for range in &lines {
+            self.paint_agent_text(
+                &mut layers,
+                &style.strong,
+                style.strong_metrics,
+                &title[range.clone()],
+                (x + pad_x).round() as usize,
+                cy.round() as usize,
+                text_w as usize,
+                style.palette.text,
+            )?;
+            cy += line + spacing;
+        }
+        Ok(())
     }
 
     /// `in_active_pane`: the agent is in the pane the user is in.
@@ -993,6 +1107,30 @@ impl TermWindow {
     }
 }
 
+/// Where a card `card` (width, height) goes under the item at `item` (x, y,
+/// width, height) in a window `window` (width, height), `gap` clear of it:
+/// from the item's left edge, moved in where it would run past the window's
+/// right, and above the item where there is no room below.
+fn card_under(
+    item: (f32, f32, f32, f32),
+    card: (f32, f32),
+    window: (f32, f32),
+    gap: f32,
+) -> (f32, f32) {
+    let (item_x, item_y, _, item_h) = item;
+    let (card_w, card_h) = card;
+    let (window_w, window_h) = window;
+    let x = item_x.min(window_w - gap - card_w).max(0.0);
+    let below = item_y + item_h + gap;
+    let above = item_y - gap - card_h;
+    let y = if below + card_h <= window_h || above < 0.0 {
+        below.min((window_h - card_h).max(0.0))
+    } else {
+        above
+    };
+    (x, y)
+}
+
 /// Pane `pane_id` as `thinkterm cli --pane` names it, so that what a card
 /// says is what a program types: `MACHINE/ID` for one on a server, its
 /// number on the session server for one that server keeps for this machine,
@@ -1154,7 +1292,37 @@ pub(crate) fn same_hover_target(a: &UIItemType, b: &UIItemType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{label_changes_in, wrap_glyphs};
+    use super::{card_under, label_changes_in, wrap_glyphs};
+
+    #[test]
+    fn a_tab_card_goes_under_the_tab_from_its_left_edge() {
+        let window = (1600.0, 1000.0);
+        // Under the tab, its left edge with the tab's.
+        assert_eq!(
+            card_under((400.0, 0.0, 320.0, 80.0), (500.0, 120.0), window, 8.0),
+            (400.0, 88.0)
+        );
+        // A tab near the right edge moves its card in, clear of the edge.
+        assert_eq!(
+            card_under((1400.0, 0.0, 320.0, 80.0), (500.0, 120.0), window, 8.0),
+            (1092.0, 88.0)
+        );
+        // A card wider than the window starts at its left edge.
+        assert_eq!(
+            card_under((400.0, 0.0, 320.0, 80.0), (1700.0, 120.0), window, 8.0).0,
+            0.0
+        );
+        // A row at the bottom has its cards above it.
+        assert_eq!(
+            card_under((400.0, 920.0, 320.0, 80.0), (500.0, 120.0), window, 8.0),
+            (400.0, 792.0)
+        );
+        // With room on neither side, it stays inside the window.
+        assert_eq!(
+            card_under((400.0, 40.0, 320.0, 80.0), (500.0, 990.0), window, 8.0).1,
+            10.0
+        );
+    }
 
     /// One unit of advance per character, the cluster its byte offset.
     fn lines(text: &str, width: f32, max: usize) -> Vec<&str> {

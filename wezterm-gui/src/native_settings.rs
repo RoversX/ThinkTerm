@@ -1313,6 +1313,11 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) right_sidebar_open_with_app: Option<NativeOpenWithApp>,
     pub(crate) right_sidebar_custom_open_with_apps: Vec<NativeOpenWithApp>,
     pub(crate) tab_font_size: Option<f64>,
+    /// How wide a tab in the window's tab row is, in design pixels, over
+    /// the configuration's `window_tab_width`. `None` follows the
+    /// configuration.
+    #[serde(deserialize_with = "window_tab_width_or_default")]
+    pub(crate) tab_width: Option<usize>,
     pub(crate) pane_header_font_size: Option<f64>,
     /// Workspace-thread statuses hidden by the sidebar view-options filter,
     /// as stable keys ("idle", "running", "needs-attention", "finished").
@@ -3435,6 +3440,67 @@ pub(crate) fn tab_font_size() -> f64 {
         .clamp(10.0, 28.0)
 }
 
+/// The narrowest and widest a window tab can be made, in design pixels, and
+/// the step Settings moves it by. Below the least a tab has no room left for
+/// its title between its icon and its close button.
+pub(crate) const WINDOW_TAB_WIDTH_LEAST: usize = 200;
+pub(crate) const WINDOW_TAB_WIDTH_MOST: usize = 1200;
+pub(crate) const WINDOW_TAB_WIDTH_STEP: usize = 40;
+
+/// How wide a window tab is, in design pixels: Settings' width where one is
+/// set, else the configuration's `window_tab_width`, kept to what a tab can
+/// be.
+pub(crate) fn window_tab_width_in(settings: &ThinkTermNativeSettings, configured: usize) -> usize {
+    settings
+        .chrome
+        .tab_width
+        .unwrap_or(configured)
+        .clamp(WINDOW_TAB_WIDTH_LEAST, WINDOW_TAB_WIDTH_MOST)
+}
+
+/// [`window_tab_width_in`] the settings in use.
+pub(crate) fn window_tab_width(config: &ConfigHandle) -> usize {
+    window_tab_width_in(&load_shared(), config.window_tab_width)
+}
+
+/// The width a Settings step takes a window tab to from `current`: the next
+/// whole step up or down, so that an odd width from the configuration file
+/// comes onto the steps, kept to what a tab can be.
+pub(crate) fn step_window_tab_width(current: usize, up: bool) -> usize {
+    let step = WINDOW_TAB_WIDTH_STEP;
+    let next = if up {
+        (current / step + 1) * step
+    } else {
+        current.saturating_sub(1) / step * step
+    };
+    next.clamp(WINDOW_TAB_WIDTH_LEAST, WINDOW_TAB_WIDTH_MOST)
+}
+
+/// A window tab width, whatever shape a hand edit gave it, as
+/// [`window_opacity_or_default`] reads an opacity: one field that fails to
+/// parse would lose the whole file. A fractional width is rounded and one
+/// out of range brought into it; anything else is no setting at all.
+fn window_tab_width_or_default<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw.as_f64() {
+        Some(number) if number.is_finite() => Some(
+            number
+                .round()
+                .clamp(WINDOW_TAB_WIDTH_LEAST as f64, WINDOW_TAB_WIDTH_MOST as f64)
+                as usize,
+        ),
+        _ => {
+            if !raw.is_null() {
+                log::warn!("unknown tab_width {raw} in the settings; following the configuration");
+            }
+            None
+        }
+    })
+}
+
 pub(crate) fn pane_header_font_size(settings: &ThinkTermNativeSettings) -> f64 {
     settings
         .chrome
@@ -3802,6 +3868,74 @@ mod tests {
                 "{written}"
             );
         }
+    }
+
+    #[test]
+    fn a_hand_edited_tab_width_never_costs_the_file() {
+        for (written, read) in [
+            ("480", Some(480)),
+            ("480.4", Some(480)),
+            ("20", Some(WINDOW_TAB_WIDTH_LEAST)),
+            ("100000", Some(WINDOW_TAB_WIDTH_MOST)),
+            ("-5", Some(WINDOW_TAB_WIDTH_LEAST)),
+            ("\"wide\"", None),
+            ("null", None),
+        ] {
+            let json = format!(
+                r#"{{"appearance":{{"theme_mode":"dark"}},"chrome":{{"tab_width":{written},"tab_font_size":15.0}}}}"#
+            );
+            let settings: ThinkTermNativeSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(settings.chrome.tab_width, read, "{written}");
+            // The rest of the file still counts.
+            assert_eq!(settings.chrome.tab_font_size, Some(15.0), "{written}");
+            assert_eq!(
+                settings.appearance.theme_mode,
+                NativeThemeMode::Dark,
+                "{written}"
+            );
+        }
+        // Absent, it is no setting, and it is written back as none.
+        let settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.chrome.tab_width, None);
+        let json = serde_json::to_string(&settings).unwrap();
+        let again: ThinkTermNativeSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.chrome.tab_width, None);
+    }
+
+    #[test]
+    fn a_window_tab_is_as_wide_as_settings_say_else_as_the_configuration_says() {
+        let mut settings = ThinkTermNativeSettings::default();
+        let configured = ConfigHandle::default_config().window_tab_width;
+        assert_eq!(configured, 320);
+        assert_eq!(window_tab_width_in(&settings, configured), 320);
+        assert_eq!(window_tab_width_in(&settings, 520), 520);
+        // Out of range in the configuration file is brought into it.
+        assert_eq!(window_tab_width_in(&settings, 10), WINDOW_TAB_WIDTH_LEAST);
+        assert_eq!(window_tab_width_in(&settings, 9000), WINDOW_TAB_WIDTH_MOST);
+        // Settings' width wins while it is set.
+        settings.chrome.tab_width = Some(640);
+        assert_eq!(window_tab_width_in(&settings, 520), 640);
+        settings.chrome.tab_width = None;
+        assert_eq!(window_tab_width_in(&settings, 520), 520);
+    }
+
+    #[test]
+    fn a_tab_width_step_lands_on_the_steps_and_stays_in_range() {
+        assert_eq!(step_window_tab_width(320, true), 360);
+        assert_eq!(step_window_tab_width(320, false), 280);
+        // An odd width from the configuration file comes onto the steps.
+        assert_eq!(step_window_tab_width(330, true), 360);
+        assert_eq!(step_window_tab_width(330, false), 320);
+        assert_eq!(
+            step_window_tab_width(WINDOW_TAB_WIDTH_LEAST, false),
+            WINDOW_TAB_WIDTH_LEAST
+        );
+        assert_eq!(
+            step_window_tab_width(WINDOW_TAB_WIDTH_MOST, true),
+            WINDOW_TAB_WIDTH_MOST
+        );
+        assert_eq!(WINDOW_TAB_WIDTH_LEAST % WINDOW_TAB_WIDTH_STEP, 0);
+        assert_eq!(WINDOW_TAB_WIDTH_MOST % WINDOW_TAB_WIDTH_STEP, 0);
     }
 
     #[test]

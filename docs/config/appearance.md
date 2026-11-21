@@ -281,8 +281,16 @@ details.
   causes the tab bar to be hidden when there is only a single tab.
 * [tab_bar_at_bottom](lua/config/tab_bar_at_bottom.md) places the tab
   bar at the bottom of the window instead of the top
+* [window_tab_width](lua/config/window_tab_width.md) sets how wide each tab
+  in the window's top tab row is, in design pixels (two to a point; default
+  320, kept between 200 and 1200). When the tabs do not all fit, the row
+  scrolls. **Settings › Appearance › Tab Width** sets it too and wins while
+  it is set; its reset button hands the width back to the option. A tab
+  whose title does not fit shows the whole title in a card when the pointer
+  rests on it.
 * [tab_max_width](lua/config/tab_max_width.md) sets the maximum width, measured in cells,
-  of a given tab when using retro tab mode.
+  of a given tab when using retro tab mode. It does not apply to the top tab
+  row's tabs: those follow `window_tab_width`.
 
 #### Native (Fancy) Tab Bar appearance
 

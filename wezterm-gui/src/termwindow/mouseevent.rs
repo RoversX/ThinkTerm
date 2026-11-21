@@ -542,8 +542,9 @@ impl super::TermWindow {
 
     /// How many surfaces the window tab row paints: the mux tabs plus the
     /// synthetic content-view tabs. Counted off `tab_bar` rather than the mux
-    /// window so this matches `paint_fancy_tab_bar` frame for frame — tab width
-    /// now depends on the count, so a stale one would resize every tab.
+    /// window so this matches `paint_fancy_tab_bar` frame for frame — how far
+    /// the row scrolls depends on the count, so a stale one would strand the
+    /// last tab out of reach or leave dead scroll past it.
     pub(super) fn window_tab_bar_item_count(&self) -> usize {
         let mux_tabs = if self.active_content_view_is_remote_thread() {
             0
@@ -557,17 +558,19 @@ impl super::TermWindow {
         mux_tabs + self.content_view_count()
     }
 
+    /// Width of one window tab: `window_tab_width`, or the width Settings
+    /// sets over it, however many tabs the row holds. As with
+    /// `TAB_MIN_WIDTH`, tabs give up nothing to crowding: the width is the
+    /// one asked for, and a row with more than fit scrolls.
     pub(super) fn window_tab_width_pixels(&self) -> f32 {
-        self.adaptive_tab_width(
-            self.window_tab_bar_item_count(),
-            self.window_tab_viewport_width(),
-            self.window_tab_gap_pixels(),
-        )
+        let width = crate::native_settings::window_tab_width(&self.config) as f32;
+        // Whole pixels, as `adaptive_tab_width` gives the pane nav row.
+        self.ui_f32(width).floor()
     }
 
     /// The collapsed pane strip still sizes its chips off the terminal cell
-    /// grid; only the window tab row and the pane nav bar moved to
-    /// `adaptive_tab_width`.
+    /// grid and `tab_max_width`; the window tab row (`window_tab_width`) and
+    /// the pane nav bar (`adaptive_tab_width`) size theirs as chrome.
     pub(super) fn collapsed_pane_tab_width_pixels(&self) -> f32 {
         let cell_width = self.render_metrics.cell_size.width.max(1) as f32;
         (self.config.tab_max_width as f32 * cell_width)
@@ -1939,6 +1942,8 @@ impl super::TermWindow {
                 crate::termwindow::tooltip_label_for(&item.item_type).is_some()
                     || crate::termwindow::thread_has_card(&item.item_type)
                     || crate::termwindow::render::hover::agent_card_pane(&item.item_type).is_some()
+                    // A tab whose title the row had to cut.
+                    || self.window_tab_cut_title(&item.item_type).is_some()
             })
             // The dynamic half of the rule: no tag over a live rename
             // editor, and none for a file row whose label already reads in

@@ -103,6 +103,10 @@ pub const WINDOW_TAB_RADIUS: f32 = 999.0;
 /// than to the terminal grid. A roomy row parks every tab at the target width;
 /// crowding shrinks them all evenly down to the floor, and only past the floor
 /// does the row scroll.
+///
+/// This is the pane nav row's. The window tab row's is the configuration's
+/// `window_tab_width`, or Settings' over it, whose default is this same
+/// width; it never shrinks either (see `window_tab_width_pixels`).
 pub const TAB_TARGET_WIDTH: f32 = 320.0;
 /// How far tabs give up width before the row scrolls instead.
 ///

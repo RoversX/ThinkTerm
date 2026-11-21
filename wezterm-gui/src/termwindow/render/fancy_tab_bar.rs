@@ -47,6 +47,8 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
         defer_trailing_actions: bool,
     ) -> anyhow::Result<Vec<UIItem>> {
+        // A tab that is not painted has no card either.
+        self.window_tab_cut_titles.clear();
         let chrome = self.chrome();
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
         if row_height == 0 || !self.window_tab_row_drawn() {
@@ -166,6 +168,7 @@ impl crate::TermWindow {
 
         let tab_step = tab_width + self.ui_px(WINDOW_TAB_GAP);
         let mut tab_sequence_idx = 0usize;
+        let mut cut_titles = Vec::new();
         if show_mux_tabs {
             for item in self.tab_bar.items() {
                 let TabBarItem::Tab { tab_idx, active } = item.item else {
@@ -189,7 +192,7 @@ impl crate::TermWindow {
                     continue;
                 }
 
-                self.paint_window_tab(
+                let cut = self.paint_window_tab(
                     layers,
                     &mut ui_items,
                     item,
@@ -212,6 +215,13 @@ impl crate::TermWindow {
                     background,
                     if active { foreground } else { muted_fg },
                 )?;
+                if let Some(title) = cut {
+                    // Keyed as the tab's item is, `active` as painted.
+                    cut_titles.push((
+                        UIItemType::TabBar(TabBarItem::Tab { tab_idx, active }),
+                        title,
+                    ));
+                }
             }
         }
 
@@ -230,7 +240,7 @@ impl crate::TermWindow {
                 let visible_width = (visible_right - visible_left).max(0.0);
                 if visible_width > 1.0 {
                     let active = active_content_view_id == Some(content_tab.id);
-                    self.paint_content_view_tab(
+                    let cut = self.paint_content_view_tab(
                         layers,
                         &mut ui_items,
                         content_tab.id,
@@ -252,9 +262,16 @@ impl crate::TermWindow {
                         background,
                         if active { foreground } else { muted_fg },
                     )?;
+                    if let Some(title) = cut {
+                        cut_titles.push((
+                            UIItemType::TabBar(TabBarItem::ContentView { id: content_tab.id }),
+                            title,
+                        ));
+                    }
                 }
             }
         }
+        self.window_tab_cut_titles = cut_titles;
 
         // Dissolve the row into the bar wherever it runs on past the viewport,
         // so a clipped tab reads as continuing rather than as one sliced in
@@ -1022,6 +1039,7 @@ impl crate::TermWindow {
         )
     }
 
+    /// Returns the tab's whole title when it did not fit, for its hover card.
     #[allow(clippy::too_many_arguments)]
     fn paint_window_tab(
         &self,
@@ -1046,7 +1064,7 @@ impl crate::TermWindow {
         chrome: UiPalette,
         background: LinearRgba,
         foreground: LinearRgba,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         let hover_x = visible_left.max(0.0) as usize;
         let hover_width = visible_width.max(0.0) as usize;
         let is_hovered = self.is_pointer_over_ui_rect(hover_x, row_y, hover_width, row_height);
@@ -1217,7 +1235,7 @@ impl crate::TermWindow {
         };
         let text_width = text_right.saturating_sub(text_x);
         let text_y = row_y + (row_height.saturating_sub(metrics.cell_size.height as usize) / 2);
-        if text_width > 0 {
+        let cut_title = if text_width > 0 {
             let text_fg = if is_renaming {
                 self.filled_rectangle(
                     layers,
@@ -1244,8 +1262,11 @@ impl crate::TermWindow {
                 text_y,
                 text_width,
                 text_fg,
-            )?;
-        }
+            )?
+        } else {
+            Some(fancy_tab_title_text(&item.title, item.status.is_some()))
+                .filter(|text| !text.trim().is_empty())
+        };
 
         drop(content_layers);
         content
@@ -1263,9 +1284,11 @@ impl crate::TermWindow {
                 1.0,
             )
             .context("window tab content")?;
-        Ok(())
+        Ok(cut_title)
     }
 
+    /// Returns the tab's whole title when it did not fit, as
+    /// `paint_window_tab` does.
     #[allow(clippy::too_many_arguments)]
     fn paint_content_view_tab(
         &self,
@@ -1289,7 +1312,7 @@ impl crate::TermWindow {
         chrome: UiPalette,
         background: LinearRgba,
         foreground: LinearRgba,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         let is_hovered = self.is_pointer_over_ui_rect(
             visible_left.max(0.0) as usize,
             row_y,
@@ -1398,12 +1421,11 @@ impl crate::TermWindow {
         let text_right = close_x.saturating_sub(self.ui_px(WINDOW_TAB_ICON_GAP));
         let text_width = text_right.saturating_sub(text_x);
         let text_y = row_y + (row_height.saturating_sub(metrics.cell_size.height as usize) / 2);
-        if text_width > 0 {
-            let line = Line::from_text(title, &CellAttributes::blank(), 0, None);
-            self.paint_fancy_tab_text(
-                layers, font, &line, false, text_x, text_y, text_width, foreground,
-            )?;
-        }
+        let line = Line::from_text(title, &CellAttributes::blank(), 0, None);
+        // With no room at all, it is all cut.
+        let cut_title = self.paint_fancy_tab_text(
+            layers, font, &line, false, text_x, text_y, text_width, foreground,
+        )?;
 
         drop(content_layers);
         content
@@ -1421,7 +1443,7 @@ impl crate::TermWindow {
                 1.0,
             )
             .context("content view tab content")?;
-        Ok(())
+        Ok(cut_title)
     }
 
     /// A square icon button at the row's end: the new-tab button, the pin.
@@ -1609,6 +1631,9 @@ impl crate::TermWindow {
         )
     }
 
+    /// A tab's title in `width`, fading out where it runs over. Returns the
+    /// whole title when it did not fit, or had no room to show at all: what
+    /// the tab's hover card shows.
     #[allow(clippy::too_many_arguments)]
     fn paint_fancy_tab_text(
         &self,
@@ -1620,30 +1645,22 @@ impl crate::TermWindow {
         y: usize,
         width: usize,
         foreground: LinearRgba,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
+        let text = fancy_tab_title_text(title, strip_leading_progress);
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let cell_width = (metrics.cell_size.width as usize).max(1);
         let min_width = WINDOW_TAB_MIN_TEXT_COLS * cell_width;
         if width < min_width {
-            return Ok(());
+            return Ok(Some(text));
         }
-
-        let mut text = String::new();
-        let mut trimming_legacy_progress = strip_leading_progress;
-        for cell in title.visible_cells() {
-            let value = cell.str();
-            if trimming_legacy_progress {
-                if is_legacy_progress_marker(value) {
-                    continue;
-                }
-                if text.is_empty() && value.trim().is_empty() {
-                    continue;
-                }
-                trimming_legacy_progress = false;
-            }
-            text.push_str(value);
-        }
-        self.paint_fading_title(layers, font, &metrics, &text, x, y, width, foreground)
+        // The same sum `paint_title_fading_with` fades by, from the same
+        // cached shaping.
+        let cut = self.cached_ui_text_advance(font, &metrics, &text)? > width as f32;
+        self.paint_fading_title(layers, font, &metrics, &text, x, y, width, foreground)?;
+        Ok(cut.then_some(text))
     }
 
     /// A tab's `title` in `width`. One too long goes out towards the end of
@@ -2281,6 +2298,28 @@ fn horizontal_texture_clip(
         texture_left: texture_left + texture_width * left_fraction,
         texture_right: texture_left + texture_width * right_fraction,
     })
+}
+
+/// The text a tab shows of `title`: its visible cells, less a leading
+/// progress glyph (and the space after it) a program put there when the
+/// tab draws its status itself.
+fn fancy_tab_title_text(title: &Line, strip_leading_progress: bool) -> String {
+    let mut text = String::new();
+    let mut trimming_legacy_progress = strip_leading_progress;
+    for cell in title.visible_cells() {
+        let value = cell.str();
+        if trimming_legacy_progress {
+            if is_legacy_progress_marker(value) {
+                continue;
+            }
+            if text.is_empty() && value.trim().is_empty() {
+                continue;
+            }
+            trimming_legacy_progress = false;
+        }
+        text.push_str(value);
+    }
+    text
 }
 
 fn is_legacy_progress_marker(value: &str) -> bool {

@@ -1223,6 +1223,7 @@ impl SettingsSection {
                 "Settings UI Font Size",
                 "Workspace Sidebar Font Size",
                 "Tab Bar Font Size",
+                "Tab Width",
                 "Pane Header Font Size",
                 "Settings UI Font Weight",
                 "Typography",
@@ -1463,6 +1464,7 @@ impl SettingsSection {
                 && [
                     "settings-window-opacity",
                     "settings-window-tabs",
+                    "settings-tab-width",
                     "settings-thread-icons",
                     "settings-thread-status",
                     "settings-agents-status",
@@ -2451,6 +2453,9 @@ enum SettingsAction {
     DecreaseChromeFontSize(ChromeFontArea),
     IncreaseChromeFontSize(ChromeFontArea),
     ResetChromeFontSize(ChromeFontArea),
+    DecreaseWindowTabWidth,
+    IncreaseWindowTabWidth,
+    ResetWindowTabWidth,
     DecreaseSettingsFontWeight,
     IncreaseSettingsFontWeight,
     ResetSettingsFontWeight,
@@ -5808,6 +5813,43 @@ impl SettingsWindow {
         self.save_native_chrome_settings(area);
     }
 
+    /// The width the window tabs are drawn at: this window's setting, else
+    /// the configuration's `window_tab_width`.
+    fn current_window_tab_width(&self) -> usize {
+        crate::native_settings::window_tab_width_in(
+            &self.native_settings,
+            configuration().window_tab_width,
+        )
+    }
+
+    fn step_window_tab_width(&mut self, up: bool) {
+        let value =
+            crate::native_settings::step_window_tab_width(self.current_window_tab_width(), up);
+        self.save_window_tab_width(Some(value));
+    }
+
+    /// Made to the latest settings, as the terminal font's edits are: this
+    /// window's copy can be older than what another window saved. `None`
+    /// hands the width back to the configuration.
+    fn save_window_tab_width(&mut self, width: Option<usize>) {
+        let setting = crate::i18n::tr("settings-tab-width");
+        match crate::native_settings::update(|settings| settings.chrome.tab_width = width) {
+            Ok(saved) => {
+                self.set_native_settings((*saved).clone());
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+                self.status = settings_tr("settings-status-saved", &[("setting", setting)]);
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn current_settings_font_weight_value(&self) -> f64 {
         crate::native_settings::settings_font_weight(&self.native_settings) as f64
     }
@@ -8308,6 +8350,9 @@ impl SettingsWindow {
             SettingsAction::DecreaseChromeFontSize(area) => self.step_chrome_font_size(area, -1.0),
             SettingsAction::IncreaseChromeFontSize(area) => self.step_chrome_font_size(area, 1.0),
             SettingsAction::ResetChromeFontSize(area) => self.reset_chrome_font_size(area),
+            SettingsAction::DecreaseWindowTabWidth => self.step_window_tab_width(false),
+            SettingsAction::IncreaseWindowTabWidth => self.step_window_tab_width(true),
+            SettingsAction::ResetWindowTabWidth => self.save_window_tab_width(None),
             SettingsAction::DecreaseSettingsFontWeight => self.step_settings_font_weight(-100),
             SettingsAction::IncreaseSettingsFontWeight => self.step_settings_font_weight(100),
             SettingsAction::ResetSettingsFontWeight => self.reset_settings_font_weight(),
@@ -10979,6 +11024,25 @@ impl SettingsWindow {
                 SettingsAction::IncreaseChromeFontSize(area),
             )?;
             band_y += band;
+            if area == ChromeFontArea::TabBar {
+                // How wide the tabs are, under their text size and its
+                // number: together the two decide how much of a title a
+                // tab shows.
+                self.paint_compact_stepper_row(
+                    layers,
+                    x + indent,
+                    band_y,
+                    width - indent,
+                    band,
+                    &crate::i18n::tr("settings-tab-width"),
+                    "settings-tab-width-description",
+                    self.current_window_tab_width() as f64,
+                    SettingsAction::ResetWindowTabWidth,
+                    SettingsAction::DecreaseWindowTabWidth,
+                    SettingsAction::IncreaseWindowTabWidth,
+                )?;
+                band_y += band;
+            }
         }
         self.paint_separator(layers, x + indent, band_y, width - indent)?;
         let (tx, tw) = self.paint_band_tile(
@@ -11685,6 +11749,13 @@ impl SettingsWindow {
             SettingsAction::ResetChromeFontSize(area)
             | SettingsAction::DecreaseChromeFontSize(area)
             | SettingsAction::IncreaseChromeFontSize(area) => Some(area),
+            // The tabs' width lights the tab bar, as their text size does.
+            SettingsAction::ResetWindowTabWidth
+            | SettingsAction::DecreaseWindowTabWidth
+            | SettingsAction::IncreaseWindowTabWidth
+            | SettingsAction::Hint("settings-tab-width-description") => {
+                Some(ChromeFontArea::TabBar)
+            }
             SettingsAction::Hint(key) => TYPOGRAPHY_FONT_AREAS
                 .iter()
                 .copied()

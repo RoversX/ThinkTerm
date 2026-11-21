@@ -552,10 +552,19 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_and_split_indices_are_zero_based: bool,
 
-    /// Specifies the maximum width that a tab can have in the
-    /// tab bar.  Defaults to 16 glyphs in width.
+    /// Specifies the maximum width, in cells, that a tab can have in the
+    /// retro tab bar (`use_fancy_tab_bar = false`). Defaults to 16 glyphs
+    /// in width. The tabs in the window's top tab row are sized by
+    /// `window_tab_width` instead.
     #[dynamic(default = "default_tab_max_width")]
     pub tab_max_width: usize,
+
+    /// How wide each tab in the window's top tab row is, in design pixels
+    /// (two to a point, as for `note_reading_max_width`), whatever its
+    /// title. A row with more tabs than fit scrolls. Settings › Appearance ›
+    /// Tab Width sets the same width and wins while it is set.
+    #[dynamic(default = "default_window_tab_width")]
+    pub window_tab_width: usize,
 
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
@@ -2206,6 +2215,10 @@ fn default_enq_answerback() -> String {
 
 fn default_tab_max_width() -> usize {
     16
+}
+
+fn default_window_tab_width() -> usize {
+    320
 }
 
 fn default_update_interval() -> u64 {
