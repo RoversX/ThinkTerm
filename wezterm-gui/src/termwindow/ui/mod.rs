@@ -115,9 +115,17 @@ impl crate::TermWindow {
         match glass {
             // Over a see-through window the edge takes none of its dark,
             // which would darken what shows through, as a shadow would.
-            Some(edge) => {
-                self.paint_glass_edge(layers, layer_num, rect, radius, edge, !see_through)
-            }
+            // Both that window's frame and high contrast's hairline are a
+            // line under the glass, which it keeps clear of.
+            Some(edge) => self.paint_glass_edge(
+                layers,
+                layer_num,
+                rect,
+                radius,
+                edge,
+                !see_through,
+                see_through || self.glass_high_contrast(),
+            ),
             None => Ok(()),
         }
     }

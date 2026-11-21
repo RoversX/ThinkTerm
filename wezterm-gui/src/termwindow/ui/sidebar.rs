@@ -4423,8 +4423,18 @@ impl crate::TermWindow {
             self.fill_rounded_rectangle(layers, 0, rect, edge.fill(fill, ground), radius)?;
         }
         // Over a see-through window the edge takes none of its dark, which
-        // would darken what shows through, as a shadow would.
-        self.paint_glass_edge(layers, 0, rect, radius, edge, !see_through)
+        // would darken what shows through, as a shadow would. Both that
+        // window's frame and high contrast's hairline are a line under the
+        // glass, which it keeps clear of.
+        self.paint_glass_edge(
+            layers,
+            0,
+            rect,
+            radius,
+            edge,
+            !see_through,
+            see_through || self.glass_high_contrast(),
+        )
     }
 
     /// One of the sidebar's add buttons: an action button whose circle shows
