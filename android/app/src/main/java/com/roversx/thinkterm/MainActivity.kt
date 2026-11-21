@@ -1,10 +1,12 @@
 package com.roversx.thinkterm
 
 import android.content.pm.ApplicationInfo
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
@@ -19,6 +21,9 @@ import androidx.compose.ui.Modifier
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        // 15 and later lay every screen out under the system's bars by
+        // themselves; 13 and 14 are asked to, so the app looks the same.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         // The core opens the faces as files, so they leave the APK once.
         Assets.install(this)

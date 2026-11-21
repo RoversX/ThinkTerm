@@ -27,11 +27,19 @@ android {
 
     defaultConfig {
         applicationId = "com.roversx.thinkterm"
-        minSdk = 35
+        // Android 13: the glass (RuntimeShader) needs it.
+        minSdk = 33
         targetSdk = 36
         versionCode = versionCodeOf(thinktermVersion)
         versionName = thinktermVersion
-        ndk { abiFilters += listOf("arm64-v8a") }
+        // Phones are arm64. An emulator on a PC, with no ARM translation,
+        // takes x86_64 too: -PthinktermAbis=arm64-v8a,x86_64, with the Rust
+        // library built for it beside the arm64 one.
+        ndk {
+            abiFilters += providers.gradleProperty("thinktermAbis").orNull
+                ?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
+                ?.takeIf { it.isNotEmpty() } ?: listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
