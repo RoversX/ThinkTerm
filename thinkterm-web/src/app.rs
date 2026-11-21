@@ -666,6 +666,9 @@ pub struct Inner<P: Platform, L: Link> {
     /// The tab the page last claimed on its own, on showing it; see
     /// `show`. A tab is claimed once per showing, not on every listing.
     auto_claimed: Option<TabId>,
+    /// Whether this page held the terminal when it last looked; see
+    /// `take_back_a_hold_let_go`.
+    held_lease: bool,
     /// The page is in its phone shape (`body[data-mobile]`), read at each
     /// resize: the grid is padded differently there.
     mobile: bool,
@@ -1000,6 +1003,7 @@ impl<P: Platform, L: Link> App<P, L> {
             tab_layout: None,
             following: true,
             auto_claimed: None,
+            held_lease: false,
             mobile: false,
             on_change: None,
             notify_pending: Rc::new(Cell::new(false)),
@@ -1924,6 +1928,7 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             Pdu::ClientViewportState(_) | Pdu::FrontendAccessState(_) => {
                 drop(inner);
+                self.take_back_a_hold_let_go();
                 // The desktop may have resized: the panes are listed again
                 // and the page's report follows that listing (a report
                 // from the old frames would not compose to the new size);
@@ -1951,6 +1956,27 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             _ => {}
         }
+    }
+
+    /// The terminal this page held, let go to nobody, is taken back by the
+    /// listing that follows a lease push, as a fresh showing takes a tab.
+    /// That is the server dropping this device's connection that a redial
+    /// has replaced: the server tells the two apart by the proxy each came
+    /// through (`ClientId::same_logical_client`), this page does not, so
+    /// the redial looked held by it until the old one went. Taken by
+    /// anyone else, it stays theirs; and a claim that did not take is not
+    /// tried again from here, the page holding nothing since.
+    fn take_back_a_hold_let_go(self: &Rc<Self>) {
+        let mut inner = self.inner.borrow_mut();
+        let (holds, let_go) = {
+            let lease = inner.link.lease();
+            let handoff = matches!(lease.mode, Some(codec::FrontendAccessMode::Handoff));
+            (lease.owns_viewport(), handoff && lease.ownerless())
+        };
+        if inner.held_lease && !holds && let_go {
+            inner.auto_claimed = None;
+        }
+        inner.held_lease = holds;
     }
 
     pub fn on_close(self: &Rc<Self>, reason: String) {
@@ -4537,7 +4563,10 @@ impl<P: Platform, L: Link> App<P, L> {
             // Handoff is exclusive: a terminal someone holds is taken by a
             // press on the card, never by a page merely opening.
             let held_exclusively = lease.needs_claim() && lease.owner.is_some();
-            showing && !lease.owns_viewport() && !held_exclusively
+            let holds = lease.owns_viewport();
+            drop(lease);
+            inner.held_lease = holds;
+            showing && !holds && !held_exclusively
         };
         if claim {
             self.take_over_with(true);
@@ -7555,6 +7584,7 @@ impl<P: Platform, L: Link> App<P, L> {
         self.spawn(async move {
             let after = match link.claim(tab_id).await {
                 Ok(true) => {
+                    app.inner.borrow_mut().held_lease = true;
                     // Back to the page's own size, and the grid with it.
                     app.match_desktop_cell();
                     app.refresh_status();

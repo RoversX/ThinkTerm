@@ -97,7 +97,12 @@ pub async fn attach<L: Link>(
     )
     .await?;
     ProtocolMismatch::check(&version)?;
-    link.lease_mut().server_id = Some(version.server_id.clone());
+    {
+        let mut lease = link.lease_mut();
+        lease.server_id = Some(version.server_id.clone());
+        // Perhaps another server process, counting from the start.
+        lease.forget_generations();
+    }
 
     link.lease_mut().me = Some(me.clone());
     request(
@@ -222,7 +227,12 @@ pub async fn reattach<L: Link>(
     )
     .await?;
     ProtocolMismatch::check(&version)?;
-    link.lease_mut().server_id = Some(version.server_id.clone());
+    {
+        let mut lease = link.lease_mut();
+        lease.server_id = Some(version.server_id.clone());
+        // Perhaps another server process, counting from the start.
+        lease.forget_generations();
+    }
 
     let me = link
         .lease()

@@ -49,6 +49,17 @@ pub struct Lease {
     /// (the pane is smaller by its bar), and a report with the wrong
     /// root would resize the tab to it.
     pub tab_sizes: HashMap<TabId, TerminalSize>,
+    /// The generation of the access state taken last, and of each tab's
+    /// viewport state: the server's own counter, which orders what it
+    /// says, as the desktop orders it (`accepts_generation` in
+    /// wezterm-client). Pushes reach a connection late -- the server sends
+    /// them from its main thread -- and one older than what this page
+    /// already knows is not taken: the release of this device's dropped
+    /// connection, say, landing after the redial's report took the
+    /// terminal back, which would leave the page offering a terminal it
+    /// holds. Forgotten at every attach (`forget_generations`).
+    pub access_generation: Option<u64>,
+    pub viewport_generations: HashMap<TabId, u64>,
 }
 
 fn same_client(a: &ClientId, b: &ClientId) -> bool {
@@ -74,11 +85,31 @@ impl Lease {
     }
 
     pub fn apply_access(&mut self, access: &codec::FrontendAccessState) {
+        if self.access_generation.is_some_and(|known| access.generation < known) {
+            return;
+        }
+        self.access_generation = Some(access.generation);
         self.mode = Some(access.mode);
         self.owner = access.owner.clone();
     }
 
+    /// A new connection may be to a new server process, whose counters
+    /// start again below what this page remembers: kept, that memory would
+    /// turn away every state it sends, the one that makes this page the
+    /// holder too.
+    pub fn forget_generations(&mut self) {
+        self.access_generation = None;
+        self.viewport_generations.clear();
+    }
+
     pub fn apply_viewport(&mut self, state: &codec::ClientViewportState) {
+        // Older than what is known of the tab: its access snapshot is as
+        // old, and nothing of it is taken.
+        let known = self.viewport_generations.get(&state.tab_id);
+        if known.is_some_and(|known| state.generation < *known) {
+            return;
+        }
+        self.viewport_generations.insert(state.tab_id, state.generation);
         // The size lays out a whole tab; one no screen could have is not
         // taken, though who holds the tab still is.
         let size = thinkterm_proto::layout::terminal_size_is_plausible(&state.canonical_size)
@@ -231,6 +262,46 @@ mod tests {
         lease.apply_viewport(&state(7, Some(id(1))));
         assert!(lease.owns_viewport());
     }
+
+    #[test]
+    fn a_state_older_than_the_one_known_is_not_taken() {
+        let mut lease = Lease {
+            me: Some(id(1)),
+            tab_id: Some(7),
+            ..Lease::default()
+        };
+        let access = |owner, generation| codec::FrontendAccessState {
+            mode: codec::FrontendAccessMode::Handoff,
+            owner,
+            generation,
+        };
+        let state = |owner, generation| codec::ClientViewportState {
+            tab_id: 7,
+            owner: None,
+            canonical_size: TerminalSize::default(),
+            view: None,
+            generation,
+            access: access(owner, generation),
+        };
+        // A redial's report took the terminal back (generation 6); the
+        // release of the connection it replaced, published at 5, comes
+        // after it.
+        lease.apply_viewport(&state(Some(id(1)), 6));
+        assert!(lease.owns_viewport());
+        lease.apply_access(&access(None, 5));
+        assert!(lease.owns_viewport(), "a late, older release changes nothing");
+        lease.apply_viewport(&state(None, 5));
+        assert!(lease.owns_viewport(), "nor does a late, older viewport state");
+        // What comes after it is taken, the same generation again too.
+        lease.apply_access(&access(Some(id(2)), 6));
+        assert!(!lease.owns_viewport());
+        lease.apply_access(&access(None, 9));
+        assert!(lease.ownerless());
+        // Another server process counts from the start.
+        lease.forget_generations();
+        lease.apply_access(&access(Some(id(1)), 1));
+        assert!(lease.owns_viewport(), "a new server's first state is taken");
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +336,8 @@ mod claim_tests {
             native_root: None,
             fit: false,
             tab_sizes: HashMap::new(),
+            access_generation: None,
+            viewport_generations: HashMap::new(),
         }
     }
     fn grid(l: &Lease) -> Option<TerminalSize> {
