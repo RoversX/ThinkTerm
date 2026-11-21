@@ -359,6 +359,9 @@ EXTRA = {
     # the right sidebar
     "panel.right": ["Right Sidebar", "右侧栏", "右サイドバー", "Barre latérale droite", "Rechte Seitenleiste"],
     "panel.agents": ["Agents", "Agents", "エージェント", "Agents", "Agenten"],
+    # Under an agent's open sub-tasks: how many more there are than it
+    # lists, as the desktop's right-agents-more-subtasks says it.
+    "agents.more": ["%d more", "还有 %d 个", "ほか %d 件", "%d de plus", "%d weitere"],
     # how the sidebar shows the Spaces
     "i.spaces": ["Spaces in the Sidebar", "侧栏里的 Space", "サイドバーの Space", "Spaces dans la barre latérale", "Spaces in der Seitenleiste"],
     "i.spaces.list": ["List", "列表", "リスト", "Liste", "Liste"],

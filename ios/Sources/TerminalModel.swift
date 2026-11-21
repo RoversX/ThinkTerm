@@ -1022,6 +1022,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     func takeOver() { core.takeOver() }
 
+    /// Open or fold the sub-task list of the agent in `pane`.
+    func toggleSubtasks(pane: Int) { core.agentToggleSubtasks(pane: UInt32(pane)) }
+
     /// The text between two visible cells of the focused pane, for the
     /// clipboard, as the core reads it from the cells; the pane's own
     /// selection is left be. A copy waits for the core.

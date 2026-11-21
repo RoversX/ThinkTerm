@@ -63,7 +63,20 @@ data class AgentRow(
     val paneCard: String?,
     val kind: String?,
     val said: String?,
+    /// How far it got, 0 to 100, when it says.
+    val progress: Int?,
+    /// "7 sub-tasks · 5 working": the one line its sub-tasks fold into;
+    /// empty when it has none.
+    val subtasksSummary: String,
+    val subtasksOpen: Boolean,
+    /// While that line is open: the sub-tasks listed, and how many more.
+    val subtasks: List<AgentSubtask>,
+    val moreSubtasks: Int,
 )
+
+/// One of an agent's sub-tasks: `state` is "working", "blocked", "error",
+/// "done" or "idle".
+data class AgentSubtask(val state: String, val label: String)
 
 data class NavView(
     val rect: NavRect,
@@ -371,6 +384,11 @@ object Views {
                     paneCard = optString(r, "pane_card"),
                     kind = optString(r, "kind"),
                     said = optString(r, "said"),
+                    progress = r.takeIf { it.has("progress") && !it.isNull("progress") }?.optInt("progress"),
+                    subtasksSummary = r.optString("subtasks_summary"),
+                    subtasksOpen = r.optBoolean("subtasks_open"),
+                    subtasks = r.optJSONArray("subtasks").map { AgentSubtask(it.optString("state"), it.optString("label")) },
+                    moreSubtasks = r.optInt("more_subtasks"),
                 )
             },
             summary = root.optString("summary"),

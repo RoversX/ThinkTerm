@@ -576,12 +576,20 @@ fun HomeRow(
     /// Unfolded (true), folded (false), or nothing to fold (null).
     chevron: Boolean? = null,
     trailing: (@Composable () -> Unit)? = null,
+    /// More under the subtitle, in the text's column: an agent's progress
+    /// and sub-tasks. The row then grows down from its first line, which
+    /// keeps the lead and the end in line with it.
+    below: (@Composable () -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
     val primary = MaterialTheme.colorScheme.onSurface
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     val rowGlass = LocalRowGlass.current
+    // With something below, each piece is centred on the first line's
+    // height rather than on the whole row's.
+    val line = if (below != null) Modifier.heightIn(min = 44.dp) else Modifier
+    val grows = below != null
     Row(
         Modifier
             .fillMaxWidth()
@@ -600,32 +608,44 @@ fun HomeRow(
             )
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(start = (12 + depth * 18).dp, end = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment = if (grows) Alignment.Top else Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         when {
-            lead != null -> lead()
-            icon != null -> Box(Modifier.width(24.dp), contentAlignment = Alignment.Center) {
+            lead != null -> FirstLine(grows) { lead() }
+            icon != null -> Box(line.width(24.dp), contentAlignment = Alignment.Center) {
                 DesktopIcon(icon, tint = secondary)
             }
         }
         Column(Modifier.weight(1f)) {
-            Text(
-                title,
-                fontSize = 16.sp,
-                fontWeight = if (bold || lead != null) FontWeight.SemiBold else FontWeight.Normal,
-                color = if (dim) secondary else primary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (subtitle != null) {
-                Text(subtitle, fontSize = 13.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Column(line, verticalArrangement = Arrangement.Center) {
+                Text(
+                    title,
+                    fontSize = 16.sp,
+                    fontWeight = if (bold || lead != null) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (dim) secondary else primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (subtitle != null) {
+                    Text(subtitle, fontSize = 13.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
             }
+            if (below != null) below()
         }
-        if (trailing != null) CompositionLocalProvider(LocalContentColor provides secondary) { trailing() }
-        if (mark != null) Box(Modifier.padding(end = 4.dp)) { mark() }
-        if (chevron != null) {
+        if (trailing != null) FirstLine(grows) {
+            CompositionLocalProvider(LocalContentColor provides secondary) { trailing() }
+        }
+        if (mark != null) FirstLine(grows) { Box(Modifier.padding(end = 4.dp)) { mark() } }
+        if (chevron != null) FirstLine(grows) {
             DesktopIcon("chevron-right", size = 14.dp, tint = secondary, modifier = Modifier.rotate(if (chevron) 90f else 0f))
         }
     }
+}
+
+/// `content` centred on a row's first line when the row grows below it
+/// (`HomeRow`'s `below`); left as it is otherwise.
+@Composable
+private fun FirstLine(grows: Boolean, content: @Composable () -> Unit) {
+    if (grows) Box(Modifier.heightIn(min = 44.dp), contentAlignment = Alignment.CenterStart) { content() } else content()
 }

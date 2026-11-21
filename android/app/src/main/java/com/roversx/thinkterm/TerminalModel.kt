@@ -699,6 +699,9 @@ class TerminalModel(
 
     fun takeOver() = core.takeOver()
 
+    /// Open or fold the sub-task list of the agent in `pane`.
+    fun toggleSubtasks(pane: Int) = core.agentToggleSubtasks(pane.toUInt())
+
     /// The selected text to the clipboard, and the selection put away.
     fun copySelection() {
         core.selectedText()?.takeIf { it.isNotEmpty() }?.let { copyToClipboard(it) }

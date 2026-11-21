@@ -98,15 +98,82 @@ struct RightPanel: View {
     private func agentRow(_ row: AgentRow) -> some View {
         // What it said about itself, else what it waits for, else its title.
         let detail = [row.said, row.kind, row.title].compactMap { $0 }.first { !$0.isEmpty }
+        let more = row.progress != nil || !row.subtasks_summary.isEmpty
         return SidebarRow(
             lead: AnyView(ThreadCards(core: model.core, icons: [row.pane_card ?? model.tabs?.icon].compactMap { $0 }, revision: model.iconsRevision)),
             mark: AnyView(ThreadMark(status: Self.status(row.state), dot: "Open", size: 9)),
             title: row.place.isEmpty ? row.name : row.place,
-            subtitle: detail
+            subtitle: detail,
+            below: more ? AnyView(agentMore(row)) : nil
         ) {
             model.chromeClick("pane", pane: row.pane)
             done()
         }
+        // The row is one element to VoiceOver: the fold is one of its
+        // actions there.
+        .accessibilityActions {
+            if !row.subtasks_summary.isEmpty {
+                Button(row.subtasks_summary) { model.toggleSubtasks(pane: row.pane) }
+            }
+        }
+    }
+
+    /// What an agent said of its progress under its row, as the web's
+    /// panel shows it: how far it got, and its sub-tasks folded into one
+    /// line that a tap opens into the list.
+    @ViewBuilder
+    private func agentMore(_ row: AgentRow) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let progress = row.progress {
+                ProgressView(value: Double(min(max(progress, 0), 100)), total: 100)
+                    .progressViewStyle(.linear)
+                    .tint(.accentColor)
+                    .padding(.vertical, 4)
+            }
+            if !row.subtasks_summary.isEmpty {
+                // A target of its own inside the row: it opens or folds the
+                // list rather than showing the pane.
+                Button {
+                    model.toggleSubtasks(pane: row.pane)
+                } label: {
+                    HStack(spacing: 6) {
+                        DesktopIcon(name: "chevron-right", size: 12)
+                            .foregroundColor(.secondary)
+                            .rotationEffect(.degrees(row.subtasks_open ? 90 : 0))
+                        Text(row.subtasks_summary)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(minHeight: 32)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if row.subtasks_open {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(row.subtasks.enumerated()), id: \.offset) { _, sub in
+                            HStack(spacing: 6) {
+                                ThreadMark(status: Self.status(sub.state), dot: "Open", size: 7)
+                                Text(sub.label)
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        if row.more_subtasks > 0 {
+                            Text(tr("agents.more", row.more_subtasks))
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.leading, 18)
+                    .padding(.bottom, 8)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, row.subtasks_open ? 0 : 4)
     }
 
     /// An agent's state as the thread's whose mark stands for it.

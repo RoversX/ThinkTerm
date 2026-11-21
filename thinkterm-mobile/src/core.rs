@@ -147,6 +147,8 @@ pub enum Cmd {
     },
     SetSpace(String),
     TakeOver,
+    /// Open or fold an agent's sub-task list in the Agents panel.
+    AgentToggleSubtasks(u32),
     Pointer {
         kind: String,
         x: f64,
@@ -763,6 +765,14 @@ impl State {
             Cmd::TakeOver => {
                 if let Some(app) = self.app.clone() {
                     app.take_over();
+                }
+            }
+            Cmd::AgentToggleSubtasks(pane) => {
+                if let Some(app) = &self.app {
+                    app.agent_toggle_subtasks(pane as usize);
+                    // The App tells of no change for a fold, as the page
+                    // redraws the panel itself: the views are made again.
+                    self.views_dirty.set(true);
                 }
             }
             Cmd::Pointer { kind, x, y } => {

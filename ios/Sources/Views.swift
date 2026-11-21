@@ -79,7 +79,23 @@ struct AgentRow: Decodable, Hashable, Identifiable {
     var pane_card: String?
     var kind: String?
     var said: String?
+    /// How far it got, 0 to 100, when it says.
+    var progress: Int?
+    /// "7 sub-tasks · 5 working": the one line its sub-tasks fold into;
+    /// empty when it has none.
+    var subtasks_summary: String
+    var subtasks_open: Bool
+    /// While that line is open: the sub-tasks listed, and how many more.
+    var subtasks: [AgentSubtask]
+    var more_subtasks: Int
     var id: Int { pane }
+}
+
+/// One of an agent's sub-tasks: "working", "blocked", "error", "done" or
+/// "idle", and what it is.
+struct AgentSubtask: Decodable, Hashable {
+    var state: String
+    var label: String
 }
 
 /// The panes of the tab on show, each where the split puts it, in cells

@@ -835,6 +835,12 @@ impl Core {
         let _ = self.tx.send(core::Cmd::TakeOver);
     }
 
+    /// Open or fold the sub-task list of the agent in `pane`, in the
+    /// Agents panel (`agents`: a row's `subtasks_open`).
+    pub fn agent_toggle_subtasks(&self, pane: u32) {
+        let _ = self.tx.send(core::Cmd::AgentToggleSubtasks(pane));
+    }
+
     /// A touch on the terminal, in points: "down", "move" or "up".
     pub fn pointer(&self, kind: String, x: f64, y: f64) {
         let _ = self.tx.send(core::Cmd::Pointer { kind, x, y });

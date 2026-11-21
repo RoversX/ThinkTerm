@@ -589,12 +589,16 @@ struct SidebarRow: View {
     /// Unfolded (true), folded (false), or nothing to fold (nil).
     var chevron: Bool?
     var trailing: AnyView?
+    /// More under the subtitle, in the text's column: an agent's progress
+    /// and sub-tasks. The row then grows down from its first line, which
+    /// keeps the lead and the end in line with it.
+    var below: AnyView?
     var action: () -> Void
 
     init(
         icon: String? = nil, lead: AnyView? = nil, mark: AnyView? = nil, title: String, subtitle: String? = nil,
         depth: Int = 0, bold: Bool = false, dim: Bool = false, selected: Bool = false,
-        chevron: Bool? = nil, trailing: AnyView? = nil, action: @escaping () -> Void
+        chevron: Bool? = nil, trailing: AnyView? = nil, below: AnyView? = nil, action: @escaping () -> Void
     ) {
         self.icon = icon
         self.lead = lead
@@ -607,11 +611,15 @@ struct SidebarRow: View {
         self.selected = selected
         self.chevron = chevron
         self.trailing = trailing
+        self.below = below
         self.action = action
     }
 
     var body: some View {
-        HStack(spacing: 12) {
+        // With something below, each piece is centred on the first line's
+        // height rather than on the whole row's.
+        let line: CGFloat? = below == nil ? nil : 44
+        HStack(alignment: below == nil ? .center : .top, spacing: 12) {
             Group {
                 if let lead {
                     lead
@@ -621,23 +629,29 @@ struct SidebarRow: View {
             }
             // A thread's cards keep the room the core says a row keeps.
             .frame(width: lead == nil ? 24 : nil)
+            .frame(minHeight: line)
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.body.weight(bold || lead != nil ? .semibold : .regular))
-                    .foregroundColor(dim ? .secondary : .primary)
-                    .lineLimit(1)
-                if let subtitle {
-                    Text(subtitle).font(.footnote).foregroundColor(.secondary).lineLimit(1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.body.weight(bold || lead != nil ? .semibold : .regular))
+                        .foregroundColor(dim ? .secondary : .primary)
+                        .lineLimit(1)
+                    if let subtitle {
+                        Text(subtitle).font(.footnote).foregroundColor(.secondary).lineLimit(1)
+                    }
                 }
+                .frame(minHeight: line)
+                if let below { below }
             }
             Spacer(minLength: 0)
-            if let trailing { trailing }
+            if let trailing { trailing.frame(minHeight: line) }
             // A thread's mark ends its row, as on the desktop.
-            if let mark { mark.padding(.trailing, 4) }
+            if let mark { mark.padding(.trailing, 4).frame(minHeight: line) }
             if let chevron {
                 DesktopIcon(name: "chevron-right", size: 14)
                     .foregroundColor(.secondary)
                     .rotationEffect(.degrees(chevron ? 90 : 0))
+                    .frame(minHeight: line)
             }
         }
         .padding(.leading, 12 + CGFloat(depth) * 18)
