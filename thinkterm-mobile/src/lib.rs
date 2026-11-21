@@ -58,7 +58,9 @@ pub trait Notify: Send + Sync {
     /// the jump host's (`connect`'s `jump`) when `jump`, else the host's.
     fn on_host_key_required(&self, request_id: String, fingerprint: String, jump: bool);
     /// Something the App publishes for the display layer, keyed: "bg" is
-    /// the terminal's background as a hex colour, for the chrome around it.
+    /// the terminal's background as a hex colour, for the chrome around it;
+    /// "link" is "down" from the moment the App's connection drops until it
+    /// is back, "up" then, said on screen or off.
     fn on_published(&self, key: String, value: String);
     /// A pane rang its bell.
     fn on_bell(&self);

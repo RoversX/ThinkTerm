@@ -1,18 +1,23 @@
 package com.roversx.thinkterm
 
+import android.Manifest
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -79,6 +84,21 @@ private fun Root(store: HostStore, debuggable: Boolean) {
         }
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
+    }
+    // The notification that keeps connections up while the app is away
+    // (ConnectionService) is asked leave to show once, when the first one
+    // comes up. Refused, the service keeps them all the same, unseen.
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    val anyUp = Sessions.all.any { it.connection.startsWith("pane ") }
+    LaunchedEffect(anyUp) {
+        val settings = AppSettings.get(context)
+        if (anyUp && settings.keepSessionInBackground && !settings.notificationsAsked &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            settings.notificationsAsked = true
+            askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
     var page by remember { mutableStateOf(Page.THREADS) }
     var open by remember { mutableStateOf<Host?>(null) }

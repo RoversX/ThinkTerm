@@ -4,6 +4,11 @@
     <!-- To hear of the default network changing (Sessions.watchNetwork). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- The service that keeps the connections up while the app is out of
+         sight, and its notification (ConnectionService). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Nothing here is backed up or moved to another device: the
          private keys and passwords are bound to this device's keystore,
          and a copy of their file elsewhere would be unreadable at best. -->
@@ -24,5 +29,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".ConnectionService"
+            android:exported="false"
+            android:stopWithTask="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the SSH terminal sessions the user opened connected while the app is in the background, as an SSH client does; it runs only while a session is connected or connecting and ends with the last one." />
+        </service>
     </application>
 </manifest>

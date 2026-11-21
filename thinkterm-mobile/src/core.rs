@@ -262,6 +262,8 @@ struct State {
     /// The GPU state until the App takes it over.
     gpu: Option<Gpu>,
     app: Option<Rc<MobileApp>>,
+    /// The App's connection was down when last told (`report_link`).
+    link_down: bool,
     target: Option<Target>,
     next_generation: u64,
     /// One per link made; a network event from an older one is dropped.
@@ -357,6 +359,7 @@ pub fn run(
         state.pool.run_until_stalled();
         state.platform.fire_due();
         state.pool.run_until_stalled();
+        state.report_link();
         state.publish_views();
     }
     state.disconnect();
@@ -387,6 +390,7 @@ impl State {
             adapter: None,
             gpu: None,
             app: None,
+            link_down: false,
             target: None,
             next_generation: 1,
             link_serial: 0,
@@ -489,6 +493,20 @@ impl State {
         // would otherwise pull every view at each paint.
         if views_dirty {
             self.notify.on_change();
+        }
+    }
+
+    /// The App's connection went down -- redialing by itself, or left for
+    /// the user -- or came back: the shell hears at once, on screen or off
+    /// (`Notify::on_published`, "link"), where the views wait for the
+    /// screen. What keeps a phone's connections up while the app is away
+    /// goes by it (Android's `ConnectionService`).
+    fn report_link(&mut self) {
+        let down = self.app.as_ref().is_some_and(|app| !app.connected());
+        if down != self.link_down {
+            self.link_down = down;
+            let said = if down { "down" } else { "up" };
+            self.notify.on_published("link".into(), said.into());
         }
     }
 

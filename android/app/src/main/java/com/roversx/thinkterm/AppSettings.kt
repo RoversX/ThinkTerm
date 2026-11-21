@@ -96,7 +96,10 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     var keepAliveSeconds by pref("conn.keepalive", 30)
     /// Hold the connection when the app goes to the background; off,
     /// drop it at once and redial on return.
-    var keepSessionInBackground by pref("conn.background", true)
+    var keepSessionInBackground by pref("conn.background", true) { Sessions.connectionsChanged() }
+    /// The notification that keeps connections up (`ConnectionService`) was
+    /// asked leave to show once already.
+    var notificationsAsked by pref("conn.notificationsasked", false)
 
     // MARK: diagnostics
 

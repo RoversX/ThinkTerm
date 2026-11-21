@@ -1,5 +1,6 @@
 package com.roversx.thinkterm
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
@@ -25,9 +26,25 @@ object Sessions {
 
     fun close(hostId: String) {
         models.remove(hostId)?.shutdown()
+        connectionsChanged()
     }
 
     val all: Collection<TerminalModel> get() = models.values
+
+    /// The app's own context, once it has started (`watchNetwork`): the
+    /// application's, which lives as long as the process does.
+    @SuppressLint("StaticFieldLeak")
+    private var app: Context? = null
+
+    /// A connection came up, went or is on its way back: the service that
+    /// keeps them up while the app is out of sight goes on for as long as
+    /// one is, with the setting on (`ConnectionService`).
+    fun connectionsChanged() {
+        val app = app ?: return
+        val kept = if (!AppSettings.get(app).keepSessionInBackground) emptyList()
+        else all.filter { it.keepsUp }.map { it.host.title }.sorted()
+        ConnectionService.keep(app, kept)
+    }
 
     /// When the app last left the screen, on the clock that goes on while
     /// the phone sleeps (the uptime clock stops in deep sleep, and a phone
@@ -54,6 +71,9 @@ object Sessions {
         if (away && all.none { it.picking }) restartTailnet()
         leftAt = null
         all.forEach { it.enteredForeground() }
+        // A connection that came up while the app was away could not start
+        // the service then (the system allows it only from the screen).
+        connectionsChanged()
     }
 
     /// When the node was last made anew from here, on `elapsedRealtime`.
@@ -98,6 +118,7 @@ object Sessions {
     /// Hear from the system when the default network changes: another one,
     /// or one back after none. Once per process.
     fun watchNetwork(context: Context) {
+        app = context.applicationContext
         if (watching) return
         val connectivity = context.applicationContext.getSystemService(ConnectivityManager::class.java) ?: return
         watching = true

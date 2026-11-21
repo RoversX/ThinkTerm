@@ -117,7 +117,8 @@ class TerminalModel(
     /// App takes it back.
     var toastText by mutableStateOf<String?>(null)
         private set
-    /// The App says its connection is down and it is redialing.
+    /// The App's connection is down: redialing by itself, or -- without
+    /// `autoReconnect` -- left for the user's retry (`linkIs`).
     var reconnecting by mutableStateOf(false)
         private set
     /// The terminal's background, as the App paints it: the chrome around
@@ -525,6 +526,15 @@ class TerminalModel(
     val isConnected: Boolean
         get() = connection.isNotEmpty() && !connection.startsWith("disconnected") && !connection.startsWith("failed")
 
+    /// What keeps connections up while the app is away is for this one
+    /// (`Sessions.connectionsChanged`): attached, or redialing by itself
+    /// (the status names the pane all the while), or on its way in -- asked
+    /// for on screen, it may only come up once the app is away. One lost
+    /// and left for the user's retry holds nothing up.
+    val keepsUp: Boolean
+        get() = if (connection.startsWith("pane ")) !(reconnecting && !autoReconnect)
+        else connection.startsWith("connecting") || connection.startsWith("connected")
+
     /// Leaving the screen for good: the frame loop stops, then the core.
     fun shutdown() {
         clearHostKeyRequest()
@@ -765,10 +775,20 @@ class TerminalModel(
 
     private val hideScrollbar = Runnable { scrollShown = false }
 
+    /// The App's connection went down or came back, as the core says it
+    /// on screen or off (`onPublished`'s "link"): the views that also say
+    /// so are read only while someone looks, and what keeps the connection
+    /// up while the app is away goes by it.
+    private fun linkIs(down: Boolean) {
+        if (reconnecting == down) return
+        log(if (down) "link: down" else "link: up")
+        reconnecting = down
+        Sessions.connectionsChanged()
+    }
+
     private fun showToast(toast: Toast?) {
         main.removeCallbacks(expireToast)
         val sticky = toast?.sticky ?: false
-        if (reconnecting != sticky) reconnecting = sticky
         if (toast == null || toast.text.isEmpty()) {
             if (toastText != null) toastText = null
             return
@@ -1025,6 +1045,7 @@ class TerminalModel(
         override fun onStatus(status: String) {
             main.post {
                 connection = status
+                Sessions.connectionsChanged()
                 log("status: $status")
                 if (status.startsWith("pane ")) {
                     attached = true
@@ -1078,9 +1099,13 @@ class TerminalModel(
         }
 
         override fun onPublished(key: String, value: String) {
-            if (key != "bg") return
-            val color = parseHex(value) ?: return
-            main.post { if (background != color) background = color }
+            when (key) {
+                "bg" -> {
+                    val color = parseHex(value) ?: return
+                    main.post { if (background != color) background = color }
+                }
+                "link" -> main.post { linkIs(down = value == "down") }
+            }
         }
 
         override fun onBell() {

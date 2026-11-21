@@ -446,6 +446,15 @@ EXTRA = {
         "C'est la clé de %@, l'hôte de rebond sur le chemin.",
         "Dies ist der Schlüssel von %@, dem Sprunghost auf dem Weg.",
     ],
+    # Android's notification while it keeps connections up in the background
+    "conn.notify.channel": ["Connections", "连接", "接続", "Connexions", "Verbindungen"],
+    "conn.notify.title": [
+        "Keeping connections open",
+        "正在保持连接",
+        "接続を維持しています",
+        "Maintien des connexions",
+        "Verbindungen bleiben offen",
+    ],
 }
 
 
