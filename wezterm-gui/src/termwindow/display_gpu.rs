@@ -14,7 +14,8 @@
 //! adapter wgpu picked when that adapter matches no DRM card with a connected
 //! connector, and only to a surface-compatible adapter that does. When the
 //! sysfs topology is unavailable or inconclusive the original choice stands,
-//! and a configured `webgpu_preferred_adapter` always wins.
+//! and a configured `webgpu_preferred_adapter` or a `HighPerformance` power
+//! preference always wins.
 //!
 //! The compositor's DMA-BUF main device would be the precise signal, but the
 //! Wayland layer does not bind `zwp_linux_dmabuf_v1` feedback yet; matching

@@ -597,13 +597,17 @@ impl WebGpuState {
         // the integrated adapter renders frames that the compositor never
         // presents, leaving a black window. Prefer an adapter that drives a
         // connected display when the one wgpu picked drives none. An explicit
-        // webgpu_preferred_adapter is always honoured.
+        // webgpu_preferred_adapter is always honoured, and so is an explicit
+        // HighPerformance: on the usual hybrid laptop the panel hangs off the
+        // integrated GPU, and the discrete one that person asked for drives
+        // no display of its own.
         #[cfg(target_os = "linux")]
         let adapter = {
             let mut adapter = adapter;
             if config.front_end == config::FrontEndSelection::WebGpu
                 && config.webgpu_preferred_adapter.is_none()
                 && !config.webgpu_force_fallback_adapter
+                && config.webgpu_power_preference == WebGpuPowerPreference::LowPower
             {
                 crate::termwindow::display_gpu::prefer_display_gpu(
                     &instance,
