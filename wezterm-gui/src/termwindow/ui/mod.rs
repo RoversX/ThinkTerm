@@ -2,6 +2,7 @@ pub mod agent_panel;
 pub mod command_palette;
 pub mod context_menu;
 pub mod folder_problem;
+pub mod glass;
 pub mod icons;
 pub mod platform_chrome;
 pub mod plugin_panel;
@@ -47,6 +48,10 @@ impl crate::TermWindow {
     /// it is handed, so a capsule drawn pre-cut turned a 30px remnant of a
     /// 320px pill into its own little lozenge. At full width the radius is the
     /// one every other tab gets, and the clip supplies the hard edge.
+    ///
+    /// The active tab is glass (`glass`), as the selected sidebar row is,
+    /// chosen for the ground both tab rows sit on, the header's. The others
+    /// keep their plain fill.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint_tab_capsule(
         &self,
@@ -61,10 +66,12 @@ impl crate::TermWindow {
         active: bool,
     ) -> anyhow::Result<()> {
         let rect = euclid::rect(0.0, y as f32, width as f32, height as f32);
+        let glass = active.then(|| glass::GlassEdge::over(self.chrome().header_bg));
+        let see_through = self.chrome_see_through();
         // Over a see-through window a tab, as a sidebar row, lets some of
         // what is behind it through: no shadow under it to darken that, and
         // its edge a ring round the fill rather than a coat under it.
-        if self.chrome_see_through() {
+        if see_through {
             use crate::termwindow::ui::tokens::{
                 SEE_THROUGH_BORDER_BOOST, SEE_THROUGH_SURFACE_ALPHA,
             };
@@ -76,7 +83,7 @@ impl crate::TermWindow {
             } else {
                 border
             };
-            return crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
+            crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
                 .draw_rounded_frame(
                     layers,
                     layer_num,
@@ -87,20 +94,32 @@ impl crate::TermWindow {
                     fill.mul_alpha(SEE_THROUGH_SURFACE_ALPHA),
                     border,
                     radius,
-                );
+                )?;
+        } else if let Some(edge) = glass.filter(|_| !self.glass_high_contrast()) {
+            let ground = self.chrome().header_bg;
+            self.fill_rounded_rectangle(layers, layer_num, rect, edge.fill(fill, ground), radius)?;
+        } else {
+            if active {
+                self.paint_active_surface_shadow(layers, layer_num, rect, radius)?;
+            }
+            self.fill_rounded_rectangle_with_border(
+                layers,
+                layer_num,
+                rect,
+                fill,
+                border,
+                radius,
+                crate::termwindow::ui::tokens::CAPSULE_BORDER_WIDTH,
+            )?;
         }
-        if active {
-            self.paint_active_surface_shadow(layers, layer_num, rect, radius)?;
+        match glass {
+            // Over a see-through window the edge takes none of its dark,
+            // which would darken what shows through, as a shadow would.
+            Some(edge) => {
+                self.paint_glass_edge(layers, layer_num, rect, radius, edge, !see_through)
+            }
+            None => Ok(()),
         }
-        self.fill_rounded_rectangle_with_border(
-            layers,
-            layer_num,
-            rect,
-            fill,
-            border,
-            radius,
-            crate::termwindow::ui::tokens::CAPSULE_BORDER_WIDTH,
-        )
     }
 
     /// A short drop shadow under a selected surface — an active tab, a selected

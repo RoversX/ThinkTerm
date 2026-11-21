@@ -7,6 +7,7 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
+use crate::termwindow::ui::glass::GlassEdge;
 use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, MaterialIcon, SvgIcon};
 use crate::termwindow::ui::platform_chrome;
 use crate::termwindow::ui::sidebar_jump::{CurrentRow, Fold, JumpList};
@@ -4376,6 +4377,9 @@ impl crate::TermWindow {
     /// window there is no shadow under it to darken what shows through, and
     /// its edge is a ring, the clearer for it, drawn round the fill rather
     /// than under it.
+    ///
+    /// The pill is glass (`glass`), as the iPhone draws the same row, chosen
+    /// for the sidebar's own ground.
     fn paint_sidebar_selected_row(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -4384,12 +4388,14 @@ impl crate::TermWindow {
         border: LinearRgba,
     ) -> anyhow::Result<()> {
         let radius = rect.height() / 2.0;
-        if self.chrome_see_through() {
+        let edge = GlassEdge::over(self.chrome().workspace_sidebar_bg);
+        let see_through = self.chrome_see_through();
+        if see_through {
             let Some(gl_state) = self.render_state.as_ref() else {
                 return Ok(());
             };
             let boost = SEE_THROUGH_BORDER_BOOST.min(1.0 / border.3.max(f32::EPSILON));
-            return DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
+            DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
                 .draw_rounded_frame(
                     layers,
                     0,
@@ -4400,18 +4406,25 @@ impl crate::TermWindow {
                     fill,
                     border.mul_alpha(boost),
                     radius,
-                );
+                )?;
+        } else if self.glass_high_contrast() {
+            self.paint_active_surface_shadow(layers, 0, rect, radius)?;
+            self.fill_rounded_rectangle_with_border(
+                layers,
+                0,
+                rect,
+                fill,
+                border,
+                radius,
+                CAPSULE_BORDER_WIDTH,
+            )?;
+        } else {
+            let ground = self.chrome().workspace_sidebar_bg;
+            self.fill_rounded_rectangle(layers, 0, rect, edge.fill(fill, ground), radius)?;
         }
-        self.paint_active_surface_shadow(layers, 0, rect, radius)?;
-        self.fill_rounded_rectangle_with_border(
-            layers,
-            0,
-            rect,
-            fill,
-            border,
-            radius,
-            CAPSULE_BORDER_WIDTH,
-        )
+        // Over a see-through window the edge takes none of its dark, which
+        // would darken what shows through, as a shadow would.
+        self.paint_glass_edge(layers, 0, rect, radius, edge, !see_through)
     }
 
     /// One of the sidebar's add buttons: an action button whose circle shows
@@ -5368,7 +5381,7 @@ impl RoundedCorners {
 
 }
 
-fn snapped_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
+pub(crate) fn snapped_rounded_corner_radius(rect: RectF, radius: f32) -> f32 {
     radius
         .min(rect.width() / 2.0)
         .min(rect.height() / 2.0)
