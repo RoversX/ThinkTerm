@@ -678,7 +678,8 @@ struct TerminalScreen: View {
     }
 
     var statusColor: Color {
-        if model.reconnecting { return .orange }
+        // A redial in its first quiet moments shows as the terminal did.
+        if model.reconnecting && !model.redialQuiet { return .orange }
         if connected { return .green }
         if model.connection.hasPrefix("connecting") || model.connection.contains("reconnect") { return .orange }
         return .red
@@ -1348,8 +1349,10 @@ struct TerminalScreen: View {
     private var statusCapsule: some View {
         let text = model.copied ? tr("copied") : (model.toastText ?? "")
         let connection = model.connection
-        let showing = !text.isEmpty || connection.hasPrefix("connecting") || connection.hasPrefix("disconnected")
-            || connection.hasPrefix("failed") || connection.contains("reconnect")
+        // A redial back within a moment says nothing (`redialQuiet`).
+        let showing = !(model.redialQuiet && !model.copied)
+            && (!text.isEmpty || connection.hasPrefix("connecting") || connection.hasPrefix("disconnected")
+                || connection.hasPrefix("failed") || connection.contains("reconnect"))
         // The App's word stays up once the connection is lost; it is on
         // its way back only where it redials by itself.
         let redialing = model.reconnecting && model.autoReconnect

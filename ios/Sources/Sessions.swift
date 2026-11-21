@@ -156,7 +156,8 @@ enum SessionState {
     case lost
 
     init(_ model: TerminalModel, autoReconnect: Bool) {
-        if model.reconnecting {
+        // A redial in its first quiet moments shows as the session did.
+        if model.reconnecting && !model.redialQuiet {
             self = autoReconnect ? .connecting : .lost
         } else if model.connection.hasPrefix("pane ") {
             self = .connected

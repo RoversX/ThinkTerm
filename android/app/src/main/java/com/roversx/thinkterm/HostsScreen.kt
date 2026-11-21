@@ -341,7 +341,8 @@ internal enum class SessionState {
 
     companion object {
         fun of(model: TerminalModel): SessionState = when {
-            model.reconnecting -> if (model.autoReconnect) CONNECTING else LOST
+            // A redial in its first quiet moments shows as the session did.
+            model.reconnecting && !model.redialQuiet -> if (model.autoReconnect) CONNECTING else LOST
             model.connection.startsWith("pane ") -> CONNECTED
             model.isConnected -> CONNECTING
             else -> NONE

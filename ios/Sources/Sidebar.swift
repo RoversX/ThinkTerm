@@ -36,7 +36,8 @@ struct SidebarPanel: View {
     private var spaces: [TreeSpace] { model.tree?.spaces ?? [] }
 
     private var connectionColor: Color {
-        if model.reconnecting { return .orange }
+        // A redial in its first quiet moments shows as the terminal did.
+        if model.reconnecting && !model.redialQuiet { return .orange }
         if connected { return .green }
         if model.connection.hasPrefix("connecting") || model.connection.contains("reconnect") { return .orange }
         return .red

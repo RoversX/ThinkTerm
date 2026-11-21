@@ -35,6 +35,9 @@ import java.util.UUID
 /// the views while the host's terminal is off screen.
 private const val LIST_REFRESH_MS = 250L
 
+/// How long a redial goes unsaid (`TerminalModel.redialQuiet`).
+private const val QUIET_REDIAL_MS = 2_500L
+
 /// The shell's side of the thread contract. `Notify` calls arrive on the
 /// core thread; nothing here blocks them and nothing here calls back into
 /// the core from inside one. The Choreographer callback is the only place
@@ -121,6 +124,12 @@ class TerminalModel(
     /// `autoReconnect` -- left for the user's retry (`linkIs`).
     var reconnecting by mutableStateOf(false)
         private set
+    /// A redial just begun by itself: for its first moments nothing says
+    /// so, and one back within them -- the usual one, on the way back to
+    /// the app -- leaves the terminal as it was, without a word.
+    var redialQuiet by mutableStateOf(false)
+        private set
+    private val redialSpoken = Runnable { redialQuiet = false }
     /// The terminal's background, as the App paints it: the chrome around
     /// the terminal takes the same colour.
     var background by mutableStateOf(Color(0xFF1C1C1C))
@@ -783,6 +792,9 @@ class TerminalModel(
         if (reconnecting == down) return
         log(if (down) "link: down" else "link: up")
         reconnecting = down
+        main.removeCallbacks(redialSpoken)
+        redialQuiet = down && autoReconnect
+        if (redialQuiet) main.postDelayed(redialSpoken, QUIET_REDIAL_MS)
         Sessions.connectionsChanged()
     }
 

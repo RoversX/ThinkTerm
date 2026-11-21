@@ -838,7 +838,8 @@ private fun ScrollToCurrent(scroll: androidx.compose.foundation.ScrollState, pos
 }
 
 fun statusColor(model: TerminalModel): Color = when {
-    model.reconnecting -> Color(0xFFFF9F0A)
+    // A redial in its first quiet moments shows as the terminal did.
+    model.reconnecting && !model.redialQuiet -> Color(0xFFFF9F0A)
     model.isConnected -> Color(0xFF34C759)
     model.connection.startsWith("connecting") || model.connection.contains("reconnect") -> Color(0xFFFF9F0A)
     else -> Color(0xFFFF453A)
@@ -1127,7 +1128,8 @@ private fun BoxScope.Scrollbar(model: TerminalModel) {
 private fun StatusCapsule(model: TerminalModel, modifier: Modifier = Modifier) {
     val text = if (model.copied) tr("copied") else (model.toastText ?: "")
     val c = model.connection
-    val showing = text.isNotEmpty() || c.startsWith("connecting") || c.startsWith("disconnected") || c.startsWith("failed") || c.contains("reconnect")
+    val showing = !(model.redialQuiet && !model.copied) &&
+        (text.isNotEmpty() || c.startsWith("connecting") || c.startsWith("disconnected") || c.startsWith("failed") || c.contains("reconnect"))
     // The App's word stays up once the connection is lost; it is on its
     // way back only where it redials by itself.
     val redialing = model.reconnecting && model.autoReconnect

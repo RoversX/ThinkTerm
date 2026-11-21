@@ -100,6 +100,13 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     @Published private(set) var toastText: String?
     /// The App says its connection is down and it is redialing.
     @Published private(set) var reconnecting = false
+    /// A redial just begun by itself: for its first moments nothing says
+    /// so, and one back within them -- the usual one, on the way back to
+    /// the app -- leaves the terminal as it was, without a word.
+    @Published private(set) var redialQuiet = false
+    private var redialSpoken: DispatchWorkItem?
+    /// How long a redial goes unsaid.
+    private static let quietRedial: TimeInterval = 2.5
     private var toastTimer: Timer?
     /// The terminal's background, as the App paints it: the chrome around
     /// the terminal takes the same colour.
@@ -645,7 +652,16 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private func showToast(_ toast: Toast?) {
         toastTimer?.invalidate()
         let sticky = toast?.sticky ?? false
-        if reconnecting != sticky { reconnecting = sticky }
+        if reconnecting != sticky {
+            reconnecting = sticky
+            redialSpoken?.cancel()
+            redialQuiet = sticky && autoReconnect
+            if redialQuiet {
+                let spoken = DispatchWorkItem { [weak self] in self?.redialQuiet = false }
+                redialSpoken = spoken
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.quietRedial, execute: spoken)
+            }
+        }
         guard let toast, !toast.text.isEmpty else {
             if toastText != nil { toastText = nil }
             return
