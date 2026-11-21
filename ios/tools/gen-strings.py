@@ -204,13 +204,13 @@ EXTRA = {
     "tab.num": ["Tab %d", "标签 %d", "タブ %d", "Onglet %d", "Tab %d"],
     "overview.none": [
         "No threads on this server.",
-        "这台服务器上没有线程。",
+        "这台服务器上没有会话。",
         "このサーバーにスレッドはありません。",
         "Aucun fil sur ce serveur.",
         "Keine Threads auf diesem Server.",
     ],
     # terminal screen
-    "m.threadstabs": ["Threads and tabs…", "线程与标签…", "スレッドとタブ…", "Fils et onglets…", "Threads & Tabs…"],
+    "m.threadstabs": ["Threads and tabs…", "会话与标签…", "スレッドとタブ…", "Fils et onglets…", "Threads & Tabs…"],
     "m.overview": ["Overview…", "总览…", "概要…", "Vue d’ensemble…", "Übersicht…"],
     "m.settings": ["Settings…", "设置…", "設定…", "Réglages…", "Einstellungen…"],
     "pane.title": ["Pane", "窗格", "ペイン", "Volet", "Bereich"],
