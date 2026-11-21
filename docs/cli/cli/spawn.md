@@ -64,6 +64,7 @@ commands deal with threads directly:
 * `thinkterm cli thread list` - the threads of the projects that are not
   archived: their Space, project, name, id and workspace. `--project PROJECT`
   shows one project's; `--format json` (or `--json`) suits scripts.
+  `thinkterm cli list` shows which thread each pane is in.
 * `thinkterm cli thread create --name NAME [--project PROJECT]` - makes a
   thread and prints its id; `--json` prints its id, name, project and
   workspace. It shows in the sidebar at once, and its terminal starts when it

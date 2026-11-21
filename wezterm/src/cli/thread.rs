@@ -9,6 +9,7 @@ use crate::cli::{printable, CliOutputFormatKind, NoSuchTarget, ServerUnreachable
 use anyhow::Context;
 use clap::Parser;
 use codec::{MutateThinkTermTree, ThinkTermTree, TreeOp, TtProject, TtThread};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tabout::{tabulate_output, tabulate_output_as_string, Alignment, Column};
@@ -905,8 +906,9 @@ fn session_host_marked() -> bool {
 }
 
 /// The tree of the session server the window `window` keeps its threads in,
-/// as long as it answers within `within_window_wait`: a check before `spawn
-/// --workspace` is not held up by a server that does not answer.
+/// as long as it answers within `within_window_wait`: what is only nice to
+/// have -- names in `list`, a check before `spawn --workspace` -- is not
+/// waited on for a server that does not answer.
 pub(crate) async fn session_tree_of_window(window: u32) -> Option<ThinkTermTree> {
     crate::cli::within_window_wait(async {
         let server = session_server_of_window(window).await.ok()?;
@@ -938,6 +940,90 @@ fn window_keeps_its_threads(detail: String) -> anyhow::Error {
          Session server > \"Keep local terminals in a background session server\"; it \
          takes effect the next time ThinkTerm starts"
     )
+}
+
+/// The thread a pane's workspace is, as `list` shows it: names, and the ids
+/// where the tree that keeps it says them. All empty for a workspace no
+/// thread has.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub(crate) struct ThreadOf {
+    pub space: Option<String>,
+    pub space_id: Option<String>,
+    pub project: Option<String>,
+    pub project_id: Option<String>,
+    pub thread: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+/// What `list` says of the thread `workspace` is: from `tree`, when one of
+/// its threads has the workspace; else from `names` -- a window's word for
+/// its workspaces (`GetWorkspaceNames`), which has a thread's project and
+/// name and no more; else nothing.
+pub(crate) fn thread_of(
+    tree: Option<&ThinkTermTree>,
+    names: &HashMap<String, (String, String)>,
+    workspace: &str,
+) -> ThreadOf {
+    if let Some((project, thread)) = tree.and_then(|tree| workspace_owner(tree, workspace)) {
+        let space = tree.and_then(|tree| tree.space(&project.space_id));
+        return ThreadOf {
+            space: space.map(|space| space.name.clone()),
+            space_id: Some(project.space_id.clone()),
+            project: Some(project.name.clone()),
+            project_id: Some(project.id.clone()),
+            thread: Some(thread.name.clone()),
+            thread_id: Some(thread.id.clone()),
+        };
+    }
+    match names.get(workspace) {
+        Some((project, thread)) => ThreadOf {
+            project: Some(project.clone()),
+            thread: Some(thread.clone()),
+            ..ThreadOf::default()
+        },
+        None => ThreadOf::default(),
+    }
+}
+
+/// Where `list` takes the threads of `client`'s panes from: the tree of the
+/// server it reached, or of the session server of the window it reached,
+/// and the window's own names for its workspaces, which take in the threads
+/// of the servers it is connected to. As much as can be had.
+pub(crate) async fn thread_sources(
+    client: &Client,
+) -> (Option<ThinkTermTree>, HashMap<String, (String, String)>) {
+    match reached_window(client) {
+        None => (
+            client
+                .get_thinkterm_tree()
+                .await
+                .ok()
+                .map(|state| state.tree),
+            HashMap::new(),
+        ),
+        Some(window) => {
+            let names = workspace_names(client).await;
+            (session_tree_of_window(window).await, names)
+        }
+    }
+}
+
+/// The project and thread `client`'s mux names each of its workspaces by,
+/// as far as it says within `within_window_wait`: a window names them on
+/// its main thread, which may be busy.
+pub(crate) async fn workspace_names(client: &Client) -> HashMap<String, (String, String)> {
+    crate::cli::within_window_wait(async {
+        let response = client.get_workspace_names().await.ok()?;
+        Some(
+            response
+                .names
+                .into_iter()
+                .map(|name| (name.workspace, (name.project, name.thread)))
+                .collect(),
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Whether `client` reached its server's socket on this machine, rather
@@ -1323,5 +1409,29 @@ mod test {
         assert_eq!(project_dir(&server_row), None);
         server_row.path = "  ".into();
         assert_eq!(project_dir(&server_row), None);
+    }
+
+    #[test]
+    fn list_names_a_pane_s_thread_from_the_tree_else_from_the_window() {
+        let tree = tree();
+        let mut names = HashMap::new();
+        names.insert(
+            "thinkterm:remote:thread-r".to_string(),
+            ("Server project".to_string(), "Thread 5".to_string()),
+        );
+        let local = thread_of(Some(&tree), &names, "thinkterm:project-2:thread-2");
+        assert_eq!(local.space.as_deref(), Some("Work"));
+        assert_eq!(local.space_id.as_deref(), Some("space-1"));
+        assert_eq!(local.project.as_deref(), Some("Home"));
+        assert_eq!(local.project_id.as_deref(), Some("project-2"));
+        assert_eq!(local.thread.as_deref(), Some("agent"));
+        assert_eq!(local.thread_id.as_deref(), Some("thread-2"));
+        // Known to the window alone: its names, and no Space or ids.
+        let remote = thread_of(Some(&tree), &names, "thinkterm:remote:thread-r");
+        assert_eq!(remote.project.as_deref(), Some("Server project"));
+        assert_eq!(remote.thread.as_deref(), Some("Thread 5"));
+        assert_eq!((remote.space, remote.thread_id), (None, None));
+        assert_eq!(thread_of(None, &names, "default"), ThreadOf::default());
+        assert_eq!(thread_of(Some(&tree), &names, "plain"), ThreadOf::default());
     }
 }

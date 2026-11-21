@@ -1,4 +1,5 @@
-use crate::cli::CliOutputFormatKind;
+use crate::cli::thread::{reached_window, thread_of, thread_sources, workspace_names, ThreadOf};
+use crate::cli::{printable, CliOutputFormatKind};
 use clap::Parser;
 use codec::ListPanesResponse;
 use mux::pane::PaneId;
@@ -19,9 +20,25 @@ pub struct ListCommand {
 }
 
 impl ListCommand {
-    pub async fn run(&self, client: Client) -> anyhow::Result<()> {
+    /// `load_config`: the user's configuration, read only when the window
+    /// was reached, whose session server it names.
+    pub async fn run(
+        &self,
+        client: Client,
+        load_config: impl FnOnce() -> anyhow::Result<config::ConfigHandle>,
+    ) -> anyhow::Result<()> {
         let panes = client.list_panes().await?;
         let mut output_items = items(panes, |_| true);
+        // The thread each pane is in, as the sidebar shows it.
+        if reached_window(&client).is_some() {
+            if let Err(err) = load_config() {
+                log::warn!("reading the configuration: {err:#}");
+            }
+        }
+        let (tree, names) = thread_sources(&client).await;
+        for item in &mut output_items {
+            item.thread = thread_of(tree.as_ref(), &names, &item.workspace);
+        }
         // Then the panes on servers, as the window this machine has open
         // is connected to them and its Settings let programs here have
         // them: asked of it unless it was asked already, and not waited
@@ -30,12 +47,21 @@ impl ListCommand {
             && !output_items.iter().any(|item| item.machine.is_some())
         {
             let theirs = crate::cli::within_window_wait(async {
-                crate::cli::window_client().await?.list_panes().await.ok()
+                let window = crate::cli::window_client().await?;
+                let panes = window.list_panes().await.ok()?;
+                Some((window, panes))
             })
             .await;
-            if let Some(theirs) = theirs {
+            if let Some((window, theirs)) = theirs {
+                // Their threads are the servers', which the window names:
+                // waited on apart, so that the panes are listed either way.
+                let names = workspace_names(&window).await;
                 let on_servers: Vec<PaneId> = theirs.pane_machines.keys().copied().collect();
-                output_items.extend(items(theirs, |pane_id| on_servers.contains(&pane_id)));
+                let mut on_servers = items(theirs, |pane_id| on_servers.contains(&pane_id));
+                for item in &mut on_servers {
+                    item.thread = thread_of(None, &names, &item.workspace);
+                }
+                output_items.extend(on_servers);
             }
         }
         let format = if self.json {
@@ -95,6 +121,20 @@ impl ListCommand {
                         name: "LABEL".to_string(),
                         alignment: Alignment::Left,
                     },
+                    // The thread the pane is in, after the rest for the
+                    // same reason.
+                    Column {
+                        name: "SPACE".to_string(),
+                        alignment: Alignment::Left,
+                    },
+                    Column {
+                        name: "PROJECT".to_string(),
+                        alignment: Alignment::Left,
+                    },
+                    Column {
+                        name: "THREAD".to_string(),
+                        alignment: Alignment::Left,
+                    },
                 ];
                 let mut data = output_items
                     .iter()
@@ -111,6 +151,9 @@ impl ListCommand {
                             },
                             output_item.cwd.to_string(),
                             output_item.label.clone().unwrap_or_default(),
+                            shown(&output_item.thread.space),
+                            shown(&output_item.thread.project),
+                            shown(&output_item.thread.thread),
                         ]
                     })
                     .collect::<Vec<_>>();
@@ -124,6 +167,9 @@ impl ListCommand {
                         item.title.clone(),
                         String::new(),
                         item.label.clone(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
                     ]
                 }));
                 tabulate_output(&cols, &data, &mut std::io::stdout().lock())
@@ -132,6 +178,11 @@ impl ListCommand {
         }
         Ok(())
     }
+}
+
+/// A name as the table shows it: as it can be shown, or nothing.
+fn shown(name: &Option<String>) -> String {
+    name.as_deref().map(printable).unwrap_or_default()
 }
 
 /// The panes `panes` lists, those `keep` keeps, as `list` prints them.
@@ -272,6 +323,12 @@ struct CliListResultItem {
     is_active: bool,
     is_zoomed: bool,
     tty_name: Option<String>,
+    /// The thread the pane's workspace is, as the sidebar shows it: its
+    /// Space, project and name, and their ids where the server that keeps
+    /// them says them (`space`, `space_id`, `project`, `project_id`,
+    /// `thread`, `thread_id`); null for a workspace no thread has.
+    #[serde(flatten)]
+    thread: ThreadOf,
 }
 
 impl CliListResultItem {
@@ -338,6 +395,7 @@ impl CliListResultItem {
             is_active: is_active_pane,
             is_zoomed: is_zoomed_pane,
             tty_name,
+            thread: ThreadOf::default(),
         }
     }
 }

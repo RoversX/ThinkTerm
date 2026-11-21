@@ -512,7 +512,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
 
     match cli.sub {
         CliSubCommand::ListClients(cmd) => cmd.run(client).await,
-        CliSubCommand::List(cmd) => cmd.run(client).await,
+        CliSubCommand::List(cmd) => cmd.run(client, || crate::init_config(opts)).await,
         CliSubCommand::MovePaneToNewTab(cmd) => cmd.run(client).await,
         CliSubCommand::SplitPane(cmd) => cmd.run(client).await,
         CliSubCommand::SendText(cmd) => cmd.run(client).await,
