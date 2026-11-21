@@ -8,6 +8,7 @@ struct TerminalScreen: View {
     @ObservedObject var model: TerminalModel
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var lang = AppLanguage.shared
+    @EnvironmentObject private var sessions: Sessions
     @Environment(\.dismiss) private var dismiss
     @Environment(\.displayScale) private var displayScale
     @Environment(\.colorScheme) private var scheme
@@ -511,7 +512,10 @@ struct TerminalScreen: View {
         .sheet(item: $model.pendingHostKey) { challenge in
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    Text(tr("hostkey.approve.title")).font(.headline)
+                    Text(tr(challenge.jump ? "hostkey.approve.jumptitle" : "hostkey.approve.title")).font(.headline)
+                    if challenge.jump {
+                        Text(tr("hostkey.approve.jumpwho", challenge.jumpName))
+                    }
                     // Verbatim: an interpolated number is localised, "2,299".
                     Text(verbatim: "\(challenge.hostname):\(challenge.port)")
                     Text(challenge.fingerprint).font(.system(.body, design: .monospaced))
@@ -597,10 +601,15 @@ struct TerminalScreen: View {
             HostEditView(host: host) { edited, secret, passphrase in
                 if !secret.isEmpty { Keychain.save(secret, account: edited.id.uuidString) }
                 if let passphrase { Keychain.save(passphrase, account: edited.id.uuidString + ".passphrase") }
+                let before = model.store?.hosts.first { $0.id == edited.id }
                 model.store?.upsert(edited)
                 // As stored: a new address drops the old pin.
                 let saved = model.store?.hosts.first { $0.id == edited.id } ?? edited
-                model.applyHostEdit(saved, credentialsChanged: !secret.isEmpty || passphrase != nil, connectOnSave: true)
+                let credentialsChanged = !secret.isEmpty || passphrase != nil
+                model.applyHostEdit(saved, credentialsChanged: credentialsChanged, connectOnSave: true)
+                if let store = model.store {
+                    sessions.jumpHostKept(before: before, saved: saved, credentialsChanged: credentialsChanged, store: store)
+                }
             }
         }
         .onAppear {
@@ -1134,11 +1143,15 @@ struct TerminalScreen: View {
                     switch action {
                     case .retry: model.connect()
                     case .forgetKeyAndRetry:
-                        if let host = model.host {
-                            model.store?.forgetHostKey(for: host.id)
-                            model.host?.knownHost = nil
+                        if case .failed(let reason) = phase {
+                            model.forgetKeyAndRetry(reason: reason, sessions: sessions)
+                        } else {
+                            if let host = model.host {
+                                model.store?.forgetHostKey(for: host.id)
+                                model.host?.knownHost = nil
+                            }
+                            model.connect()
                         }
-                        model.connect()
                     case .edit: editingHost = model.host
                     case .back: leave()
                     }

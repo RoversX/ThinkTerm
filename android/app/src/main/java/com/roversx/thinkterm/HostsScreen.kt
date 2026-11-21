@@ -67,6 +67,8 @@ fun HostsScreen(
     var adding by remember { mutableStateOf<Host?>(null) }
     var search by remember { mutableStateOf("") }
     var pendingDelete by remember { mutableStateOf<Host?>(null) }
+    // A host others are reached through, asked to be deleted: it is not.
+    var jumpInUse by remember { mutableStateOf<Host?>(null) }
     var tailnetOpen by remember { mutableStateOf(false) }
     // A page for a host since removed is no page.
     val paged = hostPage?.let { id -> store.hosts.firstOrNull { it.id == id } }
@@ -120,9 +122,13 @@ fun HostsScreen(
                                     onHostPage(null)
                                 },
                                 delete = {
-                                    Sessions.close(paged.id)
-                                    store.remove(paged)
-                                    onHostPage(null)
+                                    if (store.reachedThrough(paged.id).isNotEmpty()) {
+                                        jumpInUse = paged
+                                    } else {
+                                        Sessions.close(paged.id)
+                                        store.remove(paged)
+                                        onHostPage(null)
+                                    }
                                 },
                             ),
                         )
@@ -131,7 +137,7 @@ fun HostsScreen(
                         store, probe, search, { search = it }, onBack, onOpen,
                         page = { onHostPage(it.id) },
                         add = { adding = it },
-                        delete = { pendingDelete = it },
+                        delete = { if (store.reachedThrough(it.id).isNotEmpty()) jumpInUse = it else pendingDelete = it },
                         openTailnet = { tailnetOpen = true },
                     )
                 }
@@ -155,6 +161,15 @@ fun HostsScreen(
             },
         )
     }
+
+    jumpInUse?.let { host ->
+        AlertDialog(
+            onDismissRequest = { jumpInUse = null },
+            title = { Text(tr("jump.inuse.title")) },
+            text = { Text(tr("jump.inuse.body", store.reachedThrough(host.id).joinToString { it.display })) },
+            confirmButton = { TextButton(onClick = { jumpInUse = null }) { Text(tr("ok")) } },
+        )
+    }
 }
 
 /// Forgets a host's pinned key, in the store and in a session open on it,
@@ -165,14 +180,30 @@ internal fun forgetHostKey(store: HostStore, id: String) {
     // Not an edit of the connection: the one up stays, and one down waits
     // for the user's retry rather than dialling into the key's question.
     Sessions.existing(id)?.forgetHostKey()
+    // Those reached through it ask for its key on their next dial too.
+    for (behind in store.reachedThrough(id)) Sessions.existing(behind.id)?.forgetJumpHostKey()
 }
 
 /// Keeps a host as edited or added; a session open on it takes the edit:
 /// another address, login or key is a connection made again.
 private fun keepHost(store: HostStore, host: Host, secret: String, passphrase: String?) {
+    val before = store.hosts.firstOrNull { it.id == host.id }
     val saved = store.saveEdit(host, secret, passphrase)
-    Sessions.existing(host.id)?.applyHostEdit(saved, secret.isNotEmpty() || passphrase != null, connectOnSave = false)
+    val credentialsChanged = secret.isNotEmpty() || passphrase != null
+    Sessions.existing(host.id)?.applyHostEdit(saved, credentialsChanged, connectOnSave = false)
+    jumpHostKept(store, before, saved, credentialsChanged)
 }
+
+/// A host kept as edited: the sessions reached through it go the new way,
+/// when the way to it changed -- not for its command, which they never run.
+internal fun jumpHostKept(store: HostStore, before: Host?, saved: Host, credentialsChanged: Boolean) {
+    if (before != null && before.sameJumpWay(saved) && before.knownHost == saved.knownHost && !credentialsChanged) return
+    for (behind in store.reachedThrough(saved.id)) Sessions.existing(behind.id)?.applyJumpHostEdit()
+}
+
+/// A host's address in a row, and what it is reached through.
+internal fun hostLine(store: HostStore, host: Host): String =
+    store.jumpOf(host)?.let { host.address + "  ·  " + tr("jump.via", it.title) } ?: host.address
 
 /// The hosts themselves: searched, grouped, each a row that opens its page.
 @Composable
@@ -217,6 +248,7 @@ private fun HostList(
                     for (host in section.hosts) {
                         HostListRow(
                             host = host,
+                            line = hostLine(store, host),
                             session = Sessions.existing(host.id),
                             // Disconnected, not closed: a session the list no
                             // longer holds is one home connects again.
@@ -253,6 +285,7 @@ private fun HostList(
 @Composable
 private fun HostListRow(
     host: Host,
+    line: String,
     session: TerminalModel?,
     onDisconnect: () -> Unit,
     onPage: () -> Unit,
@@ -265,7 +298,7 @@ private fun HostListRow(
     var menu by remember { mutableStateOf(false) }
     Box {
         GroupRow(onClick = onPage, onLongClick = { menu = true }) {
-            HostRowContent(host.title, host.address, monospaced = true, session = session) {
+            HostRowContent(host.title, line, monospaced = true, session = session) {
                 DesktopIcon(host.iconFile, size = 21.dp, tint = colors.primary)
             }
             RowChevron()

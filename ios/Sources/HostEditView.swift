@@ -29,6 +29,8 @@ struct HostEditView: View {
     @State private var keptSecret = ""
     @State private var keptPassphrase = ""
     @State private var confirmDelete = false
+    /// Delete was asked of a host others are reached through: it is not.
+    @State private var jumpInUse = false
     var save: (Host, String, String?) -> Void
 
     var body: some View {
@@ -51,6 +53,11 @@ struct HostEditView: View {
                     Button(tr("cancel"), role: .cancel) {}
                 } message: {
                     Text(tr("host.delete.body"))
+                }
+                .alert(tr("jump.inuse.title"), isPresented: $jumpInUse) {
+                    Button(tr("ok"), role: .cancel) {}
+                } message: {
+                    Text(tr("jump.inuse.body", store.reachedThrough(host.id).map(\.display).joined(separator: ", ")))
                 }
         } else {
             NavigationStack {
@@ -81,7 +88,7 @@ struct HostEditView: View {
                     iconRow
                 } header: {
                     VStack(spacing: 0) {
-                        HostHero(host: kept ?? host, sessions: page.sessions)
+                        HostHero(host: kept ?? host, sessions: page.sessions, line: store.line(for: kept ?? host))
                         Text(tr("f.icon"))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, 26)
@@ -94,6 +101,7 @@ struct HostEditView: View {
             hostSection
             groupSection
             authSection
+            jumpSection
             advancedSection
             if let page { manageSection(page) }
         }
@@ -155,7 +163,9 @@ struct HostEditView: View {
             if store.hosts.first(where: { $0.id == host.id })?.knownHost != nil {
                 Button(tr("forgetkey")) { page.sessions.forgetHostKey(host.id, store: store) }
             }
-            Button(tr("host.delete"), role: .destructive) { confirmDelete = true }
+            Button(tr("host.delete"), role: .destructive) {
+                if store.reachedThrough(host.id).isEmpty { confirmDelete = true } else { jumpInUse = true }
+            }
         }
     }
 
@@ -172,6 +182,7 @@ struct HostEditView: View {
         a.name == b.name && a.hostname == b.hostname && a.port == b.port && a.user == b.user
             && a.auth == b.auth && a.remoteCommand == b.remoteCommand && a.group == b.group
             && a.publicKey == b.publicKey && a.icon == b.icon && a.autoConnect == b.autoConnect
+            && a.jumpHost == b.jumpHost
     }
 
     /// The edit onto the host as the store has it now: the key a
@@ -188,6 +199,7 @@ struct HostEditView: View {
         edited.publicKey = host.publicKey
         edited.autoConnect = host.autoConnect
         edited.icon = host.icon
+        edited.jumpHost = host.jumpHost
         if let forgottenHostKey, edited.knownHost == forgottenHostKey {
             edited.knownHost = nil
         }
@@ -208,6 +220,32 @@ struct HostEditView: View {
         keptSecret = secret
         keptPassphrase = passphrase
         if !secret.isEmpty { hasStoredSecret = true }
+    }
+
+    /// The host this one is reached through, picked from the other saved
+    /// hosts (`HostStore.jumpCandidates`). A host others are reached through
+    /// has none of its own, and says why.
+    private var jumpSection: some View {
+        let behind = store.reachedThrough(host.id)
+        let candidates = store.jumpCandidates(for: host)
+        return Section {
+            Picker(tr("f.jump"), selection: $host.jumpHost) {
+                Text(tr("f.jump.none")).tag(UUID?.none)
+                ForEach(candidates) { candidate in
+                    Text(candidate.title).tag(UUID?.some(candidate.id))
+                }
+                // One no longer offered -- gone, or given a jump host of its
+                // own since -- still shows as the one picked.
+                if let chosen = host.jumpHost, !candidates.contains(where: { $0.id == chosen }) {
+                    Text(store.hosts.first { $0.id == chosen }?.title ?? tr("jump.missing")).tag(UUID?.some(chosen))
+                }
+            }
+            .disabled(!behind.isEmpty)
+        } header: {
+            Text(tr("f.jump"))
+        } footer: {
+            Text(behind.isEmpty ? tr("f.jump.foot") : tr("f.jump.isjump"))
+        }
     }
 
     private var hostSection: some View {
@@ -463,6 +501,8 @@ struct HostPage {
 private struct HostHero: View {
     let host: Host
     @ObservedObject var sessions: Sessions
+    /// Its address and what it is reached through (`HostStore.line`).
+    var line: String? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -474,7 +514,7 @@ private struct HostHero: View {
                 .foregroundStyle(Color.primary)
                 .lineLimit(1)
                 .padding(.top, 14)
-            Text(host.address)
+            Text(line ?? host.address)
                 .font(.subheadline.monospaced())
                 .foregroundStyle(Color.secondary)
                 .lineLimit(1)

@@ -41,6 +41,7 @@ pub(crate) fn test_link() -> SshLink {
             known_host: None,
             remote_command: String::new(),
             keepalive_secs: 0,
+            jump: None,
         },
         Box::new(|_| panic!("this test must not open a network connection")),
     )
@@ -127,6 +128,13 @@ impl SshLink {
     /// now stays.
     pub fn forget_host_key(&self) {
         self.0.params.borrow_mut().known_host = None;
+    }
+
+    /// As `forget_host_key`, for the jump host the host is reached through.
+    pub fn forget_jump_host_key(&self) {
+        if let Some(jump) = self.0.params.borrow_mut().jump.as_mut() {
+            jump.known_host = None;
+        }
     }
 
     /// The transport came up.

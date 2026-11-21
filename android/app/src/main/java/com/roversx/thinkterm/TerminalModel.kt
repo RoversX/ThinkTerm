@@ -23,6 +23,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import com.roversx.thinkterm.core.Core
+import com.roversx.thinkterm.core.JumpHost
 import com.roversx.thinkterm.core.Notify
 import com.roversx.thinkterm.core.ViewSet
 import java.io.File
@@ -63,11 +64,15 @@ class TerminalModel(
     internal fun applyAutoReconnect() {
         core.setSetting("auto-reconnect", autoReconnect.toString())
     }
-    data class HostKeyChallenge(val requestId: String, val endpoint: Host, val fingerprint: String)
+    /// A key to approve: the host's own, or (`jump`) that of the jump host
+    /// it is reached through, which `endpoint` is then.
+    data class HostKeyChallenge(val requestId: String, val endpoint: Host, val fingerprint: String, val jump: Boolean = false)
     var pendingHostKey by mutableStateOf<HostKeyChallenge?>(null)
         private set
     private var activeRequestId: String? = null
     private var requestedHost: Host? = null
+    /// The jump host as the request dialled it, if it went through one.
+    private var requestedJump: Host? = null
 
 
     // The App's views, refreshed when the core says something changed.
@@ -376,11 +381,19 @@ class TerminalModel(
         // same; the core may still have the last one's out until it is up.
         lastViews = null
         connectionBefore = core.viewsConnection()
-        connected = true
         val h = host
+        // One whose jump host is gone is not dialled some other way.
+        val jump = store.jumpOf(h)
+        if (h.jumpHost != null && jump == null) {
+            connected = false
+            connection = "failed: " + tr("jump.missing")
+            return
+        }
+        requestedJump = jump
+        connected = true
         val secret = if (h.id == Host.PROBE_ID) probeKey() else store.secret(h.id)
         val passphrase = if (h.id == Host.PROBE_ID) null else store.passphrase(h.id)
-        log("shell: connecting ${h.address}, ${secret.length} chars of secret")
+        log("shell: connecting ${h.address}" + (jump?.let { " via ${it.address}" } ?: "") + ", ${secret.length} chars of secret")
         core.connect(
             requestId = requestId,
             host = h.hostname,
@@ -390,6 +403,17 @@ class TerminalModel(
             secret = secret,
             passphrase = passphrase,
             knownHost = h.knownHost,
+            jump = jump?.let { j ->
+                JumpHost(
+                    host = j.hostname,
+                    port = j.port.coerceIn(1, 65535).toUShort(),
+                    user = j.user,
+                    authKind = j.auth,
+                    secret = store.secret(j.id),
+                    passphrase = store.passphrase(j.id),
+                    knownHost = j.knownHost,
+                )
+            },
             remoteCommand = h.remoteCommand,
             deviceId = store.deviceId,
             keepaliveSecs = settings.keepAliveSeconds.coerceAtLeast(0).toUInt(),
@@ -416,11 +440,31 @@ class TerminalModel(
     private fun clearHostKeyRequest() {
         activeRequestId = null
         requestedHost = null
+        requestedJump = null
         pendingHostKey = null
     }
 
     private fun currentHostKeyEndpoint(requestId: String): Host? =
         requestedHost?.takeIf { activeRequestId == requestId && host.knownHost == null && host.sameSshConnection(it) }
+
+    /// The jump host this request dialled, as the store has it now -- with
+    /// the key pinned for it since, if one was -- while it is reached the
+    /// same way. The host's own key, pinned or not, has no say in it.
+    private fun currentJumpEndpoint(requestId: String): Host? {
+        val asked = requestedJump?.takeIf { activeRequestId == requestId } ?: return null
+        return store.hosts.firstOrNull { it.id == asked.id }?.takeIf { it.sameJumpWay(asked) }
+    }
+
+    /// The key a host's question is about was pinned in the store since the
+    /// dial was made: approved in another session -- the jump host's own, or
+    /// one through it, or the other way about. The dial is made again with
+    /// it, rather than the question put twice or left unasked.
+    private fun pinnedSince(endpoint: Host): Boolean {
+        val pinned = store.hosts.firstOrNull { it.id == endpoint.id }?.knownHost ?: return false
+        if (endpoint.id == host.id) host = host.copy(knownHost = pinned)
+        connect()
+        return true
+    }
 
     /// The host's pinned key forgotten: the connection up now stays, and
     /// the next dial -- the core's own redial of this one too -- asks for
@@ -433,7 +477,45 @@ class TerminalModel(
         core.forgetHostKey()
     }
 
+    /// As `forgetHostKey`, for the jump host this one is reached through.
+    fun forgetJumpHostKey() {
+        requestedJump = requestedJump?.copy(knownHost = null)
+        core.forgetJumpHostKey()
+    }
+
+    /// The failure card's "forget the key and retry": the key that changed
+    /// is the jump host's when the failure says so. Either way it goes from
+    /// every session that holds it, the ones reached through it too.
+    fun forgetKeyAndRetry(reason: String) {
+        val jump = store.jumpOf(host)
+        if (jump != null && reason.contains("the jump host")) {
+            com.roversx.thinkterm.forgetHostKey(store, jump.id)
+        } else {
+            com.roversx.thinkterm.forgetHostKey(store, host.id)
+            host = host.copy(knownHost = null)
+        }
+        connect()
+    }
+
+    /// The jump host this host is reached through was edited: a session up
+    /// through it is made again the new way, as one is on an edit of its
+    /// own host. One lost and left for the user's retry stays so.
+    fun applyJumpHostEdit() {
+        val lost = reconnecting && !autoReconnect
+        val redial = isConnected && !lost
+        disconnect()
+        if (redial) connect()
+    }
+
     fun approveHostKey(challenge: HostKeyChallenge) {
+        if (challenge.jump) {
+            val now = currentJumpEndpoint(challenge.requestId)?.takeIf { it.sameJumpWay(challenge.endpoint) } ?: return
+            // One pinned meanwhile, in another session, is the one dialled
+            // with: a key it does not match is the failure's to say.
+            if (now.knownHost == null) store.rememberHostKey(now.id, challenge.fingerprint)
+            connect()
+            return
+        }
         if (currentHostKeyEndpoint(challenge.requestId)?.sameSshConnection(challenge.endpoint) != true) return
         if (host.id != Host.PROBE_ID) store.rememberHostKey(host.id, challenge.fingerprint)
         host = host.copy(knownHost = challenge.fingerprint)
@@ -987,10 +1069,11 @@ class TerminalModel(
             }
         }
 
-        override fun onHostKeyRequired(requestId: String, fingerprint: String) {
+        override fun onHostKeyRequired(requestId: String, fingerprint: String, jump: Boolean) {
             main.post {
-                val endpoint = currentHostKeyEndpoint(requestId) ?: return@post
-                pendingHostKey = HostKeyChallenge(requestId, endpoint, fingerprint)
+                val endpoint = (if (jump) currentJumpEndpoint(requestId) else currentHostKeyEndpoint(requestId)) ?: return@post
+                if (endpoint.id != Host.PROBE_ID && pinnedSince(endpoint)) return@post
+                pendingHostKey = HostKeyChallenge(requestId, endpoint, fingerprint, jump)
             }
         }
 

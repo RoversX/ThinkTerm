@@ -393,6 +393,59 @@ EXTRA = {
         "Rien n’a encore été envoyé d’ici",
         "Von hier wurde noch nichts gesendet",
     ],
+    # jump hosts: a host reached through another saved one
+    "f.jump": ["Jump host", "跳板机", "踏み台ホスト", "Hôte de rebond", "Sprunghost"],
+    "f.jump.none": ["None", "无", "なし", "Aucun", "Keiner"],
+    "f.jump.foot": [
+        "Reach this host through another saved host, as ssh -J does. Each signs in with its own login, and its key is checked on its own.",
+        "经另一台已保存的主机连到这台，和 ssh -J 一样。两台各用自己的登录方式，指纹也各自确认。",
+        "ssh -J と同じように、保存済みの別のホストを経由してこのホストに接続します。それぞれ自分のログイン情報でサインインし、鍵もそれぞれ確認します。",
+        "Atteindre cet hôte via un autre hôte enregistré, comme ssh -J. Chacun se connecte avec ses propres identifiants et sa clé est vérifiée à part.",
+        "Diesen Host über einen anderen gespeicherten Host erreichen, wie mit ssh -J. Jeder meldet sich mit seinen eigenen Zugangsdaten an, und sein Schlüssel wird für sich geprüft.",
+    ],
+    "f.jump.isjump": [
+        "Other hosts are reached through this one, so it can't have a jump host of its own.",
+        "有别的主机经它连接，所以它自己不能再设跳板机。",
+        "他のホストがこのホストを経由しているため、このホスト自体には踏み台を設定できません。",
+        "D'autres hôtes passent par celui-ci : il ne peut pas avoir son propre hôte de rebond.",
+        "Andere Hosts werden über diesen erreicht, daher kann er selbst keinen Sprunghost haben.",
+    ],
+    "jump.via": ["via %@", "经由 %@", "%@ 経由", "via %@", "über %@"],
+    "jump.inuse.title": [
+        "This host is a jump host",
+        "这台主机正被当作跳板机",
+        "このホストは踏み台として使われています",
+        "Cet hôte sert d'hôte de rebond",
+        "Dieser Host ist ein Sprunghost",
+    ],
+    "jump.inuse.body": [
+        "%@ is reached through it. Change that host's jump host first, then delete this one.",
+        "%@ 经它连接。先把那台的跳板机改掉，再删这台。",
+        "%@ がこのホストを経由しています。先にそのホストの踏み台を変更してから削除してください。",
+        "%@ passe par lui. Changez d'abord l'hôte de rebond de cet hôte, puis supprimez celui-ci.",
+        "%@ wird über ihn erreicht. Ändern Sie zuerst den Sprunghost dieses Hosts und löschen Sie dann diesen.",
+    ],
+    "jump.missing": [
+        "the jump host this host is reached through is no longer saved",
+        "这台主机设的跳板机已经不在了",
+        "このホストが経由する踏み台ホストはもう保存されていません",
+        "l'hôte de rebond par lequel passe cet hôte n'est plus enregistré",
+        "der Sprunghost, über den dieser Host erreicht wird, ist nicht mehr gespeichert",
+    ],
+    "hostkey.approve.jumptitle": [
+        "Trust the jump host's key?",
+        "信任跳板机的主机密钥？",
+        "踏み台ホストの鍵を信頼しますか？",
+        "Faire confiance à la clé de l'hôte de rebond ?",
+        "Dem Schlüssel des Sprunghosts vertrauen?",
+    ],
+    "hostkey.approve.jumpwho": [
+        "This is the key of %@, the jump host on the way.",
+        "这是路上经过的跳板机 %@ 的密钥。",
+        "これは経由する踏み台ホスト %@ の鍵です。",
+        "C'est la clé de %@, l'hôte de rebond sur le chemin.",
+        "Dies ist der Schlüssel von %@, dem Sprunghost auf dem Weg.",
+    ],
 }
 
 

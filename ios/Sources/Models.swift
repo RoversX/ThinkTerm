@@ -32,6 +32,9 @@ struct Host: Codable, Identifiable, Hashable {
     /// The picture the host wears, by the desktop's name for it
     /// (`Host.icons`); empty is the server.
     var icon: String = ""
+    /// The saved host this one is reached through (`ssh -J`), if any. One
+    /// hop: that host has none of its own.
+    var jumpHost: UUID?
 
     var display: String {
         name.isEmpty ? "\(user)@\(hostname):\(port)" : name
@@ -43,7 +46,7 @@ struct Host: Codable, Identifiable, Hashable {
 
     // Fields added later are absent from hosts saved before them.
     private enum Keys: String, CodingKey {
-        case id, name, hostname, port, user, auth, knownHost, remoteCommand, group, publicKey, lastConnected, icon, autoConnect
+        case id, name, hostname, port, user, auth, knownHost, remoteCommand, group, publicKey, lastConnected, icon, autoConnect, jumpHost
     }
 
     init(from decoder: Decoder) throws {
@@ -61,6 +64,7 @@ struct Host: Codable, Identifiable, Hashable {
         autoConnect = try c.decodeIfPresent(Bool.self, forKey: .autoConnect) ?? true
         lastConnected = try c.decodeIfPresent(Date.self, forKey: .lastConnected)
         icon = try c.decodeIfPresent(String.self, forKey: .icon) ?? ""
+        jumpHost = try c.decodeIfPresent(UUID.self, forKey: .jumpHost)
     }
 }
 
@@ -149,6 +153,32 @@ final class HostStore: ObservableObject {
     /// The groups in use, for the editor's suggestions.
     var groups: [String] {
         Array(Set(hosts.map(\.group).filter { !$0.isEmpty })).sorted()
+    }
+
+    /// The host `host` is reached through, if it has one still saved.
+    func jump(of host: Host) -> Host? {
+        guard let id = host.jumpHost else { return nil }
+        return hosts.first { $0.id == id }
+    }
+
+    /// The hosts reached through the host `id`: while there are any, it is
+    /// not deleted, nor given a jump host of its own.
+    func reachedThrough(_ id: UUID) -> [Host] {
+        hosts.filter { $0.jumpHost == id }
+    }
+
+    /// The hosts `host` may be reached through: any other saved one with no
+    /// jump host of its own -- one hop, so no chain and no circle. None for
+    /// a host others are reached through.
+    func jumpCandidates(for host: Host) -> [Host] {
+        guard reachedThrough(host.id).isEmpty else { return [] }
+        return hosts.filter { $0.id != host.id && $0.jumpHost == nil }
+    }
+
+    /// A host's address in a row, and what it is reached through.
+    func line(for host: Host) -> String {
+        guard let through = jump(of: host) else { return host.address }
+        return host.address + "  ·  " + tr("jump.via", through.title)
     }
 
     func forgetHostKey(for id: UUID) {

@@ -177,16 +177,23 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private func applyAutoReconnect() {
         core.setSetting(key: "auto-reconnect", value: autoReconnect ? "true" : "false")
     }
+    /// A key to approve: the host's own, or (`jump`) that of the jump host
+    /// it is reached through, whose address and id it then has.
     struct HostKeyChallenge: Identifiable {
         let id: String
         let hostname: String
         let port: Int
         let hostID: UUID?
         let fingerprint: String
+        var jump = false
+        /// The jump host's name, for the question.
+        var jumpName = ""
     }
     @Published var pendingHostKey: HostKeyChallenge?
     private var activeRequestID: String?
     private var requestedEndpoint: (hostname: String, port: Int, hostID: UUID?)?
+    /// The jump host as the request dialled it, if it went through one.
+    private var requestedJump: Host?
 
     weak var store: HostStore?
     weak var inputView: TerminalInputView?
@@ -412,7 +419,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         let changed = host?.hostname != saved.hostname || host?.port != saved.port
             || host?.user != saved.user || host?.auth != saved.auth
             || host?.remoteCommand != saved.remoteCommand || host?.knownHost != saved.knownHost
-            || credentialsChanged
+            || host?.jumpHost != saved.jumpHost || credentialsChanged
         let lost = reconnecting && !autoReconnect
         let needsRetry: Bool
         switch ConnectionPhase(status: connection) {
@@ -441,14 +448,22 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             #endif
             return
         }
+        // One whose jump host is gone is not dialled some other way.
+        let jump = store?.jump(of: host)
+        if host.jumpHost != nil, jump == nil {
+            clearHostKeyRequest()
+            connection = "failed: " + tr("jump.missing")
+            return
+        }
         let account = host.id.uuidString
         let secret = Keychain.load(account: account) ?? ""
         let passphrase = Keychain.load(account: account + ".passphrase")
-        log("shell: \(host.auth == .password ? "password" : "key text") \(secret.count) chars from the Keychain" + (passphrase == nil ? "" : ", with a passphrase"))
+        log("shell: \(host.auth == .password ? "password" : "key text") \(secret.count) chars from the Keychain" + (passphrase == nil ? "" : ", with a passphrase") + (jump.map { " via \($0.address)" } ?? ""))
         connect(
             hostname: host.hostname, port: host.port, user: host.user,
             authKind: host.auth == .password ? "password" : "key", secret: secret,
-            passphrase: passphrase, knownHost: host.knownHost, remoteCommand: host.remoteCommand
+            passphrase: passphrase, knownHost: host.knownHost, remoteCommand: host.remoteCommand,
+            jump: jump
         )
     }
 
@@ -462,11 +477,23 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
     #endif
 
-    private func connect(hostname: String, port: Int, user: String, authKind: String, secret: String, passphrase: String?, knownHost: String?, remoteCommand: String) {
+    private func connect(hostname: String, port: Int, user: String, authKind: String, secret: String, passphrase: String?, knownHost: String?, remoteCommand: String, jump: Host? = nil) {
         clearHostKeyRequest()
         let requestID = UUID().uuidString
         activeRequestID = requestID
         requestedEndpoint = (hostname, port, host?.id)
+        requestedJump = jump
+        // The jump host signs in with its own login, from its own items.
+        let through = jump.map { jump -> JumpHost in
+            let account = jump.id.uuidString
+            return JumpHost(
+                host: jump.hostname, port: UInt16(clamping: jump.port), user: jump.user,
+                authKind: jump.auth == .password ? "password" : "key",
+                secret: Keychain.load(account: account) ?? "",
+                passphrase: Keychain.load(account: account + ".passphrase"),
+                knownHost: jump.knownHost
+            )
+        }
         let paths = fontPaths
         guard paths.count == 2 else {
             log("shell: fonts missing from the bundle (\(paths))")
@@ -476,6 +503,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             requestId: requestID,
             host: hostname, port: UInt16(clamping: port), user: user,
             authKind: authKind, secret: secret, passphrase: passphrase, knownHost: knownHost,
+            jump: through,
             remoteCommand: remoteCommand, deviceId: Self.deviceId, keepaliveSecs: UInt32(max(settings.keepAliveSeconds, 0)),
             fontPaths: paths, sizePt: settings.fontSize,
             painter: CoreTextPainter()
@@ -485,7 +513,19 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private func clearHostKeyRequest() {
         activeRequestID = nil
         requestedEndpoint = nil
+        requestedJump = nil
         pendingHostKey = nil
+    }
+
+    /// The jump host this request dialled, as the store has it now -- with
+    /// the key pinned for it since, if one was -- while it is reached the
+    /// same way.
+    private func currentJump(_ requestID: String) -> Host? {
+        guard activeRequestID == requestID, let asked = requestedJump,
+              let now = store?.hosts.first(where: { $0.id == asked.id }),
+              now.hostname == asked.hostname, now.port == asked.port,
+              now.user == asked.user, now.auth == asked.auth else { return nil }
+        return now
     }
 
     func disconnect() { clearHostKeyRequest(); core.disconnect() }
@@ -498,7 +538,46 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.forgetHostKey()
     }
 
+    /// As `forgetHostKey`, for the jump host this one is reached through.
+    func forgetJumpHostKey() {
+        requestedJump?.knownHost = nil
+        core.forgetJumpHostKey()
+    }
+
+    /// The failure card's "forget the key and retry": the key that changed
+    /// is the jump host's when the failure says so. Either way it goes from
+    /// every session that holds it, the ones reached through it too.
+    func forgetKeyAndRetry(reason: String, sessions: Sessions) {
+        guard let store, let host else { return connect() }
+        if let jump = store.jump(of: host), reason.contains("the jump host") {
+            sessions.forgetHostKey(jump.id, store: store)
+        } else {
+            sessions.forgetHostKey(host.id, store: store)
+            self.host?.knownHost = nil
+        }
+        connect()
+    }
+
+    /// The jump host this host is reached through was edited: a session up
+    /// through it is made again the new way, as one is on an edit of its
+    /// own host. One lost and left for the user's retry stays so.
+    func applyJumpHostEdit() {
+        let lost = reconnecting && !autoReconnect
+        let redial = isConnected && !lost
+        disconnect()
+        if redial { connect() }
+    }
+
     func approveHostKey(_ challenge: HostKeyChallenge) {
+        if challenge.jump {
+            guard let jump = currentJump(challenge.id), jump.id == challenge.hostID,
+                  jump.hostname == challenge.hostname, jump.port == challenge.port else { return }
+            // One pinned meanwhile, in another session, is the one dialled
+            // with: a key it does not match is the failure's to say.
+            if jump.knownHost == nil { store?.rememberHostKey(challenge.fingerprint, for: jump.id) }
+            connect()
+            return
+        }
         guard activeRequestID == challenge.id,
               requestedEndpoint?.hostname == challenge.hostname,
               requestedEndpoint?.port == challenge.port,
@@ -1221,13 +1300,34 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
-    fileprivate func coreHostKeyRequired(_ requestID: String, _ fingerprint: String) {
+    fileprivate func coreHostKeyRequired(_ requestID: String, _ fingerprint: String, _ jump: Bool) {
         DispatchQueue.main.async {
+            if jump {
+                guard let through = self.currentJump(requestID) else { return }
+                // Its key was pinned since this dial, in another session --
+                // its own, or one through it: dialled again with it, rather
+                // than asked about twice or left unasked.
+                if through.knownHost != nil {
+                    self.connect()
+                    return
+                }
+                self.pendingHostKey = HostKeyChallenge(
+                    id: requestID, hostname: through.hostname, port: through.port, hostID: through.id,
+                    fingerprint: fingerprint, jump: true, jumpName: through.display)
+                return
+            }
             guard self.activeRequestID == requestID, let endpoint = self.requestedEndpoint,
                   self.host?.id == endpoint.hostID else { return }
             if let host = self.host {
                 guard host.hostname == endpoint.hostname, host.port == endpoint.port,
                       host.knownHost == nil else { return }
+                // Pinned since this dial, in a session reached through this
+                // host: dialled again with it.
+                if let pinned = self.store?.hosts.first(where: { $0.id == host.id })?.knownHost {
+                    self.host?.knownHost = pinned
+                    self.connect()
+                    return
+                }
             }
             let challenge = HostKeyChallenge(id: requestID, hostname: endpoint.hostname,
                 port: endpoint.port, hostID: endpoint.hostID, fingerprint: fingerprint)
@@ -1714,7 +1814,7 @@ private final class NotifySink: Notify, @unchecked Sendable {
             self.model?.cursorRect = CGRect(x: left, y: top, width: width, height: height)
         }
     }
-    func onHostKeyRequired(requestId: String, fingerprint: String) { model?.coreHostKeyRequired(requestId, fingerprint) }
+    func onHostKeyRequired(requestId: String, fingerprint: String, jump: Bool) { model?.coreHostKeyRequired(requestId, fingerprint, jump) }
     func onPublished(key: String, value: String) { model?.corePublished(key, value) }
     func onBell() { model?.coreBell() }
     func onPreview(pane: UInt32, rows: String) {

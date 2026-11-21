@@ -114,6 +114,8 @@ pub enum Cmd {
     CheckConnection,
     /// `Core::forget_host_key`.
     ForgetHostKey,
+    /// `Core::forget_jump_host_key`.
+    ForgetJumpHostKey,
     /// Upload `id` is done: its path goes into the pane it was started
     /// from, if that one is still on show.
     PasteUpload {
@@ -666,6 +668,11 @@ impl State {
             Cmd::ForgetHostKey => {
                 if let Some(link) = &self.link {
                     link.forget_host_key();
+                }
+            }
+            Cmd::ForgetJumpHostKey => {
+                if let Some(link) = &self.link {
+                    link.forget_jump_host_key();
                 }
             }
             Cmd::CheckConnection => {
@@ -1227,7 +1234,8 @@ impl State {
             Net::HostKeyRequired {
                 request_id,
                 fingerprint,
-            } => self.notify.on_host_key_required(request_id, fingerprint),
+                jump,
+            } => self.notify.on_host_key_required(request_id, fingerprint, jump),
             Net::Stderr(text) => self.notify.on_log(format!("remote: {}", text.trim_end())),
             Net::Exit(code) => self
                 .notify
@@ -1807,7 +1815,7 @@ mod tests {
         fn on_clipboard(&self, _: String) {}
         fn on_focus_input(&self) {}
         fn on_ime_anchor(&self, _: f64, _: f64, _: f64, _: f64) {}
-        fn on_host_key_required(&self, _: String, _: String) {}
+        fn on_host_key_required(&self, _: String, _: String, _: bool) {}
         fn on_published(&self, _: String, _: String) {}
         fn on_bell(&self) {}
         fn on_preview(&self, _: u32, _: String) {}

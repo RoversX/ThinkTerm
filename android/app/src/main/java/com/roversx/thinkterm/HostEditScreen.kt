@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -188,6 +189,7 @@ fun HostEditScreen(
             publicKey = draft.publicKey,
             icon = draft.icon,
             autoConnect = draft.autoConnect,
+            jumpHost = draft.jumpHost,
         )
     }
 
@@ -233,7 +235,7 @@ fun HostEditScreen(
     ) {
         if (page != null) {
             // The host as kept, its session and the way in.
-            HostHero(kept, page)
+            HostHero(kept, hostLine(store, kept), page)
         }
         Group(tr("f.icon")) {
             GroupRow {
@@ -334,6 +336,8 @@ fun HostEditScreen(
                 }
             }
         }
+
+        JumpHostGroup(store, draft) { draft = draft.copy(jumpHost = it) }
 
         Group(footer = if (showAdvanced) tr("f.remotecmd.foot") else null) {
             Disclosure(tr("f.advanced"), showAdvanced) { showAdvanced = !showAdvanced }
@@ -504,13 +508,64 @@ private fun clipboardText(context: Context): String? {
     return clip.getItemAt(0).coerceToText(context)?.toString()
 }
 
+/// The host this one is reached through, picked from the other saved
+/// hosts (`HostStore.jumpCandidates`). A host others are reached through
+/// has none of its own, and says why; one whose jump host is gone shows
+/// that, until another is picked.
+@Composable
+private fun JumpHostGroup(store: HostStore, draft: Host, pick: (String?) -> Unit) {
+    val colors = groupedColors()
+    val behind = store.reachedThrough(draft.id)
+    val candidates = store.jumpCandidates(draft)
+    val chosen = draft.jumpHost?.let { id -> store.hosts.firstOrNull { it.id == id } }
+    var open by remember { mutableStateOf(false) }
+    Group(tr("f.jump"), footer = if (behind.isNotEmpty()) tr("f.jump.isjump") else tr("f.jump.foot")) {
+        Box {
+            GroupRow(onClick = if (candidates.isNotEmpty() || draft.jumpHost != null) ({ open = true }) else null) {
+                RowTitle(tr("f.jump"))
+                RowValue(
+                    when {
+                        chosen != null -> chosen.title
+                        draft.jumpHost != null -> tr("jump.missing")
+                        else -> tr("f.jump.none")
+                    },
+                    modifier = Modifier.widthIn(max = 200.dp),
+                )
+                if (candidates.isNotEmpty() || draft.jumpHost != null) {
+                    DesktopIcon("chevrons-up-down", size = 16.dp, tint = colors.tertiary)
+                }
+            }
+            androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(tr("f.jump.none")) },
+                    onClick = { open = false; pick(null) },
+                    trailingIcon = if (draft.jumpHost == null) ({ Icon(Icons.Filled.Check, null) }) else null,
+                )
+                for (host in candidates) {
+                    androidx.compose.material3.DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(host.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(host.address, color = colors.secondary, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        },
+                        onClick = { open = false; pick(host.id) },
+                        trailingIcon = if (draft.jumpHost == host.id) ({ Icon(Icons.Filled.Check, null) }) else null,
+                    )
+                }
+            }
+        }
+    }
+}
+
 /// What the page edits of a host alike. The rest -- the key pinned on a
 /// connection, when it was last reached -- the store keeps up to date
 /// behind the page, and is not the page's to write back.
 private fun sameEdits(a: Host, b: Host): Boolean =
     a.name == b.name && a.hostname == b.hostname && a.port == b.port && a.user == b.user &&
         a.auth == b.auth && a.remoteCommand == b.remoteCommand && a.group == b.group &&
-        a.publicKey == b.publicKey && a.icon == b.icon && a.autoConnect == b.autoConnect
+        a.publicKey == b.publicKey && a.icon == b.icon && a.autoConnect == b.autoConnect &&
+        a.jumpHost == b.jumpHost
 
 /// The desktop's host pictures, the one the host wears picked out; the
 /// first is the one a host with none chosen wears.
@@ -538,7 +593,7 @@ private fun RowScope.HostIconRow(icon: String, pick: (String) -> Unit) {
 /// The top of a host's page: its picture, name and address as kept, where
 /// its session stands, and the way into its terminal.
 @Composable
-private fun HostHero(host: Host, page: HostPageActions) {
+private fun HostHero(host: Host, line: String, page: HostPageActions) {
     val colors = groupedColors()
     val session = Sessions.existing(host.id)
     val state = session?.let { SessionState.of(it) } ?: SessionState.NONE
@@ -550,7 +605,7 @@ private fun HostHero(host: Host, page: HostPageActions) {
         Spacer(Modifier.height(14.dp))
         Text(host.title, color = colors.primary, fontSize = 24.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(3.dp))
-        Text(host.address, color = colors.secondary, fontSize = 14.sp, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(line, color = colors.secondary, fontSize = 14.sp, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(10.dp))
         val (said, tint) = when (state) {
             SessionState.CONNECTED -> tr("host.connected") to Color(0xFF34C759)

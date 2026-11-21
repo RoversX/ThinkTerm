@@ -37,11 +37,19 @@ data class Host(
     /// (`Host.ICONS`); empty is the server.
     val icon: String = "",
     val autoConnect: Boolean = true,
+    /// The id of the saved host this one is reached through (`ssh -J`), if
+    /// any. One hop: that host has none of its own.
+    val jumpHost: String? = null,
 ) {
     fun sameSshConnection(other: Host): Boolean =
         id == other.id && hostname == other.hostname && port == other.port &&
             user == other.user && auth == other.auth && remoteCommand == other.remoteCommand &&
-            knownHost == other.knownHost
+            knownHost == other.knownHost && jumpHost == other.jumpHost
+
+    /// Reached the same way as a jump host: what a session through it signs
+    /// in to it with, its pinned key aside. Its command is never run.
+    fun sameJumpWay(other: Host): Boolean =
+        id == other.id && hostname == other.hostname && port == other.port && user == other.user && auth == other.auth
 
     val display: String get() = if (name.isNotEmpty()) name else "$user@$hostname:$port"
     /// The headline of a row: `display` would repeat the address below it
@@ -165,6 +173,20 @@ class HostStore private constructor(context: Context) {
     /// The groups in use, for the editor's suggestions.
     val groups: List<String> get() = hosts.map { it.group }.filter { it.isNotEmpty() }.distinct().sorted()
 
+    /// The host `host` is reached through, if it has one still saved.
+    fun jumpOf(host: Host): Host? = host.jumpHost?.let { id -> hosts.firstOrNull { it.id == id } }
+
+    /// The hosts reached through the host `id`: while there are any, it is
+    /// not deleted, nor given a jump host of its own.
+    fun reachedThrough(id: String): List<Host> = hosts.filter { it.jumpHost == id }
+
+    /// The hosts `host` may be reached through: any other saved one with no
+    /// jump host of its own -- one hop, so no chain and no circle. None for
+    /// a host others are reached through.
+    fun jumpCandidates(host: Host): List<Host> =
+        if (reachedThrough(host.id).isNotEmpty()) emptyList()
+        else hosts.filter { it.id != host.id && it.id != Host.PROBE_ID && it.jumpHost == null }
+
     /// A copy under a new id, with the secret copied across so the
     /// duplicate connects without being re-keyed.
     fun duplicate(host: Host, nameSuffix: String) {
@@ -212,6 +234,7 @@ class HostStore private constructor(context: Context) {
                     .put("lastConnected", h.lastConnected ?: JSONObject.NULL)
                     .put("icon", h.icon)
                     .put("autoConnect", h.autoConnect)
+                    .put("jumpHost", h.jumpHost ?: JSONObject.NULL)
             )
         }
         prefs.edit().putString(KEY, arr.toString()).apply()
@@ -237,6 +260,7 @@ class HostStore private constructor(context: Context) {
                     lastConnected = if (o.isNull("lastConnected")) null else o.optLong("lastConnected"),
                     icon = o.optString("icon"),
                     autoConnect = o.optBoolean("autoConnect", true),
+                    jumpHost = o.stringOrNull("jumpHost"),
                 )
             }
         } catch (e: Throwable) {

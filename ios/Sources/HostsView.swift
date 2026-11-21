@@ -10,6 +10,8 @@ struct HostsView: View {
     @State private var adding = false
     @State private var search = ""
     @State private var pendingDelete: Host?
+    /// A host others are reached through, asked to be deleted: it is not.
+    @State private var jumpInUse: Host?
     @State private var connecting: ConnectTarget?
     /// A host about to be added for a machine of the tailnet.
     @State private var addingMachine: Host?
@@ -121,6 +123,20 @@ struct HostsView: View {
         } message: { _ in
             Text(tr("host.delete.body"))
         }
+        .alert(
+            tr("jump.inuse.title"),
+            isPresented: Binding(get: { jumpInUse != nil }, set: { if !$0 { jumpInUse = nil } }),
+            presenting: jumpInUse
+        ) { _ in
+            Button(tr("ok"), role: .cancel) { jumpInUse = nil }
+        } message: { host in
+            Text(tr("jump.inuse.body", store.reachedThrough(host.id).map(\.display).joined(separator: ", ")))
+        }
+    }
+
+    /// Delete, once asked: not a host others are reached through.
+    private func askDelete(_ host: Host) {
+        if store.reachedThrough(host.id).isEmpty { pendingDelete = host } else { jumpInUse = host }
     }
 
     /// A host's own page: its picture and session, its settings to edit.
@@ -141,10 +157,10 @@ struct HostsView: View {
     @ViewBuilder
     private func row(_ host: Host) -> some View {
         NavigationLink(value: host) {
-            HostRow(host: host, session: sessions.existing(host.id))
+            HostRow(host: host, session: sessions.existing(host.id), line: store.line(for: host))
         }
         .swipeActions(edge: .trailing) {
-            Button(role: .destructive) { pendingDelete = host } label: { Label(tr("delete"), systemImage: "trash") }
+            Button(role: .destructive) { askDelete(host) } label: { Label(tr("delete"), systemImage: "trash") }
             Button { connecting = ConnectTarget(host: host) } label: { Label(tr("connect"), systemImage: "bolt.horizontal") }
                 .tint(.green)
         }
@@ -160,7 +176,7 @@ struct HostsView: View {
                 Button { sessions.forgetHostKey(host.id, store: store) } label: { Label(tr("forgetkey"), systemImage: "xmark.shield") }
             }
             Divider()
-            Button(role: .destructive) { pendingDelete = host } label: { Label(tr("delete"), systemImage: "trash") }
+            Button(role: .destructive) { askDelete(host) } label: { Label(tr("delete"), systemImage: "trash") }
         }
     }
 
@@ -168,12 +184,14 @@ struct HostsView: View {
     /// session open on it takes the edit, as stored: another address, login
     /// or key is a connection made again.
     private func keep(_ host: Host, secret: String, passphrase: String?) {
+        let before = store.hosts.first { $0.id == host.id }
         if !secret.isEmpty { Keychain.save(secret, account: host.id.uuidString) }
         if let passphrase { Keychain.save(passphrase, account: host.id.uuidString + ".passphrase") }
         store.upsert(host)
-        if let model = sessions.existing(host.id), let saved = store.hosts.first(where: { $0.id == host.id }) {
-            model.applyHostEdit(saved, credentialsChanged: !secret.isEmpty || passphrase != nil, connectOnSave: false)
-        }
+        guard let saved = store.hosts.first(where: { $0.id == host.id }) else { return }
+        let credentialsChanged = !secret.isEmpty || passphrase != nil
+        sessions.existing(host.id)?.applyHostEdit(saved, credentialsChanged: credentialsChanged, connectOnSave: false)
+        sessions.jumpHostKept(before: before, saved: saved, credentialsChanged: credentialsChanged, store: store)
     }
 
     private func remove(_ host: Host) {
@@ -247,10 +265,12 @@ struct HostRow: View {
     let host: Host
     /// The host's open session, if any.
     var session: TerminalModel? = nil
+    /// Its address and what it is reached through (`HostStore.line`).
+    var line: String? = nil
     @ObservedObject private var lang = AppLanguage.shared
 
     var body: some View {
-        HostRowLayout(title: host.title, subtitle: host.address, monospaced: true, session: session) {
+        HostRowLayout(title: host.title, subtitle: line ?? host.address, monospaced: true, session: session) {
             Image(systemName: host.iconSymbol).font(.system(size: 17, weight: .medium))
         }
     }

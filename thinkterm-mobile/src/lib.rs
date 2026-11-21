@@ -54,8 +54,9 @@ pub trait Notify: Send + Sync {
     fn on_focus_input(&self);
     /// Where the cursor cell is, in points, in the terminal view.
     fn on_ime_anchor(&self, left: f64, top: f64, width: f64, height: f64);
-    /// Authentication is blocked until the user approves this request's key.
-    fn on_host_key_required(&self, request_id: String, fingerprint: String);
+    /// Authentication is blocked until the user approves this request's key:
+    /// the jump host's (`connect`'s `jump`) when `jump`, else the host's.
+    fn on_host_key_required(&self, request_id: String, fingerprint: String, jump: bool);
     /// Something the App publishes for the display layer, keyed: "bg" is
     /// the terminal's background as a hex colour, for the chrome around it.
     fn on_published(&self, key: String, value: String);
@@ -141,6 +142,32 @@ fn install_logger() {
         // goes nowhere on a phone.
         std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
     });
+}
+
+/// The host a connection goes through on its way (`connect`'s `jump`),
+/// signed in to with its own login: `auth_kind`, `secret` and `passphrase`
+/// as `connect` takes the host's, `known_host` its own pinned key.
+#[derive(uniffi::Record)]
+pub struct JumpHost {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth_kind: String,
+    pub secret: String,
+    pub passphrase: Option<String>,
+    pub known_host: Option<String>,
+}
+
+/// A login's secret as `connect` is given it.
+fn auth_of(auth_kind: &str, secret: String, passphrase: Option<String>) -> ssh::Auth {
+    match auth_kind {
+        "password" => ssh::Auth::Password(secret),
+        "key" => ssh::Auth::KeyPem {
+            pem: secret,
+            passphrase: passphrase.filter(|p| !p.is_empty()),
+        },
+        _ => ssh::Auth::KeyPath(secret),
+    }
 }
 
 /// A key pair the shell asked for: the private half in the unencrypted
@@ -475,7 +502,9 @@ impl Core {
     /// `auth_kind` is "key-path" (the secret is a file path), "key" (the
     /// secret is the private key's text, `passphrase` its passphrase) or
     /// "password". `known_host` is the fingerprint remembered from an
-    /// earlier connection, if any. `device_id` names this install to the
+    /// earlier connection, if any. `jump` is the host this one is reached
+    /// through, if any; a host of the built-in tailnet is reached over it
+    /// instead, as on the desktop. `device_id` names this install to the
     /// server, the same every launch: a tab this phone held is still its
     /// own after a relaunch, rather than "another device's".
     #[allow(clippy::too_many_arguments)]
@@ -489,6 +518,7 @@ impl Core {
         secret: String,
         passphrase: Option<String>,
         known_host: Option<String>,
+        jump: Option<JumpHost>,
         remote_command: String,
         device_id: String,
         keepalive_secs: u32,
@@ -496,14 +526,14 @@ impl Core {
         size_pt: f64,
         painter: Box<dyn painter::GlyphPainter>,
     ) {
-        let auth = match auth_kind.as_str() {
-            "password" => ssh::Auth::Password(secret),
-            "key" => ssh::Auth::KeyPem {
-                pem: secret,
-                passphrase: passphrase.filter(|p| !p.is_empty()),
-            },
-            _ => ssh::Auth::KeyPath(secret),
-        };
+        let auth = auth_of(&auth_kind, secret, passphrase);
+        let jump = jump.map(|jump| ssh::JumpParams {
+            auth: auth_of(&jump.auth_kind, jump.secret, jump.passphrase),
+            host: jump.host,
+            port: jump.port,
+            user: jump.user,
+            known_host: jump.known_host.filter(|k| !k.is_empty()),
+        });
         let _ = self.tx.send(core::Cmd::Connect {
             params: core::ConnectParams {
                 ssh: ssh::SshParams {
@@ -515,6 +545,7 @@ impl Core {
                     known_host: known_host.filter(|k| !k.is_empty()),
                     remote_command,
                     keepalive_secs: keepalive_secs as u64,
+                    jump,
                 },
                 font_paths,
                 size_pt,
@@ -709,6 +740,12 @@ impl Core {
     /// than hold it to the old one.
     pub fn forget_host_key(&self) {
         let _ = self.tx.send(core::Cmd::ForgetHostKey);
+    }
+
+    /// As `forget_host_key`, for the key of the jump host that `connect`
+    /// was given.
+    pub fn forget_jump_host_key(&self) {
+        let _ = self.tx.send(core::Cmd::ForgetJumpHostKey);
     }
 
     /// Paste a finished upload's `paste` (`UploadStatus`) into the pane the

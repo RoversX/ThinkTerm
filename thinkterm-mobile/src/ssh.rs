@@ -47,6 +47,22 @@ pub struct SshParams {
     pub remote_command: String,
     /// Seconds between keep-alives; 0 sends none.
     pub keepalive_secs: u64,
+    /// The host this one is reached through, if any (`ssh -J`).
+    pub jump: Option<JumpParams>,
+}
+
+/// A host the connection goes through on its way, as `ssh -J` has it: it
+/// is signed in to with its own login, its key held to its own pin, and
+/// the session to the host runs end to end through a channel on it. It
+/// passes the host's bytes along, encrypted, and sees none of them.
+#[derive(Debug, Clone)]
+pub struct JumpParams {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: Auth,
+    /// Its key's fingerprint seen last time (`SHA256:...`), if any.
+    pub known_host: Option<String>,
 }
 
 pub enum Out {
@@ -73,6 +89,8 @@ pub enum Net {
     HostKeyRequired {
         request_id: String,
         fingerprint: String,
+        /// The key is the jump host's, not the host's own.
+        jump: bool,
     },
     Connected,
     Data(Vec<u8>),
@@ -493,6 +511,77 @@ where
     }
 }
 
+/// Sign in to a session's host as `user`. `who` names that host in what
+/// goes wrong, so a jump host's key or password that fails is not taken
+/// for the host's behind it.
+async fn sign_in(session: &mut client::Handle<HostKeyCheck>, user: &str, auth: &Auth, who: &str) -> Result<()> {
+    let auth = async {
+        anyhow::Ok(match auth {
+            Auth::KeyPath(path) => {
+                let key = russh::keys::load_secret_key(path, None).with_context(|| format!("loading the key {path}"))?;
+                bounded(
+                    "publickey auth",
+                    session.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), None)),
+                )
+                .await?
+            }
+            Auth::KeyPem { pem, passphrase } => {
+                let key = russh::keys::decode_secret_key(pem, passphrase.as_deref()).context("reading the private key")?;
+                bounded(
+                    "publickey auth",
+                    session.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), None)),
+                )
+                .await?
+            }
+            Auth::Password(password) => {
+                bounded("password auth", session.authenticate_password(user, password.as_str())).await?
+            }
+        })
+    }
+    .await
+    .with_context(|| format!("signing in to {who}"))?;
+    if !auth.success() {
+        anyhow::bail!("{who} refused the login for {user}");
+    }
+    Ok(())
+}
+
+/// The session to the jump host, signed in. It is reached as any host is,
+/// over the tailnet's node when it is one of its machines, and held to the
+/// key pinned for it: one not pinned yet is asked about (`HostKeyRequired`
+/// with `jump`) before any of its credentials go.
+async fn sign_in_to_jump(
+    jump: &JumpParams,
+    config: &Arc<client::Config>,
+    request_id: &str,
+    deliver: &dyn Fn(Net),
+) -> Result<client::Handle<HostKeyCheck>> {
+    let seen = Arc::new(Mutex::new(None));
+    let handler = HostKeyCheck {
+        known: jump.known_host.clone(),
+        seen: Arc::clone(&seen),
+    };
+    let config = Arc::clone(config);
+    let dial = match crate::tailnet::dial(&jump.host, jump.port).await {
+        Some(Ok(stream)) => tokio::time::timeout(STEP, client::connect_stream(config, stream, handler)).await,
+        Some(Err(err)) => return Err(err.context("reaching the jump host through the tailnet")),
+        None => tokio::time::timeout(STEP, client::connect(config, (jump.host.as_str(), jump.port), handler)).await,
+    }
+    .context("connecting to the jump host timed out")?;
+    if dial.is_err() && jump.known_host.is_none() {
+        if let Some(fingerprint) = seen.lock().unwrap().clone() {
+            deliver(Net::HostKeyRequired {
+                request_id: request_id.to_string(),
+                fingerprint,
+                jump: true,
+            });
+        }
+    }
+    let mut session = dial.context("the jump host's ssh transport")?;
+    sign_in(&mut session, &jump.user, &jump.auth, "the jump host").await?;
+    Ok(session)
+}
+
 async fn run(
     params: SshParams,
     mut out_rx: UnboundedReceiver<Out>,
@@ -510,11 +599,26 @@ async fn run(
         seen: Arc::clone(&seen),
     };
     // A machine of the tailnet the app has joined is reached through the
-    // app's own node; every other host by the system's network.
-    let dial = match crate::tailnet::dial(&params.host, params.port).await {
-        Some(Ok(stream)) => tokio::time::timeout(STEP, client::connect_stream(config, stream, handler)).await,
-        Some(Err(err)) => return Err(err.context("reaching the machine through the tailnet")),
-        None => {
+    // app's own node, and never through a jump host, as on the desktop;
+    // every other host by the system's network, or through its jump host.
+    // That one is held on to while the session through it lasts.
+    let mut _through = None;
+    let dial = match (crate::tailnet::dial(&params.host, params.port).await, &params.jump) {
+        (Some(Ok(stream)), _) => tokio::time::timeout(STEP, client::connect_stream(config, stream, handler)).await,
+        (Some(Err(err)), _) => return Err(err.context("reaching the machine through the tailnet")),
+        (None, Some(jump)) => {
+            let jump_session = sign_in_to_jump(jump, &config, &params.request_id, deliver).await?;
+            // The jump host connects to the host as it names it: an address
+            // only its own network knows is found there.
+            let tunnel = bounded(
+                "opening the way through the jump host",
+                jump_session.channel_open_direct_tcpip(params.host.as_str(), u32::from(params.port), "127.0.0.1", 0),
+            )
+            .await?;
+            _through = Some(jump_session);
+            tokio::time::timeout(STEP, client::connect_stream(config, tunnel.into_stream(), handler)).await
+        }
+        (None, None) => {
             tokio::time::timeout(STEP, client::connect(config, (params.host.as_str(), params.port), handler)).await
         }
     }
@@ -524,45 +628,12 @@ async fn run(
             deliver(Net::HostKeyRequired {
                 request_id: params.request_id.clone(),
                 fingerprint,
+                jump: false,
             });
         }
     }
     let mut session = dial.context("ssh transport")?;
-
-    let auth = match &params.auth {
-        Auth::KeyPath(path) => {
-            let key = russh::keys::load_secret_key(path, None)
-                .with_context(|| format!("loading the key {path}"))?;
-            bounded(
-                "publickey auth",
-                session.authenticate_publickey(
-                    &params.user,
-                    PrivateKeyWithHashAlg::new(Arc::new(key), None),
-                ),
-            )
-            .await?
-        }
-        Auth::KeyPem { pem, passphrase } => {
-            let key = russh::keys::decode_secret_key(pem, passphrase.as_deref())
-                .context("reading the private key")?;
-            bounded(
-                "publickey auth",
-                session.authenticate_publickey(
-                    &params.user,
-                    PrivateKeyWithHashAlg::new(Arc::new(key), None),
-                ),
-            )
-            .await?
-        }
-        Auth::Password(password) => bounded(
-            "password auth",
-            session.authenticate_password(&params.user, password.as_str()),
-        )
-        .await?,
-    };
-    if !auth.success() {
-        anyhow::bail!("the host refused the login for {}", params.user);
-    }
+    sign_in(&mut session, &params.user, &params.auth, "the host").await?;
 
     let mut channel = bounded("opening a session channel", session.channel_open_session()).await?;
     let command = if params.remote_command.trim().is_empty() {
@@ -819,6 +890,7 @@ mod host_key_tests {
                 known_host,
                 remote_command: "test".into(),
                 keepalive_secs: 0,
+                jump: None,
             };
             // The server intentionally refuses opening a session after auth.
             let result = tokio::time::timeout(
@@ -837,7 +909,11 @@ mod host_key_tests {
                     Net::HostKeyRequired {
                         request_id,
                         fingerprint,
-                    } => Some((request_id.clone(), fingerprint.clone())),
+                        jump,
+                    } => {
+                        assert!(!jump, "a host reached directly has no jump host to ask about");
+                        Some((request_id.clone(), fingerprint.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -852,6 +928,272 @@ mod host_key_tests {
             server.abort();
             let _ = server.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod jump_tests {
+    use super::*;
+    use russh::server::{Auth as Answer, ChannelOpenHandle, Msg, Session};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The jump host: lets `jumper` in with its password, and carries a
+    /// direct-tcpip channel to wherever it is asked to go.
+    struct JumpServer {
+        logins: Arc<AtomicUsize>,
+        asked: Arc<Mutex<Vec<(String, u32)>>>,
+    }
+    impl russh::server::Handler for JumpServer {
+        type Error = anyhow::Error;
+        async fn auth_password(&mut self, user: &str, password: &str) -> Result<Answer> {
+            if user != "jumper" || password != "jump-secret" {
+                return Ok(Answer::reject());
+            }
+            self.logins.fetch_add(1, Ordering::SeqCst);
+            Ok(Answer::Accept)
+        }
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: russh::Channel<Msg>,
+            host: &str,
+            port: u32,
+            _: &str,
+            _: u32,
+            reply: ChannelOpenHandle,
+            _: &mut Session,
+        ) -> Result<()> {
+            self.asked.lock().unwrap().push((host.to_string(), port));
+            match tokio::net::TcpStream::connect((host, port as u16)).await {
+                Ok(mut tcp) => {
+                    reply.accept().await;
+                    tokio::spawn(async move {
+                        let mut stream = channel.into_stream();
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+                    });
+                }
+                Err(_) => reply.reject(russh::ChannelOpenFailure::ConnectFailed).await,
+            }
+            Ok(())
+        }
+    }
+
+    /// The host behind it: lets `test` in with its own password, and answers
+    /// the terminal's command with a line before ending it.
+    struct TargetServer(Arc<AtomicUsize>);
+    impl russh::server::Handler for TargetServer {
+        type Error = anyhow::Error;
+        async fn auth_password(&mut self, user: &str, password: &str) -> Result<Answer> {
+            if user != "test" || password != "target-secret" {
+                return Ok(Answer::reject());
+            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Answer::Accept)
+        }
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<Msg>,
+            reply: ChannelOpenHandle,
+            _: &mut Session,
+        ) -> Result<()> {
+            reply.accept().await;
+            Ok(())
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, command: &[u8], session: &mut Session) -> Result<()> {
+            session.channel_success(channel)?;
+            if command == b"the terminal" {
+                session.data(channel, &b"through the jump host\n"[..])?;
+                session.exit_status_request(channel, 0)?;
+            }
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    fn new_key() -> (russh::keys::PrivateKey, String) {
+        let key = russh::keys::PrivateKey::random(
+            &mut crate::SysRng(ring::rand::SystemRandom::new()),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        (key, fingerprint)
+    }
+
+    /// A server on a port of its own for as long as the test runs, taking
+    /// every connection that comes.
+    async fn serve<H: russh::server::Handler + Send + 'static>(
+        key: russh::keys::PrivateKey,
+        handler: impl Fn() -> H + Send + 'static,
+    ) -> u16 {
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (config, handler) = (Arc::clone(&config), handler());
+                tokio::spawn(async move {
+                    if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
+                        let _ = session.await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// A port nothing listens on.
+    async fn closed_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    struct Attempt {
+        result: Result<String>,
+        /// Each `HostKeyRequired`: its fingerprint, and whether it was the
+        /// jump host's.
+        asked: Vec<(String, bool)>,
+        connected: bool,
+        data: Vec<u8>,
+    }
+
+    async fn attempt(target_port: u16, target_pin: Option<&str>, jump: JumpParams) -> Attempt {
+        let (_sender, receiver) = unbounded_channel();
+        let events = std::cell::RefCell::new(Vec::new());
+        let params = SshParams {
+            request_id: "through".into(),
+            host: "127.0.0.1".into(),
+            port: target_port,
+            user: "test".into(),
+            auth: Auth::Password("target-secret".into()),
+            known_host: target_pin.map(str::to_string),
+            remote_command: "the terminal".into(),
+            keepalive_secs: 0,
+            jump: Some(jump),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run(params, receiver, &|event| events.borrow_mut().push(event)),
+        )
+        .await
+        .expect("the attempt ends within the test's deadline");
+        let events = events.into_inner();
+        Attempt {
+            result,
+            asked: events
+                .iter()
+                .filter_map(|event| match event {
+                    Net::HostKeyRequired { request_id, fingerprint, jump } => {
+                        assert_eq!(request_id, "through");
+                        Some((fingerprint.clone(), *jump))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            connected: events.iter().any(|event| matches!(event, Net::Connected)),
+            data: events
+                .iter()
+                .filter_map(|event| match event {
+                    Net::Data(data) => Some(data.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_is_reached_through_its_jump_host_each_key_approved_on_its_own() {
+        let (jump_key, jump_print) = new_key();
+        let (target_key, target_print) = new_key();
+        let (jump_logins, asked_to) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())));
+        let target_logins = Arc::new(AtomicUsize::new(0));
+        let jump_port = {
+            let (logins, asked) = (Arc::clone(&jump_logins), Arc::clone(&asked_to));
+            serve(jump_key, move || JumpServer {
+                logins: Arc::clone(&logins),
+                asked: Arc::clone(&asked),
+            })
+            .await
+        };
+        let target_port = {
+            let logins = Arc::clone(&target_logins);
+            serve(target_key, move || TargetServer(Arc::clone(&logins))).await
+        };
+        let jump = |pin: Option<&str>, password: &str| JumpParams {
+            host: "127.0.0.1".into(),
+            port: jump_port,
+            user: "jumper".into(),
+            auth: Auth::Password(password.into()),
+            known_host: pin.map(str::to_string),
+        };
+
+        // The jump host's key comes first, and nothing is sent to it -- or
+        // through it -- before it is approved.
+        let first = attempt(target_port, None, jump(None, "jump-secret")).await;
+        assert!(first.result.is_err());
+        assert_eq!(first.asked, vec![(jump_print.clone(), true)]);
+        assert_eq!(jump_logins.load(Ordering::SeqCst), 0);
+        assert!(asked_to.lock().unwrap().is_empty());
+
+        // Its key pinned, the host's own is asked about, as one reached
+        // directly: seen end to end, through the tunnel.
+        let second = attempt(target_port, None, jump(Some(&jump_print), "jump-secret")).await;
+        assert!(second.result.is_err());
+        assert_eq!(second.asked, vec![(target_print.clone(), false)]);
+        assert_eq!(jump_logins.load(Ordering::SeqCst), 1);
+        assert_eq!(*asked_to.lock().unwrap(), vec![("127.0.0.1".to_string(), u32::from(target_port))]);
+        assert_eq!(target_logins.load(Ordering::SeqCst), 0);
+
+        // Both pinned: signed in to each with its own login, and the
+        // terminal's command answers through the jump host.
+        let third = attempt(target_port, Some(&target_print), jump(Some(&jump_print), "jump-secret")).await;
+        assert_eq!(third.result.unwrap(), "the remote command ended");
+        assert!(third.asked.is_empty());
+        assert!(third.connected);
+        assert_eq!(third.data, b"through the jump host\n");
+        assert_eq!(target_logins.load(Ordering::SeqCst), 1);
+
+        // A jump host whose key changed is never signed in to.
+        let logins = jump_logins.load(Ordering::SeqCst);
+        let changed = attempt(target_port, Some(&target_print), jump(Some(&target_print), "jump-secret")).await;
+        let err = format!("{:#}", changed.result.unwrap_err());
+        assert!(err.contains("the host's key changed"), "{err}");
+        assert!(changed.asked.is_empty());
+        assert_eq!(jump_logins.load(Ordering::SeqCst), logins);
+
+        // A jump host that turns the login down: said so, and the host is
+        // never asked for.
+        let reached = asked_to.lock().unwrap().len();
+        let refused = attempt(target_port, Some(&target_print), jump(Some(&jump_print), "wrong")).await;
+        let err = format!("{:#}", refused.result.unwrap_err());
+        assert!(err.contains("the jump host refused the login for jumper"), "{err}");
+        assert_eq!(asked_to.lock().unwrap().len(), reached);
+
+        // Its key that cannot be read is said to be its own, not the host's.
+        let unreadable = JumpParams {
+            auth: Auth::KeyPem {
+                pem: "not a key".into(),
+                passphrase: None,
+            },
+            ..jump(Some(&jump_print), "")
+        };
+        let unread = attempt(target_port, Some(&target_print), unreadable).await;
+        let err = format!("{:#}", unread.result.unwrap_err());
+        assert!(err.starts_with("signing in to the jump host: reading"), "{err}");
+        assert_eq!(asked_to.lock().unwrap().len(), reached);
+
+        // A host the jump host cannot reach.
+        let nowhere = closed_port().await;
+        let unreachable = attempt(nowhere, Some(&target_print), jump(Some(&jump_print), "jump-secret")).await;
+        let err = format!("{:#}", unreachable.result.unwrap_err());
+        assert!(err.contains("opening the way through the jump host"), "{err}");
+        assert!(!unreachable.connected);
     }
 }
 

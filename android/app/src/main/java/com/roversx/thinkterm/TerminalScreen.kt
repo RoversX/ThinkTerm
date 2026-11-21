@@ -606,8 +606,11 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                             host = h,
                             onSave = { edited, secret, passphrase ->
                                 // As stored: a new address drops the old pin.
+                                val before = store.hosts.firstOrNull { it.id == edited.id }
                                 val saved = store.saveEdit(edited, secret, passphrase)
-                                model.applyHostEdit(saved, secret.isNotEmpty() || passphrase != null, connectOnSave = true)
+                                val credentialsChanged = secret.isNotEmpty() || passphrase != null
+                                model.applyHostEdit(saved, credentialsChanged, connectOnSave = true)
+                                jumpHostKept(store, before, saved, credentialsChanged)
                                 editingHost = null
                             },
                             onCancel = { editingHost = null },
@@ -927,9 +930,10 @@ private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean, on
     model.pendingHostKey?.let { challenge ->
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { model.disconnect() },
-            title = { Text(tr("hostkey.approve.title")) },
+            title = { Text(tr(if (challenge.jump) "hostkey.approve.jumptitle" else "hostkey.approve.title")) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    if (challenge.jump) Text(tr("hostkey.approve.jumpwho", challenge.endpoint.display))
                     Text("${challenge.endpoint.hostname}:${challenge.endpoint.port}")
                     androidx.compose.foundation.text.selection.SelectionContainer {
                         Text(challenge.fingerprint, fontFamily = FontFamily.Monospace)
@@ -955,11 +959,7 @@ private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean, on
         ConnectionCard(phase, model.host.display, canEdit = model.host.id != Host.PROBE_ID) { action ->
             when (action) {
                 CardAction.Retry -> model.connect()
-                CardAction.ForgetKeyAndRetry -> {
-                    model.store.forgetHostKey(model.host.id)
-                    model.host = model.host.copy(knownHost = null)
-                    model.connect()
-                }
+                CardAction.ForgetKeyAndRetry -> model.forgetKeyAndRetry((phase as? ConnectionPhase.Failed)?.reason.orEmpty())
                 CardAction.Edit -> onEditHost()
                 CardAction.Back -> onBack()
             }

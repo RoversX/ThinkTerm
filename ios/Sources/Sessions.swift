@@ -30,6 +30,18 @@ final class Sessions: ObservableObject {
         // waits for the user's retry rather than dialling into the key's
         // question.
         existing(id)?.forgetHostKey()
+        // Those reached through it ask for its key on their next dial too.
+        for behind in store.reachedThrough(id) { existing(behind.id)?.forgetJumpHostKey() }
+    }
+
+    /// A host kept as edited: the sessions reached through it go the new
+    /// way, when the way to it changed.
+    func jumpHostKept(before: Host?, saved: Host, credentialsChanged: Bool, store: HostStore) {
+        if let before, !credentialsChanged, before.hostname == saved.hostname, before.port == saved.port,
+           before.user == saved.user, before.auth == saved.auth, before.knownHost == saved.knownHost {
+            return
+        }
+        for behind in store.reachedThrough(saved.id) { existing(behind.id)?.applyJumpHostEdit() }
     }
 
     func close(_ id: UUID) {
