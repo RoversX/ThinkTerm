@@ -9,6 +9,11 @@
 //! ends, with white inside it along the top and bottom. The numbers are read
 //! off screenshots of the iPhone's rows. High contrast keeps the shadow and
 //! the hairline under the glass (`TermWindow::glass_high_contrast`).
+//!
+//! The numbers are alphas as OpenGL mixes them, which mixes the sRGB values
+//! themselves. WebGPU draws into an sRGB surface and mixes in linear light,
+//! which takes a faint white over a dark capsule half as light again; there
+//! each is turned into the alpha that comes out the same (`GlassMix`).
 
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator};
 use crate::termwindow::render::corners::{
@@ -47,18 +52,21 @@ impl GlassEdge {
     /// little lighter than the ground (`LIGHT_GLASS_MIN_LIFT`), or keeps the
     /// fill it had where that is lighter still: made see-through down to the
     /// ceiling, it would vanish and leave the capsule only its outline.
-    pub(crate) fn fill(self, fill: LinearRgba, ground: LinearRgba) -> LinearRgba {
+    /// `linear` says the frame mixes in linear light (`GlassMix`), which the
+    /// see-through-ness is worked out for.
+    pub(crate) fn fill(self, fill: LinearRgba, ground: LinearRgba, linear: bool) -> LinearRgba {
         match self {
             Self::Dark => fill,
             Self::Light => {
-                let lightness = |c: LinearRgba| {
-                    let c = c.to_srgb();
-                    0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
-                };
                 let (over, under) = (lightness(fill), lightness(ground));
-                // Blended as the chrome blends, in sRGB.
-                let seen = under + fill.3 * (over - under);
                 let most = LIGHT_GLASS_CEILING.max(under + LIGHT_GLASS_MIN_LIFT);
+                // As the frame mixes them: the sRGB values, or the light.
+                let (over, under, most) = if linear {
+                    (decode(over), decode(under), decode(most))
+                } else {
+                    (over, under, most)
+                };
+                let seen = under + fill.3 * (over - under);
                 if seen <= most || over <= under {
                     fill
                 } else {
@@ -66,6 +74,97 @@ impl GlassEdge {
                     LinearRgba(fill.0, fill.1, fill.2, alpha.clamp(0.0, fill.3))
                 }
             }
+        }
+    }
+}
+
+/// How light a colour is, in sRGB, 0 to 1. Its own curve rather than
+/// `LinearRgba::to_srgb`, which turns linear values below 0.04045 back with
+/// the slope meant for sRGB ones and so takes a dark grey, a capsule's in the
+/// dark, for one more than twice as light.
+fn lightness(c: LinearRgba) -> f32 {
+    0.2126 * encode(c.0) + 0.7152 * encode(c.1) + 0.0722 * encode(c.2)
+}
+
+/// An sRGB value as linear light.
+fn decode(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear light as an sRGB value.
+fn encode(v: f32) -> f32 {
+    if v <= 0.0031308 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The alpha that puts `colour` over `under` -- sRGB values, 0 to 1 -- in a
+/// frame that mixes in linear light, where mixing the sRGB values themselves
+/// at `alpha`, as OpenGL does, puts it.
+fn alpha_mixed_in_linear(alpha: f32, colour: f32, under: f32) -> f32 {
+    let target = under + alpha * (colour - under);
+    let (colour, under, target) = (decode(colour), decode(under), decode(target));
+    if (colour - under).abs() < f32::EPSILON {
+        return alpha;
+    }
+    ((target - under) / (colour - under)).clamp(0.0, 1.0)
+}
+
+/// How a glass edge's white and black mix with what is under them, so that
+/// they come out as OpenGL draws them whichever way the frame mixes.
+#[derive(Clone, Copy, Debug)]
+struct GlassMix {
+    /// The frame mixes in linear light: WebGPU's sRGB surface.
+    linear: bool,
+    /// How light the capsule shows, in sRGB: its fill over its ground.
+    capsule: f32,
+    /// How light the ground round it is, in sRGB.
+    ground: f32,
+}
+
+impl GlassMix {
+    /// For a capsule `fill`ed as drawn, on `ground`.
+    fn new(linear: bool, fill: LinearRgba, ground: LinearRgba) -> Self {
+        let (fill_lightness, ground_lightness) = (lightness(fill), lightness(ground));
+        let capsule = if linear {
+            let ground_light = decode(ground_lightness);
+            encode(ground_light + fill.3 * (decode(fill_lightness) - ground_light))
+        } else {
+            ground_lightness + fill.3 * (fill_lightness - ground_lightness)
+        };
+        Self {
+            linear,
+            capsule,
+            ground: ground_lightness,
+        }
+    }
+
+    /// White at `alpha` over the capsule.
+    fn light(&self, alpha: f32) -> LinearRgba {
+        LinearRgba::with_components(1.0, 1.0, 1.0, self.alpha(alpha, 1.0, self.capsule))
+    }
+
+    /// Black at `alpha` over the capsule.
+    fn shade(&self, alpha: f32) -> LinearRgba {
+        LinearRgba::with_components(0.0, 0.0, 0.0, self.alpha(alpha, 0.0, self.capsule))
+    }
+
+    /// Black at `alpha` over the ground, outside the capsule.
+    fn shade_outside(&self, alpha: f32) -> LinearRgba {
+        LinearRgba::with_components(0.0, 0.0, 0.0, self.alpha(alpha, 0.0, self.ground))
+    }
+
+    fn alpha(&self, alpha: f32, colour: f32, under: f32) -> f32 {
+        if self.linear {
+            alpha_mixed_in_linear(alpha, colour, under)
+        } else {
+            alpha
         }
     }
 }
@@ -193,6 +292,15 @@ impl crate::TermWindow {
         )
     }
 
+    /// Whether this window's frame mixes colours in linear light: WebGPU's,
+    /// when it draws into an sRGB surface, as it asks to. OpenGL's mixes the
+    /// sRGB values themselves.
+    pub(crate) fn glass_mixes_in_linear(&self) -> bool {
+        self.webgpu
+            .as_ref()
+            .map_or(false, |webgpu| webgpu.config.borrow().format.is_srgb())
+    }
+
     /// A glass capsule's edge, as Liquid Glass on the iPhone has it, drawn
     /// over its fill: `rect` with corners of `radius`, on the ground `edge`
     /// was chosen for.
@@ -206,6 +314,8 @@ impl crate::TermWindow {
     /// one-pixel line was drawn round the capsule under the glass -- a
     /// see-through window's frame, or high contrast's hairline -- which the
     /// glass then stays inside rather than painting over its top and bottom.
+    /// `fill` is the capsule's fill as it was drawn, and `ground` what it
+    /// sits on: what the edge is mixed with (`GlassMix`).
     ///
     /// Round an end the light dims with how far the edge has turned from
     /// level. Across a corner that is how far in from the pill's side the
@@ -228,6 +338,8 @@ impl crate::TermWindow {
         edge: GlassEdge,
         dark: bool,
         over_line: bool,
+        fill: LinearRgba,
+        ground: LinearRgba,
     ) -> anyhow::Result<()> {
         let radius = snapped_rounded_corner_radius(rect, radius);
         // Pixels to a point: the chrome is authored in 2x backing pixels.
@@ -235,8 +347,7 @@ impl crate::TermWindow {
         if !(pixel > 0.0) || radius < 1.0 {
             return Ok(());
         }
-        let white = |alpha: f32| LinearRgba::with_components(1.0, 1.0, 1.0, alpha);
-        let black = |alpha: f32| LinearRgba::with_components(0.0, 0.0, 0.0, alpha);
+        let mix = GlassMix::new(self.glass_mixes_in_linear(), fill, ground);
         // Where the light starts, in pixels in from the edge: inside a line
         // drawn under the glass, which it would otherwise cover.
         let mut light_from = if over_line { 1.0_f32 } else { 0.0 };
@@ -267,7 +378,7 @@ impl crate::TermWindow {
                         rect,
                         radius,
                         -outset,
-                        black(alpha),
+                        mix.shade_outside(alpha),
                         GlassRing::Ends,
                     )?;
                     outset += 1.0;
@@ -287,8 +398,8 @@ impl crate::TermWindow {
                         layer_num,
                         lifted,
                         (radius - light_from).max(0.0),
-                        white(0.0),
-                        white(LIGHT_GLASS_LIFT),
+                        mix.light(0.0),
+                        mix.light(LIGHT_GLASS_LIFT),
                     )?;
                 }
                 if dark {
@@ -302,7 +413,7 @@ impl crate::TermWindow {
                             rect,
                             radius,
                             0.0,
-                            black(alpha),
+                            mix.shade(alpha),
                             ring,
                         )?;
                     }
@@ -324,7 +435,7 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 inset,
-                white(alpha),
+                mix.light(alpha),
                 GlassRing::Lit,
             )?;
             inset += 1.0;
@@ -420,12 +531,6 @@ impl crate::TermWindow {
 mod test {
     use super::*;
 
-    /// A colour's lightness in sRGB, as `GlassEdge::fill` weighs it.
-    fn lightness(c: LinearRgba) -> f32 {
-        let c = c.to_srgb();
-        0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
-    }
-
     /// What `fill` over `ground` comes out as, blended in sRGB as the
     /// chrome blends.
     fn seen(fill: LinearRgba, ground: LinearRgba) -> f32 {
@@ -445,7 +550,7 @@ mod test {
     #[test]
     fn on_the_usual_light_sidebar_the_fill_comes_out_as_light_as_the_iphones() {
         let ground = grey(226);
-        let fill = GlassEdge::Light.fill(row(), ground);
+        let fill = GlassEdge::Light.fill(row(), ground, false);
         assert!(
             (seen(fill, ground) - LIGHT_GLASS_CEILING).abs() < 0.5 / 255.0,
             "{:?}",
@@ -456,7 +561,7 @@ mod test {
     #[test]
     fn on_a_ground_lighter_than_the_glass_the_fill_does_not_vanish() {
         let ground = grey(250);
-        let fill = GlassEdge::Light.fill(row(), ground);
+        let fill = GlassEdge::Light.fill(row(), ground, false);
         assert_eq!(fill, row());
         assert!(seen(fill, ground) > lightness(ground));
     }
@@ -464,7 +569,7 @@ mod test {
     #[test]
     fn just_under_the_glass_the_fill_is_still_a_little_lighter_than_its_ground() {
         let ground = grey(240);
-        let fill = GlassEdge::Light.fill(row(), ground);
+        let fill = GlassEdge::Light.fill(row(), ground, false);
         let lift = seen(fill, ground) - lightness(ground);
         assert!(
             (lift - LIGHT_GLASS_MIN_LIFT).abs() < 0.5 / 255.0,
@@ -476,7 +581,70 @@ mod test {
     #[test]
     fn a_fill_darker_than_its_ground_and_the_dark_glass_keep_their_fill() {
         let tab = LinearRgba::with_srgba(238, 238, 238, 255);
-        assert_eq!(GlassEdge::Light.fill(tab, grey(255)), tab);
-        assert_eq!(GlassEdge::Dark.fill(row(), grey(18)), row());
+        assert_eq!(GlassEdge::Light.fill(tab, grey(255), false), tab);
+        assert_eq!(GlassEdge::Dark.fill(row(), grey(18), false), row());
+    }
+
+    /// What `colour` at `alpha` over `under` comes out as when mixed in
+    /// linear light, as WebGPU mixes, back in sRGB.
+    fn mixed_in_linear(alpha: f32, colour: f32, under: f32) -> f32 {
+        encode(decode(under) + alpha * (decode(colour) - decode(under)))
+    }
+
+    #[test]
+    fn in_linear_light_the_edge_comes_out_as_opengl_draws_it() {
+        // A Mac's selected row in the dark, as measured under each renderer:
+        // OpenGL 111 over a fill of 46, WebGPU 157 for the same alpha.
+        let under = 46.0 / 255.0;
+        assert!((mixed_in_linear(0.31, 1.0, under) * 255.0 - 157.0).abs() < 4.0);
+        for alpha in [0.31, 0.21, 0.0525, 0.0375, 0.006] {
+            for under in [18.0 / 255.0, 46.0 / 255.0, 0.5, 242.0 / 255.0] {
+                for colour in [0.0, 1.0] {
+                    let opengl = under + alpha * (colour - under);
+                    let webgpu =
+                        mixed_in_linear(alpha_mixed_in_linear(alpha, colour, under), colour, under);
+                    assert!(
+                        (webgpu - opengl).abs() < 0.5 / 255.0,
+                        "{} of {} over {}: {} against {}",
+                        alpha,
+                        colour,
+                        under,
+                        webgpu,
+                        opengl
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dark_capsule_is_as_dark_as_it_is_drawn() {
+        // The sidebar's selected row in the dark: 54 of 255, nearly solid,
+        // over a ground of 18.
+        let fill = LinearRgba::with_srgba(54, 54, 57, 250);
+        let mix = GlassMix::new(true, fill, grey(18));
+        assert!((mix.capsule * 255.0 - 54.0).abs() < 1.0, "{:?}", mix);
+        assert!((lightness(grey(18)) * 255.0 - 18.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_frame_mixing_srgb_values_keeps_the_alphas() {
+        let mix = GlassMix::new(false, row(), grey(226));
+        assert_eq!(mix.light(0.31).3, 0.31);
+        assert_eq!(mix.shade(0.1).3, 0.1);
+        assert_eq!(mix.shade_outside(0.8).3, 0.8);
+    }
+
+    #[test]
+    fn in_linear_light_the_light_fill_still_comes_out_as_light_as_the_iphones() {
+        let ground = grey(226);
+        let fill = GlassEdge::Light.fill(row(), ground, true);
+        let under = decode(lightness(ground));
+        let seen = encode(under + fill.3 * (decode(lightness(fill)) - under));
+        assert!(
+            (seen - LIGHT_GLASS_CEILING).abs() < 0.5 / 255.0,
+            "{:?}",
+            fill
+        );
     }
 }

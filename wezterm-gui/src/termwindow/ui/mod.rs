@@ -66,12 +66,14 @@ impl crate::TermWindow {
         active: bool,
     ) -> anyhow::Result<()> {
         let rect = euclid::rect(0.0, y as f32, width as f32, height as f32);
-        let glass = active.then(|| glass::GlassEdge::over(self.chrome().header_bg));
+        let ground = self.chrome().header_bg;
+        let glass = active.then(|| glass::GlassEdge::over(ground));
         let see_through = self.chrome_see_through();
         // Over a see-through window a tab, as a sidebar row, lets some of
         // what is behind it through: no shadow under it to darken that, and
-        // its edge a ring round the fill rather than a coat under it.
-        if see_through {
+        // its edge a ring round the fill rather than a coat under it. Each
+        // way gives back the fill it drew, which a glass edge is mixed with.
+        let drawn = if see_through {
             use crate::termwindow::ui::tokens::{
                 SEE_THROUGH_BORDER_BOOST, SEE_THROUGH_SURFACE_ALPHA,
             };
@@ -83,6 +85,7 @@ impl crate::TermWindow {
             } else {
                 border
             };
+            let drawn = fill.mul_alpha(SEE_THROUGH_SURFACE_ALPHA);
             crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
                 .draw_rounded_frame(
                     layers,
@@ -91,13 +94,15 @@ impl crate::TermWindow {
                     rect.min_y(),
                     rect.width(),
                     rect.height(),
-                    fill.mul_alpha(SEE_THROUGH_SURFACE_ALPHA),
+                    drawn,
                     border,
                     radius,
                 )?;
+            drawn
         } else if let Some(edge) = glass.filter(|_| !self.glass_high_contrast()) {
-            let ground = self.chrome().header_bg;
-            self.fill_rounded_rectangle(layers, layer_num, rect, edge.fill(fill, ground), radius)?;
+            let drawn = edge.fill(fill, ground, self.glass_mixes_in_linear());
+            self.fill_rounded_rectangle(layers, layer_num, rect, drawn, radius)?;
+            drawn
         } else {
             if active {
                 self.paint_active_surface_shadow(layers, layer_num, rect, radius)?;
@@ -111,7 +116,8 @@ impl crate::TermWindow {
                 radius,
                 crate::termwindow::ui::tokens::CAPSULE_BORDER_WIDTH,
             )?;
-        }
+            fill
+        };
         match glass {
             // Over a see-through window the edge takes none of its dark,
             // which would darken what shows through, as a shadow would.
@@ -125,6 +131,8 @@ impl crate::TermWindow {
                 edge,
                 !see_through,
                 see_through || self.glass_high_contrast(),
+                drawn,
+                ground,
             ),
             None => Ok(()),
         }

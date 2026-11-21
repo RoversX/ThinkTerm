@@ -4408,9 +4408,11 @@ impl crate::TermWindow {
         border: LinearRgba,
     ) -> anyhow::Result<()> {
         let radius = rect.height() / 2.0;
-        let edge = GlassEdge::over(self.chrome().workspace_sidebar_bg);
+        let ground = self.chrome().workspace_sidebar_bg;
+        let edge = GlassEdge::over(ground);
         let see_through = self.chrome_see_through();
-        if see_through {
+        // Each way gives back the fill it drew, which the edge is mixed with.
+        let drawn = if see_through {
             let Some(gl_state) = self.render_state.as_ref() else {
                 return Ok(());
             };
@@ -4427,6 +4429,7 @@ impl crate::TermWindow {
                     border.mul_alpha(boost),
                     radius,
                 )?;
+            fill
         } else if self.glass_high_contrast() {
             self.paint_active_surface_shadow(layers, 0, rect, radius)?;
             self.fill_rounded_rectangle_with_border(
@@ -4438,10 +4441,12 @@ impl crate::TermWindow {
                 radius,
                 CAPSULE_BORDER_WIDTH,
             )?;
+            fill
         } else {
-            let ground = self.chrome().workspace_sidebar_bg;
-            self.fill_rounded_rectangle(layers, 0, rect, edge.fill(fill, ground), radius)?;
-        }
+            let drawn = edge.fill(fill, ground, self.glass_mixes_in_linear());
+            self.fill_rounded_rectangle(layers, 0, rect, drawn, radius)?;
+            drawn
+        };
         // Over a see-through window the edge takes none of its dark, which
         // would darken what shows through, as a shadow would. Both that
         // window's frame and high contrast's hairline are a line under the
@@ -4454,6 +4459,8 @@ impl crate::TermWindow {
             edge,
             !see_through,
             see_through || self.glass_high_contrast(),
+            drawn,
+            ground,
         )
     }
 
