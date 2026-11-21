@@ -14711,17 +14711,34 @@ impl crate::TermWindow {
             return Ok(None);
         }
         if let Some(target) = workspace_threads::remote_files_target(&space_id, &project.id) {
-            return Ok(Some(target));
+            return Ok(Some(self.over_active_pane_connection(target)));
         }
         let Some(domain) = workspace_threads::client_domain_for_space(&space_id) else {
             return Err("Remote Files source is unavailable".to_string());
         };
-        Ok(Some(workspace_threads::RemoteFilesTarget {
-            project_id: project.id.clone(),
-            project_name: project.name.clone(),
-            source: workspace_threads::RemoteFilesSource::ClientDomain(domain),
-            requested_root: "~".to_string(),
-        }))
+        Ok(Some(self.over_active_pane_connection(
+            workspace_threads::RemoteFilesTarget {
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                source: workspace_threads::RemoteFilesSource::ClientDomain(domain),
+                requested_root: "~".to_string(),
+            },
+        )))
+    }
+
+    /// `target`, by way of the connection the active pane came over where
+    /// that is another name for the same server (`paste_target_for_pane`):
+    /// the Files panel, and the pastes and drops that go through it, reach
+    /// the machine by the way its terminal does, and stay on one way while
+    /// it does.
+    fn over_active_pane_connection(
+        &self,
+        target: workspace_threads::RemoteFilesTarget,
+    ) -> workspace_threads::RemoteFilesTarget {
+        match self.get_active_pane_or_overlay() {
+            Some(pane) => paste_target_for_pane(pane.domain_id(), target.clone()).unwrap_or(target),
+            None => target,
+        }
     }
 
     /// Seconds between keepalives on the Files connection. Unlike a terminal
@@ -15147,13 +15164,15 @@ impl crate::TermWindow {
         // domain entirely — pasting host A's path there would name nothing.
         // Anything that does not match falls back to the local-path paste.
         // (A mosh thread's pane is a local domain running mosh-client, so
-        // mosh Spaces deliberately keep the old behavior for now.)
-        if !pane_domain_matches_remote_source(pane.domain_id(), &target.source) {
+        // mosh Spaces deliberately keep the old behavior for now.) A pane
+        // that came to the same server over its other name uploads that way
+        // (`paste_target_for_pane`).
+        let Some(target) = paste_target_for_pane(pane.domain_id(), target) else {
             return TerminalPasteTarget {
                 pane_id,
                 remote: None,
             };
-        }
+        };
         let source_key =
             crate::termwindow::remote_files::RemoteFilesState::source_key(&target.source);
         let config = match Self::ssh_config_for_remote_files_target(&target) {
@@ -15204,15 +15223,18 @@ impl crate::TermWindow {
             return Err("The paste did not originate in a remote terminal".to_string());
         };
         let remote = remote.as_ref().map_err(Clone::clone)?;
-        let current_target = self
-            .active_remote_project_for_files()
-            .map_err(|message| format!("Paste canceled: {message}"))?;
-        let current_config = Self::ssh_config_for_remote_files_target(&remote.target)
-            .map_err(|message| format!("Paste canceled: {message}"))?;
-        let current_key = remote_connection_key(&remote.source_key, &current_config);
         let pane = Mux::get()
             .get_pane(paste_target.pane_id)
             .ok_or_else(|| "Paste canceled because its pane was closed".to_string())?;
+        // Taken the way the paste was: through the pane's own connection
+        // where that is how it reaches the Space's server.
+        let current_target = self
+            .active_remote_project_for_files()
+            .map_err(|message| format!("Paste canceled: {message}"))?
+            .and_then(|target| paste_target_for_pane(pane.domain_id(), target));
+        let current_config = Self::ssh_config_for_remote_files_target(&remote.target)
+            .map_err(|message| format!("Paste canceled: {message}"))?;
+        let current_key = remote_connection_key(&remote.source_key, &current_config);
         let mismatch = terminal_paste_snapshot_mismatch(
             &remote.space_id,
             &self.content_space_id(),
@@ -22454,6 +22476,67 @@ fn pane_domain_matches_remote_source(
     }
 }
 
+/// What a paste into the pane on `domain_id` uploads through, given the
+/// active project's `target`: that target, when the pane is on its host;
+/// and, in a Connect Space held under another name, the same target over
+/// the connection the pane came over, when that reaches the same server.
+/// One machine saved twice -- on a LAN or ZeroTier, and on the embedded
+/// tailnet -- has its Spaces held under one of the two names. Its panes
+/// still arrive over the other while that one is down but retrying, or
+/// while both are up and the copy on screen is the other's. Then the upload
+/// goes the way the pane itself does, rather than the local path pasted.
+fn paste_target_for_pane(
+    domain_id: mux::domain::DomainId,
+    target: workspace_threads::RemoteFilesTarget,
+) -> Option<workspace_threads::RemoteFilesTarget> {
+    if pane_domain_matches_remote_source(domain_id, &target.source) {
+        return Some(target);
+    }
+    let workspace_threads::RemoteFilesSource::ClientDomain(held_by) = &target.source else {
+        return None;
+    };
+    let mux = Mux::get();
+    let holder_server = mux.get_domain_by_name(held_by).and_then(|domain| {
+        domain
+            .downcast_ref::<wezterm_client::domain::ClientDomain>()
+            .and_then(|client| client.remote_server_id())
+    });
+    let pane_domain = mux.get_domain(domain_id)?;
+    let came_over = pane_domain.downcast_ref::<wezterm_client::domain::ClientDomain>()?;
+    if !uploads_over_pane_connection(
+        came_over.ssh_connection_config().is_some(),
+        came_over.remote_server_id().as_deref(),
+        holder_server.as_deref(),
+        workspace_threads::reaches_the_server_held_by(pane_domain.domain_name(), held_by),
+    ) {
+        return None;
+    }
+    Some(workspace_threads::RemoteFilesTarget {
+        source: workspace_threads::RemoteFilesSource::ClientDomain(
+            pane_domain.domain_name().to_string(),
+        ),
+        ..target
+    })
+}
+
+/// Whether a pane that came over a Connect domain other than the one
+/// holding its Space can have a paste uploaded over its own. Only an SSH
+/// domain carries the Files connection, and only one that reached the same
+/// server leads to where the pane runs. Either the two handshakes gave the
+/// same runtime id, or the tree the pane's connection brought carries a
+/// Space the other holds (`trees_agree`); the second still holds after the
+/// server restarts, which gives it a new runtime id. A connection that
+/// passes a server's panes on from another, a mux of muxes, passes
+/// neither.
+fn uploads_over_pane_connection(
+    pane_is_ssh: bool,
+    pane_server: Option<&str>,
+    holder_server: Option<&str>,
+    trees_agree: bool,
+) -> bool {
+    pane_is_ssh && (trees_agree || (pane_server.is_some() && pane_server == holder_server))
+}
+
 /// Where a terminal drop should upload, given the setting and (when the
 /// setting asks for it) the pane's reported working directory. Pure, so the
 /// fallback rules stay testable: `cwd` without a usable cwd must degrade to
@@ -24521,7 +24604,7 @@ mod tests {
         search_right_sidebar_file_index, shaped_run_byte_at_x, shaped_run_x_at_byte,
         sidebar_message_layout, sidebar_row_element_visible, snippet_cursor_visible,
         sorted_open_with_candidates, spawn_pasted_image_staging, stage_pasted_image,
-        terminal_paste_snapshot_mismatch, virtual_note_line_range,
+        terminal_paste_snapshot_mismatch, uploads_over_pane_connection, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
         wrapping_note_table_columns, FilePreviewColours, FilePreviewLongLine, FileReleaseAction,
         FileRowPlacement, NoteCodeHighlightEntry, NoteCodeHighlightState, NoteGlyphWidthStore,
@@ -24871,6 +24954,48 @@ mod tests {
             ),
             Some(TerminalPasteSnapshotMismatch::Pane)
         );
+    }
+
+    #[test]
+    fn a_paste_goes_over_the_panes_own_connection_only_to_the_same_server() {
+        // The same server under its other name: where the pane runs.
+        assert!(uploads_over_pane_connection(
+            true,
+            Some("server-1"),
+            Some("server-1"),
+            false
+        ));
+        // Restarted since the Space's connection last heard from it: a new
+        // runtime id, but its tree still carries that connection's Spaces.
+        assert!(uploads_over_pane_connection(
+            true,
+            Some("server-2"),
+            Some("server-1"),
+            true
+        ));
+        // Another server, or one the Space's connection never named, with
+        // no Space in common: the pane's way leads somewhere else, or
+        // nowhere known.
+        assert!(!uploads_over_pane_connection(
+            true,
+            Some("server-1"),
+            Some("server-2"),
+            false
+        ));
+        assert!(!uploads_over_pane_connection(
+            true,
+            Some("server-1"),
+            None,
+            false
+        ));
+        assert!(!uploads_over_pane_connection(true, None, None, false));
+        // A unix or TLS domain carries no Files connection.
+        assert!(!uploads_over_pane_connection(
+            false,
+            Some("server-1"),
+            Some("server-1"),
+            true
+        ));
     }
 
     /// Backend double whose `exists` answers from a fixed set of taken names.

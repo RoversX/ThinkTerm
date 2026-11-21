@@ -5934,6 +5934,25 @@ fn rehome_orphaned_windows(rehome: Vec<(u64, SpaceId)>) {
     }
 }
 
+/// Whether the last tree the connection `tree_domain` brought carries a
+/// Space that `holder` holds here: the two names reach the same server.
+/// Space ids live in the server's tree and outlast its restarts, as the
+/// runtime id a connection learns in its handshake does not.
+pub fn reaches_the_server_held_by(tree_domain: &str, holder: &str) -> bool {
+    let held: Vec<SpaceId> = THREAD_STORE
+        .lock()
+        .spaces
+        .iter()
+        .filter(|space| space.client_domain.as_deref() == Some(holder))
+        .map(|space| space.id.clone())
+        .collect();
+    !held.is_empty()
+        && LAST_KNOWN_REMOTE_TREES
+            .lock()
+            .get(tree_domain)
+            .is_some_and(|tree| held.iter().any(|id| tree.space(id).is_some()))
+}
+
 /// Bring the server's copy of `domain_name`'s subtree in line with ours.
 ///
 /// Called from the paths that build or tear down rows in more than one step,
