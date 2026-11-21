@@ -2751,6 +2751,20 @@ impl ClientDomain {
             .map_or(false, |inner| inner.client.reconnect_is_suspended())
     }
 
+    /// The connection had its server and has lost it: the transport is
+    /// gone, and the reconnect loop is waiting to try again or has parked
+    /// itself. Not while registering or syncing, on the way back or on a
+    /// first connect, and not for a domain never attached. Its mirrors show
+    /// what was on screen when it dropped.
+    pub fn has_lost_its_server(&self) -> bool {
+        self.inner().map_or(false, |inner| {
+            matches!(
+                inner.client.connection_phase(),
+                ClientConnectionPhase::Reconnecting | ClientConnectionPhase::Suspended
+            )
+        })
+    }
+
     pub fn resume_reconnect(&self) {
         if let Some(inner) = self.inner() {
             inner.client.resume_reconnect();

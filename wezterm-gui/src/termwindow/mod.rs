@@ -7793,6 +7793,53 @@ impl TermWindow {
         true
     }
 
+    /// This window shows a server's window through a connection that has
+    /// lost that server, while another connection to it is up: show that
+    /// one's copy of the same workspace, live, in place of the frozen one.
+    /// One machine saved on two networks is mirrored once per connection.
+    /// Not onto a copy another window shows already, which would be two
+    /// windows on one mux window.
+    pub(crate) fn leave_copy_of_lost_connection(&mut self) {
+        let mux = Mux::get();
+        let copy_lost_its_server = |window_id: MuxWindowId| {
+            mux.get_window(window_id)
+                .and_then(|window| window.origin_domain())
+                .and_then(|domain_id| mux.get_domain(domain_id))
+                .is_some_and(|domain| {
+                    domain
+                        .downcast_ref::<ClientDomain>()
+                        .is_some_and(|client| client.has_lost_its_server())
+                })
+        };
+        if !copy_lost_its_server(self.mux_window_id) {
+            return;
+        }
+        let Some(workspace) = mux
+            .get_window(self.mux_window_id)
+            .map(|window| window.get_workspace().to_string())
+        else {
+            return;
+        };
+        let Some(target) = crate::workspace_threads::window_to_show_in_workspace(&workspace)
+        else {
+            return;
+        };
+        if target == self.mux_window_id
+            || copy_lost_its_server(target)
+            || crate::frontend::front_end()
+                .gui_window_for_mux_window(target)
+                .is_some()
+        {
+            return;
+        }
+        log::info!(
+            "showing mux window {target} for {workspace} in place of {}: its connection lost \
+             the server, another reaches it",
+            self.mux_window_id
+        );
+        self.adopt_workspace_in_this_window(&workspace);
+    }
+
     /// Take care to remove our panes from the mux, otherwise
     /// we can leave the mux with no windows but some panes
     /// and it won't believe that we are empty.

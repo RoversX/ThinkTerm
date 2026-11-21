@@ -5469,6 +5469,91 @@ fn another_name_keeps_its_spaces(attached_here: bool, other_live: bool) -> bool 
     !attached_here || other_live
 }
 
+/// Whether the connection named `domain_name` had its server and has lost
+/// it (`ClientDomain::has_lost_its_server`): still attached in name, but
+/// retrying or parked, with its mirrors frozen on what was on screen.
+fn remote_domain_has_lost_its_server(domain_name: &str) -> bool {
+    Mux::try_get()
+        .and_then(|mux| mux.get_domain_by_name(domain_name))
+        .is_some_and(|domain| {
+            domain
+                .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                .is_some_and(|client| client.has_lost_its_server())
+        })
+}
+
+/// Whether a connection keeps the Spaces it holds from another name for
+/// the same server (`another_name_keeps_its_spaces`): while it is up, or on
+/// its way up for the first time. One that had its server and lost it is
+/// neither, however attached it reads. Left with it, they stayed with a
+/// way that was down until a restart, while the other way showed their
+/// threads.
+fn still_holds_on(live: bool, lost_its_server: bool) -> bool {
+    live && !lost_its_server
+}
+
+/// Whether any connection has lost its server, as a cheap first look
+/// before `hand_spaces_from_lost_connections` and the windows' own.
+pub fn any_connection_has_lost_its_server() -> bool {
+    Mux::try_get().is_some_and(|mux| {
+        mux.iter_domains().iter().any(|domain| {
+            domain
+                .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                .is_some_and(|client| client.has_lost_its_server())
+        })
+    })
+}
+
+/// Hand the Spaces held by connections that lost their server to another
+/// connection to that server that is up: one whose last tree carries one of
+/// them (`takers_for_lost_holders`). The taker's tree is taken in again, as
+/// when it came, and the takeover in `ingest_remote_tree_with` does the
+/// rest. Without this, a network that drops while the other is up keeps the
+/// Spaces under its name until the next tree, which only a change on the
+/// server sends. Says whether any changed hands.
+pub fn hand_spaces_from_lost_connections() -> bool {
+    let mut holders: Vec<String> = THREAD_STORE
+        .lock()
+        .spaces
+        .iter()
+        .filter_map(|space| space.client_domain.clone())
+        .collect();
+    holders.sort();
+    holders.dedup();
+    let lost: Vec<String> = holders
+        .into_iter()
+        .filter(|holder| remote_domain_has_lost_its_server(holder))
+        .collect();
+    if lost.is_empty() {
+        return false;
+    }
+    let trees: HashMap<String, codec::ThinkTermTree> = LAST_KNOWN_REMOTE_TREES
+        .lock()
+        .iter()
+        .filter(|(name, _)| !lost.contains(name))
+        .map(|(name, tree)| (name.clone(), tree.clone()))
+        .collect();
+    let serving: Vec<String> = trees
+        .keys()
+        .filter(|name| remote_tree_domain_is_attached(name))
+        .cloned()
+        .collect();
+    let server_ids: HashMap<String, Option<String>> = lost
+        .iter()
+        .chain(&serving)
+        .map(|name| (name.clone(), remote_server_runtime_id(name)))
+        .collect();
+    let server_id_of = |name: &str| server_ids.get(name).cloned().flatten();
+    let store = THREAD_STORE.lock();
+    let takers = store.takers_for_lost_holders(&lost, &serving, &trees, &server_id_of);
+    drop(store);
+    for taker in &takers {
+        log::info!("{taker} takes over the Spaces of a connection to its server that was lost");
+        restore_last_authoritative_tree(taker);
+    }
+    !takers.is_empty()
+}
+
 fn remote_tree_domain_is_attached(domain_name: &str) -> bool {
     // try_get: unit tests and early startup have no Mux; "no mux" must read
     // as "not attached" (the conservative answer that keeps refs alive).
@@ -5673,8 +5758,16 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         // because a saved host still went by its name, they sat offline in
         // the Space menu while this connection showed their threads: only the
         // Agents panel led there, and new threads tried the way that was down.
+        // Not once it has lost its server and is only trying to get back
+        // (`still_holds_on`).
         store.ingest_remote_tree_with(domain_name, &tree_for_store, &|other| {
-            another_name_keeps_its_spaces(attached, remote_domain_is_live(other))
+            another_name_keeps_its_spaces(
+                attached,
+                still_holds_on(
+                    remote_domain_is_live(other),
+                    remote_domain_has_lost_its_server(other),
+                ),
+            )
         })
     };
     // A name never used for this server, opened while another name for it
@@ -7428,6 +7521,53 @@ impl WorkspaceThreadStore {
         self.last_space_per_domain
             .insert(domain_name.to_string(), target);
         true
+    }
+
+    /// The connections among `serving` to hand over the Spaces held by the
+    /// `lost` ones (`hand_spaces_from_lost_connections`). For each lost
+    /// holder of a Space here, a taker is one whose last tree (`trees`)
+    /// carries one of those Spaces, picked in name order so it is the same
+    /// one each time. Not one whose server and the holder's both gave a
+    /// runtime id, and different ones: two machines, one with a tree copied
+    /// from the other's.
+    fn takers_for_lost_holders(
+        &self,
+        lost: &[String],
+        serving: &[String],
+        trees: &HashMap<String, codec::ThinkTermTree>,
+        server_id_of: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<String> {
+        let mut serving: Vec<&String> = serving.iter().collect();
+        serving.sort();
+        let mut takers: Vec<String> = Vec::new();
+        for holder in lost {
+            let held: Vec<&SpaceId> = self
+                .spaces
+                .iter()
+                .filter(|space| space.client_domain.as_deref() == Some(holder.as_str()))
+                .map(|space| &space.id)
+                .collect();
+            if held.is_empty() {
+                continue;
+            }
+            let holder_server = server_id_of(holder);
+            let taker = serving.iter().find(|name| {
+                name.as_str() != holder.as_str()
+                    && !matches!(
+                        (holder_server.as_deref(), server_id_of(name).as_deref()),
+                        (Some(this), Some(other)) if this != other
+                    )
+                    && trees
+                        .get(name.as_str())
+                        .is_some_and(|tree| held.iter().any(|id| tree.space(id).is_some()))
+            });
+            if let Some(taker) = taker {
+                if !takers.contains(*taker) {
+                    takers.push((*taker).clone());
+                }
+            }
+        }
+        takers
     }
 
     /// Whether `domain_name`'s server is one this device has heard from:
@@ -11691,20 +11831,30 @@ pub(crate) fn parse_thread_workspace_name(workspace: &str) -> Option<(String, St
 /// The mux window a GUI window should show for `workspace`. A workspace
 /// normally has one; when a server holds more than one for the same thread
 /// (duplicates left by an earlier mirror rebuild), the one with the most
-/// panes is the one the user was working in. Ties go to the lowest id on
-/// the server, which is stable across launches and takeovers, unlike the
-/// local mirror ids, which follow the order the server listed them in.
+/// panes is the one the user was working in. A server reached two ways is
+/// mirrored once per connection, the same window twice: the copy of a
+/// connection that lost its server shows only what was on screen when it
+/// dropped, so any other goes first, and between two that are alike the
+/// one a window shows already stays. Ties go to the lowest id on the
+/// server, which is stable across launches and takeovers, unlike the local
+/// mirror ids, which follow the order the server listed them in.
 pub(crate) fn window_to_show_in_workspace(workspace: &str) -> Option<mux::window::WindowId> {
     let mux = mux::Mux::get();
+    let front_end = crate::frontend::try_front_end();
     let rank = |window_id: mux::window::WindowId| {
+        // Asked before the mux window is borrowed: it looks at no mux state.
+        let shown = front_end
+            .as_ref()
+            .is_some_and(|front_end| front_end.gui_window_for_mux_window(window_id).is_some());
         let Some(window) = mux.get_window(window_id) else {
-            return (0, std::cmp::Reverse((true, window_id)));
+            // Gone since it was listed: last of all.
+            return mirror_copy_rank(true, 0, false, None, window_id);
         };
         let pane_count: usize = window
             .iter()
             .map(|tab| tab.count_panes().unwrap_or(0))
             .sum();
-        let remote_id = window
+        let (remote_id, lost) = window
             .iter()
             .flat_map(|tab| tab.iter_all_panes())
             .next()
@@ -11712,16 +11862,43 @@ pub(crate) fn window_to_show_in_workspace(workspace: &str) -> Option<mux::window
             .and_then(|domain| {
                 domain
                     .downcast_ref::<wezterm_client::domain::ClientDomain>()
-                    .and_then(|client| client.local_to_remote_window_id(window_id))
-            });
-        (
-            pane_count,
-            std::cmp::Reverse((remote_id.is_none(), remote_id.unwrap_or(window_id))),
-        )
+                    .map(|client| {
+                        (
+                            client.local_to_remote_window_id(window_id),
+                            client.has_lost_its_server(),
+                        )
+                    })
+            })
+            .unwrap_or((None, false));
+        mirror_copy_rank(lost, pane_count, shown, remote_id, window_id)
     };
     mux.iter_windows_in_workspace(workspace)
         .into_iter()
         .max_by_key(|window_id| rank(*window_id))
+}
+
+/// How `window_to_show_in_workspace` ranks one of a workspace's mux windows,
+/// highest first: not a copy whose connection lost its server, then most
+/// panes, then one a window shows already, then the lowest id on the
+/// server.
+fn mirror_copy_rank(
+    lost_its_server: bool,
+    pane_count: usize,
+    shown: bool,
+    remote_id: Option<mux::window::WindowId>,
+    window_id: mux::window::WindowId,
+) -> (
+    bool,
+    usize,
+    bool,
+    std::cmp::Reverse<(bool, mux::window::WindowId)>,
+) {
+    (
+        !lost_its_server,
+        pane_count,
+        shown,
+        std::cmp::Reverse((remote_id.is_none(), remote_id.unwrap_or(window_id))),
+    )
 }
 
 /// Whether the workspace is managed by ThinkTerm's Space/thread store.
@@ -16544,6 +16721,95 @@ mod tests {
             store.last_space_per_domain.get(tailnet).map(String::as_str),
             Some("space-remote")
         );
+    }
+
+    /// A connection that had its server and lost it, still retrying, is
+    /// attached in name only: the other name, up, takes its Spaces over.
+    #[test]
+    fn a_connection_that_lost_its_server_gives_its_spaces_up() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &sample_tree()));
+
+        let lan_lost =
+            |other: &str| another_name_keeps_its_spaces(true, still_holds_on(true, other == lan));
+        assert!(store.ingest_remote_tree_with(tailnet, &sample_tree(), &lan_lost));
+        let held_by = |store: &WorkspaceThreadStore| {
+            store
+                .spaces
+                .iter()
+                .find(|space| space.id == "space-remote")
+                .and_then(|space| space.client_domain.clone())
+        };
+        assert_eq!(held_by(&store).as_deref(), Some(tailnet));
+
+        // Up again, the first name takes nothing back while the other is up.
+        let tailnet_up = |_: &str| another_name_keeps_its_spaces(true, still_holds_on(true, false));
+        assert!(!store.ingest_remote_tree_with(lan, &sample_tree(), &tailnet_up));
+        assert_eq!(held_by(&store).as_deref(), Some(tailnet));
+        // A first connect still on its way holds on.
+        assert!(still_holds_on(true, false));
+        assert!(!still_holds_on(false, false));
+    }
+
+    #[test]
+    fn a_lost_connection_hands_its_spaces_to_one_that_reaches_its_server() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let elsewhere = "Elsewhere";
+        let mut store = remote_test_store(lan);
+        assert!(store.ingest_remote_tree(lan, &sample_tree()));
+        let other_tree = codec::ThinkTermTree {
+            spaces: vec![codec::TtSpace {
+                id: "space-elsewhere".to_string(),
+                name: "elsewhere".to_string(),
+            }],
+            projects: vec![],
+            revision: 1,
+        };
+        let trees: HashMap<String, codec::ThinkTermTree> = HashMap::from([
+            (tailnet.to_string(), sample_tree()),
+            (elsewhere.to_string(), other_tree),
+        ]);
+        let lost = vec![lan.to_string()];
+        let serving = vec![elsewhere.to_string(), tailnet.to_string()];
+        let one_server = |_: &str| Some("server-1".to_string());
+
+        // The one whose tree carries the lost name's Space.
+        assert_eq!(
+            store.takers_for_lost_holders(&lost, &serving, &trees, &one_server),
+            vec![tailnet.to_string()]
+        );
+        // Two machines, one tree copied from the other: left apart.
+        let two_machines =
+            |name: &str| Some(if name == lan { "server-1" } else { "server-2" }.to_string());
+        assert!(store
+            .takers_for_lost_holders(&lost, &serving, &trees, &two_machines)
+            .is_empty());
+        // Nothing up that reaches the server: they stay.
+        assert!(store
+            .takers_for_lost_holders(&lost, &[elsewhere.to_string()], &trees, &one_server)
+            .is_empty());
+        // A lost name that holds nothing here has nothing to hand over.
+        assert!(store
+            .takers_for_lost_holders(&[tailnet.to_string()], &serving, &trees, &one_server)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_live_copy_goes_before_a_frozen_one_and_a_shown_one_keeps_its_place() {
+        let rank = mirror_copy_rank;
+        // One server window mirrored twice: the frozen copy loses, even
+        // shown and with more panes.
+        assert!(rank(false, 2, false, Some(7), 11) > rank(true, 3, true, Some(7), 10));
+        // Two live copies alike: the one a window shows stays.
+        assert!(rank(false, 2, true, Some(7), 10) > rank(false, 2, false, Some(7), 11));
+        // A connect's empty stand-in, shown, does not win over the window
+        // the server sent.
+        assert!(rank(false, 3, false, Some(7), 12) > rank(false, 0, true, None, 9));
+        // Otherwise the lowest id on the server.
+        assert!(rank(false, 2, false, Some(3), 20) > rank(false, 2, false, Some(7), 10));
     }
 
     #[test]

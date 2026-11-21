@@ -1668,6 +1668,31 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     // plugin is installed.
     crate::plugins::look_for_panels();
 
+    // A server reached two ways can lose one of them while the other is up.
+    // Nothing comes from the server to say so, so look once a second: its
+    // Spaces go over to the way that is up, and a window showing the frozen
+    // copy the lost way left shows the other's, live. One look at the
+    // connections and nothing more while none has lost its server.
+    promise::spawn::spawn_into_main_thread(async {
+        loop {
+            smol::Timer::after(std::time::Duration::from_secs(1)).await;
+            if !crate::workspace_threads::any_connection_has_lost_its_server() {
+                continue;
+            }
+            crate::workspace_threads::hand_spaces_from_lost_connections();
+            if let Some(front_end) = crate::frontend::try_front_end() {
+                for gui_window in front_end.gui_windows() {
+                    gui_window
+                        .window
+                        .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                            |term_window| term_window.leave_copy_of_lost_connection(),
+                        )));
+                }
+            }
+        }
+    })
+    .detach();
+
     // A debugging hook alongside THINKTERM_FRAME_DUMP: open the Settings
     // window on a given section once the GUI is up, so a page can be
     // captured from a scripted launch with no keyboard or mouse.
