@@ -797,6 +797,14 @@ pub(crate) async fn connect_domain_into_space(
     // builder drops so the WindowCreated notification can never race a
     // reconcile-spawned duplicate.
     let thread_workspace = workspace_threads::ensure_mux_thread_workspace(&plan);
+    // Keep the claimed connect window alive from the moment it exists, empty,
+    // all the way through creation of its first remote pane: any Activity
+    // dropped meanwhile prunes empty windows, and making the GUI window is an
+    // await long enough for one to (a slow X11 display met it every time).
+    // ClientDomain::attach has its own Activity, but drops it before
+    // returning; closing the ConnectionUI can then prune this still-empty
+    // window before spawn() installs the first tab.
+    let connect_activity = mux::activity::Activity::new();
     let window_id = {
         let builder = mux.new_empty_window_for_domain(
             Some(thread_workspace.clone()),
@@ -832,13 +840,6 @@ pub(crate) async fn connect_domain_into_space(
 
     let config = config::configuration();
     config.update_ulimit()?;
-
-    // Keep the claimed connect window alive from the authentication UI all
-    // the way through creation of its first remote pane. ClientDomain::attach
-    // has its own Activity, but drops it before returning; closing the
-    // ConnectionUI can then prune this still-empty window before spawn()
-    // installs the first tab.
-    let connect_activity = mux::activity::Activity::new();
 
     // The ConnectionUI (auth prompts) appears as a tab inside this window.
     // Transient failures retry with backoff instead of terminating the
