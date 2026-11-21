@@ -83,6 +83,8 @@ const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_SYMBOL_POINT_SIZE: f64 = 15.0;
 /// matching them by eye needs a small drop.
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_Y_DROP: f64 = 1.5;
 const THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG: NSInteger = 0x7474_7362;
+/// `NSEventMaskLeftMouseDown`: `1 << NSEventTypeLeftMouseDown`.
+const NS_EVENT_MASK_LEFT_MOUSE_DOWN: u64 = 1 << 1;
 /// userInfo marker on the titlebar sidebar button's tracking area, so the
 /// WindowView's mouseEntered:/mouseExited: can tell it apart from the
 /// content view's own tracking area.
@@ -2850,6 +2852,12 @@ fn install_thinkterm_titlebar_sidebar_button(window: &StrongPtr, target: id) {
         let () = msg_send![button, setBezelStyle: 0isize];
         let () = msg_send![button, setImagePosition: 1isize];
         let () = msg_send![button, setTag: THINKTERM_TITLEBAR_SIDEBAR_BUTTON_TAG];
+        // On the press, as the window's own buttons answer, the right
+        // sidebar's toggle among them. A button acts on the release by
+        // default, and the sidebar then set off a click later than it was
+        // asked to. Its slide goes on while the button follows the pointer
+        // to the release: see `thinktermRearmNeedsDisplay` in `draw_rect`.
+        let _: NSInteger = msg_send![button, sendActionOn: NS_EVENT_MASK_LEFT_MOUSE_DOWN];
 
         let image_class = class!(NSImage);
         let supports_symbol_images: BOOL = msg_send![
@@ -5282,12 +5290,19 @@ impl WindowView {
                     if this.invalidated.get() {
                         // Through `performSelector` rather than setting the flag
                         // inline: AppKit clears `needsDisplay` around this pass,
-                        // so a request made from inside it can be lost.
+                        // so a request made from inside it can be lost. In the
+                        // common modes, so an animation's next frame also comes
+                        // inside a tracking loop -- the titlebar's sidebar
+                        // button follows the pointer from the press that set
+                        // the sidebar sliding to the release -- rather than
+                        // after it.
                         if let Some(view_id) = inner.view_id.as_ref().map(|view| view.load()) {
                             unsafe {
+                                let modes: id = msg_send![class!(NSArray), arrayWithObject: NSRunLoopCommonModes];
                                 let () = msg_send![*view_id, performSelector: sel!(thinktermRearmNeedsDisplay)
                                                    withObject: nil
-                                                   afterDelay: 0.0];
+                                                   afterDelay: 0.0
+                                                   inModes: modes];
                             }
                         }
                     }
