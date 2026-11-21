@@ -150,6 +150,8 @@ pub mod box_model;
 pub mod charselect;
 pub mod clipboard;
 pub mod content_view;
+#[cfg(target_os = "linux")]
+mod display_gpu;
 pub mod keyevent;
 mod link_open;
 pub(crate) mod live_overview;
