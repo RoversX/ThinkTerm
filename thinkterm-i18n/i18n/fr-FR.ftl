@@ -1868,6 +1868,9 @@ link-refused-unsafe = Non ouvert : le lien est dangereux
 paste-confirm-header = Ce texte contient des retours à la ligne et pourrait lancer des commandes dès qu'il est collé
 paste-confirm-anyway = Coller quand même
 paste-confirm-cancel = Annuler
+paste-failed-clipboard-held-by = Rien n’a été collé : { $program } occupe le presse-papiers. Réessayez quand il l’aura libéré.
+paste-failed-clipboard-held = Rien n’a été collé : un autre programme occupe le presse-papiers. Réessayez dans un instant.
+paste-failed-clipboard-slow = Rien n’a été collé : le programme d’où vient la copie n’a pas fourni le contenu du presse-papiers à temps.
 settings-paste-confirmation = Demander avant de coller des retours à la ligne
 settings-paste-confirmation-description = Demande avant de coller du texte avec des retours à la ligne dans un programme qui exécuterait chaque ligne aussitôt. Les shells comme zsh, qui reçoivent un collage d'un seul bloc, ne sont pas concernés.
 

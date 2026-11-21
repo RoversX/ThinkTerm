@@ -1705,22 +1705,23 @@ impl crate::TermWindow {
         };
         let future = window.get_clipboard(Clipboard::Clipboard);
         promise::spawn::spawn(async move {
-            if let Ok(text) = future.await {
-                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    if let Some(state) = term_window.command_palette.as_mut() {
-                        // Only the palette this paste was started against; a
-                        // close-and-reopen before the clipboard resolved must
-                        // not receive the text.
-                        if state.generation == generation {
-                            let cleaned: String =
-                                text.chars().filter(|c| !c.is_control()).collect();
-                            state.search.caret_insert(&cleaned, false);
-                            state.invalidate_matches();
-                        }
+            let text = match future.await {
+                Ok(text) => text,
+                Err(err) => return crate::termwindow::clipboard::report_failed_paste(&err),
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if let Some(state) = term_window.command_palette.as_mut() {
+                    // Only the palette this paste was started against; a
+                    // close-and-reopen before the clipboard resolved must
+                    // not receive the text.
+                    if state.generation == generation {
+                        let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+                        state.search.caret_insert(&cleaned, false);
+                        state.invalidate_matches();
                     }
-                    term_window.invalidate_window();
-                })));
-            }
+                }
+                term_window.invalidate_window();
+            })));
         })
         .detach();
     }

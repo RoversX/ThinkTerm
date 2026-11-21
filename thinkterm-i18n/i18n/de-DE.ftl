@@ -1874,6 +1874,9 @@ link-refused-unsafe = Nicht geöffnet: Der Link ist unsicher
 paste-confirm-header = Der Text enthält Zeilenumbrüche und könnte beim Einfügen sofort Befehle ausführen
 paste-confirm-anyway = Trotzdem einfügen
 paste-confirm-cancel = Abbrechen
+paste-failed-clipboard-held-by = Nichts eingefügt: { $program } hält die Zwischenablage belegt. Versuchen Sie es erneut, sobald sie frei ist.
+paste-failed-clipboard-held = Nichts eingefügt: Ein anderes Programm hält die Zwischenablage belegt. Versuchen Sie es gleich noch einmal.
+paste-failed-clipboard-slow = Nichts eingefügt: Das Programm, aus dem kopiert wurde, hat den Inhalt der Zwischenablage nicht rechtzeitig geliefert.
 settings-paste-confirmation = Vor dem Einfügen von Zeilenumbrüchen fragen
 settings-paste-confirmation-description = Fragt nach, bevor Text mit Zeilenumbrüchen in ein Programm geht, das jede Zeile sofort ausführen würde. Shells wie zsh, die Eingefügtes als Ganzes annehmen, sind nicht betroffen.
 

@@ -1,10 +1,17 @@
 use crate::termwindow::{ContextMenuApplicationAction, TermWindowNotif};
 use crate::TermWindow;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource};
+use fluent_bundle::FluentArgs;
 use mux::pane::{Pane, PaneId};
 use mux::Mux;
-use std::sync::Arc;
-use window::{Clipboard, ClipboardContents, WindowOps};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use window::{Clipboard, ClipboardContents, ClipboardUnavailable, WindowOps};
+
+/// How long a paste that finds the clipboard taken stays quiet after one
+/// that said so. While another program keeps it for minutes, pressing paste
+/// again and again should not pile notices up.
+const UNAVAILABLE_NOTICE_QUIET: Duration = Duration::from_secs(30);
 
 impl TermWindow {
     pub fn copy_to_clipboard(&self, clipboard: ClipboardCopyDestination, text: String) {
@@ -39,10 +46,13 @@ impl TermWindow {
                 let paste_target = self.capture_terminal_paste_target(pane);
                 let future = window.get_clipboard_contents(Clipboard::Clipboard);
                 promise::spawn::spawn(async move {
-                    if let Ok(contents) = future.await {
-                        window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                            myself.dispatch_pasted_clipboard_contents(paste_target, contents);
-                        })));
+                    match future.await {
+                        Ok(contents) => {
+                            window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                                myself.dispatch_pasted_clipboard_contents(paste_target, contents);
+                            })));
+                        }
+                        Err(err) => report_failed_paste(&err),
                     }
                 })
                 .detach();
@@ -51,10 +61,13 @@ impl TermWindow {
                 // Middle-click territory: text only, the historical path.
                 let future = window.get_clipboard(Clipboard::PrimarySelection);
                 promise::spawn::spawn(async move {
-                    if let Ok(clip) = future.await {
-                        window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                            myself.paste_text_to_pane(pane_id, &clip);
-                        })));
+                    match future.await {
+                        Ok(clip) => {
+                            window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                                myself.paste_text_to_pane(pane_id, &clip);
+                            })));
+                        }
+                        Err(err) => report_failed_paste(&err),
                     }
                 })
                 .detach();
@@ -197,9 +210,69 @@ fn paste_needs_confirmation(text: &str, bracketed_paste: Option<bool>) -> bool {
     bracketed_paste == Some(false) && text.contains(['\n', '\r'])
 }
 
+/// A paste that found the clipboard taken by another program, or its owner
+/// too slow to answer, says so: otherwise nothing at all happens and nothing
+/// says why. An empty clipboard, or a paste a newer one replaced, stays quiet.
+pub(crate) fn report_failed_paste(err: &anyhow::Error) {
+    let Some(why) = err.downcast_ref::<ClipboardUnavailable>() else {
+        log::debug!("nothing pasted: {err:#}");
+        return;
+    };
+    static LAST_NOTICE: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    {
+        let mut last = LAST_NOTICE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !unavailable_notice_due(*last, now) {
+            return;
+        }
+        *last = Some(now);
+    }
+    wezterm_toast_notification::persistent_toast_notification("ThinkTerm", &failed_paste_text(why));
+}
+
+fn failed_paste_text(why: &ClipboardUnavailable) -> String {
+    match why {
+        ClipboardUnavailable::Locked {
+            holder: Some(holder),
+        } => {
+            let mut args = FluentArgs::new();
+            args.set("program", holder.clone());
+            crate::i18n::tr_args("paste-failed-clipboard-held-by", &args)
+        }
+        ClipboardUnavailable::Locked { holder: None } => {
+            crate::i18n::tr("paste-failed-clipboard-held")
+        }
+        ClipboardUnavailable::Slow => crate::i18n::tr("paste-failed-clipboard-slow"),
+    }
+}
+
+fn unavailable_notice_due(last: Option<Instant>, now: Instant) -> bool {
+    last.map_or(true, |last| {
+        now.saturating_duration_since(last) >= UNAVAILABLE_NOTICE_QUIET
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::paste_needs_confirmation;
+    use super::{paste_needs_confirmation, unavailable_notice_due, UNAVAILABLE_NOTICE_QUIET};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_taken_clipboard_is_told_once_in_a_while() {
+        let now = Instant::now();
+        assert!(unavailable_notice_due(None, now));
+        assert!(!unavailable_notice_due(Some(now), now));
+        assert!(!unavailable_notice_due(
+            Some(now),
+            now + UNAVAILABLE_NOTICE_QUIET - Duration::from_millis(1)
+        ));
+        assert!(unavailable_notice_due(
+            Some(now),
+            now + UNAVAILABLE_NOTICE_QUIET
+        ));
+    }
 
     #[test]
     fn only_a_line_break_into_an_unbracketed_program_asks() {

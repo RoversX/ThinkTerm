@@ -80,6 +80,38 @@ pub enum ClipboardContents {
     },
 }
 
+/// Why a clipboard read came back with nothing while the clipboard may well
+/// hold something: another program kept it, or the program that copied did
+/// not hand it over in time. A paste someone asked for can say so. An empty
+/// clipboard, or a read a newer one replaced, fails with another error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardUnavailable {
+    /// Another program had the clipboard open for as long as the read could
+    /// wait. `holder` is its executable's file name, when the system says.
+    Locked { holder: Option<String> },
+    /// The program that owns what was copied did not hand it over in time.
+    Slow,
+}
+
+impl std::fmt::Display for ClipboardUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked {
+                holder: Some(holder),
+            } => write!(f, "{holder} is holding the clipboard open"),
+            Self::Locked { holder: None } => {
+                write!(f, "another program is holding the clipboard open")
+            }
+            Self::Slow => write!(
+                f,
+                "the program that owns the clipboard took too long to answer"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClipboardUnavailable {}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipboardRepresentation {
@@ -1233,5 +1265,25 @@ mod clipboard_contents_tests {
             preferred_clipboard_representation(false, false, true),
             ClipboardRepresentation::Png
         );
+    }
+
+    /// The GUI tells a taken clipboard from an empty one by finding this
+    /// type inside the read's error, so it has to survive the trip.
+    #[test]
+    fn a_taken_clipboard_can_be_told_from_other_read_errors() {
+        let locked = ClipboardUnavailable::Locked {
+            holder: Some("Holder.exe".to_string()),
+        };
+        let err: anyhow::Error = locked.clone().into();
+        assert_eq!(err.downcast_ref::<ClipboardUnavailable>(), Some(&locked));
+        assert_eq!(err.to_string(), "Holder.exe is holding the clipboard open");
+        let wrapped = err.context("reading the clipboard");
+        assert_eq!(
+            wrapped.downcast_ref::<ClipboardUnavailable>(),
+            Some(&locked)
+        );
+
+        let empty = anyhow::anyhow!("Clipboard has no supported files, text, or bitmap");
+        assert!(empty.downcast_ref::<ClipboardUnavailable>().is_none());
     }
 }

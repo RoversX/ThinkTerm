@@ -10167,19 +10167,21 @@ impl TermWindow {
         let target = self.active_content_view().map(|view| view.paste_target());
         let future = window.get_clipboard(clipboard);
         promise::spawn::spawn(async move {
-            if let Ok(clip) = future.await {
-                window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                    // Only where this paste was started: a clipboard can
-                    // answer after the focus has moved on.
-                    let resp = myself
-                        .content_view_mut_by_id(view_id)
-                        .filter(|v| Some(v.paste_target()) == target)
-                        .map(|v| v.on_paste(&clip));
-                    if let Some(resp) = resp {
-                        myself.handle_content_response_for(view_id, resp);
-                    }
-                })));
-            }
+            let clip = match future.await {
+                Ok(clip) => clip,
+                Err(err) => return crate::termwindow::clipboard::report_failed_paste(&err),
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                // Only where this paste was started: a clipboard can
+                // answer after the focus has moved on.
+                let resp = myself
+                    .content_view_mut_by_id(view_id)
+                    .filter(|v| Some(v.paste_target()) == target)
+                    .map(|v| v.on_paste(&clip));
+                if let Some(resp) = resp {
+                    myself.handle_content_response_for(view_id, resp);
+                }
+            })));
         })
         .detach();
     }

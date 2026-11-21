@@ -322,13 +322,17 @@ impl super::TermWindow {
                     if let (Some(window), Some(edit)) = (self.window.as_ref().cloned(), edit) {
                         let future = window.get_clipboard(Clipboard::Clipboard);
                         promise::spawn::spawn(async move {
-                            if let Ok(text) = future.await {
-                                window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
-                                    move |term_window| {
-                                        term_window.paste_text_into_inline_tab_rename(edit, &text);
-                                    },
-                                )));
-                            }
+                            let text = match future.await {
+                                Ok(text) => text,
+                                Err(err) => {
+                                    return crate::termwindow::clipboard::report_failed_paste(&err)
+                                }
+                            };
+                            window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                                move |term_window| {
+                                    term_window.paste_text_into_inline_tab_rename(edit, &text);
+                                },
+                            )));
                         })
                         .detach();
                     }

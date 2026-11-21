@@ -1874,6 +1874,9 @@ link-refused-unsafe = Not Opened: the Link Is Unsafe
 paste-confirm-header = This text has line breaks and could run commands as soon as it is pasted
 paste-confirm-anyway = Paste Anyway
 paste-confirm-cancel = Cancel
+paste-failed-clipboard-held-by = Nothing was pasted: { $program } is holding the clipboard. Try again once it lets go.
+paste-failed-clipboard-held = Nothing was pasted: another program is holding the clipboard. Try again in a moment.
+paste-failed-clipboard-slow = Nothing was pasted: the program you copied from did not hand the clipboard over in time.
 settings-paste-confirmation = Ask before pasting line breaks
 settings-paste-confirmation-description = Before text with line breaks goes into a program that would run each line as it arrives, ask first. Shells that take a paste as one block, such as zsh, are not asked about.
 

@@ -1819,6 +1819,9 @@ link-refused-unsafe = 開きませんでした：安全でないリンクです
 paste-confirm-header = 改行を含むため、貼り付けるとすぐにコマンドが実行されるおそれがあります
 paste-confirm-anyway = それでも貼り付ける
 paste-confirm-cancel = キャンセル
+paste-failed-clipboard-held-by = 貼り付けられませんでした：{ $program } がクリップボードを使用中です。解放されてから再試行してください。
+paste-failed-clipboard-held = 貼り付けられませんでした：別のプログラムがクリップボードを使用中です。少し待ってから再試行してください。
+paste-failed-clipboard-slow = 貼り付けられませんでした：コピー元のプログラムがクリップボードの内容を時間内に渡しませんでした。
 settings-paste-confirmation = 改行を含む貼り付けの前に確認
 settings-paste-confirmation-description = 改行を含む内容を、1 行ずつすぐ実行してしまうプログラムに貼り付ける前に確認します。zsh のように貼り付けをひとまとまりで受け取るシェルでは確認しません。
 

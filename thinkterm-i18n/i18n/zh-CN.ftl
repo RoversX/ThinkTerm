@@ -1819,6 +1819,9 @@ link-refused-unsafe = 没有打开：链接不安全
 paste-confirm-header = 这段内容带换行，一粘贴就可能直接执行命令
 paste-confirm-anyway = 仍然粘贴
 paste-confirm-cancel = 取消
+paste-failed-clipboard-held-by = 没有粘贴：{ $program } 正占用剪贴板，等它放开后再试。
+paste-failed-clipboard-held = 没有粘贴：另一个程序正占用剪贴板，请稍后再试。
+paste-failed-clipboard-slow = 没有粘贴：复制内容的程序没有及时交出剪贴板里的内容。
 settings-paste-confirmation = 粘贴带换行的内容前先问
 settings-paste-confirmation-description = 带换行的内容要贴进会一行行马上执行的程序时，先问一下。zsh 这类把整段当一次粘贴的 shell 不会问。
 

@@ -6450,18 +6450,20 @@ impl crate::TermWindow {
         let target = self.right_sidebar_paste_target();
         let future = window.get_clipboard(clipboard);
         promise::spawn::spawn(async move {
-            if let Ok(text) = future.await {
-                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    // Only the surface this paste was started in: a clipboard
-                    // can answer after the panel has moved on, and the Note
-                    // saves what lands in it.
-                    if term_window.right_sidebar_paste_target() == target
-                        && term_window.push_right_sidebar_text(&text)
-                    {
-                        term_window.invalidate_window();
-                    }
-                })));
-            }
+            let text = match future.await {
+                Ok(text) => text,
+                Err(err) => return crate::termwindow::clipboard::report_failed_paste(&err),
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                // Only the surface this paste was started in: a clipboard
+                // can answer after the panel has moved on, and the Note
+                // saves what lands in it.
+                if term_window.right_sidebar_paste_target() == target
+                    && term_window.push_right_sidebar_text(&text)
+                {
+                    term_window.invalidate_window();
+                }
+            })));
         })
         .detach();
     }

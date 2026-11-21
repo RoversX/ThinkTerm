@@ -735,19 +735,21 @@ impl TermWindow {
             }
         });
         promise::spawn::spawn(async move {
-            if let Ok(text) = clipboard.await {
-                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let still_there = term_window
-                        .get_active_pane_or_overlay()
-                        .and_then(|pane| term_window.plugin_page_in_focus(&pane))
-                        == Some(pane_id)
-                        && !term_window.right_sidebar_has_text_focus()
-                        && !term_window.content_view_foreground();
-                    if still_there && term_window.plugin_page_text(pane_id, &text) {
-                        term_window.invalidate_window();
-                    }
-                })));
-            }
+            let text = match clipboard.await {
+                Ok(text) => text,
+                Err(err) => return crate::termwindow::clipboard::report_failed_paste(&err),
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let still_there = term_window
+                    .get_active_pane_or_overlay()
+                    .and_then(|pane| term_window.plugin_page_in_focus(&pane))
+                    == Some(pane_id)
+                    && !term_window.right_sidebar_has_text_focus()
+                    && !term_window.content_view_foreground();
+                if still_there && term_window.plugin_page_text(pane_id, &text) {
+                    term_window.invalidate_window();
+                }
+            })));
         })
         .detach();
     }

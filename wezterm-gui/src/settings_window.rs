@@ -5160,19 +5160,21 @@ impl SettingsWindow {
         let window = window.clone();
         let instance_id = self.instance_id;
         promise::spawn::spawn(async move {
-            if let Ok(text) = future.await {
-                promise::spawn::spawn_into_main_thread(async move {
-                    if let Some(settings) = settings_window_for_instance(instance_id) {
-                        let mut settings = settings.borrow_mut();
-                        if settings.ui.interaction.focused == Some(focused)
-                            && settings.push_focused_input(focused, &text)
-                        {
-                            window.invalidate();
-                        }
+            let text = match future.await {
+                Ok(text) => text,
+                Err(err) => return crate::termwindow::clipboard::report_failed_paste(&err),
+            };
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Some(settings) = settings_window_for_instance(instance_id) {
+                    let mut settings = settings.borrow_mut();
+                    if settings.ui.interaction.focused == Some(focused)
+                        && settings.push_focused_input(focused, &text)
+                    {
+                        window.invalidate();
                     }
-                })
-                .detach();
-            }
+                }
+            })
+            .detach();
         })
         .detach();
         true
