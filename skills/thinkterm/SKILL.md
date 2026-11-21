@@ -19,6 +19,15 @@ its `pane` field. They are
 there only as far as the user lets programs reach them in ThinkTerm's Settings ›
 Agents: not at all (the default), to read, or to read and type.
 
+To start work the user should see, put it in a thread: `thinkterm cli spawn
+--thread NAME -- PROGRAM` puts it in the thread of that name in the project of
+the thread you run in (or `--project PROJECT`), making the thread when no
+thread has that name, and the user finds it in the sidebar. When several
+threads have the name, or only other projects' threads do, it lists them and
+starts nothing: name the one you mean by its id. `--workspace` alone makes no
+thread, and the sidebar shows no window in a workspace without one.
+`thinkterm cli thread list` shows the threads.
+
 Some commands affect what the user or other agents are using, such as typing into a
 pane you did not open, closing panes or stopping the server; you may want to ask the
 user first. Whether to ask is up to you.

@@ -31,6 +31,7 @@ mod spawn_command;
 mod split_pane;
 mod stop_server;
 mod target;
+mod thread;
 mod tls_creds;
 mod wait;
 mod web_server;
@@ -259,6 +260,11 @@ Outputs the pane-id for the newly created pane on success"
     )]
     SpawnCommand(spawn_command::SpawnCommand),
 
+    /// The threads the sidebar shows, as the server that keeps them has
+    /// them: list them, or make one for `spawn --thread` to put programs in.
+    #[command(name = "thread")]
+    Thread(thread::ThreadCommand),
+
     /// Send text to a pane as though it were pasted.
     /// If bracketed paste mode is enabled in the pane, then the
     /// text will be sent as a bracketed paste. No Enter is added:
@@ -464,10 +470,26 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         ),
         _ => None,
     };
+    // Threads are made only where something shows them: a server started
+    // now for them would hold them for nobody to see.
+    let no_auto_start = cli.no_auto_start
+        || match &cli.sub {
+            CliSubCommand::Thread(_) => true,
+            CliSubCommand::SpawnCommand(cmd) => cmd.puts_in_thread(),
+            _ => false,
+        };
+    // The threads' commands find their server through the configuration's
+    // unix domains, as the window does: read before the first connection
+    // rather than after it, which found the default one.
+    let early_config = match &cli.sub {
+        CliSubCommand::Thread(_) => Some(crate::init_config(opts)?),
+        CliSubCommand::SpawnCommand(cmd) if cmd.puts_in_thread() => Some(crate::init_config(opts)?),
+        _ => None,
+    };
     let client = Client::new_default_unix_domain(
         initial,
         &mut ui,
-        cli.no_auto_start,
+        no_auto_start,
         prefer_mux,
         cli.class
             .as_deref()
@@ -498,7 +520,14 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::Wait(cmd) => cmd.run(client).await,
         CliSubCommand::Events(cmd) => cmd.run(client).await,
         CliSubCommand::GetText(cmd) => cmd.run(client, palette_pushes).await,
-        CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::SpawnCommand(cmd) => {
+            let config = match early_config {
+                Some(config) => config,
+                None => crate::init_config(opts)?,
+            };
+            cmd.run(client, &config).await
+        }
+        CliSubCommand::Thread(cmd) => cmd.run(client).await,
         CliSubCommand::OpenPage(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::ConnectReverseProxy(cmd) => cmd.run(client).await,

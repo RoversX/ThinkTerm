@@ -8,9 +8,15 @@ Arguments:
 
 Options:
       --pane-id <PANE_ID>          Specify the current pane. The default is to use the current pane based on the environment variable WEZTERM_PANE. The pane is used to determine the current domain and window
+      --pane <PANE>                The pane by name rather than id: its label, its thread's name (a thread with one pane), or `thread/label`
       --domain-name <DOMAIN_NAME>
       --window-id <WINDOW_ID>      Specify the window into which to spawn a tab. If omitted, the window associated with the current pane is used. Cannot be used with `--workspace` or `--new-window`
       --new-window                 Spawn into a new window, rather than a new tab
       --cwd <CWD>                  Specify the current working directory for the initially spawned program
-      --workspace <WORKSPACE>      When creating a new window, override the default workspace name with the provided name.  The default name is "default". Requires `--new-window`
+      --workspace <WORKSPACE>      When creating a new window, override the default workspace name with the provided name.  The default name is "default". Requires `--new-window`. This names the mux workspace only and makes no thread: ThinkTerm's sidebar shows a window only in a workspace a thread has, so a `thinkterm:...` name no thread has is refused before anything is spawned, and another name no thread has is spawned with a warning. To put the program in a thread, use `--thread`
+      --thread <THREAD>            Put the program in this thread: its id, which names it wherever it is, or its name, looked for in `--project`, else in the project of the current pane's thread, else in every project. When several threads have the name, or only other projects than the current pane's do, they are listed and nothing is started. A name no thread has makes a thread of it in that project. A thread with no window open, unless it was made just now, is opened first as the sidebar opens it (its saved tabs, or a shell). The program goes in a new tab of the thread's window, or in a window of its own with `--new-window`, and starts in the project's directory, or the one `--cwd` names: nothing is started when that cannot be opened
+      --project <PROJECT>          With `--thread`: the project the thread is in, or is to be made in: its id, or its name. A name several projects have is the one in the current pane's Space, when just one is there; otherwise they are listed
+      --wait                       Wait for the program to end, and exit with its status. The pane id is printed first, as without it
+      --timeout <TIMEOUT>          With --wait, give up after this long, exiting with status 124: a number of seconds, or a number with s, m or h after it. `--for` is the same [aliases: --for]
+      --label <LABEL>              Label the new pane, so that `--pane LABEL` finds it
   -h, --help                       Print help

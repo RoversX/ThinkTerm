@@ -3051,6 +3051,19 @@ impl Client {
         self.client_domain_config
     }
 
+    /// The socket this client reached, when it reached a unix domain's socket
+    /// on this machine: the one it is connected to, after any fallback
+    /// `new_default_unix_domain` made. `None` through a proxy command, whose
+    /// socket is the other end's.
+    pub fn unix_socket_path(&self) -> Option<std::path::PathBuf> {
+        match &self.client_domain_config {
+            ClientDomainConfig::Unix(domain) if domain.proxy_command.is_none() => {
+                Some(domain.socket_path())
+            }
+            _ => None,
+        }
+    }
+
     pub async fn verify_version_compat(
         &self,
         ui: &ConnectionUI,
