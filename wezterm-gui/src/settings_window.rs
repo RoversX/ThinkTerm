@@ -1225,6 +1225,7 @@ impl SettingsSection {
                 "Tab Bar Font Size",
                 "Tab Width",
                 "Pane Header Font Size",
+                "Pane Header Tab Width",
                 "Settings UI Font Weight",
                 "Typography",
                 "Theme",
@@ -1465,6 +1466,7 @@ impl SettingsSection {
                     "settings-window-opacity",
                     "settings-window-tabs",
                     "settings-tab-width",
+                    "settings-pane-tab-width",
                     "settings-thread-icons",
                     "settings-thread-status",
                     "settings-agents-status",
@@ -2453,9 +2455,9 @@ enum SettingsAction {
     DecreaseChromeFontSize(ChromeFontArea),
     IncreaseChromeFontSize(ChromeFontArea),
     ResetChromeFontSize(ChromeFontArea),
-    DecreaseWindowTabWidth,
-    IncreaseWindowTabWidth,
-    ResetWindowTabWidth,
+    DecreaseTabWidth(TabRow),
+    IncreaseTabWidth(TabRow),
+    ResetTabWidth(TabRow),
     DecreaseSettingsFontWeight,
     IncreaseSettingsFontWeight,
     ResetSettingsFontWeight,
@@ -2964,6 +2966,48 @@ const TYPOGRAPHY_FONT_AREAS: [ChromeFontArea; 6] = [
     ChromeFontArea::TabBar,
     ChromeFontArea::PaneHeader,
 ];
+
+/// The two rows of tabs Settings sizes, each with a width of its own: the
+/// window's top row, and the row in each pane's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabRow {
+    Window,
+    Pane,
+}
+
+impl TabRow {
+    /// The row whose tabs' width goes under `area`'s font size: together
+    /// the two decide how much of a title a tab shows.
+    fn under(area: ChromeFontArea) -> Option<Self> {
+        match area {
+            ChromeFontArea::TabBar => Some(Self::Window),
+            ChromeFontArea::PaneHeader => Some(Self::Pane),
+            _ => None,
+        }
+    }
+
+    /// The font area whose part of the picture the row's width lights.
+    fn area(self) -> ChromeFontArea {
+        match self {
+            Self::Window => ChromeFontArea::TabBar,
+            Self::Pane => ChromeFontArea::PaneHeader,
+        }
+    }
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Window => "settings-tab-width",
+            Self::Pane => "settings-pane-tab-width",
+        }
+    }
+
+    fn description_key(self) -> &'static str {
+        match self {
+            Self::Window => "settings-tab-width-description",
+            Self::Pane => "settings-pane-tab-width-description",
+        }
+    }
+}
 
 impl ChromeFontArea {
     fn localized_label(self) -> String {
@@ -5813,27 +5857,36 @@ impl SettingsWindow {
         self.save_native_chrome_settings(area);
     }
 
-    /// The width the window tabs are drawn at: this window's setting, else
-    /// the configuration's `window_tab_width`.
-    fn current_window_tab_width(&self) -> usize {
-        crate::native_settings::window_tab_width_in(
-            &self.native_settings,
-            configuration().window_tab_width,
-        )
+    /// The width `row`'s tabs are drawn at: this window's setting, else the
+    /// configuration's `window_tab_width` or `pane_tab_width`.
+    fn current_tab_width(&self, row: TabRow) -> usize {
+        let config = configuration();
+        match row {
+            TabRow::Window => crate::native_settings::window_tab_width_in(
+                &self.native_settings,
+                config.window_tab_width,
+            ),
+            TabRow::Pane => crate::native_settings::pane_tab_width_in(
+                &self.native_settings,
+                config.pane_tab_width,
+            ),
+        }
     }
 
-    fn step_window_tab_width(&mut self, up: bool) {
-        let value =
-            crate::native_settings::step_window_tab_width(self.current_window_tab_width(), up);
-        self.save_window_tab_width(Some(value));
+    fn step_tab_width(&mut self, row: TabRow, up: bool) {
+        let value = crate::native_settings::step_tab_width(self.current_tab_width(row), up);
+        self.save_tab_width(row, Some(value));
     }
 
     /// Made to the latest settings, as the terminal font's edits are: this
     /// window's copy can be older than what another window saved. `None`
     /// hands the width back to the configuration.
-    fn save_window_tab_width(&mut self, width: Option<usize>) {
-        let setting = crate::i18n::tr("settings-tab-width");
-        match crate::native_settings::update(|settings| settings.chrome.tab_width = width) {
+    fn save_tab_width(&mut self, row: TabRow, width: Option<usize>) {
+        let setting = crate::i18n::tr(row.label_key());
+        match crate::native_settings::update(|settings| match row {
+            TabRow::Window => settings.chrome.tab_width = width,
+            TabRow::Pane => settings.chrome.pane_tab_width = width,
+        }) {
             Ok(saved) => {
                 self.set_native_settings((*saved).clone());
                 if let Some(front_end) = crate::frontend::try_front_end() {
@@ -8350,9 +8403,9 @@ impl SettingsWindow {
             SettingsAction::DecreaseChromeFontSize(area) => self.step_chrome_font_size(area, -1.0),
             SettingsAction::IncreaseChromeFontSize(area) => self.step_chrome_font_size(area, 1.0),
             SettingsAction::ResetChromeFontSize(area) => self.reset_chrome_font_size(area),
-            SettingsAction::DecreaseWindowTabWidth => self.step_window_tab_width(false),
-            SettingsAction::IncreaseWindowTabWidth => self.step_window_tab_width(true),
-            SettingsAction::ResetWindowTabWidth => self.save_window_tab_width(None),
+            SettingsAction::DecreaseTabWidth(row) => self.step_tab_width(row, false),
+            SettingsAction::IncreaseTabWidth(row) => self.step_tab_width(row, true),
+            SettingsAction::ResetTabWidth(row) => self.save_tab_width(row, None),
             SettingsAction::DecreaseSettingsFontWeight => self.step_settings_font_weight(-100),
             SettingsAction::IncreaseSettingsFontWeight => self.step_settings_font_weight(100),
             SettingsAction::ResetSettingsFontWeight => self.reset_settings_font_weight(),
@@ -11024,22 +11077,22 @@ impl SettingsWindow {
                 SettingsAction::IncreaseChromeFontSize(area),
             )?;
             band_y += band;
-            if area == ChromeFontArea::TabBar {
-                // How wide the tabs are, under their text size and its
-                // number: together the two decide how much of a title a
-                // tab shows.
+            if let Some(row) = TabRow::under(area) {
+                // How wide the row's tabs are, under their text size and
+                // its number: together the two decide how much of a title
+                // a tab shows.
                 self.paint_compact_stepper_row(
                     layers,
                     x + indent,
                     band_y,
                     width - indent,
                     band,
-                    &crate::i18n::tr("settings-tab-width"),
-                    "settings-tab-width-description",
-                    self.current_window_tab_width() as f64,
-                    SettingsAction::ResetWindowTabWidth,
-                    SettingsAction::DecreaseWindowTabWidth,
-                    SettingsAction::IncreaseWindowTabWidth,
+                    &crate::i18n::tr(row.label_key()),
+                    row.description_key(),
+                    self.current_tab_width(row) as f64,
+                    SettingsAction::ResetTabWidth(row),
+                    SettingsAction::DecreaseTabWidth(row),
+                    SettingsAction::IncreaseTabWidth(row),
                 )?;
                 band_y += band;
             }
@@ -11749,17 +11802,14 @@ impl SettingsWindow {
             SettingsAction::ResetChromeFontSize(area)
             | SettingsAction::DecreaseChromeFontSize(area)
             | SettingsAction::IncreaseChromeFontSize(area) => Some(area),
-            // The tabs' width lights the tab bar, as their text size does.
-            SettingsAction::ResetWindowTabWidth
-            | SettingsAction::DecreaseWindowTabWidth
-            | SettingsAction::IncreaseWindowTabWidth
-            | SettingsAction::Hint("settings-tab-width-description") => {
-                Some(ChromeFontArea::TabBar)
-            }
-            SettingsAction::Hint(key) => TYPOGRAPHY_FONT_AREAS
-                .iter()
-                .copied()
-                .find(|area| area.description_key() == key),
+            // A row's tab width lights the row, as its text size does.
+            SettingsAction::ResetTabWidth(row)
+            | SettingsAction::DecreaseTabWidth(row)
+            | SettingsAction::IncreaseTabWidth(row) => Some(row.area()),
+            SettingsAction::Hint(key) => TYPOGRAPHY_FONT_AREAS.iter().copied().find(|area| {
+                area.description_key() == key
+                    || TabRow::under(*area).is_some_and(|row| row.description_key() == key)
+            }),
             _ => None,
         }
     }

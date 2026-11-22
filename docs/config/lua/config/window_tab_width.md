@@ -29,5 +29,5 @@ the tab and a card under it shows the whole title.
 This option does not size the tabs of the retro tab bar, the bar that
 [use_fancy_tab_bar = false](use_fancy_tab_bar.md) adds inside the terminal
 area; those follow [tab_max_width](tab_max_width.md). Nor does
-`tab_max_width` size these. The tabs in a pane's header keep their own
-width.
+`tab_max_width` size these. The tabs in a pane's header have a width of
+their own, [pane_tab_width](pane_tab_width.md).

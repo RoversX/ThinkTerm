@@ -99,24 +99,6 @@ pub const SIDEBAR_TITLE_FADE_GAP: f32 = 16.0;
 /// Pill: `snapped_rounded_corner_radius` clamps this to half the surface's
 /// short side, so the tab keeps semicircular ends at every row height.
 pub const WINDOW_TAB_RADIUS: f32 = 999.0;
-/// A tab surface is chrome, so it sizes itself to the row it lives in rather
-/// than to the terminal grid. A roomy row parks every tab at the target width;
-/// crowding shrinks them all evenly down to the floor, and only past the floor
-/// does the row scroll.
-///
-/// This is the pane nav row's. The window tab row's is the configuration's
-/// `window_tab_width`, or Settings' over it, whose default is this same
-/// width; it never shrinks either (see `window_tab_width_pixels`).
-pub const TAB_TARGET_WIDTH: f32 = 320.0;
-/// How far tabs give up width before the row scrolls instead.
-///
-/// Equal to the target, so they give up nothing: a tab is always
-/// `TAB_TARGET_WIDTH` wide and the row starts scrolling the moment the tabs
-/// stop fitting. Every value in between trades a scrollbar for a few narrower
-/// tabs — 240 buys roughly two extra tabs before the row scrolls — but a tab
-/// that cannot show its title has stopped doing its job, and scrolling to a
-/// legible tab beats reading a row of stubs.
-pub const TAB_MIN_WIDTH: f32 = TAB_TARGET_WIDTH;
 pub const WINDOW_TAB_ADD_BUTTON_RADIUS: f32 = 999.0;
 /// Inset from a tab pill's edge to its content — icon on the left, title's
 /// right limit, and (via the close button's own box) the close glyph. Sized

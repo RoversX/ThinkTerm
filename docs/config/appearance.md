@@ -288,6 +288,10 @@ details.
   it is set; its reset button hands the width back to the option. A tab
   whose title does not fit shows the whole title in a card when the pointer
   rests on it.
+* [pane_tab_width](lua/config/pane_tab_width.md) sets how wide each tab in
+  a pane's header is, apart from the top row's (same unit, default and
+  range). **Settings › Appearance › Pane Header Tab Width** sets it too and
+  wins while it is set. A cut title shows whole in a card here too.
 * [tab_max_width](lua/config/tab_max_width.md) sets the maximum width, measured in cells,
   of a given tab when using retro tab mode. It does not apply to the top tab
   row's tabs: those follow `window_tab_width`.

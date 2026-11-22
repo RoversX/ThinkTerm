@@ -6,10 +6,9 @@ use crate::termwindow::space_swipe::{SidebarSpaceSwipeFinish, SidebarSpaceSwipeU
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
-    MACOS_THREAD_WINDOW_TAB_START, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH,
-    TAB_ROW_START_PADDING, TAB_TARGET_WIDTH, TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
-    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
+    MACOS_THREAD_WINDOW_TAB_START, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_ROW_START_PADDING,
+    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
+    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{
     pane_drop_action, pane_drop_zone, zone_split_request, GuiWin, MouseCapture, PaneDropKind,
@@ -518,21 +517,21 @@ impl super::TermWindow {
         }
     }
 
-    /// Width of one tab surface in a row that holds `tab_count` of them.
+    /// Width of one tab surface in a pane's header that holds `tab_count` of
+    /// them: `pane_tab_width`, or the width Settings sets over it.
     ///
-    /// Tabs are chrome, so the terminal font plays no part: the row's own width
-    /// and how many tabs share it decide everything. See `TAB_TARGET_WIDTH`.
+    /// Tabs are chrome, so the terminal font plays no part. The width is its
+    /// own floor: tabs give up nothing to crowding, and a header with more
+    /// than fit scrolls. A tab too narrow to show its title has stopped
+    /// doing its job, and scrolling to a legible one beats a row of stubs.
     pub(super) fn adaptive_tab_width(&self, tab_count: usize, viewport_width: f32, gap: f32) -> f32 {
         // Whole pixels: the painters round the width up before laying tabs out,
         // and the scroll clamps use it raw. A fractional ui scale would
         // otherwise leave them disagreeing by up to a pixel per tab.
-        adaptive_tab_width_pixels(
-            tab_count,
-            viewport_width,
-            gap,
-            self.ui_f32(TAB_TARGET_WIDTH).floor(),
-            self.ui_f32(TAB_MIN_WIDTH).floor(),
-        )
+        let width = self
+            .ui_f32(crate::native_settings::pane_tab_width(&self.config) as f32)
+            .floor();
+        adaptive_tab_width_pixels(tab_count, viewport_width, gap, width, width)
     }
 
     /// The gap the window tab row leaves between neighbouring tabs.
@@ -559,9 +558,9 @@ impl super::TermWindow {
     }
 
     /// Width of one window tab: `window_tab_width`, or the width Settings
-    /// sets over it, however many tabs the row holds. As with
-    /// `TAB_MIN_WIDTH`, tabs give up nothing to crowding: the width is the
-    /// one asked for, and a row with more than fit scrolls.
+    /// sets over it, however many tabs the row holds. As in the pane
+    /// headers, tabs give up nothing to crowding: the width is the one asked
+    /// for, and a row with more than fit scrolls.
     pub(super) fn window_tab_width_pixels(&self) -> f32 {
         let width = crate::native_settings::window_tab_width(&self.config) as f32;
         // Whole pixels, as `adaptive_tab_width` gives the pane nav row.
@@ -1944,8 +1943,8 @@ impl super::TermWindow {
                 crate::termwindow::tooltip_label_for(&item.item_type).is_some()
                     || crate::termwindow::thread_has_card(&item.item_type)
                     || crate::termwindow::render::hover::agent_card_pane(&item.item_type).is_some()
-                    // A tab whose title the row had to cut.
-                    || self.window_tab_cut_title(&item.item_type).is_some()
+                    // A tab whose title its row had to cut.
+                    || self.tab_cut_title(&item.item_type).is_some()
             })
             // The dynamic half of the rule: no tag over a live rename
             // editor, and none for a file row whose label already reads in

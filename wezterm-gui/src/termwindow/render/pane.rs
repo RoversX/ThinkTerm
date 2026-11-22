@@ -20,7 +20,7 @@ use crate::termwindow::ui::tokens::{
     PANE_NAV_ACTION_ICON_SIZE, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET,
     PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
     TAB_CONTENT_INSET, TAB_ICON_CIRCLE_INSET, TAB_ICON_GLYPH_RATIO, TAB_ICON_SIZE,
-    TAB_MIN_WIDTH, TAB_VERTICAL_PADDING,
+    TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, ScrollTrack, UIItem, UIItemType};
 use crate::ui::draw::DrawContext;
@@ -349,7 +349,9 @@ impl crate::TermWindow {
         };
         let buttons = self.pane_nav_actions_width(pos, button_size)
             + self.pane_bar_window_chrome_width(parts, button_size);
-        tab_start + self.ui_f32(TAB_MIN_WIDTH / 2.0) + buttons as f32 <= width
+        // Half a tab as wide as this window's pane tabs are.
+        let half_tab = crate::native_settings::pane_tab_width(&self.config) as f32 / 2.0;
+        tab_start + self.ui_f32(half_tab) + buttons as f32 <= width
     }
 
     /// The room `pos`'s bar keeps at its end for the window's buttons
@@ -1114,6 +1116,19 @@ impl crate::TermWindow {
                     layers, &ui_font, ui_metrics, title, text_x, text_y, text_width, text_fg,
                 )?;
             }
+            // A title the tab cut shows whole in the tab's hover card.
+            if !is_renaming_tab
+                && self.pane_nav_title_is_cut(&ui_font, &ui_metrics, title, text_width)?
+            {
+                self.pane_tab_cut_titles.push((
+                    UIItemType::PaneNav {
+                        pane_id: pos.pane.pane_id(),
+                        pane_index: pos.index,
+                        action: PaneNavAction::Activate(tab.pane_id),
+                    },
+                    title.to_string(),
+                ));
+            }
 
             drop(content_layers);
             content
@@ -1796,6 +1811,19 @@ impl crate::TermWindow {
                     layers, &ui_font, ui_metrics, title, text_x, text_y, text_width, text_fg,
                 )?;
             }
+            // A title the tab cut shows whole in the tab's hover card.
+            if !is_renaming_tab
+                && self.pane_nav_title_is_cut(&ui_font, &ui_metrics, title, text_width)?
+            {
+                self.pane_tab_cut_titles.push((
+                    UIItemType::PaneNav {
+                        pane_id: pos.pane.pane_id(),
+                        pane_index: pos.index,
+                        action: PaneNavAction::Activate(tab.pane_id),
+                    },
+                    title.to_string(),
+                ));
+            }
 
             drop(content_layers);
             content
@@ -2025,6 +2053,23 @@ impl crate::TermWindow {
         }
 
         self.paint_fading_title(layers, font, &metrics, text, x, y, width, foreground)
+    }
+
+    /// Whether `title` runs past `width`, the room `paint_pane_nav_text` is
+    /// given for it, as that draws it: nothing in less than a cell, and a
+    /// fade where the text runs over. Then the tab's hover card shows it.
+    fn pane_nav_title_is_cut(
+        &self,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        title: &str,
+        width: usize,
+    ) -> anyhow::Result<bool> {
+        if title.trim().is_empty() {
+            return Ok(false);
+        }
+        Ok(width < (metrics.cell_size.width as usize).max(1)
+            || self.cached_ui_text_advance(font, metrics, title)? > width as f32)
     }
 
     /// The icon heading a pane tab: the card dressing what the pane runs,

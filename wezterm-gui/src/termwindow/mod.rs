@@ -3238,6 +3238,9 @@ pub struct TermWindow {
     /// painted, by their item, with the whole title: what a tab's hover card
     /// shows, and which tabs have one. Rebuilt by `paint_fancy_tab_bar`.
     window_tab_cut_titles: Vec<(UIItemType, String)>,
+    /// The same for the tabs in the pane headers, keyed by each tab's
+    /// item. Rebuilt every frame, as the headers paint.
+    pane_tab_cut_titles: Vec<(UIItemType, String)>,
     /// Latest-only full-viewport streams for native divider drags. A stream
     /// owns the matching ClientPane preview epoch until its final target is
     /// confirmed or explicitly rolled back.
@@ -5427,6 +5430,7 @@ impl TermWindow {
             right_sidebar_truncated_file_rows: HashSet::new(),
             right_sidebar_truncated_remote_file_rows: HashSet::new(),
             window_tab_cut_titles: Vec::new(),
+            pane_tab_cut_titles: Vec::new(),
             remote_divider_resize_streams: HashMap::new(),
             next_frontend_geometry_epoch: 1,
             frontend_viewport_report_pending: Arc::new(AtomicBool::new(false)),

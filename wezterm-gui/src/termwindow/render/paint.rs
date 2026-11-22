@@ -2130,6 +2130,7 @@ impl crate::TermWindow {
     ) -> anyhow::Result<(RecordedPane, HeapQuadAllocator)> {
         let pos = &leaving.pane;
         let ui_items = self.ui_items.len();
+        let cut_titles = self.pane_tab_cut_titles.len();
         // As `can_collapse_pane_stack` had it last frame, when it stood
         // over or under the pane that has its room now.
         let collapsed = |pane_stack_id: &mux::tab::PaneStackId| {
@@ -2162,6 +2163,7 @@ impl crate::TermWindow {
             .context("paint_split")?;
         }
         self.ui_items.truncate(ui_items);
+        self.pane_tab_cut_titles.truncate(cut_titles);
         Ok((pane, divider))
     }
 
@@ -2174,8 +2176,10 @@ impl crate::TermWindow {
         showed_tab: bool,
     ) -> anyhow::Result<RecordedPane> {
         let ui_items = self.ui_items.len();
+        let cut_titles = self.pane_tab_cut_titles.len();
         let pane = self.record_pane_alone(pos, showed_tab);
         self.ui_items.truncate(ui_items);
+        self.pane_tab_cut_titles.truncate(cut_titles);
         pane
     }
 
@@ -2201,8 +2205,10 @@ impl crate::TermWindow {
     /// there to click.
     fn record_pushed_out_pane(&mut self, pos: &PositionedPane) -> anyhow::Result<RecordedPane> {
         let ui_items = self.ui_items.len();
+        let cut_titles = self.pane_tab_cut_titles.len();
         let pane = self.record_pane(pos)?;
         self.ui_items.truncate(ui_items);
+        self.pane_tab_cut_titles.truncate(cut_titles);
         Ok(pane)
     }
 
@@ -5085,6 +5091,7 @@ impl crate::TermWindow {
 
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
+        self.pane_tab_cut_titles.clear();
         self.window_tab_reveal.begin_paint();
         // The Agents panel's arranged list lives while the panel is painted.
         if !std::mem::take(&mut self.right_sidebar_agents_painted) {

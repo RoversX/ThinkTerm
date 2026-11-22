@@ -566,6 +566,14 @@ pub struct Config {
     #[dynamic(default = "default_window_tab_width")]
     pub window_tab_width: usize,
 
+    /// How wide each tab in a pane's header, the tab row above each pane,
+    /// is, in design pixels, as `window_tab_width` sizes the window's top
+    /// row. A header with more tabs than fit scrolls. Settings ›
+    /// Appearance › Pane Header Tab Width sets the same width and wins
+    /// while it is set.
+    #[dynamic(default = "default_pane_tab_width")]
+    pub pane_tab_width: usize,
+
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
     pub hide_tab_bar_if_only_one_tab: bool,
@@ -2218,6 +2226,10 @@ fn default_tab_max_width() -> usize {
 }
 
 fn default_window_tab_width() -> usize {
+    320
+}
+
+fn default_pane_tab_width() -> usize {
     320
 }
 

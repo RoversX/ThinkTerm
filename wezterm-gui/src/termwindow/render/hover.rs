@@ -1,6 +1,6 @@
 //! Hover surfaces: the tag an icon-only button or a cut-short row shows,
-//! and the cards a thread row, an Agents panel row and a window tab whose
-//! title is cut short show. One look for
+//! and the cards a thread row, an Agents panel row and a tab whose title
+//! is cut short show, in the window's tab row or a pane's header. One look for
 //! all of them, the right-click menu's: its card colours, a hairline border
 //! and the soft two-layer shadow. They appear after a pause; once one has
 //! shown, the next one shows at once, as on the Mac.
@@ -17,7 +17,9 @@ use crate::termwindow::ui::agent_panel::{
     agent_row_title, agent_state_icon, agent_state_key, agent_title, brand_of, working_subtasks,
     AGENT_PROGRESS_HEIGHT,
 };
-use crate::termwindow::{HoverTooltip, TermWindow, UIItem, UIItemType, TOOLTIP_DELAY};
+use crate::termwindow::{
+    HoverTooltip, PaneNavAction, TermWindow, UIItem, UIItemType, TOOLTIP_DELAY,
+};
 use crate::ui::{DrawContext, UiPalette};
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
@@ -113,10 +115,10 @@ impl TermWindow {
             self.paint_agent_hover_card(&item, agent, &style)?;
             return Ok(true);
         }
-        if let Some(title) = self.window_tab_cut_title(&item.item_type) {
+        if let Some(title) = self.tab_cut_title(&item.item_type) {
             let title = title.to_string();
             let style = self.hover_style()?;
-            self.paint_window_tab_hover_card(&item, &title, &style)?;
+            self.paint_tab_hover_card(&item, &title, &style)?;
             return Ok(true);
         }
         let agents = crate::termwindow::thread_card_agents(&item.item_type);
@@ -403,29 +405,34 @@ impl TermWindow {
         (x, y)
     }
 
-    /// The whole title of the window tab `item_type` names, when the tab had
-    /// to cut it the last time the row painted: what its card shows. `None`
-    /// for a tab whose title reads in full, and for anything else.
-    pub(crate) fn window_tab_cut_title(&self, item_type: &UIItemType) -> Option<&str> {
-        if !matches!(
-            item_type,
-            UIItemType::TabBar(TabBarItem::Tab { .. } | TabBarItem::ContentView { .. })
-        ) {
-            return None;
-        }
-        self.window_tab_cut_titles
+    /// The whole title of the tab `item_type` names, in the window's tab row
+    /// or a pane's header, when the tab had to cut it the last time its row
+    /// painted: what its card shows. `None` for a tab whose title reads in
+    /// full, and for anything else.
+    pub(crate) fn tab_cut_title(&self, item_type: &UIItemType) -> Option<&str> {
+        let titles = match item_type {
+            UIItemType::TabBar(TabBarItem::Tab { .. } | TabBarItem::ContentView { .. }) => {
+                &self.window_tab_cut_titles
+            }
+            UIItemType::PaneNav {
+                action: PaneNavAction::Activate(_),
+                ..
+            } => &self.pane_tab_cut_titles,
+            _ => return None,
+        };
+        titles
             .iter()
             .find(|(item, _)| item == item_type)
             .map(|(_, title)| title.as_str())
     }
 
-    /// A window tab's card: the title the tab had no room for, whole, in as
+    /// A tab's card: the title the tab had no room for, whole, in as
     /// many lines as it takes up to `TAB_CARD_TITLE_LINES`. Under the tab
     /// rather than beside it, where its neighbours are, and from its left
     /// edge, where the title starts. As wide as its text, up to a card's
     /// width or the tab's, whichever is wider: a wide tab's card wrapping
     /// its title narrower than the tab would read as less of it.
-    fn paint_window_tab_hover_card(
+    fn paint_tab_hover_card(
         &mut self,
         item: &UIItem,
         title: &str,
