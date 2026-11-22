@@ -10,6 +10,16 @@ use std::path::{Path, PathBuf};
 
 /// The skill, as kept in the repository's `skills/thinkterm`.
 const SKILL: &str = include_str!("../../skills/thinkterm/SKILL.md");
+/// What the skill has beside it, which it sends an agent to read: making
+/// a plugin.
+const PLUGINS: &str = include_str!("../../skills/thinkterm/plugins.md");
+/// The files beside SKILL.md, by name, written and removed with it.
+const BESIDE: [(&str, &str); 1] = [("plugins.md", PLUGINS)];
+/// How each of [`BESIDE`] begins, of whatever version: one that does not is
+/// someone else's, and left alone.
+fn is_beside_ours(text: &str) -> bool {
+    text.starts_with("# Making a ThinkTerm plugin")
+}
 
 /// What the session-start hook runs: the context of the pane the agent
 /// starts in, from the ThinkTerm that pane belongs to. Outside a ThinkTerm
@@ -153,7 +163,13 @@ impl SkillCommand {
             SkillSubCommand::Remove(args) => remove(&args.agents()),
             SkillSubCommand::Show => {
                 let out = std::io::stdout();
-                write!(out.lock(), "{SKILL}").map_err(crate::stdout_error)
+                let mut out = out.lock();
+                write!(out, "{SKILL}").map_err(crate::stdout_error)?;
+                for (name, text) in BESIDE {
+                    write!(out, "\n<!-- {name}, beside SKILL.md -->\n\n{text}")
+                        .map_err(crate::stdout_error)?;
+                }
+                Ok(())
             }
         }
     }
@@ -179,7 +195,7 @@ fn setup(agents: &[Agent], dry_run: bool) -> Result<()> {
             State::Unreadable => "left alone: could not be read",
             State::Missing | State::Outdated if dry_run => "would be written",
             State::Missing | State::Outdated => {
-                write_file(&skill, SKILL)?;
+                write_skill(&skill)?;
                 "written"
             }
         };
@@ -248,8 +264,18 @@ fn remove(agents: &[Agent]) -> Result<()> {
             State::Current | State::Outdated => {
                 std::fs::remove_file(&skill)
                     .with_context(|| format!("remove {}", skill.display()))?;
-                // Only when nothing else was put beside it.
                 if let Some(dir) = skill.parent() {
+                    for (name, _) in BESIDE {
+                        let path = dir.join(name);
+                        // Only one of ours: something else by the name stays.
+                        let ours =
+                            std::fs::read_to_string(&path).is_ok_and(|text| is_beside_ours(&text));
+                        if !ours {
+                            continue;
+                        }
+                        std::fs::remove_file(&path).with_context(|| format!("remove {name}"))?;
+                    }
+                    // Only when nothing else was put beside it.
                     let _ = std::fs::remove_dir(dir);
                 }
                 "removed"
@@ -278,14 +304,42 @@ fn remove(agents: &[Agent]) -> Result<()> {
     Ok(())
 }
 
+/// How the skill at `path`, its SKILL.md, is: current only when what is
+/// beside it is too, and someone else's when what is beside it under one of
+/// its names is.
 fn skill_state(path: &Path) -> State {
+    let dir = path.parent().unwrap_or(path);
+    let foreign_beside = BESIDE.iter().any(|(name, _)| {
+        std::fs::read_to_string(dir.join(name)).is_ok_and(|text| !is_beside_ours(&text))
+    });
     match std::fs::read_to_string(path) {
-        Ok(text) if text == SKILL => State::Current,
+        Ok(_) if foreign_beside => State::Foreign,
+        Ok(text) if text == SKILL => {
+            let dir = path.parent().unwrap_or(path);
+            let beside = BESIDE.iter().all(|(name, text)| {
+                std::fs::read_to_string(dir.join(name)).is_ok_and(|have| have == *text)
+            });
+            if beside {
+                State::Current
+            } else {
+                State::Outdated
+            }
+        }
         Ok(text) if is_thinkterm_skill(&text) => State::Outdated,
         Ok(_) => State::Foreign,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => State::Missing,
         Err(_) => State::Unreadable,
     }
+}
+
+/// Writes the skill at `path`, its SKILL.md, and what goes beside it --
+/// SKILL.md last, so a skill that reads as current has all of it.
+fn write_skill(path: &Path) -> Result<()> {
+    let dir = path.parent().context("no folder")?;
+    for (name, text) in BESIDE {
+        write_file(&dir.join(name), text)?;
+    }
+    write_file(path, SKILL)
 }
 
 /// Whether `text` is a ThinkTerm skill of some version: one named that in
@@ -656,12 +710,38 @@ mod tests {
         let path = dir.path().join("thinkterm").join("SKILL.md");
         assert_eq!(skill_state(&path), State::Missing);
         write_file(&path, SKILL).unwrap();
+        assert_eq!(skill_state(&path), State::Outdated, "nothing beside it yet");
+        write_skill(&path).unwrap();
         assert_eq!(skill_state(&path), State::Current);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("thinkterm").join("plugins.md")).unwrap(),
+            PLUGINS
+        );
+        write_file(
+            &dir.path().join("thinkterm").join("plugins.md"),
+            "# Making a ThinkTerm plugin\n\nolder\n",
+        )
+        .unwrap();
+        assert_eq!(
+            skill_state(&path),
+            State::Outdated,
+            "what is beside it is old"
+        );
+        write_skill(&path).unwrap();
+        assert_eq!(skill_state(&path), State::Current);
+        // Someone else's file by the name: the skill is theirs to keep.
+        write_file(&dir.path().join("thinkterm").join("plugins.md"), "my notes").unwrap();
+        assert_eq!(skill_state(&path), State::Foreign);
+        write_skill(&path).unwrap();
+        assert!(is_beside_ours(PLUGINS));
         write_file(&path, "---\nname: thinkterm\ndescription: old\n---\nolder text\n").unwrap();
         assert_eq!(skill_state(&path), State::Outdated);
         write_file(&path, "---\nname: something-else\n---\n").unwrap();
         assert_eq!(skill_state(&path), State::Foreign);
         assert!(is_thinkterm_skill(SKILL));
+        assert!(SKILL.contains("plugins.md"), "it sends an agent to read it");
+        // Read whole by an agent, as its skill tool hands it over.
+        assert!(PLUGINS.len() <= 8 * 1024, "{} bytes", PLUGINS.len());
     }
 
     #[test]

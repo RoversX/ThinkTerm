@@ -106,8 +106,9 @@ __pycache__/
 # Keep CI documentation under version control despite the blanket *.md rule.
 !/ci/legacy-workflows/README.md
 
-# Keep the agent skill under version control; `npx skills add` installs it from GitHub.
-!/skills/*/SKILL.md
+# Keep the agent skills under version control, with the files they send an
+# agent to read; `npx skills add` installs them from GitHub.
+!/skills/*/*.md
 
 # well...
 /.claude

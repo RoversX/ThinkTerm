@@ -1,6 +1,6 @@
 ---
 name: thinkterm
-description: Use when running inside ThinkTerm (THINKTERM=1 is set) and you need to look at other terminals, check on or coordinate other coding agents, send them text, or open new panes.
+description: Use when running inside ThinkTerm (THINKTERM=1 is set) and you need to look at other terminals, check on or coordinate other coding agents, send them text, or open new panes; or when asked to make a ThinkTerm plugin -- a panel, page or command of ThinkTerm's own.
 ---
 
 You are running inside ThinkTerm. Its command line, `thinkterm cli`, lets you see every
@@ -32,3 +32,7 @@ thread each pane is in.
 Some commands affect what the user or other agents are using, such as typing into a
 pane you did not open, closing panes or stopping the server; you may want to ask the
 user first. Whether to ask is up to you.
+
+To make a ThinkTerm plugin -- a panel in its right sidebar, a page, commands of its
+own -- read plugins.md beside this file first: `thinkterm plugin new` starts one in
+Python, and `thinkterm plugin` checks it.
