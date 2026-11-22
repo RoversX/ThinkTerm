@@ -139,8 +139,11 @@ private fun Agents(model: TerminalModel, dark: Boolean, done: () -> Unit) {
                 modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 14.dp, bottom = 2.dp),
             )
             for (row in group) {
-                // What it said about itself, else what it waits for, else its title.
-                val detail = listOfNotNull(row.said, row.kind, row.title).firstOrNull { it.isNotEmpty() }
+                // What it waits for and what it said about itself, side by
+                // side as the desktop's and the web's rows have them; else
+                // its title.
+                val said = listOfNotNull(row.kind, row.said).filter { it.isNotEmpty() }.joinToString(" · ")
+                val detail = said.ifEmpty { row.title }.ifEmpty { null }
                 val card = row.paneCard ?: model.tabs?.icon
                 val more = row.progress != null || row.subtasksSummary.isNotEmpty()
                 HomeRow(

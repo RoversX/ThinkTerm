@@ -96,8 +96,10 @@ struct RightPanel: View {
     }
 
     private func agentRow(_ row: AgentRow) -> some View {
-        // What it said about itself, else what it waits for, else its title.
-        let detail = [row.said, row.kind, row.title].compactMap { $0 }.first { !$0.isEmpty }
+        // What it waits for and what it said about itself, side by side as
+        // the desktop's and the web's rows have them; else its title.
+        let said = [row.kind, row.said].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+        let detail = [said, row.title].first { !$0.isEmpty }
         let more = row.progress != nil || !row.subtasks_summary.isEmpty
         return SidebarRow(
             lead: AnyView(ThreadCards(core: model.core, icons: [row.pane_card ?? model.tabs?.icon].compactMap { $0 }, revision: model.iconsRevision)),
