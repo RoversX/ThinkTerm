@@ -38,6 +38,10 @@ private const val LIST_REFRESH_MS = 250L
 /// How long a redial goes unsaid (`TerminalModel.redialQuiet`).
 private const val QUIET_REDIAL_MS = 2_500L
 
+/// Frames in a row with nothing to draw or read before the frame loop
+/// rests (`TerminalModel.tick`): about half a second at 60 Hz.
+private const val IDLE_FRAMES_BEFORE_REST = 30
+
 /// How long the connection card waits for a dial back from the background
 /// (`TerminalModel.cardHeld`).
 private const val CARD_HOLD_MS = 3_000L
@@ -255,6 +259,16 @@ class TerminalModel(
 
     private val frameNeeded = AtomicBoolean(false)
     private val changePending = AtomicBoolean(false)
+    /// The frame loop rests while there is nothing to draw or read: up while
+    /// it rests, and taken by whatever wakes it (`wakeLoop`). Every frame
+    /// otherwise wakes the main thread at the display's rate, a frame drawn
+    /// or not, which is battery and heat spent on a terminal sitting still.
+    private val loopResting = AtomicBoolean(false)
+    /// Frames in a row that found nothing to do; main thread only.
+    private var idleFrames = 0
+    /// The frame callback is posted and not yet run; main thread only, so
+    /// a wake and a start never post it twice.
+    private var tickPosted = false
     private val main = Handler(Looper.getMainLooper())
     private val choreographer = Choreographer.getInstance()
     /// The frame loop runs: the terminal is on screen in an app in front.
@@ -266,12 +280,43 @@ class TerminalModel(
 
     private val tick = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
+            tickPosted = false
             if (!running) return
+            var busy = false
             // Nothing is drawn onto the list's stand-in surface.
-            if (!onListSurface && frameNeeded.getAndSet(false)) core.render()
-            if (changePending.getAndSet(false)) refreshViews()
-            choreographer.postFrameCallback(this)
+            if (!onListSurface && frameNeeded.getAndSet(false)) {
+                core.render()
+                busy = true
+            }
+            if (changePending.getAndSet(false)) {
+                refreshViews()
+                busy = true
+            }
+            idleFrames = if (busy) 0 else idleFrames + 1
+            if (idleFrames < IDLE_FRAMES_BEFORE_REST) {
+                postTick()
+                return
+            }
+            // Nothing for a while: the loop stops until the core asks for a
+            // frame or publishes views. One asked for between this frame's
+            // look and the flag going up found the loop awake and did not
+            // wake it: looked at again now that the flag is up.
+            idleFrames = 0
+            loopResting.set(true)
+            if ((!onListSurface && frameNeeded.get()) || changePending.get()) wakeLoop()
         }
+    }
+
+    private fun postTick() {
+        if (tickPosted) return
+        tickPosted = true
+        choreographer.postFrameCallback(tick)
+    }
+
+    /// From any thread: the loop resting is set going again, once.
+    private fun wakeLoop() {
+        if (!loopResting.compareAndSet(true, false)) return
+        main.post { if (running) postTick() }
     }
 
     private val statsTick = object : Runnable {
@@ -376,12 +421,17 @@ class TerminalModel(
         if (want == running) return
         running = want
         if (want) {
-            choreographer.postFrameCallback(tick)
+            loopResting.set(false)
+            idleFrames = 0
+            postTick()
             main.removeCallbacks(statsTick)
             main.postDelayed(statsTick, 500)
             changePending.set(true)
         } else {
             choreographer.removeFrameCallback(tick)
+            tickPosted = false
+            // Stopped, not resting: nothing is to start it but coming back.
+            loopResting.set(false)
             main.removeCallbacks(statsTick)
         }
     }
@@ -1079,6 +1129,9 @@ class TerminalModel(
         }
         listReader?.close()
         listReader = null
+        // The loop may have rested while frames went to the list's surface,
+        // with one still owed: it is owed to this surface now.
+        wakeLoop()
     }
 
     // MARK: the preferences the App honours
@@ -1153,6 +1206,7 @@ class TerminalModel(
     private inner class Sink : Notify {
         override fun onFrameNeeded() {
             frameNeeded.set(true)
+            wakeLoop()
         }
 
         override fun onStatus(status: String) {
@@ -1177,6 +1231,7 @@ class TerminalModel(
                     onDropComposition?.invoke()
                 }
                 changePending.set(true)
+                wakeLoop()
             }
         }
 
@@ -1190,6 +1245,7 @@ class TerminalModel(
 
         override fun onChange() {
             changePending.set(true)
+            wakeLoop()
             // Off screen the frame loop rests; a list may be reading.
             queueListRefresh()
         }

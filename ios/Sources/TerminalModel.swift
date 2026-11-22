@@ -218,6 +218,15 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     private let frameNeeded = AtomicFlag()
     private var displayLink: CADisplayLink?
+    /// The display link rests while there is nothing to draw or read: up
+    /// while it rests, and taken by whatever wakes it (`wakeLink`). Every
+    /// tick otherwise wakes the main thread at the display's rate, a frame
+    /// or not, which is battery spent on a terminal sitting still.
+    private let linkResting = AtomicFlag()
+    /// Ticks in a row that found nothing to do (`tick`).
+    private var idleTicks = 0
+    /// About half a second at 60 Hz: past a passing pause between frames.
+    private static let idleTicksBeforeRest = 30
     private var statsTimer: Timer?
     private var logLines: [String] = []
     private var hostKeyToRemember: String?
@@ -323,12 +332,16 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         // Its text input goes with it: nothing reads the rows.
         setScreenWanted(false)
         displayLink?.isPaused = true
+        // Off screen it is paused, not resting: nothing wakes it.
+        _ = linkResting.take()
         onScreen = false
         updateShown()
         queueListRefresh()
     }
 
     func enterScreen() {
+        _ = linkResting.take()
+        idleTicks = 0
         displayLink?.isPaused = false
         onScreen = true
         updateShown()
@@ -376,6 +389,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// From the core thread: the views changed. On screen the frame loop
     /// reads them; off it, a list may be.
     fileprivate func coreChanged() {
+        // New views: the tick reads them.
+        wakeLink()
         DispatchQueue.main.async { [weak self] in self?.queueListRefresh() }
     }
 
@@ -1062,6 +1077,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             // core makes one at once) is read, and until then the rows are
             // asked for. Taken before asking, so that one is not missed.
             screenRevision = core.screenRevision()
+            // Rows come without a word from the core: the tick reads them,
+            // so it runs while they are wanted.
+            wakeLink()
         } else {
             screenJSON = "null"
         }
@@ -1299,12 +1317,17 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             lastTickAt = now
         }
         #endif
+        // Rows read while wanted come without a word from the core, so a
+        // tick that wants them is never idle.
+        var busy = screenWanted
         if frameNeeded.take() {
+            busy = true
             core.render()
             // Unwanted rows are not kept current: read again when asked.
             if !screenWanted { inputView?.dropScreen() }
         }
         if core.viewsRevision() != lastViews?.revision {
+            busy = true
             refreshViews()
         }
         if screenWanted {
@@ -1315,9 +1338,47 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
                 inputView?.screenChanged()
             }
         }
+        #if DEBUG
+        // The acceptance flow's stall gauge reads the gaps between ticks.
+        if measuringTicks { busy = true }
+        #endif
+        if busy {
+            idleTicks = 0
+        } else {
+            idleTicks += 1
+            if idleTicks >= Self.idleTicksBeforeRest { restLink() }
+        }
     }
 
-    func requestOneFrame() { frameNeeded.set() }
+    /// Nothing to draw or read for a while: the link stops until the core
+    /// asks for a frame or publishes views (`wakeLink`).
+    private func restLink() {
+        idleTicks = 0
+        displayLink?.isPaused = true
+        linkResting.set()
+        // A frame or views asked for between this tick's look and the flag
+        // going up found the link awake and did not wake it: looked at
+        // again now that the flag is up, so neither waits for the next.
+        if frameNeeded.get() || core.viewsRevision() != lastViews?.revision {
+            wakeLink()
+        }
+    }
+
+    /// From any thread: the link resting is set going again, once.
+    private func wakeLink() {
+        guard linkResting.take() else { return }
+        DispatchQueue.main.async { [weak self] in
+            // Resting again by now (the screen left and came back, and the
+            // link went idle meanwhile): that rest has a wake of its own.
+            guard let self, self.onScreen, !self.linkResting.get() else { return }
+            self.displayLink?.isPaused = false
+        }
+    }
+
+    func requestOneFrame() {
+        frameNeeded.set()
+        wakeLink()
+    }
 
     func toggleAnimating() {
         animating.toggle()
@@ -1338,7 +1399,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     // MARK: notify (core thread)
 
-    fileprivate func coreWantsFrame() { frameNeeded.set() }
+    fileprivate func coreWantsFrame() {
+        frameNeeded.set()
+        wakeLink()
+    }
 
     fileprivate func coreStatus(_ status: String) {
         DispatchQueue.main.async {
@@ -1522,6 +1586,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             longestTickGap = 0
             lastTickAt = 0
             measuringTicks = true
+            // A link at rest ticks for nobody: the gauge needs it going.
+            wakeLink()
             acceptAnswer(n, "measuring")
         case "measured":
             // The longest the main thread went without a frame callback.
@@ -1985,4 +2051,5 @@ final class AtomicFlag: @unchecked Sendable {
     private var value = false
     func set() { lock.lock(); value = true; lock.unlock() }
     func take() -> Bool { lock.lock(); defer { lock.unlock() }; let v = value; value = false; return v }
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
