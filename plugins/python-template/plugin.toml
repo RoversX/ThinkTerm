@@ -1,0 +1,22 @@
+# A plugin made by `thinkterm plugin new`: a panel in the right sidebar and a
+# page, both drawn by main.py, which the Python on this machine runs.
+# docs/thinkterm/plugins.md says what else a manifest can say.
+id = "hello-python"
+name = "Hello Python"
+version = "0.1.0"
+description = "A panel and a page drawn by a Python script."
+api = 3
+
+[run]
+python = "main.py"
+
+[panel]
+icon = "puzzle"
+
+[page]
+icon = "puzzle"
+
+[[action]]
+id = "open"
+title = "Open Hello Python"
+page = {}
