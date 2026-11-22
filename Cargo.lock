@@ -9812,6 +9812,7 @@ dependencies = [
  "euclid",
  "futures",
  "guillotiere",
+ "image",
  "js-sys",
  "log",
  "nucleo-matcher",

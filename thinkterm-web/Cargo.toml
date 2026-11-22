@@ -21,6 +21,7 @@ codec.workspace = true
 euclid.workspace = true
 futures.workspace = true
 guillotiere.workspace = true
+image.workspace = true
 log.workspace = true
 nucleo-matcher.workspace = true
 percent-encoding.workspace = true

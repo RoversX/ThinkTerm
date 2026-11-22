@@ -16,6 +16,14 @@ const MAX_ATLAS_IMAGE_SIDE: u32 = 254;
 const MAX_ATLAS_SIDE: u32 = 1024;
 const MAX_FRAGMENTS: usize = 128 * 1024;
 const UPLOAD_STRIP_BYTES: usize = 1024 * 1024;
+/// The most an image that arrived encoded is decoded to, in bytes of RGBA: a
+/// 4096 × 4096 picture. The decoding is this side's own work and memory.
+const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+/// How much decoded pixels are kept for in all, two of the largest. Past it
+/// the least recently drawn go, to be decoded again if they come back.
+const DECODED_BUDGET: usize = 128 * 1024 * 1024;
+/// How many images, decoded or found not to decode, are remembered.
+const MAX_DECODED: usize = 256;
 type ImageKey = [u8; 32];
 
 /// One clock mapping per mux connection. Prefer the least-delayed round trip;
@@ -83,6 +91,173 @@ fn pixels(data: &ImageDataType, frame: u32) -> Option<(u32, u32, &[u8], ImageKey
             *hashes.get(frame as usize)?,
         )),
         _ => None,
+    }
+}
+
+/// The pixels of an image that arrived encoded, as one still frame: a PNG,
+/// GIF, JPEG or WebP kept as the program sent it, as the iTerm2 protocol's
+/// are, which the desktop decodes for itself. Other formats are not drawn
+/// here: their decoders would all come into the web page. An animation gives
+/// its first frame, all that is drawn of one here. `None` when it does not
+/// decode, or its header says it would take more than `largest` bytes: then
+/// it is not decoded at all.
+fn decode_encoded(bytes: &[u8], largest: usize) -> Option<ImageDataType> {
+    use image::codecs::{gif::GifDecoder, jpeg::JpegDecoder, png::PngDecoder, webp::WebPDecoder};
+    let cursor = std::io::Cursor::new(bytes);
+    let image = match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Png => still(PngDecoder::new(cursor).ok()?, largest)?,
+        image::ImageFormat::Jpeg => still(JpegDecoder::new(cursor).ok()?, largest)?,
+        image::ImageFormat::Gif => still(GifDecoder::new(cursor).ok()?, largest)?,
+        image::ImageFormat::WebP => still(WebPDecoder::new(cursor).ok()?, largest)?,
+        _ => return None,
+    };
+    let (width, height) = image.dimensions();
+    Some(ImageDataType::new_single_frame(
+        width,
+        height,
+        image.into_vec(),
+    ))
+}
+
+/// The first frame `decoder` has, when it is within `largest` bytes both as
+/// it decodes (16 bits a channel takes twice as many) and as RGBA: known
+/// from the header, before any of it is decoded.
+fn still(decoder: impl image::ImageDecoder, largest: usize) -> Option<image::RgbaImage> {
+    let (width, height) = decoder.dimensions();
+    let size = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if size == 0 || size > largest || decoder.total_bytes() > largest as u64 {
+        log::info!("not drawing a {width}x{height} image here: too large to decode");
+        return None;
+    }
+    Some(
+        image::DynamicImage::from_decoder(decoder)
+            .ok()?
+            .into_rgba8(),
+    )
+}
+
+/// Pixels this side decoded from the images on screen that arrived encoded,
+/// by the image's hash. An entry with none is one that did not decode, or
+/// was too large, kept so that it is not tried again on every frame. An
+/// image not drawn in a frame lets its entry go at the frame's end, as its
+/// texture does.
+struct DecodedImages {
+    entries: HashMap<ImageKey, DecodedImage>,
+    bytes: usize,
+    clock: u64,
+    budget: usize,
+    most: usize,
+    largest: usize,
+}
+
+struct DecodedImage {
+    pixels: Option<Rc<ImageDataType>>,
+    bytes: usize,
+    generation: u64,
+    used: u64,
+    seen: bool,
+}
+
+impl Default for DecodedImages {
+    fn default() -> Self {
+        Self::with_limits(DECODED_BUDGET, MAX_DECODED, MAX_DECODED_BYTES)
+    }
+}
+
+impl DecodedImages {
+    fn with_limits(budget: usize, most: usize, largest: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            clock: 0,
+            budget,
+            most,
+            largest,
+        }
+    }
+
+    /// The pixels of `data` when it arrived encoded, decoded the first time
+    /// they are asked for, and again if its generation moves. `None` for
+    /// data that is pixels already, and for one that does not decode. Takes
+    /// the image's lock, so a caller must not hold it.
+    fn get(&mut self, data: &ImageData) -> Option<Rc<ImageDataType>> {
+        let key = data.hash();
+        let generation = data.generation();
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.generation == generation {
+                entry.used = self.clock;
+                entry.seen = true;
+                return entry.pixels.clone();
+            }
+        }
+        // Copied out, so that the lock is not held while decoding.
+        let encoded = match &*data.data() {
+            ImageDataType::EncodedFile(bytes) => Some(bytes.clone()),
+            ImageDataType::EncodedLease(lease) => lease.get_data().ok(),
+            _ => return None,
+        };
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes -= old.bytes;
+        }
+        let pixels = encoded
+            .and_then(|bytes| decode_encoded(&bytes, self.largest))
+            .map(Rc::new);
+        let bytes = match pixels.as_deref() {
+            Some(ImageDataType::Rgba8 { data, .. }) => data.len(),
+            _ => 0,
+        };
+        // Let the least recently used go until this one fits.
+        while !self.entries.is_empty()
+            && (self.bytes + bytes > self.budget || self.entries.len() >= self.most)
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| *key)
+                .expect("not empty");
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.bytes -= entry.bytes;
+            }
+        }
+        self.bytes += bytes;
+        self.entries.insert(
+            key,
+            DecodedImage {
+                pixels: pixels.clone(),
+                bytes,
+                generation,
+                used: self.clock,
+                seen: true,
+            },
+        );
+        pixels
+    }
+
+    /// Notes the image `key` names as drawn this frame, when it has an
+    /// entry.
+    fn touch(&mut self, key: &ImageKey) {
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.used = self.clock;
+            entry.seen = true;
+        }
+    }
+
+    /// At a frame's end: lets go of the images it did not draw.
+    fn sweep(&mut self) {
+        let bytes = &mut self.bytes;
+        self.entries.retain(|_, entry| {
+            if !entry.seen {
+                *bytes -= entry.bytes;
+                return false;
+            }
+            entry.seen = false;
+            true
+        });
     }
 }
 
@@ -298,6 +473,8 @@ pub struct Graphics {
     textures: HashMap<TextureKey, Texture>,
     atlases: HashMap<usize, ImageAtlas>,
     sources: HashMap<ImageKey, Source>,
+    /// Pixels for the images that arrived still encoded.
+    decoded: DecodedImages,
     texture_bytes: usize,
     texture_count: usize,
     fragments: Vec<Fragment>,
@@ -495,11 +672,13 @@ impl Graphics {
         if let Some(source) = self.sources.get_mut(&key) {
             if source.generation == generation {
                 source.seen = true;
+                self.decoded.touch(&key);
                 return Some(source.size);
             }
         }
+        let decoded = self.decoded.get(data);
         let payload = data.data();
-        let (width, height, pixels, _) = pixels(&payload, 0)?;
+        let (width, height, pixels, _) = pixels(decoded.as_deref().unwrap_or(&payload), 0)?;
         let bytes = (width as usize)
             .checked_mul(height as usize)?
             .checked_mul(4)?;
@@ -544,8 +723,11 @@ impl Graphics {
                 return Ok(true);
             }
         }
+        let decoded = self.decoded.get(data);
         let payload = data.data();
-        let Some((source_width, source_height, pixels, content)) = pixels(&payload, frame) else {
+        let Some((source_width, source_height, pixels, content)) =
+            pixels(decoded.as_deref().unwrap_or(&payload), frame)
+        else {
             return Ok(false);
         };
         if upload[2] > source_width || upload[3] > source_height {
@@ -914,6 +1096,7 @@ impl Graphics {
 
     pub fn finish_frame(&mut self, gpu: &mut Gpu, surface: (f32, f32)) {
         self.sources.retain(|_, source| source.seen);
+        self.decoded.sweep();
         self.textures.retain(|_, texture| {
             if !texture.seen {
                 Self::release_texture(
@@ -1246,5 +1429,118 @@ mod tests {
             None
         );
         assert_eq!(left.joined(right, true), None);
+    }
+
+    /// A `width` × `height` PNG whose pixel (x, y) is (x, y, 7, 255).
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([x as u8, y as u8, 7, 255])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn decoded_size(pixels: &ImageDataType) -> (u32, u32) {
+        match pixels {
+            ImageDataType::Rgba8 { width, height, .. } => (*width, *height),
+            _ => panic!("not decoded to one frame"),
+        }
+    }
+
+    fn encoded(bytes: Vec<u8>) -> ImageData {
+        ImageData::with_data(ImageDataType::EncodedFile(bytes))
+    }
+
+    #[test]
+    fn an_image_that_arrives_encoded_is_decoded_once_and_kept() {
+        let mut decoded = DecodedImages::default();
+        let data = encoded(png(3, 2));
+        let first = decoded.get(&data).expect("decodes");
+        assert_eq!(decoded_size(&first), (3, 2));
+        let (_, _, pixels, _) = pixels(&first, 0).expect("drawable");
+        // Pixel (2, 1), row-major RGBA.
+        assert_eq!(&pixels[(1 * 3 + 2) * 4..][..4], &[2, 1, 7, 255]);
+        let again = decoded.get(&data).expect("kept");
+        assert!(Rc::ptr_eq(&first, &again), "decoded once");
+        // Pixels already decoded are drawn as they are.
+        let raw = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![9; 4]));
+        assert!(decoded.get(&raw).is_none());
+    }
+
+    #[test]
+    fn a_leased_image_decodes_as_its_file_does() {
+        thinkterm_session::blobs::ensure_blob_storage();
+        let lease = ImageDataType::EncodedFile(png(4, 4)).swap_out().unwrap();
+        assert!(matches!(lease, ImageDataType::EncodedLease(_)));
+        let mut decoded = DecodedImages::default();
+        let pixels = decoded.get(&ImageData::with_data(lease)).expect("decodes");
+        assert_eq!(decoded_size(&pixels), (4, 4));
+    }
+
+    #[test]
+    fn one_too_large_or_not_an_image_is_not_decoded_nor_tried_again() {
+        // 3 × 2 is 24 bytes of RGBA: past a limit of 16, from its header.
+        let mut decoded = DecodedImages::with_limits(1024, 8, 16);
+        assert!(decoded.get(&encoded(png(3, 2))).is_none());
+        assert!(decoded.get(&encoded(b"not an image".to_vec())).is_none());
+        assert_eq!(decoded.entries.len(), 2, "remembered, not retried");
+        assert_eq!(decoded.bytes, 0);
+    }
+
+    #[test]
+    fn past_the_budget_the_least_recently_drawn_go() {
+        // Room for 24 bytes: a 2 × 2 picture (16) and one of 2 × 1 (8).
+        let mut decoded = DecodedImages::with_limits(24, 8, 1024);
+        let (a, b, c) = (encoded(png(2, 2)), encoded(png(2, 1)), encoded(png(1, 2)));
+        decoded.get(&a).unwrap();
+        decoded.get(&b).unwrap();
+        // Drawn from its texture: only its size is asked for.
+        decoded.touch(&a.hash());
+        decoded.get(&c).unwrap();
+        assert!(decoded.entries.contains_key(&a.hash()));
+        assert!(
+            !decoded.entries.contains_key(&b.hash()),
+            "least recently drawn"
+        );
+        assert!(decoded.entries.contains_key(&c.hash()));
+        assert_eq!(decoded.bytes, 16 + 8);
+    }
+
+    #[test]
+    fn an_image_no_longer_drawn_lets_its_pixels_go_at_the_frames_end() {
+        let mut decoded = DecodedImages::default();
+        let (shown, gone) = (encoded(png(2, 2)), encoded(png(1, 1)));
+        decoded.get(&shown).unwrap();
+        decoded.get(&gone).unwrap();
+        decoded.sweep();
+        // The next frame draws only the one.
+        decoded.touch(&shown.hash());
+        decoded.sweep();
+        assert!(decoded.entries.contains_key(&shown.hash()));
+        assert!(!decoded.entries.contains_key(&gone.hash()));
+        assert_eq!(decoded.bytes, 16);
+        // And a frame that draws none lets it go too.
+        decoded.sweep();
+        assert!(decoded.entries.is_empty());
+        assert_eq!(decoded.bytes, 0);
+    }
+
+    #[test]
+    fn an_image_changed_in_place_is_decoded_again() {
+        let mut decoded = DecodedImages::default();
+        let data = encoded(png(2, 2));
+        let first = decoded.get(&data).unwrap();
+        *data.data() = ImageDataType::EncodedFile(png(3, 3));
+        data.bump_generation();
+        let second = decoded.get(&data).unwrap();
+        assert_eq!(decoded_size(&first), (2, 2));
+        assert_eq!(decoded_size(&second), (3, 3));
+        assert_eq!(decoded.bytes, 3 * 3 * 4);
     }
 }
