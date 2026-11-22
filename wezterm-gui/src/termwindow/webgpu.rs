@@ -1,3 +1,4 @@
+use crate::quad::QuadBlend;
 use thinkterm_render::pipeline::Pipeline;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
@@ -60,11 +61,20 @@ pub struct WebGpuState {
     pub queue: Arc<wgpu::Queue>,
     pub config: RefCell<wgpu::SurfaceConfiguration>,
     pub dimensions: RefCell<Dimensions>,
+    /// The format drawn in but for a see-through window's frame: card
+    /// pictures, the surfaces of other windows that show them, and the
+    /// frame of an opaque window. The surface's sRGB one when it has one, so
+    /// that colours mix in linear light.
+    pub content_format: wgpu::TextureFormat,
+    /// For `content_format`. A window's frame takes its pipelines from
+    /// `frame_pipeline`.
     pub render_pipeline: wgpu::RenderPipeline,
     /// For quads that clear some of what is under them (`QuadBlend::Clear`).
     pub clear_pipeline: wgpu::RenderPipeline,
     /// For quads that add their light to it (`QuadBlend::Add`).
     pub add_pipeline: wgpu::RenderPipeline,
+    /// For a see-through window's frame (`set_see_through`).
+    see_through: Option<SeeThroughPipelines>,
     shader_uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_nearest_sampler: wgpu::Sampler,
@@ -100,6 +110,15 @@ pub struct WebGpuState {
 /// How many frames may be submitted ahead of the device before the paint
 /// path blocks on the oldest one. Two matches `desired_maximum_frame_latency`.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// The surface's format without its sRGB suffix, and the pipelines that draw
+/// a see-through window's frame into it (`WebGpuState::set_see_through`).
+struct SeeThroughPipelines {
+    format: wgpu::TextureFormat,
+    over: wgpu::RenderPipeline,
+    clear: wgpu::RenderPipeline,
+    add: wgpu::RenderPipeline,
+}
 
 /// `QuadBlend::Clear`: keeps `1 - alpha` of what is under the quad, colour
 /// and solidity both, and adds nothing.
@@ -320,9 +339,9 @@ impl CardRenderTexture {
                  max dimension {limit} supported by your GPU"
             );
         }
-        // Same format as the surface so the shared render pipeline can
-        // target it.
-        let format = state.config.borrow().format;
+        // The format the shared render pipeline targets, which another
+        // window's surface it is copied onto has too.
+        let format = state.content_format;
         let texture = state.device.create_texture(&wgpu::TextureDescriptor {
             size: wgpu::Extent3d {
                 width,
@@ -765,6 +784,33 @@ impl WebGpuState {
         let (Some(clear_pipeline), Some(add_pipeline)) = (blended.next(), blended.next()) else {
             anyhow::bail!("no pipeline for each blend");
         };
+        let plain = format.remove_srgb_suffix();
+        let see_through = if format.is_srgb() && caps.formats.contains(&plain) {
+            let mut built = pipeline
+                .pipelines_for(
+                    &device,
+                    plain,
+                    true,
+                    &[
+                        wgpu::BlendState::ALPHA_BLENDING,
+                        CLEAR_BLENDING,
+                        ADD_BLENDING,
+                    ],
+                )
+                .into_iter();
+            let (Some(over), Some(clear), Some(add)) = (built.next(), built.next(), built.next())
+            else {
+                anyhow::bail!("no see-through pipeline for each blend");
+            };
+            Some(SeeThroughPipelines {
+                format: plain,
+                over,
+                clear,
+                add,
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             instance,
@@ -775,9 +821,11 @@ impl WebGpuState {
             queue,
             config: RefCell::new(config),
             dimensions: RefCell::new(dimensions),
+            content_format: format,
             render_pipeline: pipeline.render_pipeline,
             clear_pipeline,
             add_pipeline,
+            see_through,
             handle,
             window,
             shader_uniform_bind_group_layout: pipeline.uniform_layout,
@@ -807,6 +855,7 @@ impl WebGpuState {
         let handle = RawHandlePair::new(window);
         let surface = handle.surface_on(&self.instance)?;
         let mut config = self.config.borrow().clone();
+        config.format = self.content_format;
         config.width = width;
         config.height = height;
         config.usage |= wgpu::TextureUsages::COPY_DST;
@@ -986,6 +1035,54 @@ impl WebGpuState {
         self.queue
             .write_buffer(&slot.buffer, 0, bytemuck::bytes_of(&uniform));
         slot.bind_group.clone()
+    }
+
+    /// Draw the window's frame for a window `see_through` or not.
+    ///
+    /// The system lays a see-through window's frame over what is behind it
+    /// as its sRGB colour times its alpha. Mixed in linear light, as an
+    /// opaque frame is, a light colour leaves more than that: white at 70% is
+    /// stored as 218 where 70% of 255 is 178, so over all but a dark desktop
+    /// a light window comes out white. A dark one is all but unchanged. So a
+    /// see-through window's frame is drawn into the surface's format without
+    /// the sRGB suffix, the shader writing sRGB values that then mix as they
+    /// are, as the OpenGL renderer does (`fs_main_srgb`). A surface without
+    /// that format is left as it is.
+    pub fn set_see_through(&self, see_through: bool) {
+        let format = match &self.see_through {
+            Some(pipelines) if see_through => pipelines.format,
+            _ => self.content_format,
+        };
+        let mut config = self.config.borrow_mut();
+        if config.format == format {
+            return;
+        }
+        gpu_debug(format!(
+            "WebGpu surface format {:?} -> {:?} see_through={}",
+            config.format, format, see_through
+        ));
+        config.format = format;
+        // A zero-sized surface takes it with its next resize.
+        if config.width > 0 && config.height > 0 {
+            self.surface.configure(&self.device, &config);
+        }
+    }
+
+    /// The pipeline the window's frame lays a quad mixed as `blend` with:
+    /// for the format `set_see_through` gave the surface.
+    pub fn frame_pipeline(&self, blend: QuadBlend) -> &wgpu::RenderPipeline {
+        match &self.see_through {
+            Some(pipelines) if self.config.borrow().format == pipelines.format => match blend {
+                QuadBlend::Over => &pipelines.over,
+                QuadBlend::Clear => &pipelines.clear,
+                QuadBlend::Add => &pipelines.add,
+            },
+            _ => match blend {
+                QuadBlend::Over => &self.render_pipeline,
+                QuadBlend::Clear => &self.clear_pipeline,
+                QuadBlend::Add => &self.add_pipeline,
+            },
+        }
     }
 
     #[allow(unused_mut)]

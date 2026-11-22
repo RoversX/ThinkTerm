@@ -516,7 +516,7 @@ pub(crate) fn draw_webgpu_layers(
                 });
                 cleared = true;
 
-                render_pass.set_pipeline(&webgpu.render_pipeline);
+                render_pass.set_pipeline(webgpu.frame_pipeline(QuadBlend::Over));
                 render_pass.set_bind_group(0, &window_uniforms, &[]);
                 render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
                 render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
@@ -534,11 +534,7 @@ pub(crate) fn draw_webgpu_layers(
                     .set_index_buffer(vb.indices.webgpu().slice(..), wgpu::IndexFormat::Uint32);
                 let runs = vb.blends.borrow().runs(index_count / INDICES_PER_CELL);
                 for (quads, blend) in runs {
-                    render_pass.set_pipeline(match blend {
-                        QuadBlend::Over => &webgpu.render_pipeline,
-                        QuadBlend::Clear => &webgpu.clear_pipeline,
-                        QuadBlend::Add => &webgpu.add_pipeline,
-                    });
+                    render_pass.set_pipeline(webgpu.frame_pipeline(blend));
                     render_pass.draw_indexed(
                         (quads.start * INDICES_PER_CELL) as u32
                             ..(quads.end * INDICES_PER_CELL) as u32,
@@ -595,7 +591,7 @@ pub(crate) fn draw_webgpu_layers(
                     timestamp_writes: None,
                 });
                 cleared = true;
-                pass.set_pipeline(&webgpu.render_pipeline);
+                pass.set_pipeline(webgpu.frame_pipeline(QuadBlend::Over));
                 pass.set_bind_group(0, &window_uniforms, &[]);
                 pass.set_vertex_buffer(0, scratch.vb.slice(..));
                 pass.set_index_buffer(scratch.index.slice(..), wgpu::IndexFormat::Uint32);

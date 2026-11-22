@@ -150,8 +150,18 @@ fn vs_main(
 
 // Fragment shader
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+// A linear colour as the sRGB values that stand for it, for a target that
+// does not encode on write. As `to_srgb` in glyph-frag.glsl.
+fn to_srgb(color: vec4<f32>) -> vec4<f32> {
+  let rgb = max(color.rgb, vec3<f32>(0.0));
+  let higher = vec3<f32>(1.055) * pow(rgb, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+  let lower = rgb * vec3<f32>(12.92);
+  return vec4<f32>(select(higher, lower, rgb < vec3<f32>(0.0031308)), color.a);
+}
+
+// What a fragment's colour is in linear light, before the window's round
+// corners cut it: its entry points cut it, as only they may discard.
+fn shade(in: VertexOutput) -> vec4<f32> {
   var color: vec4<f32>;
   var linear_tex: vec4<f32> = textureSample(atlas_linear_tex, atlas_linear_sampler, in.tex);
   var nearest_tex: vec4<f32> = textureSample(atlas_nearest_tex, atlas_nearest_sampler, in.tex);
@@ -219,16 +229,37 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
   color = apply_hsv(color, hsv);
   let border_coverage = rounded_window_border_coverage(in.clip_position.xy);
-  color = mix(
+  return mix(
     color,
     vec4<f32>(uniforms.window_border.rgb, 1.0),
     border_coverage,
   );
+}
+
+// For a target that encodes to sRGB on write, so that colours mix in linear
+// light.
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+  var color = shade(in);
   let coverage = rounded_window_coverage(in.clip_position.xy);
   if coverage <= 0.0 {
     discard;
   }
   color.a *= coverage;
-
   return color;
+}
+
+// For a target that does not encode, which then mixes the sRGB values
+// themselves, as the OpenGL renderer does. A see-through window's frame is
+// drawn so (`WebGpuState::set_see_through`): the system lays it over what is
+// behind as sRGB colour times alpha, which is what mixing them leaves.
+@fragment
+fn fs_main_srgb(in: VertexOutput) -> @location(0) vec4<f32> {
+  var color = shade(in);
+  let coverage = rounded_window_coverage(in.clip_position.xy);
+  if coverage <= 0.0 {
+    discard;
+  }
+  color.a *= coverage;
+  return to_srgb(color);
 }

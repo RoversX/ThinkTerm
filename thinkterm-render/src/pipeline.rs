@@ -79,11 +79,6 @@ impl Pipeline {
         target_format: wgpu::TextureFormat,
         blends: &[wgpu::BlendState],
     ) -> (Self, Vec<wgpu::RenderPipeline>) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shader.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(crate::SHADER_SOURCE.into()),
-        });
-
         let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -134,53 +129,16 @@ impl Pipeline {
             label: Some("texture bind group layout"),
         });
 
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&uniform_layout, &texture_layout, &texture_layout],
-            push_constant_ranges: &[],
-        });
-
-        let build = |blend: wgpu::BlendState| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Render Pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[Vertex::desc()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend: Some(blend),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-                cache: None,
-            })
-        };
-        let render_pipeline = build(wgpu::BlendState::ALPHA_BLENDING);
-        let blended = blends.iter().map(|blend| build(*blend)).collect();
+        let mut built = build_pipelines(
+            device,
+            &uniform_layout,
+            &texture_layout,
+            target_format,
+            "fs_main",
+            std::iter::once(wgpu::BlendState::ALPHA_BLENDING).chain(blends.iter().copied()),
+        )
+        .into_iter();
+        let render_pipeline = built.next().expect("a pipeline for laying quads over");
 
         (
             Self {
@@ -191,7 +149,29 @@ impl Pipeline {
                 linear_sampler,
                 target_format,
             },
-            blended,
+            built.collect(),
+        )
+    }
+
+    /// The shader built with this pipeline's layouts, so that the same bind
+    /// groups serve, into a pipeline for `target_format` for each of
+    /// `blends`, in that order. `srgb`: the target does not encode to sRGB on
+    /// write, and the shader writes the sRGB values itself, which the target
+    /// then mixes as they are (`fs_main_srgb`).
+    pub fn pipelines_for(
+        &self,
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        srgb: bool,
+        blends: &[wgpu::BlendState],
+    ) -> Vec<wgpu::RenderPipeline> {
+        build_pipelines(
+            device,
+            &self.uniform_layout,
+            &self.texture_layout,
+            target_format,
+            if srgb { "fs_main_srgb" } else { "fs_main" },
+            blends.iter().copied(),
         )
     }
 
@@ -354,4 +334,65 @@ impl Texture2d for GpuTexture {
     fn height(&self) -> usize {
         self.height as usize
     }
+}
+
+/// The shader, with fragment entry point `fragment`, built into a pipeline
+/// for `target_format` for each of `blends`.
+fn build_pipelines(
+    device: &wgpu::Device,
+    uniform_layout: &wgpu::BindGroupLayout,
+    texture_layout: &wgpu::BindGroupLayout,
+    target_format: wgpu::TextureFormat,
+    fragment: &str,
+    blends: impl IntoIterator<Item = wgpu::BlendState>,
+) -> Vec<wgpu::RenderPipeline> {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("shader.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(crate::SHADER_SOURCE.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Render Pipeline Layout"),
+        bind_group_layouts: &[uniform_layout, texture_layout, texture_layout],
+        push_constant_ranges: &[],
+    });
+    let build = |blend: wgpu::BlendState| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(fragment),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        })
+    };
+    blends.into_iter().map(build).collect()
 }

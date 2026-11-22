@@ -6638,7 +6638,10 @@ impl TermWindow {
         if self.occluded.is_some() {
             self.occlusion_released = false;
         }
-        self.webgpu.as_mut().unwrap().resize(self.dimensions);
+        let webgpu = self.webgpu.as_mut().unwrap();
+        webgpu.resize(self.dimensions);
+        // Before the frame is laid out: the glass reads how it mixes.
+        webgpu.set_see_through(self.config.window_background_opacity < 1.0);
         match self.do_paint_webgpu_impl() {
             Ok(ok) => Ok(ok),
             Err(err) => {

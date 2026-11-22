@@ -31,4 +31,21 @@ mod shader_tests {
         .validate(&module)
         .expect("main WGSL shader should validate");
     }
+
+    /// `Pipeline::pipelines_for` names the fragment entry points by string.
+    #[test]
+    fn main_wgsl_shader_has_both_fragment_entry_points() {
+        let module = naga::front::wgsl::parse_str(super::SHADER_SOURCE)
+            .expect("main WGSL shader should parse");
+        for name in ["fs_main", "fs_main_srgb"] {
+            assert!(
+                module
+                    .entry_points
+                    .iter()
+                    .any(|entry| entry.name == name && entry.stage == naga::ShaderStage::Fragment),
+                "no fragment entry point {}",
+                name
+            );
+        }
+    }
 }
