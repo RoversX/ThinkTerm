@@ -31,6 +31,7 @@
 
 mod field;
 mod page;
+mod picture;
 
 pub(crate) use field::FieldSnapshot;
 pub(crate) use page::is_about_a_terminal;
@@ -411,6 +412,13 @@ fn mixed(ground: LinearRgba, over: LinearRgba, amount: f32) -> LinearRgba {
     let (r1, g1, b1, _) = over.srgba_pixel().as_rgba();
     let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
     LinearRgba::with_srgba(mix(r0, r1), mix(g0, g1), mix(b0, b1), 255)
+}
+
+/// The answer for a picture of a view this window no longer shows.
+fn closed_picture() -> thinkterm_plugin_panel::Picture {
+    thinkterm_plugin_panel::Picture::Failed {
+        why: "the view closed".into(),
+    }
 }
 
 fn color(chrome: &UiPalette, color: Color) -> LinearRgba {
@@ -1347,6 +1355,37 @@ impl TermWindow {
             return;
         }
         let news = match news {
+            // Drawn alone into a picture, for `thinkterm plugin shot`: the
+            // panel, its extended view or -- in the panel's place now -- a page.
+            PanelNews::Picture { id } => {
+                let picture = match self.right_sidebar_plugin.take() {
+                    Some(panel) => {
+                        let shown = if panel.shown.view == view {
+                            Some(&panel.shown)
+                        } else {
+                            panel
+                                .extended
+                                .as_ref()
+                                .map(|(extended, _)| extended)
+                                .filter(|extended| extended.view == view)
+                        };
+                        let picture = match shown {
+                            Some(shown) => self.picture_of_view(shown),
+                            None => closed_picture(),
+                        };
+                        self.right_sidebar_plugin = Some(panel);
+                        picture
+                    }
+                    None => closed_picture(),
+                };
+                return plugins::tell_panel(
+                    view,
+                    PanelRequest::Picture {
+                        id,
+                        picture: Raw::new(&picture),
+                    },
+                );
+            }
             PanelNews::Remote { id, machine, ask } => {
                 if self.plugin_view_numbered(view).is_none() {
                     // A view this window let go of meanwhile.
@@ -2331,6 +2370,7 @@ fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, sc
             feature::FIELDS.to_string(),
             feature::KEYS.to_string(),
             feature::WRAP.to_string(),
+            feature::PICTURE.to_string(),
         ],
         pointer: Default::default(),
     }
@@ -2409,7 +2449,7 @@ fn heard(shown: &mut Shown, plugin: &str, news: PanelNews) {
         // An extended view's: it goes with its panel, which is opened again.
         PanelNews::Reconnected => {}
         // Answered by the window, before it gets here.
-        PanelNews::Remote { .. } => {}
+        PanelNews::Remote { .. } | PanelNews::Picture { .. } => {}
     }
 }
 

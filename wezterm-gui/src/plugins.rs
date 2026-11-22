@@ -188,6 +188,11 @@ pub enum PanelNews {
         machine: String,
         ask: Ask,
     },
+    /// The host asks for the view drawn alone into a picture, to be
+    /// answered with `PanelRequest::Picture` and `id`.
+    Picture {
+        id: u64,
+    },
 }
 
 static SHARED: Mutex<Shared> = parking_lot::const_mutex(Shared {
@@ -676,6 +681,7 @@ fn heard_for_panel(view: u64, event: PanelEvent) {
         },
         PanelEvent::Closed { reason, again } => PanelNews::Closed { reason, again },
         PanelEvent::Heard => PanelNews::Heard,
+        PanelEvent::Picture { id } => PanelNews::Picture { id },
         PanelEvent::Remote { id, machine, ask } => match ask.read::<Ask>() {
             Ok(ask) => PanelNews::Remote { id, machine, ask },
             Err(err) => {
@@ -1037,13 +1043,14 @@ fn follow_snippets_switch(plugins: &[Info]) {
 }
 
 /// The plugins' panels the right sidebar offers: those of the plugins that
-/// are on and not broken. The desktop keeps them as last heard, so they are
-/// offered from the start, without asking the host; its word wins when it
-/// comes. On the GUI thread, with the settings.
+/// are on and not broken -- or failed, whose panel stays saying why until
+/// the plugin runs again (`Info::offers_panel`). The desktop keeps them as
+/// last heard, so they are offered from the start, without asking the
+/// host; its word wins when it comes. On the GUI thread, with the settings.
 fn follow_panels(plugins: &[Info]) {
     let panels: Vec<crate::native_settings::NativePluginPanel> = plugins
         .iter()
-        .filter(|plugin| plugin.usable())
+        .filter(|plugin| plugin.offers_panel())
         .filter_map(|plugin| {
             Some(crate::native_settings::NativePluginPanel {
                 id: plugin.id.clone(),

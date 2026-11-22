@@ -18,6 +18,7 @@ mod builtins;
 mod host;
 mod manifest;
 mod process;
+mod python;
 mod registry;
 mod snippets;
 mod stamp;
@@ -173,6 +174,8 @@ fn run(args: Args) -> anyhow::Result<()> {
     );
     let host = host::Host::new(args.socket, args.idle, registry);
     host.exit_when_idle();
+    host.watch_files();
+    host.follow_python();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => host.accept(stream),

@@ -9,16 +9,22 @@
 //! A program told to stop is [`Exiting`] until it is gone, and the host
 //! starts no other run of the plugin meanwhile: one writing its files on
 //! the way out would write over what a new run had already saved.
+//!
+//! What a program writes to its standard error goes to the host's log, and
+//! the last of it is kept in the plugin's [`Log`] as well: for saying why a
+//! run stopped -- the last thing it said, read to its end first -- and for
+//! `thinkterm plugin logs`.
 
+use crate::manifest::Source;
 use crate::stamp::Stamp;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thinkterm_plugin_sdk::protocol::{self, FromPlugin, ToPlugin, API};
 
 /// Messages that may wait for one program. A program this far behind is
@@ -44,6 +50,16 @@ const ERRORS_LOGGED: usize = 4 * 1024 * 1024;
 const ERROR_LINE: u64 = 4096;
 /// What is left of [`ERRORS_LOGGED`].
 static ERRORS_LEFT: AtomicUsize = AtomicUsize::new(ERRORS_LOGGED);
+/// The lines of standard error a plugin's [`Log`] keeps, across its runs,
+/// and the most bytes they come to.
+const LOG_LINES: usize = 400;
+const LOG_BYTES: usize = 64 * 1024;
+/// How long the host waits, once a program has exited, for the rest of
+/// what it wrote to standard error: something it started may keep that
+/// open after it is gone.
+const LAST_WORDS_WITHIN: Duration = Duration::from_millis(300);
+/// The longest last thing said that a reason quotes.
+const LAST_WORDS_LIMIT: usize = 300;
 /// The stack of the host's threads, here and in `host`. They parse JSON and
 /// move bytes, and any of them may read a manifest -- a scan, a tidy -- one
 /// nested as deep as the TOML parser goes (80 levels) taking 512 KiB in a
@@ -82,9 +98,15 @@ pub struct Start<'a> {
     pub generation: u64,
     pub program: &'a Path,
     pub args: &'a [String],
+    /// What it is given in its environment besides what every plugin is.
+    pub env: &'a [(String, String)],
+    /// What of the host's environment it is not given.
+    pub unset: &'a [String],
     pub dir: &'a Path,
     pub data_dir: &'a Path,
     pub ready_within: Duration,
+    /// Where what it writes to standard error is kept.
+    pub log: &'a SharedLog,
 }
 
 pub struct Process {
@@ -97,11 +119,221 @@ pub struct Process {
     next_id: u64,
     /// It said it is ready.
     pub ready: bool,
-    /// The program file, and how it was when started: a program rebuilt
-    /// since is started again.
-    pub program: PathBuf,
-    pub program_stamp: Option<Stamp>,
+    /// What it is made of, and how that was when it started: a program
+    /// rebuilt since, or a script edited, is started again.
+    pub source: Source,
+    pub source_stamp: Option<Stamp>,
     listener: Arc<dyn Listener>,
+}
+
+/// What a plugin's programs wrote to standard error, as [`Log`] keeps it,
+/// with word of each run's standard error ending.
+pub type SharedLog = Arc<(Mutex<Log>, Condvar)>;
+
+pub fn new_log() -> SharedLog {
+    Arc::new((Mutex::new(Log::default()), Condvar::new()))
+}
+
+/// The last of what a plugin's programs wrote to standard error, across
+/// its runs: at most [`LOG_LINES`] lines and [`LOG_BYTES`], each run's
+/// begun by a line saying when it started. Terminal controls are taken out.
+#[derive(Debug, Default)]
+pub struct Log {
+    /// The run each line is of, whether it is the line saying when that
+    /// run started, and the line.
+    lines: VecDeque<(u64, bool, String)>,
+    bytes: usize,
+    cut: bool,
+    /// The last runs whose standard error has ended: all they wrote is in.
+    ended: VecDeque<u64>,
+}
+
+impl Log {
+    fn begin(&mut self, generation: u64) {
+        let line = format!("-- started at {} --", clock_now());
+        self.add(generation, true, line);
+    }
+
+    fn push(&mut self, generation: u64, line: String) {
+        self.add(generation, false, line);
+    }
+
+    fn add(&mut self, generation: u64, begins: bool, line: String) {
+        self.bytes += line.len();
+        self.lines.push_back((generation, begins, line));
+        while self.lines.len() > LOG_LINES || (self.bytes > LOG_BYTES && self.lines.len() > 1) {
+            if let Some((_, _, gone)) = self.lines.pop_front() {
+                self.bytes -= gone.len();
+                self.cut = true;
+            }
+        }
+    }
+
+    fn end(&mut self, generation: u64) {
+        self.ended.push_back(generation);
+        while self.ended.len() > 8 {
+            self.ended.pop_front();
+        }
+    }
+
+    /// Every line kept, oldest first, and whether older ones were let go.
+    pub fn lines(&self) -> (Vec<String>, bool) {
+        (
+            self.lines.iter().map(|(_, _, line)| line.clone()).collect(),
+            self.cut,
+        )
+    }
+
+    /// The last thing run `generation` said that tells why it stopped, on
+    /// one line: for a Python traceback, its error and where in the
+    /// plugin's own files it was raised.
+    pub fn last_words(&self, generation: u64) -> Option<String> {
+        let said: Vec<&str> = self
+            .lines
+            .iter()
+            .filter(|(run, begins, _)| *run == generation && !begins)
+            .map(|(_, _, line)| line.as_str())
+            .collect();
+        last_words(&said)
+    }
+}
+
+/// `why` a run ended, with the last thing it said after it when it said
+/// something.
+pub fn with_last_words(why: String, words: Option<String>) -> String {
+    match words {
+        Some(words) if !why.contains(&words) => format!("{why}: {words}"),
+        _ => why,
+    }
+}
+
+/// Waits a moment for run `generation`'s standard error to have ended,
+/// then says the last thing it said.
+pub fn last_words_of(log: &SharedLog, generation: u64) -> Option<String> {
+    let (log, ended) = &**log;
+    let deadline = Instant::now() + LAST_WORDS_WITHIN;
+    let mut held = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    while !held.ended.contains(&generation) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        held = match ended.wait_timeout(held, left) {
+            Ok((held, _)) => held,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
+    }
+    held.last_words(generation)
+}
+
+fn last_words(said: &[&str]) -> Option<String> {
+    let said: Vec<&str> = said
+        .iter()
+        .map(|line| line.trim_end())
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let last = *said.last()?;
+    let words = match said
+        .iter()
+        .rposition(|line| line.starts_with("Traceback (most recent call last):"))
+    {
+        Some(start) => python_error(&said[start..]).unwrap_or_else(|| last.to_string()),
+        None => last.to_string(),
+    };
+    Some(shorten(&words, LAST_WORDS_LIMIT))
+}
+
+/// A Python traceback's error, and the innermost place it went through in
+/// a file of the plugin's own, not the helper ThinkTerm gives scripts --
+/// `NameError: name 'x' is not defined (main.py, line 8)`.
+fn python_error(traceback: &[&str]) -> Option<String> {
+    let error = traceback
+        .iter()
+        .skip(1)
+        .rev()
+        .find(|line| !line.starts_with(' ') && !line.starts_with('\t'))?;
+    let places: Vec<(String, String)> = traceback
+        .iter()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("File \"")?;
+            let (file, rest) = rest.split_once('"')?;
+            let line = rest.strip_prefix(", line ")?;
+            let line: String = line.chars().take_while(char::is_ascii_digit).collect();
+            let file = file.rsplit(['/', '\\']).next().unwrap_or(file).to_string();
+            Some((file, line))
+        })
+        .collect();
+    let place = places
+        .iter()
+        .rev()
+        .find(|(file, _)| file != "thinkterm.py" && !file.starts_with('<'))
+        .or_else(|| places.last());
+    Some(match place {
+        Some((file, line)) => format!("{error} ({file}, line {line})"),
+        None => error.to_string(),
+    })
+}
+
+fn shorten(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut short: String = text.chars().take(limit.saturating_sub(1)).collect();
+    short.push('…');
+    short
+}
+
+/// `text` without what a terminal would act on: escape sequences, and
+/// control characters but tabs.
+fn plain(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters, then one final byte.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC and the other strings: up to BEL or ST.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\t' => plain.push(c),
+            c if c.is_control() => {}
+            c => plain.push(c),
+        }
+    }
+    plain
+}
+
+/// The time of day now, in UTC, as a log line gives it: 13:04:59 UTC.
+fn clock_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let day = secs % 86_400;
+    format!(
+        "{:02}:{:02}:{:02} UTC",
+        day / 3600,
+        day % 3600 / 60,
+        day % 60
+    )
 }
 
 /// A program told to stop, until it is gone.
@@ -131,7 +363,8 @@ pub enum Refused {
 impl Process {
     pub fn start(
         start: Start<'_>,
-        program_stamp: Option<Stamp>,
+        source: Source,
+        source_stamp: Option<Stamp>,
         listener: Arc<dyn Listener>,
     ) -> Result<Self, String> {
         create_private_dir(start.data_dir)
@@ -140,6 +373,7 @@ impl Process {
         command
             .args(start.args)
             .current_dir(start.dir)
+            .envs(start.env.iter().map(|(name, value)| (name, value)))
             .env("THINKTERM_PLUGIN_ID", start.id)
             .env("THINKTERM_PLUGIN_DIR", start.dir)
             .env("THINKTERM_PLUGIN_DATA", start.data_dir)
@@ -154,6 +388,9 @@ impl Process {
             // server with `--prefer-mux`.
             .env_remove("WEZTERM_PANE")
             .env_remove("WEZTERM_UNIX_SOCKET");
+        for name in start.unset {
+            command.env_remove(name);
+        }
         // The command line shipped beside the host, which reaches the
         // terminal beside a panel (`Env::terminal`): a plugin need not
         // find it on a PATH ThinkTerm was started with.
@@ -184,6 +421,11 @@ impl Process {
             return Err("its input and output were not piped".into());
         };
         let child = Arc::new(Mutex::new(child));
+        let log = Arc::clone(start.log);
+        log.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .begin(start.generation);
         let (outbox, queued) = sync_channel::<Vec<u8>>(QUEUE);
 
         let writing = std::thread::Builder::new()
@@ -203,6 +445,7 @@ impl Process {
             let generation = start.generation;
             let child = Arc::clone(&child);
             let listener = Arc::clone(&listener);
+            let log = Arc::clone(&log);
             std::thread::Builder::new()
                 .name(format!("plugin-{id}-out"))
                 .stack_size(STACK)
@@ -230,6 +473,8 @@ impl Process {
                         Some(broken) => format!("{broken}; {exit}"),
                         None => exit,
                     };
+                    // What it said last is most often why it stopped.
+                    let why = with_last_words(why, last_words_of(&log, generation));
                     listener.ended(&id, generation, why);
                 })
         };
@@ -250,13 +495,25 @@ impl Process {
 
         let logging = {
             let id = start.id.to_string();
+            let generation = start.generation;
+            let log = Arc::clone(&log);
             std::thread::Builder::new()
                 .name(format!("plugin-{id}-err"))
                 .stack_size(STACK)
                 .spawn(move || {
-                    log_errors(errors, &ERRORS_LEFT, |line| {
+                    let (kept, ended) = &*log;
+                    let keep = |line: &str| {
+                        kept.lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(generation, line.to_string());
+                    };
+                    log_errors(errors, &ERRORS_LEFT, keep, |line| {
                         log::info!("plugin {id}: {line}")
                     });
+                    kept.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .end(generation);
+                    ended.notify_all();
                 })
         };
 
@@ -272,10 +529,16 @@ impl Process {
             pending: HashMap::new(),
             next_id: 0,
             ready: false,
-            program: start.program.to_path_buf(),
-            program_stamp,
+            source,
+            source_stamp,
             listener,
         })
+    }
+
+    /// Whether what it is made of has changed since it started: it is to
+    /// be started again.
+    pub fn changed(&self) -> bool {
+        self.source.stamp() != self.source_stamp
     }
 
     /// Sends a call or a command, made by `message` from the id it is
@@ -487,10 +750,16 @@ fn kill(child: &Mutex<Child>) {
     }
 }
 
-/// Hands what a program writes to its standard error to `log`, a line at a
-/// time, while `left` allows. Past that the rest is read and dropped, said
-/// once: a program is never held up writing it.
-fn log_errors(from: impl Read, left: &AtomicUsize, mut log: impl FnMut(&str)) {
+/// Hands what a program writes to its standard error to `keep`, a line at
+/// a time without terminal controls, and to `log` while `left` allows. Past
+/// that the rest goes to `keep` alone, which said once: a program is never
+/// held up writing it.
+fn log_errors(
+    from: impl Read,
+    left: &AtomicUsize,
+    mut keep: impl FnMut(&str),
+    mut log: impl FnMut(&str),
+) {
     let mut from = BufReader::new(from);
     let mut line = Vec::new();
     let mut dropping = false;
@@ -500,16 +769,18 @@ fn log_errors(from: impl Read, left: &AtomicUsize, mut log: impl FnMut(&str)) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
+        let text = plain(String::from_utf8_lossy(&line).trim_end());
+        if !text.trim().is_empty() {
+            keep(&text);
+        }
         let allowed = left
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 left.checked_sub(line.len())
             })
             .is_ok();
         if allowed {
-            let text = String::from_utf8_lossy(&line);
-            let text = text.trim_end();
             if !text.is_empty() {
-                log(text);
+                log(&text);
             }
         } else if !dropping {
             dropping = true;
@@ -561,10 +832,21 @@ mod tests {
         // Room for the first three lines, the empty one among them.
         let left = AtomicUsize::new(6 + 1 + 12);
         let mut logged = Vec::new();
-        log_errors(&written[..], &left, |line| logged.push(line.to_string()));
+        let mut kept = Vec::new();
+        log_errors(
+            &written[..],
+            &left,
+            |line| kept.push(line.to_string()),
+            |line| logged.push(line.to_string()),
+        );
         assert_eq!(logged.len(), 3, "{logged:?}");
         assert_eq!(logged[..2], ["first", "second line"]);
         assert!(logged[2].contains("dropped"), "{logged:?}");
+        assert_eq!(
+            kept,
+            ["first", "second line", "third", "fourth"],
+            "the plugin's own log keeps what the host's has no room for"
+        );
     }
 
     #[test]
@@ -572,7 +854,112 @@ mod tests {
         let written = vec![b'x'; ERROR_LINE as usize + 10];
         let left = AtomicUsize::new(usize::MAX);
         let mut logged = Vec::new();
-        log_errors(&written[..], &left, |line| logged.push(line.len()));
+        log_errors(&written[..], &left, |_| {}, |line| logged.push(line.len()));
         assert_eq!(logged, [ERROR_LINE as usize, 10]);
+    }
+
+    #[test]
+    fn what_a_terminal_would_act_on_is_taken_out() {
+        assert_eq!(plain("\u{1b}[31mred\u{1b}[0m text"), "red text");
+        assert_eq!(plain("a\u{1b}]0;title\u{7}b"), "ab");
+        assert_eq!(
+            plain("a\u{1b}]8;;http://x\u{1b}\\link\u{1b}]8;;\u{1b}\\b"),
+            "alinkb"
+        );
+        assert_eq!(plain("tab\tkept\r\u{8}"), "tab\tkept");
+        assert_eq!(plain("中文 ok"), "中文 ok");
+    }
+
+    #[test]
+    fn a_python_traceback_comes_to_its_error_and_where_in_the_plugin() {
+        let said = [
+            "Traceback (most recent call last):",
+            "  File \"main.py\", line 40, in <module>",
+            "    thinkterm.run(Hello())",
+            "  File \"/home/u/plugins/hello/thinkterm.py\", line 512, in run",
+            "    plugin.draw(ui)",
+            "  File \"main.py\", line 12, in draw",
+            "    ui.text(f\"{count}\")",
+            "            ^^^^^",
+            "NameError: name 'count' is not defined",
+        ];
+        assert_eq!(
+            last_words(&said).as_deref(),
+            Some("NameError: name 'count' is not defined (main.py, line 12)")
+        );
+        // Raised in the helper itself, with nothing of the plugin's after.
+        let helper = [
+            "Traceback (most recent call last):",
+            "  File \"C:\\p\\thinkterm.py\", line 9, in run",
+            "ValueError: bad",
+        ];
+        assert_eq!(
+            last_words(&helper).as_deref(),
+            Some("ValueError: bad (thinkterm.py, line 9)")
+        );
+        assert_eq!(
+            last_words(&["starting", "error: no config", ""]).as_deref(),
+            Some("error: no config")
+        );
+        assert_eq!(last_words(&["  ", ""]), None);
+        let long = "x".repeat(1000);
+        assert_eq!(
+            last_words(&[long.as_str()]).unwrap().chars().count(),
+            LAST_WORDS_LIMIT
+        );
+    }
+
+    #[test]
+    fn a_log_keeps_the_last_of_every_run_and_each_runs_last_words() {
+        let mut log = Log::default();
+        log.begin(1);
+        log.push(1, "first run".into());
+        log.begin(2);
+        log.push(2, "second run".into());
+        assert_eq!(log.last_words(1).as_deref(), Some("first run"));
+        assert_eq!(log.last_words(2).as_deref(), Some("second run"));
+        assert_eq!(log.last_words(3), None);
+        let (lines, cut) = log.lines();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("-- started at ") && lines[0].ends_with(" UTC --"));
+        assert!(!cut);
+        for n in 0..LOG_LINES {
+            log.push(2, format!("line {n}"));
+        }
+        let (lines, cut) = log.lines();
+        assert_eq!(lines.len(), LOG_LINES);
+        assert!(cut);
+        assert_eq!(lines.last().unwrap(), &format!("line {}", LOG_LINES - 1));
+        log.push(2, "y".repeat(LOG_BYTES));
+        assert_eq!(log.lines().0.len(), 1, "one line too long for the rest");
+    }
+
+    #[test]
+    fn a_runs_last_words_wait_for_its_standard_error_to_end() {
+        let log = new_log();
+        log.0.lock().unwrap().push(5, "early".into());
+        let later = Arc::clone(&log);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut held = later.0.lock().unwrap();
+            held.push(5, "last".into());
+            held.end(5);
+            later.1.notify_all();
+        });
+        assert_eq!(last_words_of(&log, 5).as_deref(), Some("last"));
+        writer.join().unwrap();
+        // One whose standard error never ends is not waited for long.
+        let started = Instant::now();
+        assert_eq!(last_words_of(&log, 6), None);
+        assert!(started.elapsed() < LAST_WORDS_WITHIN * 3);
+        assert_eq!(
+            with_last_words("it exited with status 1".into(), Some("boom".into())),
+            "it exited with status 1: boom"
+        );
+        assert_eq!(
+            with_last_words("x: boom".into(), Some("boom".into())),
+            "x: boom"
+        );
+        assert_eq!(with_last_words("quiet".into(), None), "quiet");
     }
 }

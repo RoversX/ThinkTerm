@@ -41,7 +41,7 @@ use thinkterm_plugin_channel::wire::{
     frame_header, read_frame, write_frame, FromHost, PageArgs, PanelEvent, PanelRequest, Raw,
     ToHost, PROTOCOL,
 };
-use thinkterm_plugin_sdk::panel::{Answer, Env, Input, RowsWanted};
+use thinkterm_plugin_sdk::panel::{feature, Answer, Env, Input, Picture, RowsWanted};
 use thinkterm_plugin_sdk::protocol::{FromPlugin, ToPlugin};
 use thinkterm_plugin_sdk::Cx;
 use wezterm_uds::UnixStream;
@@ -52,6 +52,21 @@ const QUEUE: usize = 256;
 /// What one panel's plugin may have asked of its client and not heard back
 /// about. A plugin this far ahead is not waiting for its answers.
 const ASKS: usize = 64;
+/// How often the views the host could not open are looked at again, while
+/// any wait: whether their plugins can run now.
+const REFUSED_EVERY: Duration = Duration::from_secs(1);
+/// How often the running programs' files are looked at, and how long a
+/// change to them has to stay as it is before the program is started again:
+/// an editor, or an agent, writes several files one after another.
+const FILES_EVERY: Duration = Duration::from_millis(500);
+const FILES_SETTLE: Duration = Duration::from_millis(400);
+/// How long a client has to draw a picture of a view it was asked for.
+const PICTURE_WITHIN: Duration = Duration::from_secs(10);
+/// The views one client may have waiting for their plugins; past this, its
+/// oldest is forgotten.
+const REFUSED_PER_CLIENT: usize = 32;
+/// The pictures of views the host keeps, newest; older ones are let go.
+const PICTURES_KEPT: usize = 20;
 
 struct Client {
     outbox: SyncSender<Vec<u8>>,
@@ -83,6 +98,10 @@ struct Route {
     remote: bool,
     /// What the plugin asked of it that the client has not answered.
     asks: HashSet<u64>,
+    /// It is a page of the plugin's, not its panel.
+    page: bool,
+    /// The client draws it into a picture when asked (`feature::PICTURE`).
+    pictures: bool,
 }
 
 struct State {
@@ -98,6 +117,36 @@ struct State {
     keepers: HashSet<u64>,
     /// When a program is next due to be stopped or started.
     next_tidy: Option<Instant>,
+    /// The views the host could not open because their plugin could not
+    /// run -- turned off, failed -- by client and the client's own number,
+    /// with the plugin: told to open again once it can, which a client
+    /// still showing one does. A client letting go of one forgets it.
+    refused: Vec<Refused>,
+    /// When `refused` was last looked at.
+    refused_looked: Option<Instant>,
+    /// Pictures of views asked of the clients showing them, by the number
+    /// they were asked under.
+    pictures: HashMap<u64, Asked>,
+    next_picture: u64,
+}
+
+/// A picture of a view asked of the client showing it, for whoever called.
+struct Asked {
+    /// Who called, and their id for the call.
+    caller: u64,
+    call: u64,
+    /// The view, by the host's number for it, and whose it is.
+    view: u64,
+    plugin: String,
+    page: bool,
+    until: Instant,
+}
+
+/// A view the host could not open, waiting for its plugin.
+struct Refused {
+    client: u64,
+    view: u64,
+    plugin: String,
 }
 
 pub struct Host {
@@ -174,6 +223,10 @@ impl Host {
                 idle_since: Some(Instant::now()),
                 keepers: HashSet::new(),
                 next_tidy: None,
+                refused: Vec::new(),
+                refused_looked: None,
+                pictures: HashMap::new(),
+                next_picture: 0,
             }),
             wake: Condvar::new(),
             socket,
@@ -301,6 +354,13 @@ impl Host {
                 return out.answer(client, id, Err(why));
             }
         };
+        if let api::Request::Picture { id: plugin, page } = &request {
+            // Answered once the client showing the view has drawn it.
+            if let Err(why) = self.ask_picture(state, client, id, plugin, *page, out) {
+                out.answer(client, id, Err(why));
+            }
+            return;
+        }
         let mut fallout = Fallout::default();
         let answer = match request {
             api::Request::List { locale } => {
@@ -337,9 +397,205 @@ impl Host {
                 .registry
                 .reload(plugin.as_deref(), &mut fallout)
                 .map(|()| Value::Null),
+            api::Request::Allow { id: plugin, dir } => state
+                .registry
+                .allow(&plugin, &dir, &mut fallout)
+                .map(|()| Value::Null),
+            api::Request::Logs { id: plugin } => {
+                state.registry.scan(&mut fallout);
+                state.registry.logs(&plugin).map(|logs| {
+                    serde_json::to_value(logs).expect("a plugin's logs always serialise")
+                })
+            }
+            api::Request::Picture { .. } => unreachable!("asked of a client above"),
         };
         out.answer(client, id, answer);
+        // A plugin turned on or reloaded may serve the views it could not.
+        state.refused_looked = None;
         out.fallout(fallout);
+    }
+
+    /// Asks the client showing plugin `plugin`'s view -- its panel, or a
+    /// page, as `page` says, else the one view of it that is open -- to
+    /// draw it into a picture, for `caller`'s call `call`. Why not, when it
+    /// cannot be asked.
+    #[allow(clippy::too_many_arguments)]
+    fn ask_picture(
+        &self,
+        state: &mut State,
+        caller: u64,
+        call: u64,
+        plugin: &str,
+        page: Option<bool>,
+        out: &mut Out,
+    ) -> Result<(), String> {
+        let open: Vec<(u64, &Route)> = state
+            .views
+            .iter()
+            .filter(|(_, route)| route.plugin == plugin && route.extends.is_none())
+            .map(|(number, route)| (*number, route))
+            .collect();
+        if open.is_empty() {
+            return Err(format!(
+                "no view of {plugin:?} is open: open its page -- `thinkterm plugin do {plugin} open`, \
+                 when it has an action that does -- or its panel, in the right sidebar, first"
+            ));
+        }
+        let asked: Vec<(u64, &Route)> = open
+            .iter()
+            .copied()
+            .filter(|(_, route)| page.is_none_or(|page| route.page == page))
+            .collect();
+        if asked.is_empty() {
+            return Err(match page {
+                Some(true) => format!("no page of {plugin:?} is open"),
+                _ => format!("the panel of {plugin:?} is not open"),
+            });
+        }
+        let drawable: Vec<(u64, &Route)> = asked
+            .iter()
+            .copied()
+            .filter(|(_, route)| route.pictures)
+            .collect();
+        if drawable.is_empty() {
+            return Err(format!(
+                "{plugin:?} is open only where its view cannot be drawn into a picture: \
+                 a browser, or a ThinkTerm older than this one"
+            ));
+        }
+        let panels = drawable.iter().filter(|(_, route)| !route.page).count();
+        let pages = drawable.len() - panels;
+        if page.is_none() && drawable.len() > 1 {
+            return Err(format!(
+                "{plugin:?} is open in {} places -- {} -- so say which: --page or --panel",
+                drawable.len(),
+                match (panels, pages) {
+                    (0, pages) => format!("{pages} pages"),
+                    (panels, 0) => format!("{panels} panels"),
+                    (1, 1) => "its panel and a page".to_string(),
+                    (1, pages) => format!("its panel and {pages} pages"),
+                    (panels, pages) => format!("{panels} panels and {pages} pages"),
+                }
+            ));
+        }
+        // Of several asked for by kind, the one opened last.
+        let (number, route) = drawable
+            .iter()
+            .max_by_key(|(number, _)| *number)
+            .copied()
+            .expect("one at least");
+        let (client, view, is_page) = (route.client, route.view, route.page);
+        state.next_picture += 1;
+        let picture = state.next_picture;
+        if !out.panel(client, view, PanelEvent::Picture { id: picture }) {
+            return Err("the view cannot be asked for a picture".into());
+        }
+        state.pictures.insert(
+            picture,
+            Asked {
+                caller,
+                call,
+                view: number,
+                plugin: plugin.to_string(),
+                page: is_page,
+                until: Instant::now() + PICTURE_WITHIN,
+            },
+        );
+        Ok(())
+    }
+
+    /// A picture the client drew of its view, as asked under `id`: kept,
+    /// and where it was put told to whoever asked.
+    fn picture_drawn(
+        &self,
+        state: &mut State,
+        client: u64,
+        view: u64,
+        id: u64,
+        picture: Raw,
+        out: &mut Out,
+    ) {
+        let Some(asked) = state.pictures.get(&id) else {
+            // Given up on already.
+            return;
+        };
+        let by = state
+            .views
+            .get(&asked.view)
+            .map(|route| (route.client, route.view));
+        if by != Some((client, view)) {
+            log::warn!("client {client} sent a picture of a view it was not asked for");
+            return;
+        }
+        let asked = state.pictures.remove(&id).expect("found above");
+        let answer = match picture.read::<Picture>() {
+            Ok(Picture::Drawn { png, width, height }) => {
+                self.keep_picture(&asked.plugin, id, &png.0).map(|path| {
+                    let kept = api::Picture {
+                        path: path.display().to_string(),
+                        width,
+                        height,
+                        page: asked.page,
+                    };
+                    serde_json::to_value(kept).expect("a picture always serialises")
+                })
+            }
+            Ok(Picture::Failed { why }) => Err(format!("ThinkTerm could not draw it: {why}")),
+            Err(err) => Err(format!("what ThinkTerm drew does not read: {err}")),
+        };
+        out.answer(asked.caller, asked.call, answer);
+    }
+
+    /// Writes `png`, a picture of plugin `plugin`'s view asked for as
+    /// `number`, into the host's own directory of them, beside its socket,
+    /// readable by the user alone; the oldest past [`PICTURES_KEPT`] go.
+    fn keep_picture(&self, plugin: &str, number: u64, png: &[u8]) -> Result<PathBuf, String> {
+        let dir = self
+            .socket
+            .parent()
+            .map(|dir| dir.join("plugin-pictures"))
+            .ok_or_else(|| "the host has no directory to keep it in".to_string())?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .map_err(|err| format!("cannot make {}: {err}", dir.display()))?;
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("{plugin}-{millis}-{number}.png"));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let written = options.open(&path).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(png)
+        });
+        written.map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+        // The newest kept: the names sort by when, within a plugin's.
+        if let Ok(entries) = fs::read_dir(&dir) {
+            let mut kept: Vec<(std::time::SystemTime, PathBuf)> = entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+                .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+                .collect();
+            kept.sort();
+            let extra = kept.len().saturating_sub(PICTURES_KEPT);
+            for (_, old) in kept.into_iter().take(extra) {
+                let _ = fs::remove_file(old);
+            }
+        }
+        Ok(path)
     }
 
     /// A call for the plugin `plugin`.
@@ -417,8 +673,18 @@ impl Host {
             self.open_panel(&mut state, client, view, plugin, env, extends, page, &mut out);
             return self.send(&mut state, out);
         }
+        if let PanelRequest::Picture { id, picture } = request {
+            self.picture_drawn(&mut state, client, view, id, picture, &mut out);
+            return self.send(&mut state, out);
+        }
         let Some(number) = route_of(&state.views, client, view) else {
-            // Closed already: the client hears so, or has.
+            // Closed already: the client hears so, or has. One it lets go
+            // of is not opened again.
+            if matches!(request, PanelRequest::Close) {
+                state
+                    .refused
+                    .retain(|refused| !(refused.client == client && refused.view == view));
+            }
             return;
         };
         // As a plugin's drawing is, in `said`.
@@ -429,6 +695,7 @@ impl Host {
             PanelRequest::Env { env } => match env.read::<Env>() {
                 Ok(env) => {
                     route.remote = env.remote.is_some();
+                    route.pictures = env.has(feature::PICTURE);
                     Some(Told::Message(ToPlugin::Env { view: number, env }))
                 }
                 Err(err) => {
@@ -482,6 +749,7 @@ impl Host {
                 .asks
                 .remove(&id)
                 .then(|| Told::Line(answer_line(number, id, &answer))),
+            PanelRequest::Picture { .. } => unreachable!("handled above"),
         };
         if let Some(told) = told {
             let route = &state.views[&number];
@@ -534,6 +802,7 @@ impl Host {
             }
         };
         let remote = env.remote.is_some();
+        let pictures = env.has(feature::PICTURE);
         // A page stands by itself: it is nothing's extended view.
         if page.is_some() && extends.is_some() {
             out.fallout(fallout);
@@ -586,6 +855,9 @@ impl Host {
             }),
         };
         out.fallout(fallout);
+        state
+            .refused
+            .retain(|refused| !(refused.client == client && refused.view == view));
         match opened {
             Ok(generation) => {
                 let route = Route {
@@ -599,10 +871,38 @@ impl Host {
                     asked: 0,
                     remote,
                     asks: HashSet::new(),
+                    page: page.is_some(),
+                    pictures,
                 };
                 state.views.insert(number, route);
             }
-            Err(Refusal { reason, again }) => out.closed(client, view, reason, again),
+            Err(Refusal { reason, again }) => {
+                // One that cannot run now may later: once it can, the
+                // client is told to try again. One that can run, and still
+                // would not open -- no panel, say -- is not.
+                if !again && index.is_some() && !state.registry.servable(&plugin) {
+                    let held = state
+                        .refused
+                        .iter()
+                        .filter(|refused| refused.client == client)
+                        .count();
+                    if held >= REFUSED_PER_CLIENT {
+                        if let Some(oldest) = state
+                            .refused
+                            .iter()
+                            .position(|refused| refused.client == client)
+                        {
+                            state.refused.remove(oldest);
+                        }
+                    }
+                    state.refused.push(Refused {
+                        client,
+                        view,
+                        plugin: plugin.clone(),
+                    });
+                }
+                out.closed(client, view, reason, again)
+            }
         }
     }
 
@@ -651,6 +951,7 @@ impl Host {
         let mut state = self.state();
         state.clients.remove(&client);
         state.keepers.remove(&client);
+        state.refused.retain(|refused| refused.client != client);
         // Nobody is left to answer: its calls free the plugins' slots.
         state.registry.forget_client(client);
         let views: Vec<u64> = state
@@ -707,6 +1008,89 @@ impl Host {
             });
         if let Err(err) = reaper {
             log::warn!("cannot watch for idleness, so this host stays up: {err}");
+        }
+    }
+
+    /// Has the host told each time Python has been looked for: the calls
+    /// that waited for it go on, and the views that did open.
+    pub fn follow_python(self: &Arc<Self>) {
+        let host = Arc::downgrade(self);
+        crate::python::when_looked(move || {
+            if let Some(host) = host.upgrade() {
+                host.python_looked();
+            }
+        });
+    }
+
+    fn python_looked(&self) {
+        let Some(listener) = self.listener() else {
+            return;
+        };
+        let mut state = self.state();
+        let mut fallout = Fallout::default();
+        state.registry.send_queued(&listener, &mut fallout);
+        state.refused_looked = None;
+        let mut out = Out::default();
+        out.fallout(fallout);
+        self.send(&mut state, out);
+    }
+
+    /// Starts the programs running again whose files changed -- a script
+    /// edited, a program rebuilt -- once the change has settled, so their
+    /// views show what they are now without anyone asking. The files are
+    /// looked at without the host locked.
+    pub fn watch_files(self: &Arc<Self>) {
+        let host = Arc::clone(self);
+        let watching = std::thread::Builder::new()
+            .name("plugin-files".into())
+            .stack_size(STACK)
+            .spawn(move || {
+                // A change seen, by run: what the files came to, and since when.
+                let mut settling: HashMap<u64, (Option<crate::stamp::Stamp>, Instant)> =
+                    HashMap::new();
+                loop {
+                    std::thread::sleep(FILES_EVERY);
+                    let running = host.state().registry.running_sources();
+                    let mut changed = Vec::new();
+                    settling.retain(|generation, _| {
+                        running.iter().any(|(_, run, _, _)| run == generation)
+                    });
+                    for (id, generation, source, then) in running {
+                        let now = source.stamp();
+                        if now == then {
+                            settling.remove(&generation);
+                            continue;
+                        }
+                        match settling.get(&generation) {
+                            Some((seen, since)) if *seen == now => {
+                                if since.elapsed() >= FILES_SETTLE {
+                                    settling.remove(&generation);
+                                    changed.push((id, generation));
+                                }
+                            }
+                            _ => {
+                                settling.insert(generation, (now, Instant::now()));
+                            }
+                        }
+                    }
+                    if changed.is_empty() {
+                        continue;
+                    }
+                    let mut state = host.state();
+                    let mut fallout = Fallout::default();
+                    for (id, generation) in changed {
+                        log::info!("plugin {id}'s files changed: starting it again");
+                        state
+                            .registry
+                            .restart_changed(&id, generation, &mut fallout);
+                    }
+                    let mut out = Out::default();
+                    out.fallout(fallout);
+                    host.send(&mut state, out);
+                }
+            });
+        if let Err(err) = watching {
+            log::warn!("cannot watch the plugins' files, so an edit waits for a call: {err}");
         }
     }
 
@@ -901,6 +1285,8 @@ impl Host {
     /// started as how they are used now says.
     fn send(&self, state: &mut State, mut out: Out) {
         self.tidy(state, &mut out);
+        retry_refused(state, &mut out);
+        give_up_pictures(state, &mut out);
         deliver_out(state, out);
     }
 
@@ -917,6 +1303,8 @@ impl Host {
             views,
             keepers,
             next_tidy,
+            refused,
+            pictures,
             ..
         } = state;
         let used = |plugin: &str| {
@@ -925,18 +1313,88 @@ impl Host {
                     .values()
                     .any(|client| client.watching.contains(plugin))
         };
-        let next = registry.tidy(
-            Instant::now(),
-            !keepers.is_empty(),
-            used,
-            &listener,
-            &mut fallout,
-        );
+        let now = Instant::now();
+        let next = registry.tidy(now, !keepers.is_empty(), used, &listener, &mut fallout);
+        // The views waiting for their plugins are looked at again in time.
+        let next = match (next, refused.is_empty()) {
+            (next, true) => next,
+            (None, false) => Some(now + REFUSED_EVERY),
+            (Some(next), false) => Some(next.min(now + REFUSED_EVERY)),
+        };
+        // A picture not drawn in time is given up on in time.
+        let next = match (next, pictures.values().map(|asked| asked.until).min()) {
+            (next, None) => next,
+            (None, until) => until,
+            (Some(next), Some(until)) => Some(next.min(until)),
+        };
         out.fallout(fallout);
         if next != *next_tidy {
             *next_tidy = next;
             self.wake.notify_all();
         }
+    }
+}
+
+/// Answers the calls for pictures that will not come: asked too long ago,
+/// or of a view gone since.
+fn give_up_pictures(state: &mut State, out: &mut Out) {
+    if state.pictures.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let views = &state.views;
+    let gone: Vec<u64> = state
+        .pictures
+        .iter()
+        .filter(|(_, asked)| asked.until <= now || !views.contains_key(&asked.view))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in gone {
+        let asked = state.pictures.remove(&id).expect("listed above");
+        let why = if views.contains_key(&asked.view) {
+            format!(
+                "ThinkTerm did not draw the view of {:?} within {PICTURE_WITHIN:?}",
+                asked.plugin
+            )
+        } else {
+            format!("the view of {:?} closed before it was drawn", asked.plugin)
+        };
+        out.answer(asked.caller, asked.call, Err(why));
+    }
+}
+
+/// Tells the clients whose views waited for their plugins, those that can
+/// run now, to open them again -- looking at most every [`REFUSED_EVERY`],
+/// unless something just changed.
+fn retry_refused(state: &mut State, out: &mut Out) {
+    if state.refused.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    if state
+        .refused_looked
+        .is_some_and(|looked| now.saturating_duration_since(looked) < REFUSED_EVERY)
+    {
+        return;
+    }
+    state.refused_looked = Some(now);
+    let registry = &state.registry;
+    // Each plugin looked at once, however many views wait for it.
+    let mut can: HashMap<String, bool> = HashMap::new();
+    let (ready, waiting): (Vec<Refused>, Vec<Refused>) = std::mem::take(&mut state.refused)
+        .into_iter()
+        .partition(|refused| {
+            *can.entry(refused.plugin.clone())
+                .or_insert_with(|| registry.servable(&refused.plugin))
+        });
+    state.refused = waiting;
+    for refused in ready {
+        log::info!(
+            "plugin {} can run now: client {} opens its view again",
+            refused.plugin,
+            refused.client
+        );
+        out.closed(refused.client, refused.view, "it can run now".into(), true);
     }
 }
 

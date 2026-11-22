@@ -1,7 +1,7 @@
 //! The plugin host's own API: the plugins it knows, turning them on and
-//! off, how long they run unused, and reloading them. It is called as the
-//! plugin named [`PLUGIN`], and its events go to every client that asked
-//! for the list.
+//! off, how long they run unused, reloading them, and what their programs
+//! wrote to standard error. It is called as the plugin named [`PLUGIN`],
+//! and its events go to every client that asked for the list.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -12,6 +12,25 @@ pub const PLUGIN: &str = "plugins";
 /// Directories looked at in the plugins directory; one with more than this
 /// is not a plugins directory someone keeps by hand.
 pub const DIR_LIMIT: usize = 256;
+
+/// The longest id: it names a directory, a switch, and every event.
+pub const ID_LIMIT: usize = 64;
+
+/// Whether `id` can name a plugin, or one of its actions: a-z, 0-9 and
+/// "-", starting with a letter or digit.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= ID_LIMIT
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// [`valid_id`]'s rule, as a person reads it.
+pub fn id_rule() -> String {
+    format!("a-z, 0-9 and \"-\", at most {ID_LIMIT} characters")
+}
 
 /// How long an installed plugin's program runs while nothing uses it --
 /// no panel of it on show, no call to it unanswered, no client watching
@@ -77,6 +96,46 @@ pub enum Request {
         #[serde(default)]
         id: Option<String>,
     },
+    /// Turn on the plugin installed in `dir` -- links followed -- under
+    /// `id`, which lets it run from there: [`Request::SetEnabled`], made
+    /// only if `id` is that plugin's, and not another's that claims the
+    /// same id. `thinkterm plugin new` turns on what it just made with
+    /// this. Answered with `null`; the change is announced.
+    Allow { id: String, dir: String },
+    /// What plugin `id`'s programs wrote to standard error, oldest first,
+    /// as the host kept it since it started: its last runs', each begun by
+    /// a line saying when it started. Answered with [`Logs`].
+    Logs { id: String },
+    /// A picture of plugin `id`'s view as a ThinkTerm on this machine or
+    /// beyond shows it, drawn alone: its panel, or a page -- with `page`,
+    /// the one it says, else the one view of it that is open. The host
+    /// keeps it in a directory of its own and answers with [`Picture`],
+    /// once the client has drawn it.
+    Picture {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<bool>,
+    },
+}
+
+/// Where the host put a picture of a plugin's view, and what it is of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Picture {
+    /// A PNG, readable only by the user.
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    /// Whether it is of a page, rather than the panel.
+    pub page: bool,
+}
+
+/// What the host kept of what a plugin's programs wrote to standard error.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Logs {
+    pub lines: Vec<String>,
+    /// Older lines were let go of: the host keeps only the last of them.
+    #[serde(default)]
+    pub cut: bool,
 }
 
 /// One plugin as a list shows it.
@@ -182,6 +241,14 @@ impl Info {
     pub fn usable(&self) -> bool {
         self.enabled && self.state.usable()
     }
+
+    /// Whether the sidebar offers its panel: one that can be used, or one
+    /// that failed and is still on -- its panel stays where the user put
+    /// it, saying what stopped it, and opens again by itself once the
+    /// plugin is mended or reloaded.
+    pub fn offers_panel(&self) -> bool {
+        self.enabled && (self.state.usable() || matches!(self.state, State::Failed { .. }))
+    }
 }
 
 /// Where a plugin is in its life. A built-in plugin is `Off` or `Idle`:
@@ -256,6 +323,48 @@ pub enum Event {
 mod tests {
     use super::*;
     use serde_json::{from_value, json, to_value};
+
+    #[test]
+    fn allowing_one_directory_and_asking_for_logs_are_requests_too() {
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({"op": "allow", "id": "a", "dir": "/p/a"}))
+                .unwrap(),
+            Request::Allow {
+                id: "a".into(),
+                dir: "/p/a".into()
+            }
+        );
+        assert_eq!(
+            to_value(Request::Logs { id: "a".into() }).unwrap(),
+            json!({"op": "logs", "id": "a"})
+        );
+        assert_eq!(
+            from_value::<Logs>(json!({"lines": ["x"]})).unwrap(),
+            Logs {
+                lines: vec!["x".into()],
+                cut: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_id_is_lowercase_letters_digits_and_dashes() {
+        for good in ["a", "text-tools", "x2", "2x", &"a".repeat(ID_LIMIT)] {
+            assert!(valid_id(good), "{good}");
+        }
+        for bad in [
+            "",
+            "-a",
+            "A",
+            "a_b",
+            "a.b",
+            "a b",
+            "ä",
+            &"a".repeat(ID_LIMIT + 1),
+        ] {
+            assert!(!valid_id(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn requests_states_and_events_are_tagged_json() {
@@ -348,13 +457,19 @@ mod tests {
             background_default: Background::Briefly,
         };
         assert!(info.usable());
+        assert!(info.offers_panel());
         info.state = State::Failed {
             reason: "no".into(),
         };
         assert!(!info.usable());
+        assert!(info.offers_panel(), "it stays, saying why");
         assert_eq!(info.state.reason(), Some("no"));
+        info.enabled = false;
+        assert!(!info.offers_panel(), "turned off, it goes");
+        info.enabled = true;
         info.state = State::New;
         assert!(!info.usable(), "not until it is let run");
+        assert!(!info.offers_panel());
         assert_eq!(to_value(State::New).unwrap(), json!({"kind": "new"}));
     }
 }

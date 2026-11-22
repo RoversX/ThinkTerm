@@ -324,14 +324,15 @@ impl PluginsModel {
     }
 
     /// The panels plugins add to the right panel, as last heard: those of
-    /// the plugins that are on and not broken, in the list's order.
+    /// the plugins that are on and not broken -- or failed, whose panel
+    /// stays saying why until the plugin runs again -- in the list's order.
     pub fn panels(&self) -> Vec<crate::agents::PluginPanel> {
         let Some(plugins) = &self.plugins else {
             return Vec::new();
         };
         plugins
             .iter()
-            .filter(|plugin| plugin.usable())
+            .filter(|plugin| plugin.offers_panel())
             .filter_map(|plugin| {
                 Some(crate::agents::PluginPanel {
                     id: plugin.id.clone(),

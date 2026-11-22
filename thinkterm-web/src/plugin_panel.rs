@@ -338,6 +338,15 @@ impl PanelModel {
                 let answer = Raw::new(&answer);
                 sends.push(self.frame(PanelRequest::Answer { id, answer }));
             }
+            // The page says it draws no pictures of its views: one asked of
+            // it anyway is told so.
+            PanelEvent::Picture { id } => {
+                let picture = thinkterm_plugin_panel::Picture::Failed {
+                    why: "a browser does not draw a view into a picture".into(),
+                };
+                let picture = Raw::new(&picture);
+                sends.push(self.frame(PanelRequest::Picture { id, picture }));
+            }
         }
         sends.extend(self.wanted());
         self.changed();

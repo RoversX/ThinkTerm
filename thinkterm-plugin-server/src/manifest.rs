@@ -1,17 +1,18 @@
 //! A plugin's manifest, `plugin.toml`: who the plugin is, and the program
-//! it runs. docs/thinkterm/plugins.md describes it.
+//! it runs -- or the Python script, which the Python found on this machine
+//! runs (`python`). docs/thinkterm/plugins.md describes it.
 //! A built-in plugin has one too, without the program.
 
+use crate::python;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use thinkterm_plugin_channel::registry::{self, Action, Background, Does, Page, Panel};
+pub use thinkterm_plugin_channel::registry::valid_id;
+use thinkterm_plugin_channel::registry::{self, id_rule, Action, Background, Does, Page, Panel};
 use thinkterm_plugin_sdk::protocol::{API, PAGE_API, PANEL_API};
 
 pub const FILE: &str = "plugin.toml";
-/// The longest id: it names a directory, a switch, and every event.
-const ID_LIMIT: usize = 64;
 /// A file this long is not a manifest.
 const SIZE_LIMIT: u64 = 256 * 1024;
 /// The most actions a plugin lists: every one is a row in the command
@@ -65,6 +66,10 @@ struct RawPanel {
 struct RawRun {
     #[serde(default)]
     program: Option<String>,
+    /// A Python script in the plugin's directory, which the Python found on
+    /// this machine runs: in place of `program`.
+    #[serde(default)]
+    python: Option<String>,
     #[serde(default)]
     args: Option<Vec<String>>,
     /// How long the program runs unused: `[run]`'s own, the same on every
@@ -106,11 +111,70 @@ pub struct Manifest {
     actions: Vec<Action>,
     /// How long its program runs unused, unless the user chose otherwise.
     pub background: Background,
-    /// The program for this system, and its arguments. None for a built-in
-    /// plugin, and for one that does not run on this system.
-    run: Option<(String, Vec<String>)>,
+    /// What it runs on this system. None for a built-in plugin, and for one
+    /// that does not run on this system.
+    run: Option<Run>,
     /// By language tag, lowercased.
     locales: BTreeMap<String, Locale>,
+}
+
+/// What `[run]` says to run on this system.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Run {
+    /// A program, and its arguments.
+    Program { program: String, args: Vec<String> },
+    /// A Python script in the plugin's directory, and its arguments.
+    Python { script: String, args: Vec<String> },
+}
+
+/// What starting a plugin's program comes to on this machine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolved {
+    /// The program started: for a Python script, the Python found here.
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// What it is given in its environment besides what every plugin is.
+    pub env: Vec<(String, String)>,
+    /// What of the host's environment it is not given.
+    pub unset: Vec<String>,
+    /// What a change to means that it is started again: its program file,
+    /// or a script's directory too.
+    pub source: Source,
+}
+
+/// What a plugin's program is made of, as far as a change to it means it
+/// is started again ([`Source::stamp`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A program file of its own, rebuilt in place.
+    Program(PathBuf),
+    /// A script run by an interpreter: the interpreter, and every file of
+    /// the plugin's directory, which the script may load any of.
+    Script { interpreter: PathBuf, dir: PathBuf },
+}
+
+/// Why a plugin's program cannot be started now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cannot {
+    /// Not yet: the Python it runs on is being looked for.
+    Yet,
+    /// Not until something changes, and why.
+    Because(String),
+}
+
+impl Source {
+    /// What it is made of, as it is now. A script's directory counts its
+    /// Python files alone: what a plugin writes beside them as it runs --
+    /// a state file, a log -- is not a change to the plugin.
+    pub fn stamp(&self) -> Option<crate::stamp::Stamp> {
+        match self {
+            Self::Program(program) => crate::stamp::stamp(program),
+            Self::Script { interpreter, dir } => {
+                let tree = crate::stamp::tree_stamp(dir, Some("py"))?;
+                Some(tree.with(crate::stamp::stamp(interpreter)))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -124,21 +188,6 @@ struct Locale {
 pub struct Localized<'a> {
     pub name: &'a str,
     pub description: &'a str,
-}
-
-/// Whether `id` can name a plugin: a-z, 0-9 and "-", starting with a letter
-/// or digit.
-pub fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= ID_LIMIT
-        && !id.starts_with('-')
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-fn id_rule() -> String {
-    format!("a-z, 0-9 and \"-\", at most {ID_LIMIT} characters")
 }
 
 /// The icon a panel that names none, or one no client has, gets.
@@ -360,29 +409,97 @@ impl Manifest {
             })
     }
 
-    /// The program to start for the plugin in `dir`, and its arguments: the
-    /// file beside the manifest when there is one, else, for a bare name, a
-    /// program on PATH.
-    pub fn program(&self, dir: &Path) -> Result<(PathBuf, Vec<String>), String> {
-        let Some((program, args)) = &self.run else {
-            return Err("it runs no program on this system".into());
-        };
-        let named = Path::new(program);
-        let found = if named.is_absolute() {
-            existing(named)
-        } else {
-            existing(&dir.join(named)).or_else(|| {
-                // A bare name, such as an interpreter.
-                (named.components().count() == 1)
-                    .then(|| on_path(named))
-                    .flatten()
-            })
-        };
-        match found {
-            Some(found) => Ok((found, args.clone())),
-            None => Err(format!("cannot find its program {program:?}")),
+    /// What to start for the plugin in `dir`, which is where it really is,
+    /// links followed. A program is the file beside the manifest when there
+    /// is one, else, for a bare name, a program on PATH. A Python script is
+    /// a file in `dir`, run by the Python [`python::lookup`] found: while that is
+    /// being looked for, [`Cannot::Yet`].
+    pub fn program(&self, dir: &Path) -> Result<Resolved, Cannot> {
+        match &self.run {
+            None => Err(Cannot::Because("it runs no program on this system".into())),
+            Some(Run::Program { program, args }) => {
+                let named = Path::new(program);
+                let found = if named.is_absolute() {
+                    existing(named)
+                } else {
+                    existing(&dir.join(named)).or_else(|| {
+                        // A bare name, such as an interpreter.
+                        (named.components().count() == 1)
+                            .then(|| on_path(named))
+                            .flatten()
+                    })
+                };
+                let program = found.ok_or_else(|| {
+                    Cannot::Because(format!("cannot find its program {program:?}"))
+                })?;
+                Ok(Resolved {
+                    source: Source::Program(program.clone()),
+                    program,
+                    args: args.clone(),
+                    env: Vec::new(),
+                    unset: Vec::new(),
+                })
+            }
+            Some(Run::Python { script, args }) => {
+                let script = script_in(dir, script).map_err(Cannot::Because)?;
+                let python = match python::lookup() {
+                    python::Lookup::Found(found) => found,
+                    python::Lookup::Missing(why) => return Err(Cannot::Because(why)),
+                    python::Lookup::Looking => return Err(Cannot::Yet),
+                };
+                // The file as it was found: what a link in the directory
+                // leads to is not looked up again, and a name that starts
+                // with "-" is not taken for an option.
+                let mut given = vec![script.display().to_string()];
+                given.extend(args.iter().cloned());
+                Ok(Resolved {
+                    source: Source::Script {
+                        interpreter: python.program.clone(),
+                        dir: dir.to_path_buf(),
+                    },
+                    program: python.program,
+                    args: given,
+                    env: python::ENV
+                        .iter()
+                        .map(|(name, value)| (name.to_string(), value.to_string()))
+                        .collect(),
+                    unset: python::UNSET.iter().map(|name| name.to_string()).collect(),
+                })
+            }
         }
     }
+}
+
+/// Where `script`, as a manifest names it, really is: a file in `dir`,
+/// which is where the plugin really is. A script is the plugin's own, and
+/// runs from there.
+fn script_in(dir: &Path, script: &str) -> Result<PathBuf, String> {
+    let named = Path::new(script);
+    use std::path::Component;
+    if named.is_absolute()
+        || named.components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!(
+            "its python script {script:?} is not a path within its directory"
+        ));
+    }
+    let path = dir.join(named);
+    let real = std::fs::canonicalize(&path).map_err(|_| format!("there is no {script}"))?;
+    let home = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !real.starts_with(&home) {
+        return Err(format!(
+            "its python script {script:?} leads out of its directory"
+        ));
+    }
+    if !real.is_file() {
+        return Err(format!("{script} is not a file"));
+    }
+    Ok(real)
 }
 
 /// A table of the manifest as the JSON it stands for. A date, which JSON
@@ -412,23 +529,41 @@ fn supports(platforms: &[String]) -> bool {
 }
 
 impl RawRun {
-    /// The program and arguments for this system: its own section's, where
-    /// it has one, over the shared ones.
-    fn for_this_system(self) -> Result<(String, Vec<String>), String> {
+    /// What runs on this system, with its arguments: its own section's,
+    /// where it has one, over the shared ones. A section naming a program
+    /// or a script names what runs, whichever the other says.
+    fn for_this_system(mut self) -> Result<Run, String> {
         let own = match std::env::consts::OS {
-            "macos" => self.macos,
-            "linux" => self.linux,
-            "windows" => self.windows,
+            "macos" => self.macos.take(),
+            "linux" => self.linux.take(),
+            "windows" => self.windows.take(),
             _ => None,
         };
-        let (program, args) = match own {
-            Some(own) => (own.program.or(self.program), own.args.or(self.args)),
-            None => (self.program, self.args),
+        fn given(text: Option<String>) -> Option<String> {
+            text.filter(|text| !text.trim().is_empty())
+        }
+        let names = |run: &RawRun| {
+            given(run.program.clone()).is_some() || given(run.python.clone()).is_some()
         };
-        let program = program
-            .filter(|program| !program.trim().is_empty())
-            .ok_or_else(|| format!("[run] names no program for {}", std::env::consts::OS))?;
-        Ok((program, args.unwrap_or_default()))
+        for section in std::iter::once(&self).chain(own.as_deref()) {
+            if given(section.program.clone()).is_some() && given(section.python.clone()).is_some() {
+                return Err("[run] names both a program and a python script".into());
+            }
+        }
+        let (program, python, args) = match own {
+            Some(own) if names(&own) => (own.program, own.python, own.args.or(self.args)),
+            Some(own) => (self.program, self.python, own.args.or(self.args)),
+            None => (self.program, self.python, self.args),
+        };
+        let args = args.unwrap_or_default();
+        match (given(program), given(python)) {
+            (Some(program), _) => Ok(Run::Program { program, args }),
+            (None, Some(script)) => Ok(Run::Python { script, args }),
+            (None, None) => Err(format!(
+                "[run] names no program for {}",
+                std::env::consts::OS
+            )),
+        }
     }
 }
 
@@ -480,7 +615,9 @@ mod tests {
     fn a_manifest_reads_and_localizes() {
         let manifest = Manifest::parse(EXAMPLE, false).unwrap();
         assert_eq!(manifest.id, "text-tools");
-        let (program, args) = manifest.run.clone().unwrap();
+        let Some(Run::Program { program, args }) = manifest.run.clone() else {
+            panic!("it runs a program: {:?}", manifest.run);
+        };
         assert_eq!(program, if cfg!(windows) { "tool.exe" } else { "tool" });
         assert_eq!(args, ["--stdio"]);
         assert!(manifest.supported());
@@ -650,14 +787,16 @@ mod tests {
     fn the_program_is_found_beside_the_manifest_or_on_path() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = Manifest::parse(EXAMPLE, false).unwrap();
-        assert!(manifest
-            .program(dir.path())
-            .unwrap_err()
-            .contains("cannot find"));
+        assert!(matches!(
+            manifest.program(dir.path()),
+            Err(Cannot::Because(why)) if why.contains("cannot find")
+        ));
         let name = if cfg!(windows) { "tool.exe" } else { "tool" };
         std::fs::write(dir.path().join(name), "").unwrap();
-        let (found, _) = manifest.program(dir.path()).unwrap();
-        assert_eq!(found, dir.path().join(name));
+        let found = manifest.program(dir.path()).unwrap();
+        assert_eq!(found.program, dir.path().join(name));
+        assert_eq!(found.source, Source::Program(dir.path().join(name)));
+        assert!(found.env.is_empty());
 
         let interpreter = if cfg!(windows) { "cmd" } else { "sh" };
         let text = EXAMPLE
@@ -670,8 +809,109 @@ mod tests {
                 &format!("program = \"{interpreter}\""),
             );
         let manifest = Manifest::parse(&text, false).unwrap();
-        let (found, _) = manifest.program(dir.path()).unwrap();
+        let found = manifest.program(dir.path()).unwrap().program;
         assert!(found.is_absolute(), "{found:?} is from PATH");
+    }
+
+    const SCRIPT: &str = r#"
+        id = "hello"
+        name = "Hello"
+        version = "0.1.0"
+        api = 3
+
+        [run]
+        python = "main.py"
+        args = ["--quiet"]
+    "#;
+
+    #[test]
+    fn a_python_script_runs_in_place_of_a_program() {
+        let manifest = Manifest::parse(SCRIPT, false).unwrap();
+        assert_eq!(
+            manifest.run,
+            Some(Run::Python {
+                script: "main.py".into(),
+                args: vec!["--quiet".into()]
+            })
+        );
+        // A section of this system's naming a program runs that instead,
+        // with the shared arguments.
+        let own = match std::env::consts::OS {
+            "macos" => "macos",
+            "windows" => "windows",
+            _ => "linux",
+        };
+        let text = format!("{SCRIPT}\n[run.{own}]\nprogram = \"tool\"\n");
+        let manifest = Manifest::parse(&text, false).unwrap();
+        assert_eq!(
+            manifest.run,
+            Some(Run::Program {
+                program: "tool".into(),
+                args: vec!["--quiet".into()]
+            })
+        );
+        // One that names only arguments keeps the shared script.
+        let text = format!("{SCRIPT}\n[run.{own}]\nargs = [\"-v\"]\n");
+        let manifest = Manifest::parse(&text, false).unwrap();
+        assert_eq!(
+            manifest.run,
+            Some(Run::Python {
+                script: "main.py".into(),
+                args: vec!["-v".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn a_section_names_a_program_or_a_script_not_both() {
+        let text = SCRIPT.replace(
+            "python = \"main.py\"",
+            "python = \"main.py\"\nprogram = \"x\"",
+        );
+        assert!(Manifest::parse(&text, false)
+            .unwrap_err()
+            .contains("both a program and a python script"));
+        let text = SCRIPT.replace("python = \"main.py\"", "python = \"  \"");
+        assert!(Manifest::parse(&text, false)
+            .unwrap_err()
+            .contains("names no program"));
+    }
+
+    #[test]
+    fn a_python_script_is_a_file_within_the_plugins_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(script_in(&home, "main.py")
+            .unwrap_err()
+            .contains("there is no main.py"));
+        std::fs::write(home.join("main.py"), "").unwrap();
+        assert_eq!(script_in(&home, "main.py"), Ok(home.join("main.py")));
+        std::fs::create_dir(home.join("src")).unwrap();
+        std::fs::write(home.join("src").join("run.py"), "").unwrap();
+        assert_eq!(
+            script_in(&home, "src/run.py"),
+            Ok(home.join("src").join("run.py"))
+        );
+        assert_eq!(script_in(&home, "./main.py"), Ok(home.join("main.py")));
+        for outside in ["../main.py", "/etc/passwd", "src/../main.py"] {
+            assert!(
+                script_in(&home, outside)
+                    .unwrap_err()
+                    .contains("not a path within"),
+                "{outside}"
+            );
+        }
+        assert!(script_in(&home, "src").unwrap_err().contains("not a file"));
+        #[cfg(unix)]
+        {
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::fs::write(elsewhere.path().join("x.py"), "").unwrap();
+            std::os::unix::fs::symlink(elsewhere.path().join("x.py"), home.join("link.py"))
+                .unwrap();
+            assert!(script_in(&home, "link.py")
+                .unwrap_err()
+                .contains("leads out"));
+        }
     }
 
     #[test]

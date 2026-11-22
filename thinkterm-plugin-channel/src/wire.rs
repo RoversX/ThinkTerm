@@ -14,8 +14,9 @@ use std::io::{self, Read, Write};
 /// out of it; 4 added plugins' panels; 5 what a panel's plugin asks of
 /// another machine, and how long plugins run unused; 6 what is typed and
 /// pressed in a panel, and plugins that wait for the user to let them run;
-/// 7 a plugin's pages.
-pub const PROTOCOL: u32 = 7;
+/// 7 a plugin's pages; 8 Python scripts, what a plugin wrote to standard
+/// error, turning on the plugin in one directory, and pictures of a view.
+pub const PROTOCOL: u32 = 8;
 
 /// The largest frame either side sends or accepts, so a confused peer
 /// cannot have the other allocate without bound. A thousand scripts of
@@ -102,6 +103,9 @@ pub enum PanelRequest {
     /// What came of what the plugin asked, [`PanelEvent::Remote`] `id`: an
     /// `Answer`.
     Answer { id: u64, answer: Raw },
+    /// The view drawn alone into a picture, as [`PanelEvent::Picture`]
+    /// `id` asked: a `Picture`.
+    Picture { id: u64, picture: Raw },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,6 +130,11 @@ pub enum PanelEvent {
     /// came. Until it is, the client shows what was pressed as pressed --
     /// over a slow connection, for as long as the press is on its way.
     Heard,
+    /// Draw the view alone, as it shows now, into a picture -- for
+    /// `thinkterm plugin shot` -- answered with [`PanelRequest::Picture`]
+    /// and the same `id`. Asked only of a view whose `Env` says the client
+    /// can (`feature::PICTURE`).
+    Picture { id: u64 },
 }
 
 /// A view opened as a page, which page, and what it was opened with.

@@ -60,6 +60,7 @@ pub use scene::{
     Line, List, PageAsk, PageChange, Rect, Scroll, Size, Text, Token,
 };
 pub use wire::{
-    feature, Answer, Ask, At, Button, Bytes, Click, CloseButton, Entry, EntryKind, Env, Focus, Input,
-    Key, Mods, MonoMetrics, Pointer, Remote, Rows, RowsWanted, Terminal, TextMetrics, Typed,
+    feature, Answer, Ask, At, Button, Bytes, Click, CloseButton, Entry, EntryKind, Env, Focus,
+    Input, Key, Mods, MonoMetrics, Picture, Pointer, Remote, Rows, RowsWanted, Terminal,
+    TextMetrics, Typed,
 };

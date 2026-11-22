@@ -22,3 +22,8 @@ thinkterm-plugin-sdk.workspace = true
 thinkterm-snippets = { workspace = true, features = ["native"] }
 toml.workspace = true
 wezterm-uds.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# The user's shell, from the password database, for the PATH their
+# terminal has.
+libc.workspace = true

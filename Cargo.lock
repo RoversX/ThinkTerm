@@ -9542,6 +9542,7 @@ name = "thinkterm-plugin-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "log",
  "serde",
  "serde_json",

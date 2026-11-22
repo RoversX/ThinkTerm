@@ -96,6 +96,10 @@ pub mod feature {
     ///
     /// [`Text::wrap`]: crate::scene::Text::wrap
     pub const WRAP: &str = "wrap";
+    /// It draws the view alone into a picture when the host asks, for
+    /// `thinkterm plugin shot` ([`Picture`](super::Picture)). For the host,
+    /// not the plugin.
+    pub const PICTURE: &str = "picture";
 }
 
 impl Env {
@@ -273,6 +277,18 @@ impl<'de> Deserialize<'de> for Bytes {
             .map(Bytes)
             .map_err(serde::de::Error::custom)
     }
+}
+
+/// A view drawn alone, as the client shows it, into a picture: what a client
+/// that says [`feature::PICTURE`] answers the host's asking for one with.
+/// Nothing but the view is in it -- not what is drawn over it, nor beside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum Picture {
+    /// A PNG, `width` by `height` device pixels.
+    Drawn { png: Bytes, width: u32, height: u32 },
+    /// It could not be drawn, and why.
+    Failed { why: String },
 }
 
 /// Where a close button sits, in a view's units: its top left corner, and

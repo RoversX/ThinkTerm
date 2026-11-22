@@ -14,14 +14,14 @@
 //! -- is still on its way out: they share a data directory, and calls made
 //! meanwhile wait for it to be gone.
 
-use crate::manifest::{self, Manifest};
-use crate::process::{self, Exiting, Listener, Process, Refused, Start, Waiter};
+use crate::manifest::{self, Cannot, Manifest, Resolved};
+use crate::process::{self, Exiting, Listener, Process, Refused, SharedLog, Start, Waiter};
 use crate::stamp::{stamp, Stamp};
 use crate::switches::{self, Switches};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use thinkterm_plugin_channel::registry::{Background, Info, State, DIR_LIMIT};
+use thinkterm_plugin_channel::registry::{Background, Info, Logs, State, DIR_LIMIT};
 use thinkterm_plugin_sdk::protocol::{ToPlugin, API, PAGE_API, PANEL_API};
 use thinkterm_plugin_sdk::Plugin;
 
@@ -87,8 +87,18 @@ struct Launch {
     /// Where it was let run from, links followed, as just looked at: what
     /// runs, and where, so that a link turned since starts nothing new.
     dir: PathBuf,
-    program: Result<(PathBuf, Vec<String>), String>,
-    program_stamp: Option<Stamp>,
+    program: Result<Resolved, Cannot>,
+    /// How what it is made of is now ([`manifest::Source`]), when it is
+    /// not running: looked at only to start it, or to tell whether it
+    /// changed since it failed.
+    source_stamp: Option<Stamp>,
+}
+
+impl Launch {
+    /// Whether it cannot start until the Python it runs on is found.
+    fn waits(&self) -> bool {
+        matches!(self.program, Err(Cannot::Yet))
+    }
 }
 
 struct Installed {
@@ -114,6 +124,11 @@ struct Installed {
     queued: Vec<Queued>,
     /// Since when its running program has gone unused.
     unused_since: Option<Instant>,
+    /// What its programs wrote to standard error, the last of it.
+    log: SharedLog,
+    /// It was stopped because it changed, while something used it: it is
+    /// started again once its last run is gone, if something still does.
+    again: bool,
 }
 
 enum Run {
@@ -121,11 +136,12 @@ enum Run {
     Running(Process),
     Crashed(String),
     /// It stays so until it is reloaded, turned off and on, or its manifest
-    /// or program changes from how they were when it failed.
+    /// or what it is made of -- its program, a script's files -- changes
+    /// from how they were when it failed.
     Failed {
         reason: String,
         manifest: Option<Stamp>,
-        program: Option<Stamp>,
+        source: Option<Stamp>,
     },
 }
 
@@ -143,6 +159,8 @@ impl Installed {
             exiting: Vec::new(),
             queued: Vec::new(),
             unused_since: None,
+            log: process::new_log(),
+            again: false,
         };
         installed.read_manifest();
         installed
@@ -615,16 +633,23 @@ impl Registry {
         enabled: bool,
         fallout: &mut Fallout,
     ) -> Result<(), String> {
-        let known = self
-            .builtins
-            .iter()
-            .any(|builtin| builtin.manifest.id == id)
-            || self
-                .installed
+        let known = |registry: &Self| {
+            registry
+                .builtins
                 .iter()
-                .any(|installed| installed.id() == Some(id));
-        if !known {
-            return Err(format!("there is no plugin {id:?}"));
+                .any(|builtin| builtin.manifest.id == id)
+                || registry
+                    .installed
+                    .iter()
+                    .any(|installed| installed.id() == Some(id))
+        };
+        if !known(self) {
+            // Installed since the directory was last looked at, maybe:
+            // `thinkterm plugin enable` right after putting it there.
+            self.scan(fallout);
+            if !known(self) {
+                return Err(format!("there is no plugin {id:?}"));
+            }
         }
         // The file is written over what it says now, so what another host
         // changed in it is acted on first, not just carried along.
@@ -659,6 +684,152 @@ impl Registry {
             }
         }
         Ok(())
+    }
+
+    /// Turns on the plugin installed in `dir` under `id`, letting it run
+    /// from there -- and only that one: not when another plugin answers to
+    /// `id`, nor when the one there says it is another.
+    pub fn allow(&mut self, id: &str, dir: &str, fallout: &mut Fallout) -> Result<(), String> {
+        self.scan(fallout);
+        let real = real_dir(Path::new(dir));
+        let Some(installed) = self
+            .installed
+            .iter()
+            .find(|installed| installed.real_dir == real)
+        else {
+            return Err(format!(
+                "{dir} is not a plugin's directory in {}",
+                self.plugins_dir.display()
+            ));
+        };
+        match &installed.manifest {
+            Err(reason) => return Err(format!("the plugin in {dir} cannot be used: {reason}")),
+            Ok(manifest) if manifest.id != id => {
+                return Err(format!(
+                    "the plugin in {dir} is {:?}, not {id:?}",
+                    manifest.id
+                ))
+            }
+            Ok(_) => {}
+        }
+        if let Some(reason) = &installed.shadowed {
+            return Err(format!("{reason}, so the one in {dir} is not used"));
+        }
+        self.set_enabled(id, true, fallout)
+    }
+
+    /// What plugin `id`'s programs wrote to standard error, as kept.
+    pub fn logs(&self, id: &str) -> Result<Logs, String> {
+        let installed = self
+            .installed
+            .iter()
+            .find(|installed| installed.answers_to(id))
+            .or_else(|| {
+                self.installed
+                    .iter()
+                    .find(|installed| installed.id() == Some(id) || installed.dir_name == id)
+            });
+        match installed {
+            Some(installed) => {
+                let (lines, cut) = installed
+                    .log
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .lines();
+                Ok(Logs { lines, cut })
+            }
+            None if self
+                .builtins
+                .iter()
+                .any(|builtin| builtin.manifest.id == id) =>
+            {
+                Err(format!(
+                    "{id:?} runs inside ThinkTerm, as part of the plugin host"
+                ))
+            }
+            None => Err(format!("there is no plugin {id:?}")),
+        }
+    }
+
+    /// Whether a view of plugin `id` the host could not open before may
+    /// open now: it is on and let run, and has not failed -- or has, and
+    /// its manifest or what it is made of changed since.
+    pub fn servable(&self, id: &str) -> bool {
+        let Some(installed) = self
+            .installed
+            .iter()
+            .find(|installed| installed.answers_to(id))
+        else {
+            return false;
+        };
+        let Ok(manifest) = &installed.manifest else {
+            return false;
+        };
+        if !manifest.supported() || !installed.runs(&self.switches) {
+            return false;
+        }
+        match &installed.run {
+            Run::Failed {
+                manifest: manifest_then,
+                source,
+                ..
+            } => {
+                stamp(&installed.dir.join(manifest::FILE)) != *manifest_then
+                    || source_stamp(manifest, &installed.real_dir) != *source
+            }
+            _ => true,
+        }
+    }
+
+    /// What every program running is made of, with the run it is and how
+    /// that was when it started: for a look at whether it changed since,
+    /// made without the host locked ([`manifest::Source::stamp`]).
+    pub fn running_sources(&self) -> Vec<(String, u64, manifest::Source, Option<Stamp>)> {
+        self.installed
+            .iter()
+            .filter_map(|installed| match (&installed.run, installed.id()) {
+                (Run::Running(process), Some(id)) => Some((
+                    id.to_string(),
+                    process.generation,
+                    process.source.clone(),
+                    process.source_stamp,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stops run `generation` of plugin `id` if what it is made of changed
+    /// since it started: its views open on it are closed for their clients
+    /// to open again, which starts it anew.
+    pub fn restart_changed(&mut self, id: &str, generation: u64, fallout: &mut Fallout) {
+        for installed in &mut self.installed {
+            let changed = matches!(
+                &installed.run,
+                Run::Running(process) if process.generation == generation && process.changed()
+            );
+            if changed && installed.answers_to(id) {
+                installed.stop("its files changed, and it is started again", fallout);
+                installed.again = true;
+            }
+        }
+    }
+
+    /// The last thing run `generation` of plugin `id` wrote to standard
+    /// error, while it still runs.
+    fn last_words(&self, id: &str, generation: u64) -> Option<String> {
+        self.installed
+            .iter()
+            .find(|installed| installed.answers_to(id))
+            .and_then(|installed| {
+                installed
+                    .log
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .last_words(generation)
+            })
     }
 
     /// Keeps the user's choice of how long plugin `id` runs unused, `None`
@@ -762,6 +933,13 @@ impl Registry {
                 }
                 _ => false,
             };
+            // Stopped because it changed, while something used it: started
+            // again while something still does.
+            let again = installed.again && used(&id);
+            if installed.again && !again && !matches!(installed.run, Run::Running(_)) {
+                self.installed[index].again = false;
+            }
+            let installed = &self.installed[index];
             match &installed.run {
                 Run::Running(_) if in_use(installed) => {
                     self.installed[index].unused_since = None;
@@ -782,7 +960,7 @@ impl Registry {
                         due(since + limit);
                     }
                 }
-                Run::Idle | Run::Crashed(_) if always => {
+                Run::Idle | Run::Crashed(_) if always || again => {
                     if let (Run::Crashed(_), Some(crashed)) =
                         (&installed.run, installed.crashes.last())
                     {
@@ -799,9 +977,19 @@ impl Registry {
                     let Ok(launch) = self.launchable(index, Some(&id), fallout) else {
                         continue;
                     };
-                    log::info!("starting plugin {id}: it runs always");
+                    // Started once its Python is found: word of that runs
+                    // this again.
+                    if launch.waits() {
+                        continue;
+                    }
+                    self.installed[index].again = false;
+                    if always {
+                        log::info!("starting plugin {id}: it runs always");
+                    } else {
+                        log::info!("starting plugin {id} again: it changed while in use");
+                    }
                     if let Err(why) = self.start(index, launch, listener, fallout) {
-                        log::warn!("plugin {id} runs always, and cannot start: {why}");
+                        log::warn!("plugin {id} cannot start: {why}");
                     }
                 }
                 _ => {}
@@ -850,6 +1038,8 @@ impl Registry {
     /// removed ones.
     pub fn reload(&mut self, id: Option<&str>, fallout: &mut Fallout) -> Result<(), String> {
         fallout.changed = true;
+        // Python installed since, say: looked for again.
+        crate::python::forget();
         let Some(id) = id else {
             self.scan(fallout);
             for installed in &mut self.installed {
@@ -895,12 +1085,15 @@ impl Registry {
         let launch = self.launchable(index, Some(id), fallout)?;
         let installed = &mut self.installed[index];
         if let Run::Running(process) = &installed.run {
-            if stamp(&process.program) != process.program_stamp {
-                installed.stop("its program changed, and it is started again", fallout);
+            if process.changed() {
+                installed.stop("it changed, and is started again", fallout);
             }
         }
         let call = Queued { waiter, message };
-        if self.still_exiting(id) {
+        // Waiting for its last run to be gone, or for its Python to be
+        // found: told when that is done (`ended`, `python_looked`).
+        let waits = launch.waits() && !matches!(self.installed[index].run, Run::Running(_));
+        if waits || self.still_exiting(id) {
             let installed = &mut self.installed[index];
             if installed.queued.len() >= process::PENDING_LIMIT {
                 return Err(format!(
@@ -951,13 +1144,19 @@ impl Registry {
             return Err(for_good(format!("{} has no panel", manifest.name)));
         }
         if let Run::Running(process) = &installed.run {
-            if stamp(&process.program) != process.program_stamp {
-                installed.stop("its program changed, and it is started again", fallout);
+            if process.changed() {
+                installed.stop("it changed, and is started again", fallout);
             }
         }
         if self.still_exiting(id) {
             return Err(Refusal {
                 reason: "it is still stopping".into(),
+                again: true,
+            });
+        }
+        if launch.waits() && !matches!(self.installed[index].run, Run::Running(_)) {
+            return Err(Refusal {
+                reason: "it waits for its Python to be found".into(),
                 again: true,
             });
         }
@@ -1046,9 +1245,9 @@ impl Registry {
         exiting
     }
 
-    /// Sends the calls that waited for programs on their way out, for each
-    /// plugin whose id has none left.
-    fn send_queued(&mut self, listener: &Arc<dyn Listener>, fallout: &mut Fallout) {
+    /// Sends the calls that waited -- for programs on their way out, for
+    /// Python to be found -- for each plugin that need wait no more.
+    pub fn send_queued(&mut self, listener: &Arc<dyn Listener>, fallout: &mut Fallout) {
         for index in 0..self.installed.len() {
             if self.installed[index].queued.is_empty() {
                 continue;
@@ -1063,7 +1262,9 @@ impl Registry {
                     continue;
                 }
             };
-            if self.still_exiting(&launch.id) {
+            if self.still_exiting(&launch.id)
+                || (launch.waits() && !matches!(self.installed[index].run, Run::Running(_)))
+            {
                 continue;
             }
             let calls = std::mem::take(&mut self.installed[index].queued);
@@ -1118,16 +1319,24 @@ impl Registry {
         let id = manifest.id.clone();
         let dir = PathBuf::from(&installed.real_dir);
         let program = manifest.program(&dir);
-        let program_stamp = program.as_ref().ok().and_then(|(path, _)| stamp(path));
+        // A running one is compared with how it started by whoever asks.
+        let running = matches!(installed.run, Run::Running(_));
+        let source_stamp = match &program {
+            Ok(resolved) if !running => resolved.source.stamp(),
+            _ => None,
+        };
 
         let installed = &mut self.installed[index];
         if let Run::Failed {
             reason,
             manifest: manifest_then,
-            program: program_then,
+            source: source_then,
         } = &installed.run
         {
-            if *manifest_then == installed.manifest_stamp && *program_then == program_stamp {
+            // Whether it changed is not known before its Python is.
+            let unchanged = matches!(program, Err(Cannot::Yet))
+                || (*manifest_then == installed.manifest_stamp && *source_then == source_stamp);
+            if unchanged {
                 return Err(reason.clone());
             }
             // Something changed since: worth another try.
@@ -1139,7 +1348,7 @@ impl Registry {
             id,
             dir,
             program,
-            program_stamp,
+            source_stamp,
         })
     }
 
@@ -1204,33 +1413,39 @@ impl Registry {
             id,
             dir,
             program,
-            program_stamp,
+            source_stamp,
         } = launch;
         let installed = &mut self.installed[index];
         fallout.changed = true;
-        let (path, args) = match program {
-            Ok(found) => found,
-            Err(reason) => {
+        let resolved = match program {
+            Ok(resolved) => resolved,
+            // Not failed: started once its Python is found.
+            Err(Cannot::Yet) => return Err("it waits for its Python to be found".into()),
+            Err(Cannot::Because(reason)) => {
                 installed.run = Run::Failed {
                     reason: reason.clone(),
                     manifest: installed.manifest_stamp,
-                    program: None,
+                    source: None,
                 };
                 return Err(reason);
             }
         };
         self.generation += 1;
         let data_dir = self.plugin_data.join(&id);
+        let log = Arc::clone(&installed.log);
         let start = Start {
             id: &id,
             generation: self.generation,
-            program: &path,
-            args: &args,
+            program: &resolved.program,
+            args: &resolved.args,
+            env: &resolved.env,
+            unset: &resolved.unset,
             dir: &dir,
             data_dir: &data_dir,
             ready_within: self.ready_within,
+            log: &log,
         };
-        match Process::start(start, program_stamp, Arc::clone(listener)) {
+        match Process::start(start, resolved.source, source_stamp, Arc::clone(listener)) {
             Ok(process) => {
                 installed.run = Run::Running(process);
                 Ok(())
@@ -1240,7 +1455,7 @@ impl Registry {
                 installed.run = Run::Failed {
                     reason: reason.clone(),
                     manifest: installed.manifest_stamp,
-                    program: program_stamp,
+                    source: source_stamp,
                 };
                 Err(reason)
             }
@@ -1343,6 +1558,7 @@ impl Registry {
             .is_some_and(|process| process.ready);
         if !ready {
             let why = format!("it did not say it was ready within {:?}", self.ready_within);
+            let why = process::with_last_words(why, self.last_words(id, generation));
             self.gave_up(id, generation, why, false, fallout);
         }
     }
@@ -1366,7 +1582,9 @@ impl Registry {
         let Run::Running(process) = std::mem::replace(&mut installed.run, Run::Idle) else {
             return;
         };
-        let program = stamp(&process.program);
+        // What it was made of as it started: a mend made while it went
+        // down is a change from that, and gets another try.
+        let source = process.source_stamp;
         log::warn!("plugin {id} stopped: {why}");
         fallout.lost(process.kill(), &format!("the plugin stopped: {why}"));
 
@@ -1385,7 +1603,7 @@ impl Registry {
             Run::Failed {
                 reason,
                 manifest: installed.manifest_stamp,
-                program,
+                source,
             }
         } else {
             Run::Crashed(why)
@@ -1406,6 +1624,15 @@ impl Registry {
             process::stop_all(running, exiting, EXIT_GRACE);
         }
     }
+}
+
+/// How what the plugin with `manifest`, really in `dir`, is made of is
+/// now: `None` when it cannot be started.
+fn source_stamp(manifest: &Manifest, dir: &str) -> Option<Stamp> {
+    manifest
+        .program(Path::new(dir))
+        .ok()
+        .and_then(|resolved| resolved.source.stamp())
 }
 
 /// Where `dir` really is, links followed, as the switches keep it: itself,
