@@ -38,6 +38,10 @@ private const val LIST_REFRESH_MS = 250L
 /// How long a redial goes unsaid (`TerminalModel.redialQuiet`).
 private const val QUIET_REDIAL_MS = 2_500L
 
+/// How long the connection card waits for a dial back from the background
+/// (`TerminalModel.cardHeld`).
+private const val CARD_HOLD_MS = 3_000L
+
 /// The shell's side of the thread contract. `Notify` calls arrive on the
 /// core thread; nothing here blocks them and nothing here calls back into
 /// the core from inside one. The Choreographer callback is the only place
@@ -120,6 +124,10 @@ class TerminalModel(
     /// App takes it back.
     var toastText by mutableStateOf<String?>(null)
         private set
+    /// `toastText` is the App's sticky word on the connection, which the
+    /// connection card says itself while it is up.
+    var toastSticky by mutableStateOf(false)
+        private set
     /// The App's connection is down: redialing by itself, or -- without
     /// `autoReconnect` -- left for the user's retry (`linkIs`).
     var reconnecting by mutableStateOf(false)
@@ -130,6 +138,12 @@ class TerminalModel(
     var redialQuiet by mutableStateOf(false)
         private set
     private val redialSpoken = Runnable { redialQuiet = false }
+    /// Dialled again on the way back from the background: for its first
+    /// moments the last frame stays in sight with a line over its top, and
+    /// the connection card waits. A failure, or the pane, ends it at once.
+    var cardHeld by mutableStateOf(false)
+        private set
+    private val releaseCard = Runnable { cardHeld = false }
     /// The terminal's background, as the App paints it: the chrome around
     /// the terminal takes the same colour.
     var background by mutableStateOf(Color(0xFF1C1C1C))
@@ -394,6 +408,9 @@ class TerminalModel(
     }
 
     fun connect() {
+        // A dial of its own: whoever holds the card back holds it for this
+        // one, after the call (`enteredForeground`).
+        endCardHold()
         pausedForBackground = false
         clearHostKeyRequest()
         val requestId = UUID.randomUUID().toString()
@@ -455,6 +472,7 @@ class TerminalModel(
     }
 
     fun disconnect() {
+        endCardHold()
         clearHostKeyRequest()
         connected = false
         core.disconnect()
@@ -600,7 +618,10 @@ class TerminalModel(
         // user disconnected stays so.
         if (pausedForBackground) {
             pausedForBackground = false
-            if (host.autoConnect) connect()
+            if (host.autoConnect) {
+                connect()
+                holdCard()
+            }
         } else {
             checkConnection()
         }
@@ -611,7 +632,23 @@ class TerminalModel(
     fun checkConnection() = core.checkConnection()
 
     /// The background took the connection down; the foreground brings it back.
-    private var pausedForBackground = false
+    /// Meanwhile the connection page stays away: a "disconnected" of the
+    /// app's own making is not one to show, in the recent apps' picture of
+    /// it or as the app comes back (`connectionCovers`).
+    var pausedForBackground by mutableStateOf(false)
+        private set
+
+    /// See `cardHeld`.
+    private fun holdCard() {
+        main.removeCallbacks(releaseCard)
+        cardHeld = true
+        main.postDelayed(releaseCard, CARD_HOLD_MS)
+    }
+
+    private fun endCardHold() {
+        main.removeCallbacks(releaseCard)
+        cardHeld = false
+    }
 
     // MARK: input
 
@@ -868,6 +905,7 @@ class TerminalModel(
             return
         }
         toastText = toast.text
+        toastSticky = sticky
         toastShown = toast.text
         if (!sticky) main.postDelayed(expireToast, 4000)
     }
@@ -977,6 +1015,7 @@ class TerminalModel(
     fun note(text: String) {
         main.removeCallbacks(expireToast)
         toastText = text
+        toastSticky = false
         toastShown = text
         main.postDelayed(expireToast, 4000)
     }
@@ -1124,6 +1163,12 @@ class TerminalModel(
                 if (status.startsWith("pane ")) {
                     attached = true
                     if (host.id != Host.PROBE_ID) store.touchConnected(host.id)
+                }
+                // Back on the pane, or stopped: nothing is left to wait for.
+                // A plain "disconnected" may be the background's own, landing
+                // after the dial back began, so it does not end the wait.
+                if (status.startsWith("pane ") || ConnectionPhase.of(status) is ConnectionPhase.Failed) {
+                    endCardHold()
                 }
                 if (status.startsWith("connecting") || status.contains("reconnect") || status.startsWith("disconnected")) {
                     composing = null

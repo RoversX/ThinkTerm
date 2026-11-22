@@ -197,11 +197,38 @@ fun LaunchSkyHost(
     }
 }
 
+/// The sky on its own, under the connection page while a connection is on
+/// its way (`TerminalOverlays`): it fades in over the terminal, the stars
+/// come out and drift, and once `rushing` they streak past as its black
+/// clears to the pane under it, as the app comes out from behind the
+/// launch's. The iOS app plays the same.
+@Composable
+fun ConnectionSky(rushing: Boolean) {
+    var t by remember { mutableFloatStateOf(0f) }
+    var rushAt by remember { mutableStateOf<Float?>(null) }
+    LaunchedEffect(rushing) { if (rushing && rushAt == null) rushAt = t }
+    LaunchedEffect(Unit) {
+        val start = withFrameNanos { it }
+        while (true) withFrameNanos { now -> t = (now - start) / 1e9f }
+    }
+    val sky = rememberLayerBackdrop()
+    // Rushing off, it lets the pane under it take touches at once.
+    Sky(t, rushAt, sky, 0f, 0f, out(seg(t, 0f, .35f)), takesTouches = !rushing)
+}
+
 /// The sky itself, over everything, taking the touches meant for an app
 /// not yet in sight: the stars from `SKY_SHADER`, the shooting stars over
 /// them.
 @Composable
-private fun Sky(t: Float, rushAt: Float?, glass: LayerBackdrop, camera: Float, moving: Float, fadeIn: Float) {
+private fun Sky(
+    t: Float,
+    rushAt: Float?,
+    glass: LayerBackdrop,
+    camera: Float,
+    moving: Float,
+    fadeIn: Float,
+    takesTouches: Boolean = true,
+) {
     val density = LocalDensity.current.density
     // Compiled on the phone: a sky the GPU will not take is plain black,
     // never a start that fails.
@@ -219,11 +246,17 @@ private fun Sky(t: Float, rushAt: Float?, glass: LayerBackdrop, camera: Float, m
         android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
     }
     Canvas(
-        Modifier.fillMaxSize().layerBackdrop(glass).pointerInput(Unit) {
-            awaitPointerEventScope {
-                while (true) awaitPointerEvent().changes.forEach { it.consume() }
-            }
-        },
+        Modifier.fillMaxSize().layerBackdrop(glass).then(
+            if (takesTouches) {
+                Modifier.pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) awaitPointerEvent().changes.forEach { it.consume() }
+                    }
+                }
+            } else {
+                Modifier
+            },
+        ),
     ) {
         val w = size.width
         val h = size.height

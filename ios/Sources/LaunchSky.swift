@@ -119,7 +119,7 @@ final class WelcomeAgain: ObservableObject {
 
 /// A move through the sky from one page's place to another's: a page
 /// further on is deeper in, straight ahead.
-private struct Travel {
+struct Travel {
     var from: Double = 0
     var to: Double = 0
     var at: TimeInterval = -10
@@ -139,7 +139,11 @@ private struct Meteor {
     var length: Double, life: Double
 }
 
-private struct StarSky: View {
+/// The sky on its own, from `start`: the stars coming out and drifting,
+/// and from `rushAt` (seconds after `start`) streaking past as its black
+/// clears to what is under it. The launch plays it over the app; the
+/// terminal plays it while a connection is on its way (`ConnectionCard`).
+struct StarSky: View {
     let start: Date
     let rushAt: TimeInterval?
     let travel: Travel

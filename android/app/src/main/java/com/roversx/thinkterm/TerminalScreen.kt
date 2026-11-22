@@ -8,6 +8,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.spring
@@ -40,6 +41,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -51,7 +53,6 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.PowerOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -67,6 +68,8 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -80,6 +83,7 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.clipRect
@@ -94,6 +98,9 @@ import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -109,6 +116,7 @@ import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 /// One host: its terminal, the two strips (threads over the current
 /// thread's tabs), the bars over the panes, the key bar with the soft
@@ -452,7 +460,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                                 )
                                 if (!overviewOpen) {
                                     CompositionLocalProvider(LocalGlass provides glass) {
-                                        TerminalOverlays(model, showLog.value, onEditHost = { editingHost = model.host }, onBack = { model.disconnect(); onBack() })
+                                        TerminalOverlays(model, showLog.value)
                                         // Over the terminal's top: in the layout it
                                         // would resize the terminal as it comes and goes.
                                         StatusCapsule(model, Modifier.align(Alignment.TopCenter).padding(top = 8.dp, start = 16.dp, end = 16.dp))
@@ -464,21 +472,47 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                                 // Under the terminal whether the keyboard is up or not,
                                 // so the terminal is sized once as it comes and goes:
                                 // the tab's panes, then the keys.
-                                Column(
-                                    // With the keyboard up it sits on the keyboard; down,
-                                // clear of the screen's edge, as on iOS.
-                                Modifier.fillMaxWidth().padding(top = 6.dp, bottom = if (keyboardUp) 6.dp else 20.dp),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    UploadStrip(model, pageGlass)
-                                    PaneSwitcher(model, pageGlass) { model.onHideKeyboard?.invoke(); showPanes = true }
-                                    KeyBar(
-                                        model = model,
-                                        keyboardUp = keyboardUp,
-                                        glass = pageGlass,
-                                        onOpenSettings = { showSettings = true },
-                                        hardKeyboard = hardKeyboard,
-                                    )
+                                // Out of sight while the connection page covers the
+                                // terminal, but still in the layout: the terminal keeps
+                                // its size, and the pane is not resized twice a dial.
+                                val covered = connectionCovers(model)
+                                // The first moments of a dial back from the
+                                // background: dimmed, and not taking a touch,
+                                // the connection not being live yet.
+                                val held = model.cardHeld &&
+                                    ConnectionPhase.of(model.connection).let { it != null && it !is ConnectionPhase.Failed }
+                                val keysAlpha by androidx.compose.animation.core.animateFloatAsState(
+                                    if (covered) 0f else if (held) 0.4f else 1f, tween(200), label = "keys",
+                                )
+                                Box {
+                                    Column(
+                                        // With the keyboard up it sits on the keyboard; down,
+                                        // clear of the screen's edge, as on iOS.
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .graphicsLayer { alpha = keysAlpha }
+                                            .padding(top = 6.dp, bottom = if (keyboardUp) 6.dp else 20.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        UploadStrip(model, pageGlass)
+                                        PaneSwitcher(model, pageGlass) { model.onHideKeyboard?.invoke(); showPanes = true }
+                                        KeyBar(
+                                            model = model,
+                                            keyboardUp = keyboardUp,
+                                            glass = pageGlass,
+                                            onOpenSettings = { showSettings = true },
+                                            hardKeyboard = hardKeyboard,
+                                        )
+                                    }
+                                    if (covered || held) {
+                                        Box(
+                                            Modifier.matchParentSize().pointerInput(Unit) {
+                                                awaitPointerEventScope {
+                                                    while (true) awaitPointerEvent().changes.forEach { it.consume() }
+                                                }
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -550,6 +584,10 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                             )
                         }
 
+                        // Over the whole page too, under the pane map.
+                        Box(Modifier.fillMaxSize().zIndex(2.6f)) {
+                            ConnectionPage(model, overviewOpen, onEditHost = { editingHost = model.host }, onBack = { model.disconnect(); onBack() })
+                        }
                         if (showPanes) {
                             // Over the whole page, the bars at its foot included.
                             Box(Modifier.fillMaxSize().zIndex(2.7f)) {
@@ -868,7 +906,7 @@ private fun ClipChoice(icon: String, label: String, enabled: Boolean = true, onC
 /// the take-over card, the log, the selection's copy chip, and the card
 /// while there is no terminal to show.
 @Composable
-private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean, onEditHost: () -> Unit, onBack: () -> Unit) {
+private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean) {
     val settings = model.settings
     if (model.navs.size > 1 && settings.paneBars) {
         NavBars(model)
@@ -970,24 +1008,21 @@ private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean, on
         )
     }
     val phase = ConnectionPhase.of(model.connection)
-    if (model.reconnecting && !model.autoReconnect && phase == null) {
-        // Asked not to redial: the card offers it instead.
-        ConnectionCard(ConnectionPhase.Disconnected, model.host.display, canEdit = model.host.id != Host.PROBE_ID) { action ->
-            when (action) {
-                CardAction.Back -> onBack()
-                else -> model.connect()
-            }
-        }
-    }
-    if (phase != null) {
-        ConnectionCard(phase, model.host.display, canEdit = model.host.id != Host.PROBE_ID) { action ->
-            when (action) {
-                CardAction.Retry -> model.connect()
-                CardAction.ForgetKeyAndRetry -> model.forgetKeyAndRetry((phase as? ConnectionPhase.Failed)?.reason.orEmpty())
-                CardAction.Edit -> onEditHost()
-                CardAction.Back -> onBack()
-            }
-        }
+    // Back from the background, the first moments of the dial back show the
+    // last frame and a line over it (`StatusCapsule`). It is not live yet,
+    // so it is dimmed, and a touch on it goes nowhere, as the card would
+    // have it.
+    if (model.cardHeld && phase != null && phase !is ConnectionPhase.Failed) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.3f))
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) awaitPointerEvent().changes.forEach { it.consume() }
+                    }
+                },
+        )
     }
 }
 
@@ -1143,26 +1178,32 @@ private fun BoxScope.Scrollbar(model: TerminalModel) {
     }
 }
 
-/// The App's remark, "copied", or the connection's own line while it is
-/// not yet a pane: a capsule of glass over the terminal's top, so the
-/// terminal keeps its size as it comes and goes. It turns while the
-/// connection is on its way back, and warns once it is given up.
+/// The App's remark, "copied", or the first moments of a dial back from the
+/// background: a capsule of glass over the terminal's top, so the terminal
+/// keeps its size as it comes and goes. It turns while the connection is on
+/// its way back. Where the connection card is up, the card says how the
+/// connection is going: the App's sticky word on it is left to the card,
+/// and only passing remarks show here.
 @Composable
 private fun StatusCapsule(model: TerminalModel, modifier: Modifier = Modifier) {
-    val text = if (model.copied) tr("copied") else (model.toastText ?: "")
-    val c = model.connection
-    val showing = !(model.redialQuiet && !model.copied) &&
-        (text.isNotEmpty() || c.startsWith("connecting") || c.startsWith("disconnected") || c.startsWith("failed") || c.contains("reconnect"))
-    // The App's word stays up once the connection is lost; it is on its
-    // way back only where it redials by itself.
-    val redialing = model.reconnecting && model.autoReconnect
-    val turning = !model.copied && (redialing || c.startsWith("connecting") || c.contains("reconnect"))
-    // Lost with nothing redialing it warns too, though the status still
-    // names the pane.
-    val lost = !model.copied && !turning && (c.startsWith("disconnected") || c.startsWith("failed") || model.reconnecting)
+    val phase = ConnectionPhase.of(model.connection)
+    val held = model.cardHeld && phase != null && phase !is ConnectionPhase.Failed
+    val carded = !held && (phase != null || (model.reconnecting && !model.autoReconnect))
+    val text = when {
+        model.copied -> tr("copied")
+        held -> tr("card.reconnecting", model.host.display)
+        carded && model.toastSticky -> ""
+        else -> model.toastText ?: ""
+    }
+    // A redial back within a moment says nothing (`redialQuiet`).
+    val showing = text.isNotEmpty() && (model.copied || held || !model.redialQuiet)
+    // It turns while the connection is on its way back by itself; over a
+    // card, what it says is a remark, not the connection.
+    val redialing = model.reconnecting && model.autoReconnect && !carded
+    val turning = !model.copied && (held || redialing)
     // What it said last stays on it while it goes.
-    var said by remember { mutableStateOf(Triple("", false, false)) }
-    if (showing) said = Triple(text.ifEmpty { c }, turning, lost)
+    var said by remember { mutableStateOf(Pair("", false)) }
+    if (showing) said = Pair(text, turning)
     val chrome = LocalChrome.current
     AnimatedVisibility(
         visible = showing,
@@ -1170,7 +1211,7 @@ private fun StatusCapsule(model: TerminalModel, modifier: Modifier = Modifier) {
         enter = fadeIn(tween(200)) + slideInVertically(tween(200)) { -it / 2 },
         exit = fadeOut(tween(200)) + slideOutVertically(tween(200)) { -it / 2 },
     ) {
-        val (words, spinning, warning) = said
+        val (words, spinning) = said
         Row(
             Modifier
                 .glass(LocalGlass.current, chrome.dark, RoundedCornerShape(20.dp))
@@ -1181,7 +1222,6 @@ private fun StatusCapsule(model: TerminalModel, modifier: Modifier = Modifier) {
             when {
                 model.copied -> DesktopIcon("check", size = 15.dp, tint = chrome.ink)
                 spinning -> CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = chrome.ink)
-                warning -> DesktopIcon("triangle-alert", size = 15.dp, tint = Color(0xFFFF9F0A))
             }
             Text(words, color = chrome.ink, fontSize = 13.sp, lineHeight = 17.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
@@ -1216,93 +1256,289 @@ sealed class ConnectionPhase {
 
 enum class CardAction { Retry, ForgetKeyAndRetry, Edit, Back }
 
-/// The card over the terminal while there is no terminal to show: the
-/// steps of a connection, or what stopped it and what to do about it.
+/// The connection page, over the whole screen, the bars included: the star
+/// sky, and on it how the connection is going (`ConnectionCard`).
 @Composable
-private fun BoxScope.ConnectionCard(phase: ConnectionPhase, hostName: String, canEdit: Boolean, act: (CardAction) -> Unit) {
-    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)), contentAlignment = Alignment.Center) {
+private fun BoxScope.ConnectionPage(model: TerminalModel, overviewOpen: Boolean, onEditHost: () -> Unit, onBack: () -> Unit) {
+    val phase = ConnectionPhase.of(model.connection)
+    // The night the connection page sits on, from the moment it covers the
+    // terminal. When the page goes because the pane is there, it streaks
+    // past to show it, as the app comes out from behind the launch's;
+    // otherwise it fades.
+    // The overview's cards are what the screen shows then: the page waits
+    // until it closes, as the card it replaced did.
+    val covered = !overviewOpen && connectionCovers(model)
+    var skyUp by remember { mutableStateOf(covered) }
+    var skyRushing by remember { mutableStateOf(false) }
+    var skyKey by remember { mutableIntStateOf(0) }
+    LaunchedEffect(covered) {
+        if (covered) {
+            // Each page its own sky: one still rushing off, or fading out
+            // after the rush, has already cleared.
+            skyKey++
+            skyRushing = false
+            skyUp = true
+            // Nothing typed reaches the terminal under the page, and the
+            // keyboard would cover the page's buttons.
+            model.onHideKeyboard?.invoke()
+        } else if (skyUp && model.connection.startsWith("pane ")) {
+            skyRushing = true
+            delay((LaunchSky.AFTER_RUSH * 1000).toLong())
+            skyUp = false
+            skyRushing = false
+        } else {
+            skyUp = false
+        }
+    }
+    AnimatedVisibility(skyUp, enter = EnterTransition.None, exit = fadeOut(tween(250))) {
+        key(skyKey) { ConnectionSky(rushing = skyRushing) }
+    }
+    if (covered && phase == null) {
+        // Asked not to redial: the card offers it instead.
+        ConnectionCard(
+            ConnectionPhase.Disconnected, model.host.display, endpointOf(model.host),
+            canEdit = model.host.id != Host.PROBE_ID,
+        ) { action ->
+            when (action) {
+                CardAction.Back -> onBack()
+                else -> model.connect()
+            }
+        }
+    }
+    if (covered && phase != null) {
+        ConnectionCard(
+            phase, model.host.display, endpointOf(model.host),
+            canEdit = model.host.id != Host.PROBE_ID,
+        ) { action ->
+            when (action) {
+                CardAction.Retry -> model.connect()
+                CardAction.ForgetKeyAndRetry -> model.forgetKeyAndRetry((phase as? ConnectionPhase.Failed)?.reason.orEmpty())
+                CardAction.Edit -> onEditHost()
+                CardAction.Back -> onBack()
+            }
+        }
+    }
+}
+
+/// What a connection on its way says over the star sky (`ConnectionSky`,
+/// under it in `ConnectionPage`): the host, how far the connection has
+/// got, or what stopped it and what to do about it, with the buttons at the
+/// foot where a thumb is. The sky is night whatever the terminal's colours,
+/// so the words are white. The iOS app draws the same.
+@Composable
+private fun BoxScope.ConnectionCard(
+    phase: ConnectionPhase,
+    hostName: String,
+    endpoint: String,
+    canEdit: Boolean,
+    act: (CardAction) -> Unit,
+) {
+    val shownEndpoint = if (endpoint.isEmpty() && phase is ConnectionPhase.Connecting) phase.target else endpoint
+    // Where the connection is, over the host's name: the words of the
+    // card's sentence without the name ("Connecting to"), so the name can
+    // stand large under them.
+    val label = when (phase) {
+        is ConnectionPhase.Connecting -> tr("conn.connecting")
+        ConnectionPhase.Attaching -> tr("conn.attaching")
+        ConnectionPhase.Reconnecting -> tr("conn.reconnecting")
+        is ConnectionPhase.Failed -> tr("conn.failed")
+        ConnectionPhase.Disconnected -> tr("conn.disconnected")
+    }
+    // Stars pass behind the words: a soft shadow keeps them clear.
+    val clear = TextStyle(shadow = Shadow(Color.Black.copy(alpha = 0.6f), blurRadius = 16f))
+    BoxWithConstraints(
+        Modifier
+            .fillMaxSize()
+            // Every touch is the page's: none reaches the terminal under it.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) awaitPointerEvent().changes.forEach { it.consume() }
+                }
+            }
+            // The sky runs under the system's bars and the keyboard; the
+            // words and the buttons stay clear of them.
+            .safeDrawingPadding()
+            .padding(horizontal = 28.dp),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        // Upright there is room to spare and the page spreads out over the
+        // screen's height; on its side a phone has not the height for all
+        // of it, and the page scrolls rather than push its buttons off.
         Column(
             Modifier
-                .widthIn(max = 340.dp)
-                .clip(RoundedCornerShape(16.dp))
-                .background(LocalChrome.current.card)
-                .padding(20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+                .widthIn(max = 520.dp)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .heightIn(min = maxHeight),
         ) {
-            when (phase) {
-                is ConnectionPhase.Connecting -> {
-                    CircularProgressIndicator()
-                    Text(tr("card.connecting", hostName), color = ink, fontWeight = FontWeight.SemiBold)
-                    if (phase.target.isNotEmpty()) {
-                        Text(phase.target, color = ink.copy(alpha = 0.6f), fontSize = 12.sp, fontFamily = FontFamily.Monospace)
-                    }
-                    Steps(done = 0)
+            Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.weight(1f))
+            Column(verticalArrangement = Arrangement.spacedBy(22.dp)) {
+                // On the way the sky is the picture; stopped, a mark says why.
+                when (phase) {
+                    is ConnectionPhase.Failed -> Icon(Icons.Default.Warning, contentDescription = null, tint = Amber, modifier = Modifier.size(40.dp))
+                    ConnectionPhase.Disconnected -> Icon(Icons.Outlined.PowerOff, contentDescription = null, tint = Color.White.copy(alpha = 0.75f), modifier = Modifier.size(38.dp))
+                    else -> {}
                 }
-                ConnectionPhase.Attaching -> {
-                    CircularProgressIndicator()
-                    Text(tr("card.attaching", hostName), color = ink, fontWeight = FontWeight.SemiBold)
-                    Steps(done = 1)
-                }
-                ConnectionPhase.Reconnecting -> {
-                    CircularProgressIndicator()
-                    Text(tr("card.reconnecting", hostName), color = ink, fontWeight = FontWeight.SemiBold)
-                }
-                ConnectionPhase.Disconnected -> {
-                    Icon(Icons.Outlined.PowerOff, contentDescription = null, tint = ink.copy(alpha = 0.6f), modifier = Modifier.size(34.dp))
-                    Text(tr("conn.disconnected"), color = ink, fontWeight = FontWeight.SemiBold)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        CapsuleButton(tr("back"), lead = false, ink = ink) { act(CardAction.Back) }
-                        CapsuleButton(tr("reconnect"), lead = true, ink = ink) { act(CardAction.Retry) }
-                    }
-                }
-                is ConnectionPhase.Failed -> {
-                    Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFF9F0A), modifier = Modifier.size(34.dp))
-                    Text(tr("card.failed", hostName), color = ink, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(
-                        phase.reason,
-                        color = ink.copy(alpha = 0.6f),
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
-                        textAlign = TextAlign.Center,
-                        maxLines = 6,
-                        overflow = TextOverflow.Ellipsis,
+                        label,
+                        color = if (phase is ConnectionPhase.Failed) Amber else Color.White.copy(alpha = 0.7f),
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        style = clear,
                     )
-                    hintFor(phase.reason)?.let { Text(it, color = ink, fontSize = 13.sp, textAlign = TextAlign.Center) }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        CapsuleButton(tr("back"), lead = false, ink = ink) { act(CardAction.Back) }
-                        if (canEdit) CapsuleButton(tr("edithost"), lead = false, ink = ink) { act(CardAction.Edit) }
-                        if (phase.reason.contains("key changed") && canEdit) {
-                            CapsuleButton(tr("forgetretry"), lead = true, ink = ink) { act(CardAction.ForgetKeyAndRetry) }
-                        } else {
-                            CapsuleButton(tr("retry"), lead = true, ink = ink) { act(CardAction.Retry) }
+                    // One line, a long name made smaller rather than broken at
+                    // a hyphen.
+                    BasicText(
+                        hostName,
+                        style = clear.copy(color = Color.White, fontWeight = FontWeight.Bold),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        autoSize = TextAutoSize.StepBased(minFontSize = 18.sp, maxFontSize = 34.sp),
+                    )
+                    if (shownEndpoint.isNotEmpty()) {
+                        Text(
+                            shownEndpoint,
+                            color = Color.White.copy(alpha = 0.55f),
+                            fontSize = 15.sp,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                            overflow = TextOverflow.MiddleEllipsis,
+                            style = clear,
+                        )
+                    }
+                }
+                when (phase) {
+                    is ConnectionPhase.Connecting, ConnectionPhase.Reconnecting -> ConnectionSteps(current = 0)
+                    ConnectionPhase.Attaching -> ConnectionSteps(current = 1)
+                    is ConnectionPhase.Failed -> Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        hintFor(phase.reason)?.let {
+                            Text(it, color = Color.White.copy(alpha = 0.85f), fontSize = 17.sp, lineHeight = 23.sp, style = clear)
+                        }
+                        androidx.compose.foundation.text.selection.SelectionContainer {
+                            Text(
+                                phase.reason,
+                                color = Color.White.copy(alpha = 0.6f),
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp,
+                                fontFamily = FontFamily.Monospace,
+                                maxLines = 4,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color.White.copy(alpha = 0.08f))
+                                    .padding(horizontal = 14.dp, vertical = 11.dp),
+                            )
                         }
                     }
+                    ConnectionPhase.Disconnected -> {}
+                }
+            }
+            // A little above the middle: more room under it than over it.
+            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.weight(2f))
+            Column(
+                Modifier.fillMaxWidth().padding(bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                when (phase) {
+                    is ConnectionPhase.Failed -> {
+                        if (phase.reason.contains("key changed") && canEdit) {
+                            PageButton(tr("forgetretry"), lead = true) { act(CardAction.ForgetKeyAndRetry) }
+                        } else {
+                            PageButton(tr("retry"), lead = true) { act(CardAction.Retry) }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            if (canEdit) PageButton(tr("edithost"), lead = false, Modifier.weight(1f)) { act(CardAction.Edit) }
+                            PageButton(tr("back"), lead = false, Modifier.weight(1f)) { act(CardAction.Back) }
+                        }
+                    }
+                    ConnectionPhase.Disconnected -> {
+                        PageButton(tr("reconnect"), lead = true) { act(CardAction.Retry) }
+                        PageButton(tr("back"), lead = false) { act(CardAction.Back) }
+                    }
+                    else -> PageButton(tr("back"), lead = false) { act(CardAction.Back) }
                 }
             }
         }
     }
 }
 
+/// The two steps of a connection, one under the other: done, on its way
+/// (turning), or still to come.
 @Composable
-private fun Steps(done: Int) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Step(tr("conn.step1"), state = if (done > 0) 2 else 1)
-        Step(tr("conn.step2"), state = if (done > 1) 2 else if (done == 1) 1 else 0)
+private fun ConnectionSteps(current: Int) {
+    Column(Modifier.padding(top = 4.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        ConnectionStep(tr("conn.step1"), if (current > 0) 2 else 1)
+        ConnectionStep(tr("conn.step2"), if (current > 1) 2 else if (current == 1) 1 else 0)
     }
 }
 
+/// `state`: 0 still to come, 1 on its way, 2 done.
 @Composable
-private fun Step(label: String, state: Int) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Icon(
-            if (state == 2) Icons.Default.CheckCircle else Icons.Outlined.Circle,
-            contentDescription = null,
-            tint = if (state == 2) Color(0xFF34C759) else ink.copy(alpha = 0.5f),
-            modifier = Modifier.size(16.dp),
+private fun ConnectionStep(label: String, state: Int) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
+            when (state) {
+                2 -> Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF34C759), modifier = Modifier.size(22.dp))
+                1 -> CircularProgressIndicator(Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
+                else -> Box(Modifier.size(18.dp).border(1.5.dp, Color.White.copy(alpha = 0.35f), CircleShape))
+            }
+        }
+        Text(
+            label,
+            color = Color.White.copy(alpha = when (state) { 0 -> 0.4f; 1 -> 1f; else -> 0.7f }),
+            fontSize = 17.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
-        Text(label, color = if (state == 0) ink.copy(alpha = 0.5f) else ink, fontSize = 13.sp)
     }
+}
+
+/// A button at the page's foot: the lead one in the desktop's blue, the
+/// rest a frosted white over the sky.
+@Composable
+private fun PageButton(label: String, lead: Boolean, modifier: Modifier = Modifier.fillMaxWidth(), onClick: () -> Unit) {
+    Box(
+        modifier
+            .height(if (lead) 54.dp else 50.dp)
+            .clip(CircleShape)
+            .background(if (lead) LeadBlue else Color.White.copy(alpha = 0.14f))
+            .border(1.dp, Color.White.copy(alpha = if (lead) 0.18f else 0.12f), CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = Color.White,
+            fontSize = 17.sp,
+            fontWeight = if (lead) FontWeight.SemiBold else FontWeight.Medium,
+            maxLines = 1,
+        )
+    }
+}
+
+/// The amber of a stop, as the desktop's and iOS's.
+private val Amber = Color(0xFFFF9F0A)
+
+/// Where a host is dialled, as the connection page names it under the
+/// host: the user, the address, and the port when it is not 22.
+private fun endpointOf(host: Host): String {
+    if (host.hostname.isEmpty()) return ""
+    val user = if (host.user.isEmpty()) "" else host.user + "@"
+    val port = if (host.port == 22) "" else ":${host.port}"
+    return user + host.hostname + port
+}
+
+/// The connection page covers the terminal (`ConnectionCard`): the keys
+/// under it have nothing to type into.
+private fun connectionCovers(model: TerminalModel): Boolean {
+    if (model.pausedForBackground) return false
+    val phase = ConnectionPhase.of(model.connection)
+    return if (phase != null) !model.cardHeld || phase is ConnectionPhase.Failed
+    else model.reconnecting && !model.autoReconnect
 }
 
 /// What the reason usually means, in plain words.

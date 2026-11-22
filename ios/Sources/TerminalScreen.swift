@@ -19,6 +19,10 @@ struct TerminalScreen: View {
     @State private var wide = false
     @AppStorage("sidebar.pinned") private var sidebarPinned = true
     @State private var showLog = false
+    /// The connection page's sky (`skyFollows`): when it came up, and when
+    /// it rushes off, in seconds after that.
+    @State private var skyStart: Date?
+    @State private var skyRushAt: TimeInterval?
     @State private var showSettings = false
     @State private var menu: MenuSheet?
     @State private var editingHost: Host?
@@ -356,6 +360,7 @@ struct TerminalScreen: View {
         // Another keyboard (the sidebar's search, a name being asked for)
         // is not the terminal's: it does not resize it.
         .ignoresSafeArea(keyboardUp ? [] : .keyboard, edges: .bottom)
+        .overlay { connectionPage }
         // Over the whole page, the bars at its foot included.
         .overlay {
             if showPanes {
@@ -363,6 +368,57 @@ struct TerminalScreen: View {
             }
         }
         .animation(.easeOut(duration: 0.18), value: showPanes)
+    }
+
+    /// The connection page, over the whole screen, the bars included: the
+    /// star sky, and on it how the connection is going (`ConnectionCard`).
+    private var connectionPage: some View {
+        ZStack {
+            // The night the connection page sits on, from the moment it
+            // covers the terminal; it streaks past as the pane comes up.
+            if let start = skyStart {
+                StarSky(start: start, rushAt: skyRushAt, travel: Travel())
+                    .ignoresSafeArea()
+                    // What it covers takes no touches, as under the launch's
+                    // sky; as it rushes off, the pane already does.
+                    .contentShape(Rectangle())
+                    .onTapGesture {}
+                    .allowsHitTesting(skyRushAt == nil)
+                    .transition(.opacity)
+            }
+            if connectionCovers, ConnectionPhase(status: model.connection) == nil {
+                // Asked not to redial: the card offers it instead.
+                ConnectionCard(phase: .disconnected, hostName: hostName, endpoint: endpoint, canEdit: model.host != nil) { action in
+                    switch action {
+                    case .back: leave()
+                    default: model.connect()
+                    }
+                }
+            }
+            if connectionCovers, let phase = ConnectionPhase(status: model.connection) {
+                ConnectionCard(phase: phase, hostName: hostName, endpoint: endpoint, canEdit: model.host != nil) { action in
+                    switch action {
+                    case .retry: model.connect()
+                    case .forgetKeyAndRetry:
+                        if case .failed(let reason) = phase {
+                            model.forgetKeyAndRetry(reason: reason, sessions: sessions)
+                        } else {
+                            if let host = model.host {
+                                model.store?.forgetHostKey(for: host.id)
+                                model.host?.knownHost = nil
+                            }
+                            model.connect()
+                        }
+                    case .edit: editingHost = model.host
+                    case .back: leave()
+                    }
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.25), value: connectionCovers)
+        .onAppear { if connectionCovers { skyStart = Date() } }
+        .onChange(of: connectionCovers) { _, covers in skyFollows(covers) }
     }
 
     /// The sidebar, back to the hosts, and the strip in the rest of the
@@ -462,6 +518,13 @@ struct TerminalScreen: View {
                     }
                     .padding(.top, 6)
                     .padding(.bottom, keyboardUp ? 6 : max(Self.bottomInset, 8))
+                    // Out of sight while the connection page covers the
+                    // terminal, but still in the layout: the terminal keeps
+                    // its size, and the pane is not resized twice a dial.
+                    .opacity(connectionCovers ? 0 : (connectionHeld ? 0.4 : 1))
+                    .allowsHitTesting(!connectionCovers && !connectionHeld)
+                    .animation(.easeOut(duration: 0.2), value: connectionCovers)
+                    .animation(.easeOut(duration: 0.2), value: connectionHeld)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
@@ -671,6 +734,61 @@ struct TerminalScreen: View {
 
     private var connected: Bool {
         !(model.connection.hasPrefix("disconnected") || model.connection.hasPrefix("failed") || model.connection.isEmpty)
+    }
+
+    /// Where the host is dialled, as the connection page names it under
+    /// the host: the user, the address, and the port when it is not 22.
+    private var endpoint: String {
+        guard let host = model.host, !host.hostname.isEmpty else { return "" }
+        let user = host.user.isEmpty ? "" : host.user + "@"
+        let port = host.port == 22 ? "" : ":\(host.port)"
+        return user + host.hostname + port
+    }
+
+    /// The sky under the connection page: up as the page comes, and, when
+    /// the page goes because the pane is there, rushed off to show it, as
+    /// the app comes out from behind the launch's. Otherwise it fades.
+    private func skyFollows(_ covers: Bool) {
+        if covers {
+            skyRushAt = nil
+            skyStart = Date()
+            // Nothing typed reaches the terminal under the page, and the
+            // keyboard would cover the page's buttons.
+            model.dismissKeyboard()
+            return
+        }
+        guard let start = skyStart, skyRushAt == nil else { return }
+        guard model.connection.hasPrefix("pane ") else {
+            withAnimation(.easeOut(duration: 0.25)) { skyStart = nil }
+            return
+        }
+        let at = Date().timeIntervalSince(start)
+        skyRushAt = at
+        DispatchQueue.main.asyncAfter(deadline: .now() + LaunchSky.afterRush) {
+            // Unless another page has come up meanwhile, with its own sky.
+            guard skyStart == start, skyRushAt == at else { return }
+            skyStart = nil
+            skyRushAt = nil
+        }
+    }
+
+    /// The connection page covers the terminal (`ConnectionCard`): the
+    /// keys under it have nothing to type into.
+    private var connectionCovers: Bool {
+        // The overview's cards are what the screen shows then: the page
+        // waits until it closes, as the card it replaced did.
+        if model.pausedForBackground || overviewOpen { return false }
+        if let phase = ConnectionPhase(status: model.connection) {
+            return !model.cardHeld || phase.isFailure
+        }
+        return model.reconnecting && !model.autoReconnect
+    }
+
+    /// The first moments of a dial back from the background (`cardHeld`):
+    /// the last frame shows, dimmed, and neither it nor the keys under it
+    /// take a touch, the connection not being live yet.
+    private var connectionHeld: Bool {
+        model.cardHeld && (ConnectionPhase(status: model.connection).map { !$0.isFailure } ?? false)
     }
 
     private var hostName: String {
@@ -1130,33 +1248,15 @@ struct TerminalScreen: View {
             if showLog {
                 logView
             }
-            if model.reconnecting && !model.autoReconnect && ConnectionPhase(status: model.connection) == nil {
-                // Asked not to redial: the card offers it instead.
-                ConnectionCard(phase: .disconnected, hostName: hostName, canEdit: model.host != nil) { action in
-                    switch action {
-                    case .back: leave()
-                    default: model.connect()
-                    }
-                }
-            }
-            if let phase = ConnectionPhase(status: model.connection) {
-                ConnectionCard(phase: phase, hostName: hostName, canEdit: model.host != nil) { action in
-                    switch action {
-                    case .retry: model.connect()
-                    case .forgetKeyAndRetry:
-                        if case .failed(let reason) = phase {
-                            model.forgetKeyAndRetry(reason: reason, sessions: sessions)
-                        } else {
-                            if let host = model.host {
-                                model.store?.forgetHostKey(for: host.id)
-                                model.host?.knownHost = nil
-                            }
-                            model.connect()
-                        }
-                    case .edit: editingHost = model.host
-                    case .back: leave()
-                    }
-                }
+            // Back from the background, the first moments of the dial back
+            // show the last frame and a line over it (`statusCapsule`). It
+            // is not live yet, so it is dimmed, and a tap on it goes nowhere,
+            // as the card would have it.
+            if connectionHeld {
+                Color.black.opacity(0.3)
+                    .contentShape(Rectangle())
+                    .onTapGesture {}
+                    .transition(.opacity)
             }
         }
         .environmentObject(model)
@@ -1342,26 +1442,25 @@ struct TerminalScreen: View {
 
     // MARK: the status line
 
-    /// The App's remark, "copied", or the connection's own line while it is
-    /// not yet a pane: a capsule of glass over the terminal's top, so the
+    /// The App's remark, "copied", or the first moments of a dial back from
+    /// the background: a capsule of glass over the terminal's top, so the
     /// terminal keeps its size as it comes and goes. It turns while the
-    /// connection is on its way back, and warns once it is given up.
+    /// connection is on its way back. Where the connection card is up, the
+    /// card says how the connection is going: the App's sticky word on it
+    /// is left to the card, and only passing remarks show here.
     private var statusCapsule: some View {
-        let text = model.copied ? tr("copied") : (model.toastText ?? "")
-        let connection = model.connection
+        let phase = ConnectionPhase(status: model.connection)
+        let held = model.cardHeld && phase.map { !$0.isFailure } ?? false
+        let carded = !held && (phase != nil || (model.reconnecting && !model.autoReconnect))
+        let text = model.copied ? tr("copied")
+            : held ? tr("card.reconnecting", hostName)
+            : carded && model.toastSticky ? "" : (model.toastText ?? "")
         // A redial back within a moment says nothing (`redialQuiet`).
-        let showing = !(model.redialQuiet && !model.copied)
-            && (!text.isEmpty || connection.hasPrefix("connecting") || connection.hasPrefix("disconnected")
-                || connection.hasPrefix("failed") || connection.contains("reconnect"))
-        // The App's word stays up once the connection is lost; it is on
-        // its way back only where it redials by itself.
-        let redialing = model.reconnecting && model.autoReconnect
-        let turning = !model.copied
-            && (redialing || connection.hasPrefix("connecting") || connection.contains("reconnect"))
-        // Lost with nothing redialing it warns too, though the status
-        // still names the pane.
-        let lost = !model.copied && !turning
-            && (connection.hasPrefix("disconnected") || connection.hasPrefix("failed") || model.reconnecting)
+        let showing = !text.isEmpty && (model.copied || held || !model.redialQuiet)
+        // It turns while the connection is on its way back by itself; over
+        // a card, what it says is a remark, not the connection.
+        let redialing = model.reconnecting && model.autoReconnect && !carded
+        let turning = !model.copied && (held || redialing)
         return ZStack {
             if showing {
                 HStack(spacing: 8) {
@@ -1369,10 +1468,8 @@ struct TerminalScreen: View {
                         Image(systemName: "checkmark").font(.footnote.weight(.semibold))
                     } else if turning {
                         Spinner(color: model.ink).frame(width: 14, height: 14)
-                    } else if lost {
-                        DesktopIcon(name: "triangle-alert", size: 15).foregroundColor(.orange)
                     }
-                    Text(text.isEmpty ? connection : text)
+                    Text(text)
                         .font(.footnote)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
@@ -1591,10 +1688,19 @@ enum ConnectionPhase: Equatable {
             self = .connecting("")
         }
     }
+
+    /// Stopped, with a reason to show: the card says so at once.
+    var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
+    }
 }
 
-/// The card over the terminal while there is no terminal to show: the
-/// steps of a connection, or what stopped it and what to do about it.
+/// What a connection on its way says over the star sky (`StarSky`, under
+/// it in `TerminalScreen`): the host, how far the connection has got, or
+/// what stopped it and what to do about it, with the buttons at the foot
+/// where a thumb is. The sky is night whatever the terminal's colours, so
+/// the words are white.
 struct ConnectionCard: View {
     enum Action { case retry, forgetKeyAndRetry, edit, back }
 
@@ -1602,80 +1708,223 @@ struct ConnectionCard: View {
 
     var phase: ConnectionPhase
     var hostName: String
+    /// Where it is dialled: `user@host`, and the port when it is not 22.
+    var endpoint: String
     var canEdit: Bool
     var act: (Action) -> Void
 
     var body: some View {
-        VStack(spacing: 14) {
-            switch phase {
-            case .connecting(let target):
-                ProgressView().controlSize(.large)
-                Text(tr("card.connecting", hostName)).font(.headline)
-                if !target.isEmpty {
-                    Text(target).font(.caption.monospaced()).foregroundColor(.secondary)
-                }
-                steps(done: 0)
-            case .attaching:
-                ProgressView().controlSize(.large)
-                Text(tr("card.attaching", hostName)).font(.headline)
-                steps(done: 1)
-            case .reconnecting:
-                ProgressView().controlSize(.large)
-                Text(tr("card.reconnecting", hostName)).font(.headline)
-            case .disconnected:
-                Image(systemName: "bolt.slash").font(.system(size: 34)).foregroundColor(.secondary)
-                Text(tr("conn.disconnected")).font(.headline)
-                HStack {
-                    Button(tr("back")) { act(.back) }.buttonStyle(.bordered)
-                    Button(tr("reconnect")) { act(.retry) }.buttonStyle(.borderedProminent)
-                }
-            case .failed(let reason):
-                Image(systemName: "exclamationmark.triangle").font(.system(size: 34)).foregroundColor(.orange)
-                Text(tr("card.failed", hostName)).font(.headline).multilineTextAlignment(.center)
-                Text(reason)
-                    .font(.caption.monospaced())
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(6)
-                if let hint = Self.hint(for: reason) {
-                    Text(hint).font(.footnote).multilineTextAlignment(.center)
-                }
-                HStack {
-                    Button(tr("back")) { act(.back) }.buttonStyle(.bordered)
-                    if canEdit {
-                        Button(tr("edithost")) { act(.edit) }.buttonStyle(.bordered)
-                    }
-                    if reason.contains("key changed") && canEdit {
-                        Button(tr("forgetretry")) { act(.forgetKeyAndRetry) }.buttonStyle(.borderedProminent)
-                    } else {
-                        Button(tr("retry")) { act(.retry) }.buttonStyle(.borderedProminent)
-                    }
-                }
+        // Upright there is room to spare and the page spreads out; on its
+        // side a phone has not the height for all of it, and the page
+        // scrolls rather than push its buttons off the screen.
+        ViewThatFits(in: .vertical) {
+            page(spread: true)
+            ScrollView(.vertical, showsIndicators: false) {
+                page(spread: false).padding(.top, 16)
             }
+            .scrollBounceBehavior(.basedOnSize)
         }
-        .padding(20)
-        .frame(maxWidth: 340)
-        .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.4))
+        // Every touch is the page's: none reaches the terminal under it.
+        .contentShape(Rectangle())
     }
 
-    private func steps(done: Int) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            step(tr("conn.step1"), state: done > 0 ? 2 : 1)
-            step(tr("conn.step2"), state: done > 1 ? 2 : (done == 1 ? 1 : 0))
+    /// The words a little above the middle and the buttons at the foot
+    /// (`spread`), or one after the other.
+    private func page(spread: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if spread { Spacer(minLength: 24) }
+            words
+            if spread {
+                Spacer(minLength: 24)
+                Spacer(minLength: 0)
+            } else {
+                Color.clear.frame(height: 28)
+            }
+            buttons
+                .padding(.bottom, 20)
         }
-        .font(.footnote)
+        .multilineTextAlignment(.leading)
+        .foregroundColor(.white)
+        .frame(maxWidth: 520, alignment: .leading)
+        .padding(.horizontal, 28)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var words: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            mark
+            VStack(alignment: .leading, spacing: 6) {
+                Text(label)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(phase.isFailure ? .orange : .white.opacity(0.7))
+                // One line, a long name made smaller rather than broken at
+                // a hyphen.
+                Text(hostName)
+                    .font(.system(size: 34, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+                if !shownEndpoint.isEmpty {
+                    Text(shownEndpoint)
+                        .font(.system(size: 15, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.55))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            details
+        }
+        // Stars pass behind the words: a soft shadow keeps them clear.
+        .shadow(color: .black.opacity(0.6), radius: 8)
+    }
+
+    /// Where the connection is, over the host's name: the words of the
+    /// card's sentence without the name (`conn.connecting`, "Connecting
+    /// to"), so the name can stand large under them.
+    private var label: String {
+        switch phase {
+        case .connecting: return tr("conn.connecting")
+        case .attaching: return tr("conn.attaching")
+        case .reconnecting: return tr("conn.reconnecting")
+        case .failed: return tr("conn.failed")
+        case .disconnected: return tr("conn.disconnected")
+        }
+    }
+
+    /// The host's own address, or, for a dial with no saved host behind
+    /// it, the one the status names.
+    private var shownEndpoint: String {
+        if endpoint.isEmpty, case .connecting(let target) = phase { return target }
+        return endpoint
+    }
+
+    /// On the way the sky is the picture; stopped, a mark says why.
+    @ViewBuilder private var mark: some View {
+        switch phase {
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundColor(.orange)
+        case .disconnected:
+            Image(systemName: "bolt.slash.fill")
+                .font(.system(size: 32, weight: .semibold))
+                .foregroundColor(.white.opacity(0.75))
+        default:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder private var details: some View {
+        switch phase {
+        case .connecting, .reconnecting:
+            steps(at: 0)
+        case .attaching:
+            steps(at: 1)
+        case .failed(let reason):
+            VStack(alignment: .leading, spacing: 14) {
+                if let hint = Self.hint(for: reason) {
+                    Text(hint)
+                        .font(.system(size: 17))
+                        .foregroundColor(.white.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(reason)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.6))
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 11)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+        case .disconnected:
+            EmptyView()
+        }
+    }
+
+    /// The two steps of a connection, one under the other: done, on its
+    /// way (turning), or still to come.
+    private func steps(at current: Int) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            step(tr("conn.step1"), state: current > 0 ? 2 : 1)
+            step(tr("conn.step2"), state: current > 1 ? 2 : (current == 1 ? 1 : 0))
+        }
         .padding(.top, 4)
     }
 
+    /// `state`: 0 still to come, 1 on its way, 2 done.
     private func step(_ label: String, state: Int) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: state == 2 ? "checkmark.circle.fill" : (state == 1 ? "circle.dotted" : "circle"))
-                .foregroundColor(state == 2 ? .green : .secondary)
-            Text(label).foregroundColor(state == 0 ? .secondary : .primary)
+        HStack(spacing: 12) {
+            ZStack {
+                switch state {
+                case 2:
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(.green)
+                case 1:
+                    Spinner(color: .white).frame(width: 18, height: 18)
+                default:
+                    Circle().strokeBorder(.white.opacity(0.35), lineWidth: 1.5).frame(width: 18, height: 18)
+                }
+            }
+            .frame(width: 22, height: 22)
+            Text(label)
+                .font(.system(size: 17))
+                .foregroundColor(.white.opacity(state == 0 ? 0.4 : (state == 1 ? 1 : 0.7)))
+                .lineLimit(1)
         }
+    }
+
+    @ViewBuilder private var buttons: some View {
+        switch phase {
+        case .failed(let reason):
+            VStack(spacing: 10) {
+                if reason.contains("key changed") && canEdit {
+                    lead(tr("forgetretry")) { act(.forgetKeyAndRetry) }
+                } else {
+                    lead(tr("retry")) { act(.retry) }
+                }
+                HStack(spacing: 10) {
+                    if canEdit { plain(tr("edithost")) { act(.edit) } }
+                    plain(tr("back")) { act(.back) }
+                }
+            }
+        case .disconnected:
+            VStack(spacing: 10) {
+                lead(tr("reconnect")) { act(.retry) }
+                plain(tr("back")) { act(.back) }
+            }
+        default:
+            plain(tr("back")) { act(.back) }
+        }
+    }
+
+    /// The one that leads: glass in the desktop's blue.
+    private func lead(_ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 54)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .glassCapsule(tint: .accentColor)
+    }
+
+    private func plain(_ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .glassCapsule()
     }
 
     /// What the reason usually means, in plain words.

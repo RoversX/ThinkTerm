@@ -98,6 +98,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// few seconds, a sticky one (the connection is down) stays until the
     /// App takes it back.
     @Published private(set) var toastText: String?
+    /// `toastText` is the App's sticky word on the connection, which the
+    /// connection card says itself while it is up.
+    @Published private(set) var toastSticky = false
     /// The App says its connection is down and it is redialing.
     @Published private(set) var reconnecting = false
     /// A redial just begun by itself: for its first moments nothing says
@@ -107,6 +110,13 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private var redialSpoken: DispatchWorkItem?
     /// How long a redial goes unsaid.
     private static let quietRedial: TimeInterval = 2.5
+    /// Dialled again on the way back from the background: for its first
+    /// moments the last frame stays in sight with a line over its top, and
+    /// the connection card waits. A failure, or the pane, ends it at once.
+    @Published private(set) var cardHeld = false
+    private var cardRelease: DispatchWorkItem?
+    /// How long the card waits for a dial back from the background.
+    private static let cardHold: TimeInterval = 3.0
     private var toastTimer: Timer?
     /// The terminal's background, as the App paints it: the chrome around
     /// the terminal takes the same colour.
@@ -442,6 +452,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     /// Connect to the model's host with the secret from the Keychain.
     func connect() {
+        // A dial of its own: whoever holds the card back holds it for this
+        // one, after the call (`reattachAfterBackground`).
+        releaseCard()
         restoredThread = false
         // A new connection's views are all new, even ones that read the
         // same: the first listing puts the phone back on its thread. The
@@ -535,7 +548,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         return now
     }
 
-    func disconnect() { clearHostKeyRequest(); core.disconnect() }
+    func disconnect() {
+        releaseCard()
+        clearHostKeyRequest()
+        core.disconnect()
+    }
 
     /// The host's pinned key forgotten: the connection up now stays, and
     /// the next dial -- the core's own redial of this one too -- asks for
@@ -667,6 +684,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             return
         }
         toastText = toast.text
+        toastSticky = sticky
         if !sticky {
             toastTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
                 guard let self, self.toastText == toast.text else { return }
@@ -679,6 +697,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func note(_ text: String) {
         toastTimer?.invalidate()
         toastText = text
+        toastSticky = false
         toastTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
             guard let self, self.toastText == text else { return }
             self.toastText = nil
@@ -1182,7 +1201,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
 
     /// The background took the connection down; the foreground brings it back.
-    private var pausedForBackground = false
+    /// Meanwhile the connection page stays away: a "disconnected" of the
+    /// app's own making is not one to show, in the app switcher's picture
+    /// of it or as the app comes back (`TerminalScreen.connectionCovers`).
+    @Published private(set) var pausedForBackground = false
 
     func detachForBackground() {
         inFront = false
@@ -1203,6 +1225,21 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// See `cardHeld`.
+    private func holdCard() {
+        cardRelease?.cancel()
+        cardHeld = true
+        let release = DispatchWorkItem { [weak self] in self?.releaseCard() }
+        cardRelease = release
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.cardHold, execute: release)
+    }
+
+    private func releaseCard() {
+        cardRelease?.cancel()
+        cardRelease = nil
+        if cardHeld { cardHeld = false }
+    }
+
     private func endBackgroundTask() {
         if backgroundTask != .invalid {
             UIApplication.shared.endBackgroundTask(backgroundTask)
@@ -1217,7 +1254,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         endBackgroundTask()
         if pausedForBackground {
             pausedForBackground = false
-            if host?.autoConnect != false { connect() }
+            if host?.autoConnect != false {
+                connect()
+                holdCard()
+            }
         } else {
             // What the wait cut is found out now, and what was already
             // down is tried again at once.
@@ -1306,6 +1346,12 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             self.log("status: " + status)
             if status.hasPrefix("pane "), let host = self.host {
                 self.store?.touchConnected(host.id)
+            }
+            // Back on the pane, or stopped: nothing is left to wait for.
+            // A plain "disconnected" may be the background's own, landing
+            // after the dial back began, so it does not end the wait.
+            if status.hasPrefix("pane ") || ConnectionPhase(status: status)?.isFailure == true {
+                self.releaseCard()
             }
             if status.hasPrefix("connecting") || status.contains("reconnect") || status.hasPrefix("disconnected") {
                 self.inputView?.dropComposition()
