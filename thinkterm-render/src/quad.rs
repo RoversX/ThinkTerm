@@ -291,9 +291,37 @@ pub trait QuadAllocator {
     fn extend_with(&mut self, vertices: &[Vertex]);
 }
 
+/// How a quad is mixed with what is drawn under it.
+///
+/// Everything is laid over what is under it (`Over`). The other two are for
+/// glass over a see-through window, where what shows through the window is
+/// behind the whole frame: `Clear` lets more of it through, and `Add` puts
+/// light on it without hiding any of it. The colour of a `Clear` quad is not
+/// used; one drawn by a renderer that mixes only one way is laid over, so
+/// the colour it is given is what it should look like then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuadBlend {
+    #[default]
+    Over,
+    /// Keeps only `1 - alpha` of what is under it, colour and solidity both.
+    Clear,
+    /// Adds its colour, times its alpha, to what is under it, and leaves how
+    /// solid that is alone.
+    Add,
+}
+
 pub trait TripleLayerQuadAllocatorTrait {
     fn allocate(&mut self, layer_num: usize) -> anyhow::Result<QuadImpl<'_>>;
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]);
+
+    /// Mix the quads allocated in `layer_num` from now on as `blend`. An
+    /// allocator that cannot keeps laying them over.
+    fn set_blend(&mut self, _layer_num: usize, _blend: QuadBlend) {}
+
+    /// `extend_with`, for quads that are mixed as `blend`.
+    fn extend_with_blend(&mut self, layer_num: usize, vertices: &[Vertex], _blend: QuadBlend) {
+        self.extend_with(layer_num, vertices)
+    }
 }
 
 impl<T: TripleLayerQuadAllocatorTrait + ?Sized> TripleLayerQuadAllocatorTrait for &mut T {
@@ -303,6 +331,14 @@ impl<T: TripleLayerQuadAllocatorTrait + ?Sized> TripleLayerQuadAllocatorTrait fo
 
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
         (**self).extend_with(layer_num, vertices)
+    }
+
+    fn set_blend(&mut self, layer_num: usize, blend: QuadBlend) {
+        (**self).set_blend(layer_num, blend)
+    }
+
+    fn extend_with_blend(&mut self, layer_num: usize, vertices: &[Vertex], blend: QuadBlend) {
+        (**self).extend_with_blend(layer_num, vertices, blend)
     }
 }
 
@@ -321,6 +357,9 @@ pub struct BoxedQuad {
     hsv: [f32; 3],
     has_color: f32,
     mix_value: f32,
+    /// How the quad is mixed when it is replayed. It sits in what was the
+    /// struct's padding.
+    blend: QuadBlend,
 }
 
 impl QuadTrait for BoxedQuad {
@@ -417,6 +456,7 @@ impl BoxedQuad {
                 .then(|| Box::new(fg_color_corners)),
             hsv: verts[V_TOP_LEFT].hsv,
             mix_value: verts[V_TOP_LEFT].mix_value,
+            blend: QuadBlend::Over,
         }
     }
 
@@ -570,6 +610,7 @@ impl BoxedQuad {
             hsv: self.hsv,
             has_color: self.has_color,
             mix_value: self.mix_value,
+            blend: self.blend,
         };
         // Solid-colour quads conventionally use zero-width texture intervals.
         // Preserve those intervals exactly rather than introducing tiny
@@ -713,6 +754,9 @@ pub struct HeapQuadAllocator {
     layer1: Vec<BoxedQuad>,
     layer2: Vec<BoxedQuad>,
     position_transform: Option<QuadPositionTransform>,
+    /// How the quads allocated in each layer from now on are mixed
+    /// (`set_blend`).
+    blend: [QuadBlend; 3],
 }
 
 impl std::fmt::Debug for HeapQuadAllocator {
@@ -894,11 +938,13 @@ impl HeapQuadAllocator {
             layer1,
             layer2,
             position_transform,
+            blend,
         } = self;
         layer0.clear();
         layer1.clear();
         layer2.clear();
         *position_transform = None;
+        *blend = Default::default();
     }
 
     /// Move the recording into a new allocator whose vectors have no spare
@@ -929,13 +975,16 @@ impl HeapQuadAllocator {
             layer1,
             layer2,
             position_transform,
+            blend,
         } = self;
         *position_transform = None;
+        *blend = Default::default();
         Self {
             layer0: move_exact(layer0),
             layer1: move_exact(layer1),
             layer2: move_exact(layer2),
             position_transform: None,
+            blend: Default::default(),
         }
     }
 
@@ -1002,7 +1051,7 @@ impl HeapQuadAllocator {
         let start = std::time::Instant::now();
         for (layer_num, quads) in self.layers() {
             for quad in quads {
-                other.extend_with(layer_num, &quad.to_vertices());
+                other.extend_with_blend(layer_num, &quad.to_vertices(), quad.blend);
             }
         }
         #[cfg(not(target_family = "wasm"))]
@@ -1028,7 +1077,7 @@ impl HeapQuadAllocator {
                     vertex.position[0] += offset_x;
                     vertex.position[1] += offset_y;
                 }
-                other.extend_with(layer_num, &vertices);
+                other.extend_with_blend(layer_num, &vertices, quad.blend);
             }
         }
         Ok(())
@@ -1285,7 +1334,7 @@ impl HeapQuadAllocator {
                 } else {
                     clipped
                 };
-                other.extend_with(layer_num, &clipped.to_vertices());
+                other.extend_with_blend(layer_num, &clipped.to_vertices(), clipped.blend);
             }
         }
         #[cfg(not(target_family = "wasm"))]
@@ -1322,7 +1371,7 @@ impl HeapQuadAllocator {
                 } else {
                     mapped
                 };
-                other.extend_with(layer_num, &mapped.to_vertices());
+                other.extend_with_blend(layer_num, &mapped.to_vertices(), mapped.blend);
             }
         }
         #[cfg(not(target_family = "wasm"))]
@@ -1339,7 +1388,7 @@ impl HeapQuadAllocator {
         for (layer_num, quads) in self.layers() {
             let end = Self::layer_bounds(mark, layer_num).min(quads.len());
             for quad in &quads[..end] {
-                other.extend_with(layer_num, &quad.to_vertices());
+                other.extend_with_blend(layer_num, &quad.to_vertices(), quad.blend);
             }
         }
         Ok(())
@@ -1354,7 +1403,7 @@ impl HeapQuadAllocator {
         for (layer_num, quads) in self.layers() {
             let begin = Self::layer_bounds(mark, layer_num).min(quads.len());
             for quad in &quads[begin..] {
-                other.extend_with(layer_num, &quad.to_vertices());
+                other.extend_with_blend(layer_num, &quad.to_vertices(), quad.blend);
             }
         }
         Ok(())
@@ -1384,7 +1433,7 @@ impl HeapQuadAllocator {
                 let Some(clipped) = quad.translated_clipped(offset_x, 0.0, clip) else {
                     continue;
                 };
-                other.extend_with(layer_num, &clipped.to_vertices());
+                other.extend_with_blend(layer_num, &clipped.to_vertices(), clipped.blend);
             }
         }
         #[cfg(not(target_family = "wasm"))]
@@ -1419,7 +1468,7 @@ impl HeapQuadAllocator {
                 let Some(clipped) = quad.translated_clipped(offset_x, 0.0, clip) else {
                     continue;
                 };
-                other.extend_with(layer_num, &clipped.to_vertices());
+                other.extend_with_blend(layer_num, &clipped.to_vertices(), clipped.blend);
             }
         }
         #[cfg(not(target_family = "wasm"))]
@@ -1435,6 +1484,7 @@ impl HeapQuadAllocator {
 impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
     fn allocate(&mut self, layer_num: usize) -> anyhow::Result<QuadImpl<'_>> {
         let position_transform = self.position_transform;
+        let blend = self.blend[layer_num];
         let quads = match layer_num {
             0 => &mut self.layer0,
             1 => &mut self.layer1,
@@ -1442,7 +1492,10 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
             _ => unreachable!(),
         };
 
-        quads.push(BoxedQuad::default());
+        quads.push(BoxedQuad {
+            blend,
+            ..Default::default()
+        });
 
         let quad = quads.last_mut().unwrap();
         Ok(match position_transform {
@@ -1452,6 +1505,14 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
     }
 
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
+        self.extend_with_blend(layer_num, vertices, QuadBlend::Over)
+    }
+
+    fn set_blend(&mut self, layer_num: usize, blend: QuadBlend) {
+        self.blend[layer_num] = blend;
+    }
+
+    fn extend_with_blend(&mut self, layer_num: usize, vertices: &[Vertex], blend: QuadBlend) {
         if vertices.is_empty() {
             return;
         }
@@ -1473,6 +1534,7 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
 
         for quad in src_quads {
             let mut quad = BoxedQuad::from_vertices(quad);
+            quad.blend = blend;
             if let Some(transform) = position_transform {
                 let (left, top, right, bottom) = quad.position;
                 quad.position = transform.map_position(left, top, right, bottom);
@@ -1506,6 +1568,69 @@ fn record_quads(heap: &mut HeapQuadAllocator, per_layer: [usize; 3]) {
             quad.set_position(x, 0.0, x + 5.0, 5.0);
         }
     }
+}
+
+/// Records how each quad replayed into it is mixed, and in which layer.
+#[cfg(test)]
+#[derive(Default)]
+struct BlendLog(Vec<(usize, QuadBlend)>);
+
+#[cfg(test)]
+impl TripleLayerQuadAllocatorTrait for BlendLog {
+    fn allocate(&mut self, _layer_num: usize) -> anyhow::Result<QuadImpl<'_>> {
+        unreachable!("only replayed into")
+    }
+
+    fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
+        self.extend_with_blend(layer_num, vertices, QuadBlend::Over)
+    }
+
+    fn extend_with_blend(&mut self, layer_num: usize, vertices: &[Vertex], blend: QuadBlend) {
+        for _ in 0..vertices.len() / VERTICES_PER_CELL {
+            self.0.push((layer_num, blend));
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_replay_mixes_each_quad_as_it_was_recorded() {
+    use QuadBlend::{Add, Clear, Over};
+    let mut heap = HeapQuadAllocator::default();
+    record_quads(&mut heap, [1, 0, 0]);
+    heap.set_blend(0, Clear);
+    record_quads(&mut heap, [1, 0, 0]);
+    heap.set_blend(0, Add);
+    record_quads(&mut heap, [1, 0, 0]);
+    heap.set_blend(0, Over);
+    record_quads(&mut heap, [1, 1, 0]);
+    let recorded = vec![(0, Over), (0, Clear), (0, Add), (0, Over), (1, Over)];
+
+    let mut log = BlendLog::default();
+    heap.apply_to(&mut log).unwrap();
+    assert_eq!(log.0, recorded);
+
+    let clip = QuadClipRect::from_top_left_pixels(0.0, 0.0, 5000.0, 5000.0, &TEST_ORIGIN);
+    let mut log = BlendLog::default();
+    heap.apply_to_clipped(&mut log, clip, 0.5).unwrap();
+    assert_eq!(log.0, recorded, "a clipped, faded replay keeps them");
+
+    let mut copy = HeapQuadAllocator::default();
+    heap.apply_to(&mut copy).unwrap();
+    let mut log = BlendLog::default();
+    copy.apply_to(&mut log).unwrap();
+    assert_eq!(log.0, recorded, "a heap replayed into another keeps them");
+
+    heap.set_blend(0, Clear);
+    heap.recycle();
+    record_quads(&mut heap, [1, 0, 0]);
+    let mut log = BlendLog::default();
+    heap.apply_to(&mut log).unwrap();
+    assert_eq!(
+        log.0,
+        vec![(0, Over)],
+        "a recycled heap lays quads over again"
+    );
 }
 
 #[cfg(test)]

@@ -68,6 +68,16 @@ impl crate::TermWindow {
         let rect = euclid::rect(0.0, y as f32, width as f32, height as f32);
         let ground = self.chrome().header_bg;
         let glass = active.then(|| glass::GlassEdge::over(ground));
+        if let Some(edge) = glass.filter(|_| self.glass_lets_through()) {
+            return self.paint_through_glass(
+                layers,
+                layer_num,
+                rect,
+                radius,
+                edge,
+                self.tab_bar_surface(ground),
+            );
+        }
         let see_through = self.chrome_see_through();
         // Over a see-through window a tab, as a sidebar row, lets some of
         // what is behind it through: no shadow under it to darken that, and

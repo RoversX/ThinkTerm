@@ -1,5 +1,6 @@
 use crate::colorease::ColorEaseUniform;
-use crate::renderstate::{LoggedSrgbTexture2d, RenderState};
+use crate::quad::QuadBlend;
+use crate::renderstate::{LoggedSrgbTexture2d, RenderState, INDICES_PER_CELL};
 use crate::termwindow::render::paint::{ImageComposite, ImageCompositeBatch, ImageCompositeSlot};
 use crate::termwindow::webgpu::{ShaderUniform, WebGpuState};
 use crate::termwindow::RenderFrame;
@@ -531,8 +532,21 @@ pub(crate) fn draw_webgpu_layers(
                 render_pass.set_vertex_buffer(0, vertices.webgpu().slice(..));
                 render_pass
                     .set_index_buffer(vb.indices.webgpu().slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..index_count as _, 0, 0..1);
-                draw_calls += 1;
+                let runs = vb.blends.borrow().runs(index_count / INDICES_PER_CELL);
+                for (quads, blend) in runs {
+                    render_pass.set_pipeline(match blend {
+                        QuadBlend::Over => &webgpu.render_pipeline,
+                        QuadBlend::Clear => &webgpu.clear_pipeline,
+                        QuadBlend::Add => &webgpu.add_pipeline,
+                    });
+                    render_pass.draw_indexed(
+                        (quads.start * INDICES_PER_CELL) as u32
+                            ..(quads.end * INDICES_PER_CELL) as u32,
+                        0,
+                        0..1,
+                    );
+                    draw_calls += 1;
+                }
                 vertices_total += vertex_count;
             }
 
@@ -713,6 +727,38 @@ pub(crate) fn draw_opengl_layers(
         ..Default::default()
     };
 
+    // Glass over a see-through window (`QuadBlend`): clearing some of what
+    // is under it, and adding light that leaves it as see-through.
+    let clear_blending = glium::DrawParameters {
+        blend: glium::Blend {
+            color: BlendingFunction::Addition {
+                source: LinearBlendingFactor::Zero,
+                destination: LinearBlendingFactor::OneMinusSourceAlpha,
+            },
+            alpha: BlendingFunction::Addition {
+                source: LinearBlendingFactor::Zero,
+                destination: LinearBlendingFactor::OneMinusSourceAlpha,
+            },
+            constant_value: (0.0, 0.0, 0.0, 0.0),
+        },
+        ..Default::default()
+    };
+
+    let add_blending = glium::DrawParameters {
+        blend: glium::Blend {
+            color: BlendingFunction::Addition {
+                source: LinearBlendingFactor::SourceAlpha,
+                destination: LinearBlendingFactor::One,
+            },
+            alpha: BlendingFunction::Addition {
+                source: LinearBlendingFactor::Zero,
+                destination: LinearBlendingFactor::One,
+            },
+            constant_value: (0.0, 0.0, 0.0, 0.0),
+        },
+        ..Default::default()
+    };
+
     // Clamp and use the nearest texel rather than interpolate.
     // This prevents things like the box cursor outlines from
     // being randomly doubled in width or height
@@ -767,17 +813,25 @@ pub(crate) fn draw_opengl_layers(
                 uniforms.add_struct("blink", blink);
                 uniforms.add_struct("rapid_blink", rapid_blink);
 
-                frame.draw(
-                    vertices.glium().slice(0..vertex_count).unwrap(),
-                    vb.indices.glium().slice(0..index_count).unwrap(),
-                    gl_state.glyph_prog.as_ref().unwrap(),
-                    &uniforms,
-                    if subpixel_aa {
-                        &dual_source_blending
-                    } else {
-                        &alpha_blending
-                    },
-                )?;
+                let runs = vb.blends.borrow().runs(index_count / INDICES_PER_CELL);
+                for (quads, blend) in runs {
+                    let params = match blend {
+                        QuadBlend::Over if subpixel_aa => &dual_source_blending,
+                        QuadBlend::Over => &alpha_blending,
+                        QuadBlend::Clear => &clear_blending,
+                        QuadBlend::Add => &add_blending,
+                    };
+                    frame.draw(
+                        vertices.glium().slice(0..vertex_count).unwrap(),
+                        vb.indices
+                            .glium()
+                            .slice(quads.start * INDICES_PER_CELL..quads.end * INDICES_PER_CELL)
+                            .unwrap(),
+                        gl_state.glyph_prog.as_ref().unwrap(),
+                        &uniforms,
+                        params,
+                    )?;
+                }
             }
 
             vb.next_index();

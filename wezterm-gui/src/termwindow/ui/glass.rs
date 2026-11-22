@@ -15,7 +15,7 @@
 //! which takes a faint white over a dark capsule half as light again; there
 //! each is turned into the alpha that comes out the same (`GlassMix`).
 
-use crate::quad::{QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{QuadBlend, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE, BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE,
     TOP_LEFT_ROUNDED_CORNER_OUTLINE, TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
@@ -269,6 +269,232 @@ fn glass_light_on_light(depth: f32) -> f32 {
     )
 }
 
+/// Over a see-through window, how much more of what is behind the window
+/// shows through a glass capsule in the dark than round it, as a share of
+/// what shows round it. Read off a Mac's own Liquid Glass row in a
+/// see-through sidebar: what is behind comes through it a fifth again as
+/// strongly as through the sidebar.
+const THROUGH_GLASS_CLEAR: f32 = 0.22;
+
+/// The light a glass capsule's fill adds over a see-through window in the
+/// dark, in sRGB. The Mac's row is 28 of 255 lighter than the sidebar round
+/// it; clearing the glass takes it a little of the way, as what shows
+/// through it is lighter than the sidebar's own dark.
+const THROUGH_GLASS_LIFT: f32 = 26.0 / 255.0;
+
+/// How much more of what is behind shows through a glass capsule's edge
+/// than through its fill, `depth` points in, on top of
+/// `THROUGH_GLASS_CLEAR`: on the Mac half again as much as round the row
+/// on the very edge, still more than through the middle a point or two in.
+fn glass_clear_through(depth: f32) -> f32 {
+    glass_profile(
+        &[
+            (0.0, 0.33),
+            (0.45, 0.3),
+            (0.55, 0.2),
+            (1.0, 0.12),
+            (1.3, 0.06),
+            (3.0, 0.05),
+            (4.0, 0.0),
+        ],
+        depth,
+    )
+}
+
+/// The light on a glass capsule's edge over a see-through window in the
+/// dark, `depth` points in, in sRGB over its fill. On the Mac a line half a
+/// point wide is 49 of 255 lighter than the middle, the next half point 28,
+/// then a glow goes back down to the fill by six or seven points. Some of
+/// that is what shows through the edge more than the middle
+/// (`glass_clear_through`), lighter than the sidebar it replaces; this is
+/// the rest.
+fn glass_light_through(depth: f32) -> f32 {
+    glass_profile(
+        &[
+            (0.0, 43.0),
+            (0.4, 42.0),
+            (0.6, 24.0),
+            (0.9, 20.0),
+            (1.1, 7.0),
+            (1.5, 6.0),
+            (2.0, 5.5),
+            (3.0, 4.0),
+            (4.0, 3.0),
+            (5.0, 2.0),
+            (6.0, 1.2),
+            (7.0, 0.0),
+        ],
+        depth,
+    ) / 255.0
+}
+
+/// How much of a see-through window's light glass capsule is a white veil
+/// over what shows through: the Mac's row there is 3 or 4 of 255 lighter
+/// than the sidebar round it, which is about 236, and what is behind shows
+/// through it about 0.85 as strongly.
+const THROUGH_LIGHT_GLASS_VEIL: f32 = 0.16;
+
+/// The light added to a light glass capsule over a see-through window, in
+/// sRGB, at its top and at its bottom, which hides nothing of what shows
+/// through: the Mac's row is 2 or 3 of 255 lighter through its lower half
+/// than its top, where what is behind shows hardly less.
+const THROUGH_LIGHT_GLASS_LIFT_TOP: f32 = 0.0;
+const THROUGH_LIGHT_GLASS_LIFT_BOTTOM: f32 = 5.0 / 255.0;
+
+/// The light inside a light glass capsule's outline over a see-through
+/// window, `depth` points in from the outline, as the alpha of white over
+/// the capsule. On the Mac the line inside the outline is white for half a
+/// point, nearly so for the next, then glows down to the veil by about five
+/// points: less, and over less, than the iPhone's opaque row
+/// (`glass_light_on_light`).
+fn glass_light_through_light(depth: f32) -> f32 {
+    glass_profile(
+        &[
+            (0.0, 1.0),
+            (0.45, 1.0),
+            (0.6, 0.9),
+            (0.9, 0.8),
+            (1.1, 0.45),
+            (1.5, 0.36),
+            (2.0, 0.3),
+            (2.75, 0.22),
+            (3.25, 0.14),
+            (4.0, 0.11),
+            (4.75, 0.05),
+            (5.5, 0.0),
+        ],
+        depth,
+    )
+}
+
+/// How dark a light glass capsule's shadow is along its bottom, `depth`
+/// points out from its edge, as the alpha of black: on the Mac 9 of 255
+/// under the row's ground of 234 just under it, gone by about seven points.
+fn glass_shadow_below(depth: f32) -> f32 {
+    glass_profile(
+        &[
+            (0.0, 0.04),
+            (1.0, 0.035),
+            (2.0, 0.028),
+            (3.0, 0.018),
+            (4.0, 0.012),
+            (5.0, 0.01),
+            (6.0, 0.005),
+            (7.0, 0.0),
+        ],
+        depth,
+    )
+}
+
+/// The same along the top, where the Mac's is a sixth as dark and gone by
+/// about five points.
+fn glass_shadow_above(depth: f32) -> f32 {
+    glass_profile(
+        &[
+            (0.0, 0.008),
+            (1.0, 0.005),
+            (2.0, 0.0035),
+            (3.0, 0.0025),
+            (5.0, 0.0),
+        ],
+        depth,
+    )
+}
+
+/// What a see-through window's frame holds under a glass capsule, and how
+/// clearing and lighting it come out there (`TermWindow::paint_through_glass`).
+///
+/// The frame holds each colour times how solid it is, which the system then
+/// lays over what is behind the window: so clearing some of it lets that
+/// much more of what is behind show, and adding light to it lights that
+/// without hiding any of it.
+#[derive(Clone, Copy, Debug)]
+struct ThroughGlass {
+    /// The frame mixes in linear light: WebGPU's sRGB surface.
+    linear: bool,
+    /// How solid the ground under the capsule is.
+    solid: f32,
+    /// How light the ground's own colour is: in linear light if the frame
+    /// mixes in it, sRGB if not.
+    colour: f32,
+}
+
+impl ThroughGlass {
+    fn new(linear: bool, ground: LinearRgba) -> Self {
+        let colour = if linear {
+            0.2126 * ground.0 + 0.7152 * ground.1 + 0.0722 * ground.2
+        } else {
+            lightness(ground)
+        };
+        Self {
+            linear,
+            solid: ground.3.clamp(0.0, 1.0),
+            colour,
+        }
+    }
+
+    /// How much of the ground to keep so that `more` again as much of what is
+    /// behind the window shows through as round the capsule.
+    fn kept(&self, more: f32) -> f32 {
+        if self.solid <= f32::EPSILON {
+            return 1.0;
+        }
+        ((1.0 - (1.0 + more) * (1.0 - self.solid)) / self.solid).clamp(0.0, 1.0)
+    }
+
+    /// What the frame holds where `kept` of the ground is left, in sRGB.
+    fn held(&self, kept: f32) -> f32 {
+        let held = self.colour * self.solid * kept;
+        if self.linear {
+            encode(held)
+        } else {
+            held
+        }
+    }
+
+    /// A quad laid over where the frame holds `held` (sRGB) that comes out
+    /// as the grey `level` (sRGB) laid over it at `alpha` does as the system
+    /// mixes what is behind the window in: the sRGB values themselves. It is
+    /// that solid, so it hides as much of what is behind. A frame mixing in
+    /// linear light would make its colour come out lighter over a light
+    /// ground, so there it is a darker grey: at most `level`, as mixing in
+    /// linear light never comes out darker.
+    fn over(&self, level: f32, alpha: f32, held: f32) -> LinearRgba {
+        let alpha = alpha.clamp(0.0, 1.0);
+        let grey = if self.linear && alpha > 0.0 {
+            let seen = alpha * level + (1.0 - alpha) * held;
+            ((decode(seen) - (1.0 - alpha) * decode(held)) / alpha).clamp(0.0, 1.0)
+        } else {
+            decode(level)
+        };
+        LinearRgba::with_components(grey, grey, grey, alpha)
+    }
+
+    /// Black laid over where the frame holds `held` (sRGB) that darkens it
+    /// as black at `alpha` does when the sRGB values themselves are mixed. In
+    /// a frame mixing in linear light that takes more black, which also
+    /// hides a little more of what is behind the window than it would.
+    fn shade(&self, alpha: f32, held: f32) -> LinearRgba {
+        let alpha = alpha.clamp(0.0, 1.0);
+        let alpha = if self.linear && held > 0.0 {
+            (1.0 - decode((1.0 - alpha) * held) / decode(held)).clamp(0.0, 1.0)
+        } else {
+            alpha
+        };
+        LinearRgba::with_components(0.0, 0.0, 0.0, alpha)
+    }
+
+    /// The alpha of white that, added where the frame holds `held` (sRGB),
+    /// makes it `lift` lighter in sRGB.
+    fn light(&self, held: f32, lift: f32) -> f32 {
+        if self.linear {
+            (decode((held + lift).min(1.0)) - decode(held)).clamp(0.0, 1.0)
+        } else {
+            lift.clamp(0.0, 1.0)
+        }
+    }
+}
+
 /// A glass edge's `profile` averaged over a ring of pixels from `from` to
 /// `to` points from the edge: a pixel wider than the line takes in some of
 /// what is beside it too, so the line keeps the weight it has on the iPhone
@@ -443,6 +669,316 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Whether a glass capsule is drawn as glass that lets what is behind a
+    /// see-through window through (`paint_through_glass`): over such a
+    /// window, out of high contrast, which keeps its solid fill and frame.
+    pub(crate) fn glass_lets_through(&self) -> bool {
+        self.chrome_see_through() && !self.glass_high_contrast()
+    }
+
+    /// A glass capsule over a see-through window, as the Mac's Liquid Glass
+    /// draws a selected row there: `rect` with corners of `radius`, on
+    /// `ground` as that was painted, see-through-ness and all, with the glass
+    /// `edge` chose for it.
+    ///
+    /// In the dark there is no fill laid over the ground. Some of the ground
+    /// is cleared, so that what is behind the window shows through the
+    /// capsule more than round it, and more again along its edge
+    /// (`glass_clear_through`); then light is added, which lights what shows
+    /// through without hiding it: over the whole capsule, and along the top
+    /// and bottom edge in a line and a glow (`glass_light_through`). The
+    /// edge's light and clearing fade round each end as the opaque glass's
+    /// do, and outside each end there is the same dark line.
+    ///
+    /// In the light the capsule is a thin white veil, which still lets most
+    /// of what is behind through (`THROUGH_LIGHT_GLASS_VEIL`), with light
+    /// added that grows towards its bottom, the opaque glass's grey outline,
+    /// a white line inside it and a short glow (`glass_light_through_light`),
+    /// and a soft shadow round it, more below than above.
+    pub(crate) fn paint_through_glass(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        edge: GlassEdge,
+        ground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let radius = snapped_rounded_corner_radius(rect, radius);
+        let pixel = self.ui_f32(2.0);
+        if !(pixel > 0.0) || radius < 1.0 {
+            return Ok(());
+        }
+        if edge == GlassEdge::Light {
+            return self.paint_through_glass_light(layers, layer_num, rect, radius, pixel, ground);
+        }
+        let through = ThroughGlass::new(self.glass_mixes_in_linear(), ground);
+        // A cleared quad's colour is not used. A renderer that cannot clear
+        // lays it over instead, where the ground's own colour changes
+        // nothing.
+        let clearing = |alpha: f32| {
+            LinearRgba::with_components(ground.0, ground.1, ground.2, alpha.clamp(0.0, 1.0))
+        };
+        let light = |alpha: f32| LinearRgba::with_components(1.0, 1.0, 1.0, alpha);
+        // Each ring of the edge, in from it, with how much more shows
+        // through there and how much lighter it is than the fill.
+        let mut rings = vec![];
+        let mut inset = 0.0_f32;
+        while radius - inset >= 1.0 {
+            let depth = inset / pixel;
+            let next = depth + 1.0 / pixel;
+            let clear = across_pixel(glass_clear_through, depth, next);
+            let lift = across_pixel(glass_light_through, depth, next);
+            if clear <= 0.0 && lift <= 0.0 {
+                break;
+            }
+            rings.push((inset, clear, lift));
+            inset += 1.0;
+        }
+
+        let kept = through.kept(THROUGH_GLASS_CLEAR);
+        let result = (|| {
+            layers.set_blend(layer_num, QuadBlend::Clear);
+            self.fill_rounded_rectangle(layers, layer_num, rect, clearing(1.0 - kept), radius)?;
+            for &(inset, clear, _) in &rings {
+                let ring_kept = through.kept(THROUGH_GLASS_CLEAR + clear) / kept.max(f32::EPSILON);
+                self.paint_glass_edge_ring(
+                    layers,
+                    layer_num,
+                    rect,
+                    radius,
+                    inset,
+                    clearing(1.0 - ring_kept.min(1.0)),
+                    GlassRing::Lit,
+                )?;
+            }
+
+            layers.set_blend(layer_num, QuadBlend::Add);
+            let held = through.held(kept);
+            self.fill_rounded_rectangle(
+                layers,
+                layer_num,
+                rect,
+                light(through.light(held, THROUGH_GLASS_LIFT)),
+                radius,
+            )?;
+            for &(inset, clear, lift) in &rings {
+                let held =
+                    through.held(through.kept(THROUGH_GLASS_CLEAR + clear)) + THROUGH_GLASS_LIFT;
+                self.paint_glass_edge_ring(
+                    layers,
+                    layer_num,
+                    rect,
+                    radius,
+                    inset,
+                    light(through.light(held, lift)),
+                    GlassRing::Lit,
+                )?;
+            }
+            anyhow::Ok(())
+        })();
+        // Whatever happened, what is painted after is laid over again.
+        layers.set_blend(layer_num, QuadBlend::Over);
+        result?;
+
+        // The dark outside the ends, laid over what shows round the capsule:
+        // mostly what is behind the window, which the system mixes as its
+        // sRGB values, so the alphas go as they are.
+        let mix = GlassMix::new(false, ground, ground);
+        let mut outset = 1.0_f32;
+        loop {
+            let alpha = across_pixel(glass_shade_on_dark, (outset - 1.0) / pixel, outset / pixel);
+            if alpha <= 0.0 {
+                break;
+            }
+            self.paint_glass_edge_ring(
+                layers,
+                layer_num,
+                rect,
+                radius,
+                -outset,
+                mix.shade_outside(alpha),
+                GlassRing::Ends,
+            )?;
+            outset += 1.0;
+        }
+        Ok(())
+    }
+
+    /// `paint_through_glass` in the light, with `radius` already snapped and
+    /// `pixel` pixels to a point.
+    fn paint_through_glass_light(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        pixel: f32,
+        ground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        // What the frame holds under the capsule as each coat goes on, in
+        // sRGB, for laying the next one over it.
+        let through = ThroughGlass::new(self.glass_mixes_in_linear(), ground);
+        let held = through.held(1.0);
+        let mut outset = 1.0_f32;
+        loop {
+            let (from, to) = ((outset - 1.0) / pixel, outset / pixel);
+            let above = across_pixel(glass_shadow_above, from, to);
+            let below = across_pixel(glass_shadow_below, from, to);
+            if above <= 0.0 && below <= 0.0 {
+                break;
+            }
+            self.paint_glass_shadow_ring(
+                layers,
+                layer_num,
+                rect,
+                radius,
+                outset,
+                through.shade(above, held),
+                through.shade(below, held),
+            )?;
+            outset += 1.0;
+        }
+
+        self.fill_rounded_rectangle(
+            layers,
+            layer_num,
+            rect,
+            through.over(1.0, THROUGH_LIGHT_GLASS_VEIL, held),
+            radius,
+        )?;
+        let held = THROUGH_LIGHT_GLASS_VEIL + (1.0 - THROUGH_LIGHT_GLASS_VEIL) * held;
+        if let Some(gl_state) = self.render_state.as_ref() {
+            let light =
+                |lift: f32| LinearRgba::with_components(1.0, 1.0, 1.0, through.light(held, lift));
+            layers.set_blend(layer_num, QuadBlend::Add);
+            let result =
+                crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
+                    .draw_rounded_rect_vertical_gradient(
+                        layers,
+                        layer_num,
+                        rect,
+                        radius,
+                        light(THROUGH_LIGHT_GLASS_LIFT_TOP),
+                        light(THROUGH_LIGHT_GLASS_LIFT_BOTTOM),
+                    );
+            layers.set_blend(layer_num, QuadBlend::Over);
+            result?;
+        }
+        let held = held + (THROUGH_LIGHT_GLASS_LIFT_TOP + THROUGH_LIGHT_GLASS_LIFT_BOTTOM) / 2.0;
+        for (alpha, ring) in [
+            (LIGHT_GLASS_OUTLINE, GlassRing::Even),
+            (LIGHT_GLASS_OUTLINE_ENDS, GlassRing::Ends),
+        ] {
+            self.paint_glass_edge_ring(
+                layers,
+                layer_num,
+                rect,
+                radius,
+                0.0,
+                through.shade(alpha, held),
+                ring,
+            )?;
+        }
+        let mut inset = 1.0_f32;
+        loop {
+            let depth = (inset - 1.0) / pixel;
+            let alpha = across_pixel(glass_light_through_light, depth, depth + 1.0 / pixel);
+            if radius - inset < 1.0 || alpha <= 0.0 {
+                break;
+            }
+            self.paint_glass_edge_ring(
+                layers,
+                layer_num,
+                rect,
+                radius,
+                inset,
+                through.over(1.0, alpha, held),
+                GlassRing::Lit,
+            )?;
+            inset += 1.0;
+        }
+        Ok(())
+    }
+
+    /// One ring of a glass capsule's shadow, a pixel wide, `outset` pixels
+    /// out from `rect`: `above` along its top, `below` along its bottom, and
+    /// going from one to the other round each end.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_glass_shadow_ring(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        outset: f32,
+        above: LinearRgba,
+        below: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let r = radius + outset;
+        let x = rect.min_x() - outset;
+        let y = rect.min_y() - outset;
+        let width = rect.width() + outset * 2.0;
+        let height = rect.height() + outset * 2.0;
+        let middle = LinearRgba::with_components(0.0, 0.0, 0.0, (above.3 + below.3) / 2.0);
+        let straight = (width - r * 2.0).max(0.0);
+        for (line_y, color) in [(y, above), (y + height - 1.0, below)] {
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(x + r, line_y, straight, 1.0),
+                color,
+            )?;
+        }
+        let upright = (height - r * 2.0).max(0.0);
+        for line_x in [x, x + width - 1.0] {
+            self.filled_rectangle(
+                layers,
+                layer_num,
+                euclid::rect(line_x, y + r, 1.0, upright),
+                middle,
+            )?;
+        }
+        let size = euclid::size2(r, r);
+        for (polys, corner_x, corner_y, top, bottom) in [
+            (TOP_LEFT_ROUNDED_CORNER_OUTLINE, x, y, above, middle),
+            (
+                TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
+                x + width - r,
+                y,
+                above,
+                middle,
+            ),
+            (
+                BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE,
+                x,
+                y + height - r,
+                middle,
+                below,
+            ),
+            (
+                BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE,
+                x + width - r,
+                y + height - r,
+                middle,
+                below,
+            ),
+        ] {
+            let mut quad = self.poly_quad(
+                layers,
+                layer_num,
+                euclid::point2(corner_x, corner_y),
+                polys,
+                0,
+                size,
+                top,
+            )?;
+            quad.set_grayscale();
+            quad.set_corner_gradient(top, top, bottom, bottom);
+        }
+        Ok(())
+    }
+
     /// One ring of a glass edge, a pixel wide, `inset` pixels in from the
     /// edge of `rect` (out from it when negative), in `color`, running round
     /// the pill as `ring` says.
@@ -540,6 +1076,80 @@ mod test {
 
     fn grey(level: u8) -> LinearRgba {
         LinearRgba::with_srgba(level, level, level, 255)
+    }
+
+    /// A see-through window's dark sidebar, as it is painted there.
+    fn see_through_sidebar() -> LinearRgba {
+        LinearRgba::with_srgba(18, 18, 20, 198)
+    }
+
+    #[test]
+    fn through_glass_lets_as_much_more_through_as_it_is_asked() {
+        for linear in [false, true] {
+            let through = ThroughGlass::new(linear, see_through_sidebar());
+            for more in [THROUGH_GLASS_CLEAR, THROUGH_GLASS_CLEAR + 0.33] {
+                let shown = 1.0 - through.solid * through.kept(more);
+                let round = 1.0 - through.solid;
+                assert!(
+                    (shown / round - (1.0 + more)).abs() < 1e-4,
+                    "linear {}, more {}: {} against {}",
+                    linear,
+                    more,
+                    shown,
+                    round
+                );
+            }
+        }
+        // An opaque ground has nothing behind it to show, and a clear one
+        // nothing to clear.
+        assert_eq!(ThroughGlass::new(true, grey(18)).kept(0.5), 1.0);
+        let clear = LinearRgba::with_srgba(18, 18, 20, 0);
+        assert_eq!(ThroughGlass::new(true, clear).kept(0.5), 1.0);
+    }
+
+    #[test]
+    fn through_glass_lays_white_and_black_over_as_the_system_mixes() {
+        let sidebar = LinearRgba::with_srgba(227, 227, 230, 134);
+        for linear in [false, true] {
+            let through = ThroughGlass::new(linear, sidebar);
+            let held = through.held(1.0);
+            // What the frame holds after a quad is laid over, as it mixes.
+            let after = |quad: LinearRgba| {
+                if linear {
+                    encode(quad.0 * quad.3 + (1.0 - quad.3) * decode(held))
+                } else {
+                    encode(quad.0) * quad.3 + (1.0 - quad.3) * held
+                }
+            };
+            let veil = through.over(1.0, THROUGH_LIGHT_GLASS_VEIL, held);
+            assert_eq!(veil.3, THROUGH_LIGHT_GLASS_VEIL, "as solid in either frame");
+            let wanted = THROUGH_LIGHT_GLASS_VEIL + (1.0 - THROUGH_LIGHT_GLASS_VEIL) * held;
+            assert!((after(veil) - wanted).abs() < 1e-4, "linear {}", linear);
+            let line = through.shade(LIGHT_GLASS_OUTLINE, held);
+            let wanted = (1.0 - LIGHT_GLASS_OUTLINE) * held;
+            assert!((after(line) - wanted).abs() < 1e-4, "linear {}", linear);
+        }
+    }
+
+    #[test]
+    fn through_glass_light_lifts_the_frame_by_as_much_in_srgb() {
+        for linear in [false, true] {
+            let through = ThroughGlass::new(linear, see_through_sidebar());
+            let held = through.held(through.kept(THROUGH_GLASS_CLEAR));
+            let alpha = through.light(held, THROUGH_GLASS_LIFT);
+            let after = if linear {
+                encode(decode(held) + alpha)
+            } else {
+                held + alpha
+            };
+            assert!(
+                (after - held - THROUGH_GLASS_LIFT).abs() < 1e-4,
+                "linear {}: {} to {}",
+                linear,
+                held,
+                after
+            );
+        }
     }
 
     /// The sidebar's selected row in the light: white, mostly opaque.

@@ -4399,7 +4399,9 @@ impl crate::TermWindow {
     /// than under it.
     ///
     /// The pill is glass (`glass`), as the iPhone draws the same row, chosen
-    /// for the sidebar's own ground.
+    /// for the sidebar's own ground. Over a see-through window it is the
+    /// glass that lets what is behind through (`paint_through_glass`), with
+    /// no solid fill or ring.
     fn paint_sidebar_selected_row(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -4410,6 +4412,10 @@ impl crate::TermWindow {
         let radius = rect.height() / 2.0;
         let ground = self.chrome().workspace_sidebar_bg;
         let edge = GlassEdge::over(ground);
+        if self.glass_lets_through() {
+            let ground = self.sidebar_surface(ground);
+            return self.paint_through_glass(layers, 0, rect, radius, edge, ground);
+        }
         let see_through = self.chrome_see_through();
         // Each way gives back the fill it drew, which the edge is mixed with.
         let drawn = if see_through {

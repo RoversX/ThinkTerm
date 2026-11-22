@@ -76,4 +76,26 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
             }
         }
     }
+
+    fn set_blend(&mut self, layer_num: usize, blend: QuadBlend) {
+        match self {
+            Self::Gpu(b) => b.set_blend(layer_num, blend),
+            Self::Heap(h) => h.set_blend(layer_num, blend),
+            Self::Tee { gpu, heap } => {
+                gpu.set_blend(layer_num, blend);
+                heap.set_blend(layer_num, blend);
+            }
+        }
+    }
+
+    fn extend_with_blend(&mut self, layer_num: usize, vertices: &[Vertex], blend: QuadBlend) {
+        match self {
+            Self::Gpu(b) => b.extend_with_blend(layer_num, vertices, blend),
+            Self::Heap(h) => h.extend_with_blend(layer_num, vertices, blend),
+            Self::Tee { gpu, heap } => {
+                gpu.extend_with_blend(layer_num, vertices, blend);
+                heap.extend_with_blend(layer_num, vertices, blend);
+            }
+        }
+    }
 }

@@ -19,7 +19,7 @@ use std::rc::Rc;
 use wezterm_font::FontConfiguration;
 use wgpu::util::DeviceExt;
 
-const INDICES_PER_CELL: usize = 6;
+pub(crate) const INDICES_PER_CELL: usize = 6;
 
 fn gpu_debug_enabled() -> bool {
     std::env::var_os("THINKTERM_GPU_DEBUG").is_some()
@@ -296,6 +296,78 @@ pub struct MappedQuads<'a> {
     mapping: MappedVertexBuffer,
     next: RefMut<'a, usize>,
     capacity: usize,
+    blends: RefMut<'a, QuadBlends>,
+    /// How the quads `allocate` hands out are mixed (`set_blend`).
+    painting: QuadBlend,
+}
+
+impl<'a> MappedQuads<'a> {
+    pub fn set_blend(&mut self, blend: QuadBlend) {
+        self.painting = blend;
+    }
+
+    pub fn extend_with_blend(&mut self, vertices: &[Vertex], blend: QuadBlend) {
+        let idx = *self.next;
+        let len = vertices.len();
+        self.blends.note(idx, blend);
+
+        // idx and next are number of quads, so divide by number of vertices
+        *self.next += len / VERTICES_PER_CELL;
+        // Only copy in if there is enough room.
+        // We'll detect the out of space condition at the end of
+        // the render pass.
+        let idx = idx * VERTICES_PER_CELL;
+        let capacity = self.capacity * VERTICES_PER_CELL;
+        if idx + len <= capacity {
+            self.mapping
+                .slice_mut(idx..idx + len)
+                .copy_from_slice(vertices);
+        }
+    }
+}
+
+/// Where in a vertex buffer the quads stop being mixed one way and start
+/// being mixed another (`QuadBlend`), so that it can be drawn in runs.
+/// Nearly every buffer is laid over throughout and has none.
+#[derive(Default)]
+pub struct QuadBlends {
+    /// The quad each run starts at and how it is mixed, after the first,
+    /// which starts at 0 and is laid over.
+    changes: Vec<(usize, QuadBlend)>,
+    last: QuadBlend,
+}
+
+impl QuadBlends {
+    fn note(&mut self, quad: usize, blend: QuadBlend) {
+        if blend != self.last {
+            self.changes.push((quad, blend));
+            self.last = blend;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.changes.clear();
+        self.last = QuadBlend::Over;
+    }
+
+    /// The runs of the first `count` quads, each with how it is mixed.
+    pub fn runs(&self, count: usize) -> Vec<(std::ops::Range<usize>, QuadBlend)> {
+        let mut runs = Vec::with_capacity(self.changes.len() + 1);
+        let mut start = 0;
+        let mut blend = QuadBlend::Over;
+        for &(at, next) in &self.changes {
+            let at = at.min(count);
+            if at > start {
+                runs.push((start..at, blend));
+            }
+            start = start.max(at);
+            blend = next;
+        }
+        if count > start {
+            runs.push((start..count, blend));
+        }
+        runs
+    }
 }
 
 pub struct WebGpuMappedVertexBuffer {
@@ -392,6 +464,7 @@ pub struct GliumMappedVertexBuffer {
 impl<'a> QuadAllocator for MappedQuads<'a> {
     fn allocate<'b>(&'b mut self) -> anyhow::Result<QuadImpl<'b>> {
         let idx = *self.next;
+        self.blends.note(idx, self.painting);
         *self.next += 1;
         let idx = if idx >= self.capacity {
             // We don't have enough quads, so we'll keep re-using
@@ -414,21 +487,7 @@ impl<'a> QuadAllocator for MappedQuads<'a> {
     }
 
     fn extend_with(&mut self, vertices: &[Vertex]) {
-        let idx = *self.next;
-        let len = vertices.len();
-
-        // idx and next are number of quads, so divide by number of vertices
-        *self.next += len / VERTICES_PER_CELL;
-        // Only copy in if there is enough room.
-        // We'll detect the out of space condition at the end of
-        // the render pass.
-        let idx = idx * VERTICES_PER_CELL;
-        let capacity = self.capacity * VERTICES_PER_CELL;
-        if idx + len <= capacity {
-            self.mapping
-                .slice_mut(idx..idx + len)
-                .copy_from_slice(vertices);
-        }
+        self.extend_with_blend(vertices, QuadBlend::Over)
     }
 }
 
@@ -448,6 +507,8 @@ pub struct TripleVertexBuffer {
     pub indices: IndexBuffer,
     pub capacity: usize,
     pub next_quad: RefCell<usize>,
+    /// Where this frame's quads change how they are mixed.
+    pub blends: RefCell<QuadBlends>,
     /// Peak quad usage seen in the current shrink observation window.
     high_water: Cell<usize>,
     /// Frames observed so far in the current shrink window.
@@ -504,6 +565,7 @@ unsafe impl<'a, T: ?Sized + ::window::glium::buffer::Content + 'static> ExtendSt
 impl TripleVertexBuffer {
     pub fn clear_quad_allocation(&self) {
         *self.next_quad.borrow_mut() = 0;
+        self.blends.borrow_mut().clear();
     }
 
     pub fn need_more_quads(&self) -> Option<usize> {
@@ -573,6 +635,8 @@ impl TripleVertexBuffer {
             mapping,
             next: self.next_quad.borrow_mut(),
             capacity: self.capacity,
+            blends: self.blends.borrow_mut(),
+            painting: QuadBlend::Over,
         }
     }
 
@@ -742,6 +806,7 @@ impl RenderLayer {
             capacity: num_quads,
             indices: context.allocate_index_buffer(&indices)?,
             next_quad: RefCell::new(0),
+            blends: RefCell::new(QuadBlends::default()),
             high_water: Cell::new(0),
             frames_observed: Cell::new(0),
         };
@@ -764,6 +829,14 @@ impl TripleLayerQuadAllocatorTrait for BorrowedLayers {
 
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
         self.layers[layer_num].extend_with(vertices)
+    }
+
+    fn set_blend(&mut self, layer_num: usize, blend: QuadBlend) {
+        self.layers[layer_num].set_blend(blend)
+    }
+
+    fn extend_with_blend(&mut self, layer_num: usize, vertices: &[Vertex], blend: QuadBlend) {
+        self.layers[layer_num].extend_with_blend(vertices, blend)
     }
 }
 
@@ -1306,6 +1379,41 @@ impl RenderState {
 
         *glyph_cache = new_glyph_cache;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::QuadBlends;
+    use crate::quad::QuadBlend::{Add, Clear, Over};
+
+    #[test]
+    fn a_buffer_is_drawn_in_runs_of_how_its_quads_mix() {
+        let mut blends = QuadBlends::default();
+        for (quad, blend) in [
+            (0, Over),
+            (1, Over),
+            (2, Clear),
+            (3, Clear),
+            (4, Add),
+            (5, Over),
+        ] {
+            blends.note(quad, blend);
+        }
+        assert_eq!(
+            blends.runs(6),
+            vec![(0..2, Over), (2..4, Clear), (4..5, Add), (5..6, Over)]
+        );
+        // A frame that ran out of quads is drawn only as far as it holds.
+        assert_eq!(blends.runs(3), vec![(0..2, Over), (2..3, Clear)]);
+
+        let mut blends = QuadBlends::default();
+        blends.note(0, Clear);
+        blends.note(1, Over);
+        assert_eq!(blends.runs(2), vec![(0..1, Clear), (1..2, Over)]);
+        blends.clear();
+        assert_eq!(blends.runs(2), vec![(0..2, Over)]);
+        assert_eq!(blends.runs(0), vec![]);
     }
 }
 

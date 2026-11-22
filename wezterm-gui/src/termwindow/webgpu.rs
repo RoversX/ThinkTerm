@@ -61,6 +61,10 @@ pub struct WebGpuState {
     pub config: RefCell<wgpu::SurfaceConfiguration>,
     pub dimensions: RefCell<Dimensions>,
     pub render_pipeline: wgpu::RenderPipeline,
+    /// For quads that clear some of what is under them (`QuadBlend::Clear`).
+    pub clear_pipeline: wgpu::RenderPipeline,
+    /// For quads that add their light to it (`QuadBlend::Add`).
+    pub add_pipeline: wgpu::RenderPipeline,
     shader_uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_nearest_sampler: wgpu::Sampler,
@@ -96,6 +100,36 @@ pub struct WebGpuState {
 /// How many frames may be submitted ahead of the device before the paint
 /// path blocks on the oldest one. Two matches `desired_maximum_frame_latency`.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// `QuadBlend::Clear`: keeps `1 - alpha` of what is under the quad, colour
+/// and solidity both, and adds nothing.
+const CLEAR_BLENDING: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
+
+/// `QuadBlend::Add`: adds the quad's colour, times its alpha, and leaves how
+/// solid what is under it is.
+const ADD_BLENDING: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::SrcAlpha,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
 
 pub struct RawHandlePair {
     window: RawWindowHandle,
@@ -725,7 +759,12 @@ impl WebGpuState {
 
         // The shader, layouts, samplers and pipeline are the shared
         // renderer's; the browser builds the very same ones.
-        let pipeline = Pipeline::new(&device, config.format);
+        let (pipeline, blended) =
+            Pipeline::with_blends(&device, config.format, &[CLEAR_BLENDING, ADD_BLENDING]);
+        let mut blended = blended.into_iter();
+        let (Some(clear_pipeline), Some(add_pipeline)) = (blended.next(), blended.next()) else {
+            anyhow::bail!("no pipeline for each blend");
+        };
 
         Ok(Self {
             instance,
@@ -737,6 +776,8 @@ impl WebGpuState {
             config: RefCell::new(config),
             dimensions: RefCell::new(dimensions),
             render_pipeline: pipeline.render_pipeline,
+            clear_pipeline,
+            add_pipeline,
             handle,
             window,
             shader_uniform_bind_group_layout: pipeline.uniform_layout,
