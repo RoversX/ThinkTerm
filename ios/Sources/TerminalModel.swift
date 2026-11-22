@@ -910,7 +910,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.setSetting(key: "language", value: "\"\(L10n.currentTag)\"")
     }
 
-    /// The base text size of every pane; a pinch scales one pane on top.
+    /// The text size every pane takes, pinned: the settings' size, which a
+    /// pinch steps (`stepFont`).
     private func applyFontSize(_ pt: Double) {
         core.setSetting(key: "font", value: "{\"mode\":\"pinned\",\"pt\":\(pt)}")
     }
@@ -990,7 +991,15 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
-    func stepFont(_ by: Double) { core.stepFont(by: by) }
+    /// A pinch's step: a point on the text size every pane takes, kept as
+    /// the settings' size, so the next connection and the next launch
+    /// start at it too. (The core's own step, the desktop's Cmd+= for one
+    /// pane, lives only as long as the connection; on a phone a pinch is
+    /// the text size.)
+    func stepFont(_ by: Double) {
+        let size = min(max((settings.fontSize + by).rounded(), 6), 40)
+        if size != settings.fontSize { settings.fontSize = size }
+    }
 
     // MARK: the App's chrome
 

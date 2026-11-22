@@ -204,6 +204,9 @@ class TerminalModel(
     private var appliedIncognito = settings.incognitoKeyboard
     /// The followed preferences as last applied (`followedSettings`).
     private var appliedSettings: List<Any?> = emptyList()
+    /// The text size last given the core (`applyFontSize`): one changed from
+    /// another screen meanwhile is given on the way back (`enterScreen`).
+    private var appliedFontSize = 0.0
     var onScreenChanged: (() -> Unit)? = null
     var onHideKeyboard: (() -> Unit)? = null
     /// The terminal takes the keys and the keyboard comes up.
@@ -336,6 +339,7 @@ class TerminalModel(
         applyScheme()
         applyScrollMode()
         applyTerminalPrefs()
+        applyFontSize()
         applyAutoReconnect()
         appliedFamily = settings.fontFamily
         appliedSettings = followedSettings()
@@ -412,6 +416,7 @@ class TerminalModel(
         updateRunning()
         // Changed from another screen while this one was away.
         if (followedSettings() != appliedSettings) settingsChanged()
+        if (settings.fontSize != appliedFontSize) applyFontSize()
     }
 
     /// The frame loop runs while the terminal is on screen in an app in
@@ -783,7 +788,25 @@ class TerminalModel(
 
     fun wheelPx(x: Double, y: Double, px: Double) = core.wheelPx(x, y, px)
 
-    fun stepFont(by: Double) = core.stepFont(by)
+    /// A pinch's step, and the settings' live text size: a point on the
+    /// text size every pane takes, kept in the settings, so the next
+    /// connection and the next launch start at it too. (The core's own
+    /// step, the desktop's Cmd+= for one pane, lives only as long as the
+    /// connection; on a phone a pinch is the text size.)
+    fun stepFont(by: Double) {
+        val size = Math.round(settings.fontSize + by).toDouble().coerceIn(6.0, 40.0)
+        if (size == settings.fontSize) return
+        settings.fontSize = size
+        applyFontSize()
+    }
+
+    /// The text size every pane takes, pinned, as iOS's. Apart from the
+    /// rest of the settings (`settingsChanged`), which a pinch's every step
+    /// would otherwise send again.
+    private fun applyFontSize() {
+        appliedFontSize = settings.fontSize
+        core.setSetting("font", "{\"mode\":\"pinned\",\"pt\":${settings.fontSize}}")
+    }
 
     /// The tab `by` places along the strip from the current one, shown.
     fun switchTab(by: Int) {

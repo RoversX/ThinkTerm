@@ -81,7 +81,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.util.Locale
 import kotlinx.coroutines.delay
-import kotlin.math.round
 
 /// The app's preferences, in the prototype's eight sections (the iOS
 /// SettingsSheet one to one). The Settings tab shows it with no terminal;
@@ -354,7 +353,7 @@ private fun SettingsSection(
                     if (scheme == Schemes.FOLLOW_DESKTOP) tr("followhost") else scheme,
                     swatch = Schemes.background(scheme),
                 ) { onPush("theme") }
-                if (model != null) LiveTextSize(model, settings) else TextSizeStepper(settings)
+                if (model != null) LiveTextSize(model) else TextSizeStepper(settings)
                 PushRow(tr("font.family"), label(fonts(), settings.fontFamily)) { onPush("font.family") }
                 PushRow(tr("contrast"), label(contrasts(), settings.contrast)) { onPush("contrast") }
             }
@@ -565,18 +564,20 @@ private fun Swatch(color: Color, shape: Shape, size: Dp) {
 /// The open terminal's text size, stepped live; the size a new
 /// connection starts at follows it.
 @Composable
-private fun LiveTextSize(model: TerminalModel, settings: AppSettings) {
+private fun LiveTextSize(model: TerminalModel) {
     StepperRow(
         tr("textsize"),
-        String.format(Locale.US, "%.1f pt", model.fontPt),
-        onMinus = { stepText(model, settings, -1.0) },
-        onPlus = { stepText(model, settings, 1.0) },
+        // The size the buttons step and keep, not the core's word on it,
+        // which waits for a connection to say.
+        String.format(Locale.US, "%.0f pt", model.settings.fontSize),
+        onMinus = { stepText(model, -1.0) },
+        onPlus = { stepText(model, 1.0) },
     )
 }
 
-private fun stepText(model: TerminalModel, settings: AppSettings, by: Double) {
+private fun stepText(model: TerminalModel, by: Double) {
+    // Kept in the settings by the model, as a pinch is.
     model.stepFont(by)
-    settings.fontSize = round(model.fontPt * (1 + 0.1 * by)).coerceIn(6.0, 40.0)
 }
 
 @Composable
