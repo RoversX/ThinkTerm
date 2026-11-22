@@ -475,4 +475,89 @@ mod tests {
         assert_eq!(again.hash(), key);
         assert!(Arc::ptr_eq(&again, &repeat));
     }
+
+    fn kitty_term() -> crate::Terminal {
+        #[derive(Debug)]
+        struct Kitty;
+        impl crate::TerminalConfiguration for Kitty {
+            fn color_palette(&self) -> crate::color::ColorPalette {
+                Default::default()
+            }
+            fn enable_kitty_graphics(&self) -> bool {
+                true
+            }
+        }
+        crate::Terminal::new(
+            wezterm_term_size(),
+            Arc::new(Kitty),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    /// The images on cell `x` of the top row.
+    fn images_at(term: &mut crate::Terminal, x: usize) -> Vec<ImageCell> {
+        let row = term.screen().phys_row(0);
+        term.screen_mut()
+            .line_mut(row)
+            .get_cell(x)
+            .unwrap()
+            .attrs()
+            .image_attachments()
+            .cloned()
+            .collect()
+    }
+
+    /// One RGBA pixel, base64.
+    const PIXEL: &str = "AAAAAA==";
+
+    #[test]
+    fn placing_over_a_named_placement_keeps_one_copy_of_it() {
+        // Two one-pixel images with placement ids on the top-left cell, the
+        // second then placed again and again, as a program redrawing a
+        // picture in place does. Each placement used to double the first.
+        let mut term = kitty_term();
+        for image in 1..=2 {
+            term.advance_bytes(format!(
+                "\x1b_Ga=T,f=32,s=1,v=1,i={image},p=1,C=1,q=2;{PIXEL}\x1b\\"
+            ));
+        }
+        for _ in 0..8 {
+            term.advance_bytes("\x1b_Ga=p,i=2,p=1,C=1,q=2\x1b\\");
+        }
+        let ids: Vec<_> = images_at(&mut term, 0)
+            .iter()
+            .map(|image| image.image_id())
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&Some(1)) && ids.contains(&Some(2)), "{ids:?}");
+    }
+
+    #[test]
+    fn placing_over_a_wide_character_keeps_the_cells_own_placement() {
+        // Image 2 over the first two columns, a wide character written over
+        // them, then image 1 placed over the two: writing the second column
+        // first blanks it with the wide first one's attributes, so what is
+        // carried over from it is the first column's, and the second must
+        // keep its own slice of image 2 all the same, once.
+        let mut term = kitty_term();
+        term.advance_bytes(format!(
+            "\x1b_Ga=T,f=32,s=1,v=1,i=2,p=1,c=2,r=1,C=1,q=2;{PIXEL}\x1b\\"
+        ));
+        term.advance_bytes("\x1b[1;1H\u{4e2d}\x1b[1;1H");
+        term.advance_bytes(format!(
+            "\x1b_Ga=T,f=32,s=1,v=1,i=1,p=1,c=2,r=1,C=1,q=2;{PIXEL}\x1b\\"
+        ));
+        let second = images_at(&mut term, 1);
+        assert!(
+            second
+                .iter()
+                .any(|image| image.image_id() == Some(2) && *image.top_left().x > 0.0),
+            "{second:?}"
+        );
+        for (i, image) in second.iter().enumerate() {
+            assert!(!second[i + 1..].contains(image), "{second:?}");
+        }
+    }
 }

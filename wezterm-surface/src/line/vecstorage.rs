@@ -55,7 +55,14 @@ impl VecStorage {
         if !clear_image_placement {
             if let Some(images) = self.cells[idx].attrs().images() {
                 for image in images {
-                    if image.has_placement_id() {
+                    // Not one the new cell has already: a cell made from a
+                    // copy of this one, as an image placed over it is, has
+                    // them all, and carried again each one doubled with
+                    // every placement over the cell. Copies a cell holds
+                    // twice already come over once.
+                    if image.has_placement_id()
+                        && !cell.attrs().image_attachments().any(|held| *held == image)
+                    {
                         cell.attrs_mut().attach_image(Box::new(image));
                     }
                 }
