@@ -4091,7 +4091,8 @@ impl WindowView {
     /// the default mode and can defer for the whole interaction.
     ///
     /// Earlier pending posts of the same selector are cancelled first
-    /// (the rechecks are level reads, one is enough), and the small
+    /// (the rechecks are level reads, a re-arm sets a level flag and a
+    /// drain takes the whole backlog, so one is enough), and the small
     /// non-zero delay keeps a busy-borrow retry from turning into a
     /// zero-delay spin should a future handler ever hold the borrow
     /// across a nested runloop.
@@ -5221,15 +5222,14 @@ impl WindowView {
                 // needsDisplay for this pass, so if we simply return here the
                 // frame is lost and the window stays stale until the next
                 // interaction sets needsDisplay again. Re-arm it for the next
-                // runloop turn instead.
+                // runloop turn instead, in the common modes: a frame missed
+                // inside a tracking loop (a held titlebar button, a live
+                // resize, a title-bar drag) is then drawn there rather than
+                // after the release.
                 log::trace!("skipping draw while window is busy; re-arming");
                 this.invalidated.set(true);
                 let view_ptr: id = view as *mut Object;
-                unsafe {
-                    let () = msg_send![view_ptr, performSelector: sel!(thinktermRearmNeedsDisplay)
-                                       withObject: nil
-                                       afterDelay: 0.0];
-                }
+                Self::perform_in_common_modes(view_ptr, sel!(thinktermRearmNeedsDisplay));
                 return;
             };
 
@@ -5458,11 +5458,11 @@ impl WindowView {
             log::trace!(
                 "window is busy; queued {pending} notification(s) for the next runloop turn"
             );
-            unsafe {
-                let () = msg_send![view, performSelector: sel!(thinktermDrainNotifications)
-                                   withObject: nil
-                                   afterDelay: 0.0];
-            }
+            // In the common modes, so the backlog is also delivered inside a
+            // tracking loop rather than held until the release. Cancelling an
+            // earlier post loses nothing: `drain_scheduled` keeps at most one
+            // pending.
+            Self::perform_in_common_modes(view, sel!(thinktermDrainNotifications));
         }
     }
 
