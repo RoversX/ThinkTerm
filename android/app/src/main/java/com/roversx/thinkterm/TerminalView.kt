@@ -213,6 +213,11 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             imm.restartInput(this)
         }
         model.onLineDisturbed = { lineDisturbed() }
+        model.onSelectionGone = {
+            anchor = null
+            head = null
+            screen = null
+        }
     }
 
     fun keyboardShown(): Boolean =
@@ -238,7 +243,13 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
     /// as it is, and the keyboard starts afresh, so a correction or a
     /// backspace of that word does not reach into what came after it.
     private fun lineDisturbed() {
-        if (imeSending || sent == null) return
+        if (!imeSending) letGoOfWord()
+    }
+
+    /// A word the keyboard was making in place stays on the terminal as it
+    /// is, and the keyboard starts afresh.
+    private fun letGoOfWord() {
+        if (sent == null) return
         sent = null
         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.restartInput(this)
@@ -371,6 +382,8 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             clearSelection()
             return
         }
+        // A chip a right click opened, with nothing selected, goes too.
+        model.selectionMenuAt = null
         val x = (downX / density).toDouble()
         val y = (downY / density).toDouble()
         // The tap may give another pane the focus.
@@ -387,18 +400,23 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
     /// The button held down, as the core counts them (0 left, 1 middle,
     /// 2 right), or none.
     private var mouseButton: Int? = null
+    /// A right press is down that opens the copy and paste chip on its
+    /// release, rather than going to the program under it.
+    private var clipChipPress = false
 
     private fun isMouse(event: MotionEvent): Boolean =
         event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE || event.isFromSource(InputDevice.SOURCE_MOUSE)
 
-    private fun mouse(kind: String, event: MotionEvent, button: Int, held: Boolean) {
+    /// `heldBack`: no program's, should the one under it ask for the mouse,
+    /// as Shift holds an event back from it.
+    private fun mouse(kind: String, event: MotionEvent, button: Int, held: Boolean, heldBack: Boolean = false) {
         model.core.mouse(
             kind,
             (event.x / density).toDouble(),
             (event.y / density).toDouble(),
             button.toUByte(),
             held,
-            event.metaState and KeyEvent.META_SHIFT_ON != 0,
+            heldBack || event.metaState and KeyEvent.META_SHIFT_ON != 0,
             event.metaState and KeyEvent.META_CTRL_ON != 0,
             event.metaState and KeyEvent.META_ALT_ON != 0,
         )
@@ -413,12 +431,21 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 requestFocus()
-                if (anchor != null) clearSelection()
-                model.selectionMenuAt = null
+                // A right press keeps the selection for the chip it opens.
+                if (event.buttonState and MotionEvent.BUTTON_PRIMARY != 0 ||
+                    event.buttonState and MotionEvent.BUTTON_SECONDARY == 0
+                ) {
+                    if (anchor != null) clearSelection()
+                    model.selectionMenuAt = null
+                }
             }
             MotionEvent.ACTION_MOVE -> mouseButton?.let { mouse("move", event, it, true) }
-            // The release, should no button release come before it.
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> mouseButton?.let { release(event, it) }
+            // The release, should no button release come before it. A
+            // cancel ends the chip's press without its chip.
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (clipChipPress) clipChipRelease(event, opens = event.actionMasked == MotionEvent.ACTION_UP)
+                mouseButton?.let { release(event, it) }
+            }
         }
         return true
     }
@@ -428,14 +455,37 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         when (event.actionMasked) {
             MotionEvent.ACTION_BUTTON_PRESS -> {
                 val button = coreButton(event.actionButton) ?: return super.onGenericMotionEvent(event)
-                mouseButton = button
+                // A press the chip took that nothing ended is over: the
+                // release that comes next is this press's.
+                if (clipChipPress) clipChipRelease(event, opens = false)
                 // A press may put another pane in focus: a word the
                 // keyboard was making stays where it was typed.
                 lineDisturbed()
+                if (button == 2 && opensClipChip(event)) {
+                    // The terminal's own copy and paste, where a right click
+                    // opens the desktop's menu; it comes up on the release.
+                    // The core still takes the press, held back from any
+                    // program: it focuses the pane under it, the one Copy
+                    // and Paste then act on, and does nothing more with it.
+                    clipChipPress = true
+                    mouse("down", event, button, true, heldBack = true)
+                    return true
+                }
+                if (button == 2) {
+                    // The program under it takes the press: a selection of
+                    // the terminal's own goes, and its chip, as for any.
+                    if (anchor != null) clearSelection()
+                    model.selectionMenuAt = null
+                }
+                mouseButton = button
                 mouse("down", event, button, true)
             }
             MotionEvent.ACTION_BUTTON_RELEASE -> {
                 val button = coreButton(event.actionButton) ?: return super.onGenericMotionEvent(event)
+                if (button == 2 && clipChipPress) {
+                    clipChipRelease(event, opens = true)
+                    return true
+                }
                 release(event, button)
             }
             // A hover: no button down. The core shows what is under it to a
@@ -458,9 +508,29 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         mouse("up", event, button, false)
         mouseButton = null
         if (button == 0 && !model.core.selectedText().isNullOrEmpty()) {
-            model.selectionMenuAt = Pair((event.x / density).toDouble(), (event.y / density).toDouble())
+            model.openClipChip((event.x / density).toDouble(), (event.y / density).toDouble(), copies = true)
         }
     }
+
+    /// The end of a right press the chip took: the core has its release as
+    /// it had the press, the core's and no program's, and the chip comes up
+    /// where it let go -- unless `opens` is false, for a press cancelled.
+    private fun clipChipRelease(event: MotionEvent, opens: Boolean) {
+        clipChipPress = false
+        mouse("up", event, 2, false, heldBack = true)
+        if (!opens) return
+        model.openClipChip(
+            (event.x / density).toDouble(),
+            (event.y / density).toDouble(),
+            copies = !model.core.selectedText().isNullOrEmpty(),
+        )
+    }
+
+    /// A right press the chip takes: the program under it did not ask for
+    /// the mouse, or Shift holds the press back from it, as on the desktop.
+    private fun opensClipChip(event: MotionEvent): Boolean =
+        event.metaState and KeyEvent.META_SHIFT_ON != 0 ||
+            !model.core.mouseGrabbedAt((event.x / density).toDouble(), (event.y / density).toDouble())
 
     private fun coreButton(button: Int): Int? = when (button) {
         MotionEvent.BUTTON_PRIMARY -> 0
@@ -580,7 +650,7 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
     private fun finishSelection() {
         val s = screen ?: return
         val h = head ?: return
-        model.selectionMenuAt = Pair(s.originX + h.second * s.cellW, s.originY + h.first * s.cellH)
+        model.openClipChip(s.originX + h.second * s.cellW, s.originY + h.first * s.cellH, copies = true)
     }
 
     fun clearSelection() {
@@ -596,6 +666,17 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         val ctrl = event.isCtrlPressed
         val alt = event.isAltPressed
         val shift = event.isShiftPressed
+        // A keyboard's own Paste and Copy keys.
+        when (keyCode) {
+            KeyEvent.KEYCODE_PASTE -> {
+                pasteKey()
+                return true
+            }
+            KeyEvent.KEYCODE_COPY -> {
+                if (!model.core.selectedText().isNullOrEmpty()) model.copySelection()
+                return true
+            }
+        }
         // A terminal's own copy and paste, Ctrl+C being the shell's.
         if (ctrl && shift && !alt) {
             when (keyCode) {
@@ -606,7 +687,7 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                     }
                     return true
                 }
-                KeyEvent.KEYCODE_V -> { model.pasteFromClipboard(); return true }
+                KeyEvent.KEYCODE_V -> { pasteKey(); return true }
             }
         }
         val name = domName(keyCode)
@@ -621,6 +702,14 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /// A Paste key, the on-screen keyboard's too (`sendKeyEvent`): the text
+    /// is not part of the word that keyboard was making in place, which it
+    /// lets go of first, as for any paste.
+    private fun pasteKey() {
+        letGoOfWord()
+        model.pasteFromClipboard()
     }
 
     private fun domName(keyCode: Int): String? = when (keyCode) {
@@ -696,6 +785,11 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                     if (s == "\n") {
                         sendChange(inPlace, "")
                         model.key("Enter")
+                    } else if (isPasted(s) && !hasLineBreak(inPlace)) {
+                        // A composition with a line in it ran that line on
+                        // the way; taken back and pasted, it would run twice.
+                        sendChange(inPlace, "")
+                        model.paste(s)
                     } else {
                         sendChange(inPlace, s)
                     }
@@ -703,7 +797,39 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                 return true
             }
             endComposing()
-            fromIme { if (s == "\n") model.key("Enter") else if (s.isNotEmpty()) model.text(s) }
+            fromIme {
+                when {
+                    s == "\n" -> model.key("Enter")
+                    isPasted(s) -> model.paste(s)
+                    s.isNotEmpty() -> model.text(s)
+                }
+            }
+            return true
+        }
+
+        /// Text a keyboard commits with more than one line in it is a
+        /// paste: from its clipboard strip, say. Typed, each line would run
+        /// as it arrived. One line ending in a line break is typed, as it
+        /// was: a keyboard may send a word together with its Enter.
+        private fun isPasted(s: String): Boolean = hasLineBreak(s.removeSuffix("\n").removeSuffix("\r"))
+
+        private fun hasLineBreak(s: String): Boolean = s.contains('\n') || s.contains('\r')
+
+        /// The keyboard's own Paste and Copy, as on its editing panel.
+        override fun performContextMenuAction(id: Int): Boolean {
+            when (id) {
+                android.R.id.paste, android.R.id.pasteAsPlainText -> {
+                    // As the key bar's Paste: a word the keyboard was making
+                    // in place is let go of first (`lineDisturbed`).
+                    endComposing()
+                    model.pasteFromClipboard()
+                }
+                android.R.id.copy -> {
+                    if (model.core.selectedText().isNullOrEmpty()) return false
+                    model.copySelection()
+                }
+                else -> return false
+            }
             return true
         }
 

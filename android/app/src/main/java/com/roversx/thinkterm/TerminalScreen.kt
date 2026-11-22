@@ -87,6 +87,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.layout.positionInRoot
@@ -847,6 +848,22 @@ fun statusColor(model: TerminalModel): Color = when {
 
 // MARK: over the terminal
 
+/// One of the copy and paste chip's two: its icon and its word, greyed and
+/// not to be pressed while it has nothing to act on.
+@Composable
+private fun ClipChoice(icon: String, label: String, enabled: Boolean = true, onClick: () -> Unit) {
+    val tint = if (enabled) ink else ink.copy(alpha = 0.35f)
+    Row(
+        Modifier
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        DesktopIcon(icon, size = 15.dp, tint = tint)
+        Text(label, color = tint, fontSize = 13.sp, modifier = Modifier.padding(start = 6.dp))
+    }
+}
+
 /// The bars over split panes, the scrollbar, the stats, the composition,
 /// the take-over card, the log, the selection's copy chip, and the card
 /// while there is no terminal to show.
@@ -897,18 +914,24 @@ private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean, on
         )
     }
     model.selectionMenuAt?.let { (x, y) ->
-        // The chip sits over the head cell, a row above it when it fits.
+        // The chip sits over the head cell, a row above it when it fits,
+        // and stays inside the terminal at its right edge.
         val top = (y - 40).coerceAtLeast(0.0)
-        Text(
-            if (model.copied) tr("copied") else tr("copy"),
-            color = ink,
-            fontSize = 13.sp,
-            modifier = Modifier
-                .offset(x = x.dp, y = top.dp)
-                .glass(LocalGlass.current, LocalChrome.current.dark, RoundedCornerShape(8.dp))
-                .clickable { model.copySelection() }
-                .padding(horizontal = 12.dp, vertical = 7.dp),
-        )
+        Row(
+            Modifier
+                .layout { measurable, constraints ->
+                    val chip = measurable.measure(constraints.copy(minWidth = 0, minHeight = 0))
+                    val most = (constraints.maxWidth - chip.width).coerceAtLeast(0)
+                    layout(chip.width, chip.height) {
+                        chip.place(x.dp.roundToPx().coerceIn(0, most), top.dp.roundToPx())
+                    }
+                }
+                .glass(LocalGlass.current, LocalChrome.current.dark, RoundedCornerShape(8.dp)),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ClipChoice("copy", tr("copy"), enabled = model.selectionMenuCopies) { model.copyFromMenu() }
+            ClipChoice("clipboard-paste", tr("paste")) { model.pasteFromMenu() }
+        }
     }
     model.status?.card?.let { card ->
         TakeOverBanner(model, card, Modifier.align(Alignment.BottomCenter))

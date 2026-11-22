@@ -190,9 +190,22 @@ class TerminalModel(
     var onHideKeyboard: (() -> Unit)? = null
     /// The terminal takes the keys and the keyboard comes up.
     var onShowKeyboard: (() -> Unit)? = null
-    /// A selection stands: where its copy chip goes, in dp from the
-    /// terminal's origin (the head cell's top-left), or null for none.
+    /// Where the copy and paste chip goes, in dp from the terminal's origin
+    /// (a selection's head cell's top-left, or where a right click let
+    /// go), or null for none.
     var selectionMenuAt by mutableStateOf<Pair<Double, Double>?>(null)
+    /// Whether the chip has something to copy: a right click with nothing
+    /// selected offers its Paste alone, its Copy greyed.
+    var selectionMenuCopies by mutableStateOf(true)
+    /// The pane the chip was opened over, the focused one then
+    /// (`openClipChip`).
+    private var selectionMenuPane: UInt? = null
+    /// The focused pane as the layout last said it.
+    private var layoutFocused: Int? = null
+    /// The selection was put away, by the chip or by anything else: the
+    /// view lets go of the ends it was keeping, so the next tap is a tap
+    /// rather than the one that puts a selection away.
+    var onSelectionGone: (() -> Unit)? = null
 
     val smoothScroll: Boolean get() = settings.smoothScroll
 
@@ -625,10 +638,47 @@ class TerminalModel(
     fun pasteFromClipboard() {
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
         val text = cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: return
-        if (text.isNotEmpty()) {
-            onLineDisturbed?.invoke()
-            core.paste(text)
-        }
+        paste(text)
+    }
+
+    /// `text` into the pane as a paste rather than as typing: a program
+    /// that asked for pastes bracketed gets it so, and does not run each
+    /// line as it arrives.
+    fun paste(text: String) {
+        if (text.isEmpty()) return
+        onLineDisturbed?.invoke()
+        core.paste(text)
+    }
+
+    /// The copy and paste chip, at `x`, `y` in dp from the terminal's
+    /// origin, over the pane focused now: the one its Copy and Paste act
+    /// on. `copies`: whether a selection is there for its Copy.
+    fun openClipChip(x: Double, y: Double, copies: Boolean) {
+        selectionMenuCopies = copies
+        selectionMenuPane = core.focusedPane()
+        selectionMenuAt = Pair(x, y)
+    }
+
+    /// Whether the chip still stands over the focused pane. Another one
+    /// focused since -- a tab picked, its pane gone -- takes the chip away
+    /// instead: its Paste is not for a pane it was not opened over.
+    private fun chipOverFocus(): Boolean {
+        if (selectionMenuPane != null && core.focusedPane() == selectionMenuPane) return true
+        selectionMenuAt = null
+        return false
+    }
+
+    /// The chip's Paste: the clipboard into the pane, and the chip put away
+    /// with any selection it stood over, as its Copy puts them away.
+    fun pasteFromMenu() {
+        if (!chipOverFocus()) return
+        clearSelection()
+        pasteFromClipboard()
+    }
+
+    /// The chip's Copy.
+    fun copyFromMenu() {
+        if (chipOverFocus()) copySelection()
     }
 
     fun copyToClipboard(text: String) {
@@ -711,6 +761,7 @@ class TerminalModel(
     fun clearSelection() {
         core.clearSelection()
         selectionMenuAt = null
+        onSelectionGone?.invoke()
     }
 
     fun showCopied() {
@@ -772,6 +823,14 @@ class TerminalModel(
             }
         }
         if (views.layout != last?.layout) Views.layout(views.layout)?.let { layout ->
+            // Another pane focused takes away the chip opened over the
+            // last. Only a change counts: a layout the core published
+            // before the right click that focused the chip's own pane
+            // still names the pane before it.
+            if (layout.focused != layoutFocused) {
+                layoutFocused = layout.focused
+                if (selectionMenuAt != null && layout.focused.toUInt() != selectionMenuPane) selectionMenuAt = null
+            }
             if (layout.cellH > 0) cellHeight = layout.cellH
             if (layout.cellW > 0) cellWidth = layout.cellW
             if (layout.fontPt > 0 && layout.fontPt != fontPt) fontPt = layout.fontPt
@@ -1068,6 +1127,8 @@ class TerminalModel(
                 }
                 if (status.startsWith("connecting") || status.contains("reconnect") || status.startsWith("disconnected")) {
                     composing = null
+                    // The chip stood over a pane of the connection that went.
+                    selectionMenuAt = null
                     onDropComposition?.invoke()
                 }
                 changePending.set(true)

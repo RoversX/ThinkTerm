@@ -867,6 +867,17 @@ impl Core {
         let _ = self.tx.send(core::Cmd::Mouse { kind, x, y, button, held, mods });
     }
 
+    /// Whether the program in the pane under a point, in points, asked for
+    /// the mouse: a right click there goes to it, as on the desktop, and
+    /// the copy and paste chip waits for one with Shift held.
+    pub fn mouse_grabbed_at(&self, x: f64, y: f64) -> bool {
+        let (reply, ack) = mpsc::channel();
+        if self.tx.send(core::Cmd::MouseGrabbedAt { x, y, reply }).is_err() {
+            return false;
+        }
+        ack.recv().unwrap_or(false)
+    }
+
     /// Scroll at a point by `lines`; positive is back into history.
     pub fn wheel(&self, x: f64, y: f64, lines: f64) {
         let _ = self.tx.send(core::Cmd::Wheel { x, y, lines });
@@ -945,6 +956,16 @@ impl Core {
     pub fn selected_text(&self) -> Option<String> {
         let (reply, ack) = mpsc::channel();
         if self.tx.send(core::Cmd::SelectedText { reply }).is_err() {
+            return None;
+        }
+        ack.recv().unwrap_or(None)
+    }
+
+    /// The pane focused now, the one a paste and the selection go to, with
+    /// whatever was sent before this taken in; none without a connection.
+    pub fn focused_pane(&self) -> Option<u32> {
+        let (reply, ack) = mpsc::channel();
+        if self.tx.send(core::Cmd::FocusedPane { reply }).is_err() {
             return None;
         }
         ack.recv().unwrap_or(None)

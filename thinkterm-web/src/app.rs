@@ -1524,6 +1524,16 @@ impl<P: Platform, L: Link> App<P, L> {
         Self::text_of(&inner, &selection)
     }
 
+    /// Whether the program in the pane under the point `x`, `y` (as
+    /// `pointer` takes one) asked for the mouse: a right click there is the
+    /// program's, as on the desktop, rather than the platform's own menu.
+    pub fn mouse_grabbed_at(&self, x: f64, y: f64) -> bool {
+        let inner = self.inner.borrow();
+        Self::hit_under(&inner, x, y)
+            .and_then(|hit| inner.panes.get(&hit.pane_id))
+            .is_some_and(|cell| cell.session.is_mouse_grabbed())
+    }
+
     /// A cell selection between two visible cells of the focused pane, in
     /// the rows of its scrollback they show.
     fn visible_selection(inner: &Inner<P, L>, anchor: (usize, usize), head: (usize, usize)) -> Option<(PaneId, Selection)> {

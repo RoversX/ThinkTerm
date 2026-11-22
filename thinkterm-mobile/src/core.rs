@@ -177,6 +177,14 @@ pub enum Cmd {
     ScreenText {
         reply: Sender<String>,
     },
+    MouseGrabbedAt {
+        x: f64,
+        y: f64,
+        reply: Sender<bool>,
+    },
+    FocusedPane {
+        reply: Sender<Option<u32>>,
+    },
     SetSelection {
         anchor: (usize, usize),
         head: (usize, usize),
@@ -831,6 +839,9 @@ impl State {
             Cmd::ScreenText { reply } => {
                 let _ = reply.send(self.screen_json());
             }
+            Cmd::MouseGrabbedAt { x, y, reply } => {
+                let _ = reply.send(self.app.as_ref().is_some_and(|app| app.mouse_grabbed_at(x, y)));
+            }
             Cmd::TextBetween { anchor, head, reply } => {
                 let _ = reply.send(self.app.as_ref().and_then(|app| app.text_between(anchor, head)));
             }
@@ -870,6 +881,9 @@ impl State {
             }
             Cmd::SelectedText { reply } => {
                 let _ = reply.send(self.app.as_ref().and_then(|app| app.selected_text()));
+            }
+            Cmd::FocusedPane { reply } => {
+                let _ = reply.send(self.app.as_ref().map(|app| app.focused_pane() as u32));
             }
             Cmd::StepFont(by) => {
                 if let Some(app) = self.app.clone() {

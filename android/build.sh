@@ -75,7 +75,7 @@ mkdir -p android/app/src/main/assets
 # the tree. The same list as ios/build.sh's.
 rm -rf android/app/src/main/assets/lucide
 mkdir -p android/app/src/main/assets/lucide
-for name in app-window archive bot check hand laptop-minimal monitor-smartphone smartphone chevron-down circle-check clipboard copy lock shield-off triangle-alert chevron-left panel-left panel-right chevron-right chevrons-up-down circle-plus folder \
+for name in app-window archive bot check hand laptop-minimal monitor-smartphone smartphone chevron-down circle-check clipboard clipboard-paste copy lock shield-off triangle-alert chevron-left panel-left panel-right chevron-right chevrons-up-down circle-plus folder \
   folder-open globe grid-2x2 key-round keyboard layers link-2 paperclip plus rotate-ccw search server \
   settings square-pen x cloud laptop hard-drive monitor cpu package square-terminal power \
   palette panels-top-left wifi info stethoscope git-branch scale arrow-up-right; do
