@@ -87,6 +87,81 @@ A plugin's directory can be a symbolic link. That is the easiest way to work
 on one: link your source directory in, and rebuild. ThinkTerm restarts the
 plugin the next time it is used after its program changes.
 
+### Making a plugin
+
+`thinkterm plugin new <id>` makes a plugin to start from, in the plugins
+directory: a directory of its own named by the id, holding a `plugin.toml`,
+`main.py` -- a panel and a page drawn by a Python script -- and
+`thinkterm.py`, ThinkTerm's helper for scripts, which speaks the protocol
+and draws buttons, switches, fields and text laid out one under another.
+It turns on that plugin, and only that one -- not another that claims the
+id -- and calls it once to say whether it runs. `--name` names it; `--off`
+leaves it off -- whatever a plugin of the id there before was left as --
+for `thinkterm plugin enable` to let it run.
+
+```
+thinkterm plugin new weather --name "Weather"
+thinkterm plugin do weather open        opens its page, beside the terminal
+thinkterm plugin call weather '{}'      what its call() answers
+thinkterm plugin logs weather           what it wrote to standard error
+thinkterm plugin shot weather           a picture of its open view
+```
+
+Edit `main.py`: once a Python file in the plugin's directory has changed
+and stayed so for a moment, ThinkTerm starts the plugin again, and its
+panel and pages show what it draws now. What the plugin writes beside them
+as it runs -- a state file, a log -- is not a change to it. A plugin that stopped shows why: `thinkterm
+plugin list`, its panel and Settings give the last thing it wrote to
+standard error -- for a Python traceback, the error and the line of the
+plugin's own file it came from -- and `thinkterm plugin logs` the rest.
+One that failed, its panel staying where it was and saying so, runs again
+once it is mended, and its panel and pages open again by themselves.
+
+`thinkterm plugin shot` draws a view of the plugin that is open in
+ThinkTerm -- its page, or its panel; say which with `--page` or `--panel`
+when both are -- into a PNG, as ThinkTerm shows it, and prints where it
+is. Nothing but the view is in it: not the terminal beside it, nor what is
+drawn over it. A browser cannot draw one, nor a ThinkTerm older than this.
+
+`thinkterm skill setup` gives Claude Code and Codex a guide to all of this,
+so that one asked to make a ThinkTerm plugin does it this way and checks
+what it made.
+
+### Python scripts
+
+A plugin can be a Python script rather than a program of its own:
+
+```toml
+[run]
+python = "main.py"
+args = []
+```
+
+ThinkTerm ships no Python. It runs the script with the Python 3.8 or later
+it finds on the machine: where the user's own terminal would find it -- the
+PATH of their login shell, which a ThinkTerm started from the Dock or a
+desktop menu does not have -- then on its own PATH, then where the usual
+installers put it (Homebrew, python.org, pyenv, `~/.local/bin`, the
+Windows launcher `py`). Each candidate is asked its version, and the first
+recent enough runs the script as the program it says it is. On a Mac
+without Apple's command line tools, `/usr/bin/python3` is passed over
+rather than asked, since running it offers to install them; the Python
+install manager on Windows is told not to install one. It is looked for
+on a thread of its own when a script plugin first needs it, so nothing else
+waits: the plugin's calls wait, and its panel opens once it is found. What
+was found is kept. With none found, the plugin fails saying how to install
+one, and Python is looked for again 30 seconds later, or at once when a
+plugin is reloaded.
+
+The script is a file in the plugin's own directory, named by a path within
+it, and is run by its whole path; it runs there, with `PYTHONUTF8`,
+`PYTHONIOENCODING=utf-8`, `PYTHONUNBUFFERED` and `PYTHONDONTWRITEBYTECODE`
+set besides the variables every plugin gets, and without the `PYTHONHOME`
+and `PYTHONPATH` ThinkTerm was started with, which would make it another
+Python than the one found. A change to any of its `.py` files -- but those
+in hidden directories, `__pycache__`, `node_modules`, `target` and `venv`
+-- starts it again, as a rebuilt program is; so does its `plugin.toml`.
+
 ### Finding and sharing plugins
 
 Plugins people share are repositories on GitHub with the topic
@@ -112,7 +187,8 @@ platforms = ["macos", "linux", "windows"]
 
 [run]
 # Found beside plugin.toml first, then on PATH. On Windows, ".exe" is
-# tried too.
+# tried too. Or, in its place, a Python script in the plugin's directory:
+# python = "main.py" (see "Python scripts").
 program = "thinkterm-plugin-example"
 args = []
 # Optional. How long the program runs while nothing uses it: "always",
@@ -733,7 +809,9 @@ is one line of JSON, UTF-8, ending in `\n`, and no longer than 16 MiB.
 Anything the program writes to standard error goes to the plugin server's log
 (`plugins-log` in the runtime directory), a line at a time under the plugin's
 id. Past 4 MiB from all plugins together, the rest is dropped until the server
-starts again.
+starts again. The server keeps the last of it for each plugin as well -- 400
+lines, 64 KiB, across its runs, terminal controls taken out -- for `thinkterm
+plugin logs`, and says the last of it in why a run stopped.
 
 The program starts with these environment variables, in its own directory:
 
@@ -925,6 +1003,14 @@ Sidebar shows the reason for a failed state.
 | `invalid`     | `plugin.toml` cannot be used; the reason is kept           | the manifest is fixed                           |
 | `unsupported` | `platforms` does not include this system                   | the manifest changes                            |
 
+The reason a `crashed` or `failed` plugin is given ends with the last thing
+its program wrote to standard error, read to its end first: for a Python
+traceback, the error and the line of the plugin's own file it was raised
+in. A failed plugin's panel stays offered where it was, saying why, and a
+panel or page of it the server could not open -- the plugin failed, or was
+off -- is opened again by itself once the plugin can run: turned on,
+reloaded, or its files changed.
+
 A client that uses a plugin starts it: a call from the command line, or a
 panel on show. Only a plugin that runs always starts without one. Nothing
 starts a `new` plugin. Calls that
@@ -971,6 +1057,7 @@ desktop, that is the mux server.
 | Find new and removed plugins | Each `list`: opening Settings › Sidebar & Plugins, `thinkterm plugin list`; a `keep` |
 | A changed `plugin.toml`      | Read again at the next `list` or use. A running plugin is stopped first.             |
 | A rebuilt program            | Checked before each use. A running plugin is stopped and started again.              |
+| A script's `.py` files, or a program, changed while it runs | Looked at every half second; once a change has settled, the plugin is started again, its views open again, and one only watched starts again too |
 | One plugin, by hand          | `thinkterm plugin reload <id>`: stop, read again, and clear `crashed`/`failed`       |
 | Everything, by hand          | Reload in Settings › Sidebar & Plugins, or `thinkterm plugin reload`                 |
 | The on/off switches          | `plugins.json` is read again when another server changes it                          |
@@ -989,6 +1076,8 @@ treats what it last saw as current once the connection is gone.
 | A plugin's own files        | `<data>/plugin-data/<id>/`                           | that plugin         |
 | Snippets                    | `<data>/snippets.json`                               | the Snippets plugin |
 | Plugin list, states, calls  | memory                                               | the plugin server   |
+| What plugins wrote to standard error | memory, the last 400 lines of each           | the plugin server   |
+| Pictures of views (`shot`)  | `<runtime>/plugin-pictures/`, the newest 20, the user's alone | the plugin server |
 | What a client shows         | memory, per window or page                           | that client         |
 
 `<data>` is the parent of the plugins directory. An installed plugin runs
@@ -1035,6 +1124,9 @@ thinkterm plugin reload [<id>]
 thinkterm plugin call <id> <json>
 thinkterm plugin do <id> <action> [--pane-id ID]   one of its actions
 thinkterm plugin dir                         where plugins are installed
+thinkterm plugin new <id> [--name N] [--off] a Python plugin to start from, turned on
+thinkterm plugin logs <id> [-n LINES]        what it wrote to standard error
+thinkterm plugin shot <id> [--page|--panel]  a PNG of its open view; prints its path
 ```
 
 ## Security
@@ -1062,6 +1154,10 @@ or Command, never a field's text while an input method composes it, and a
 secret field's only when you submit it. Nothing can be copied out of a secret
 field, and the clipboard reaches a plugin only as what you paste into its
 field.
+
+`thinkterm plugin new` turns on only the plugin it made, in the directory
+it made for it. `thinkterm plugin shot` draws only a plugin's own view,
+never what else the window shows, into a file only you can read.
 
 An action is done only when you ask for it -- you pick it in the command
 palette, press the key you gave it, or run `thinkterm plugin do` -- and
