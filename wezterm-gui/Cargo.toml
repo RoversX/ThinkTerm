@@ -153,6 +153,7 @@ wezterm-open-url.workspace = true
 wezterm-ssh.workspace = true
 wezterm-term.workspace = true
 wezterm-toast-notification.workspace = true
+wezterm-version.workspace = true
 wgpu.workspace = true
 window-funcs.workspace = true
 window.workspace = true

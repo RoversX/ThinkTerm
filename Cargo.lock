@@ -12259,6 +12259,7 @@ dependencies = [
  "wezterm-ssh",
  "wezterm-term",
  "wezterm-toast-notification",
+ "wezterm-version",
  "wgpu",
  "winapi",
  "window",

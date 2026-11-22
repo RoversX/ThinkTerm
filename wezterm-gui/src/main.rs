@@ -102,7 +102,10 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
 #[command(
     name = "thinkterm-gui",
     about = "ThinkTerm - a workspace-first terminal\nhttps://github.com/RoversX/thinkterm",
-    version = config::wezterm_version()
+    // The build's own, not config's: the options are parsed before
+    // env_bootstrap gives config the version, and `-V` printed its
+    // placeholder.
+    version = wezterm_version::wezterm_version()
 )]
 struct Opt {
     /// Skip loading the ThinkTerm configuration
