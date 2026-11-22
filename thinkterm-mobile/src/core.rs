@@ -1465,6 +1465,7 @@ impl State {
             .unwrap_or((attached.dims.cols, attached.dims.viewport_rows));
 
         let host = Arc::new(AppHost::new(Rc::clone(&self.platform), link.clone()));
+        host.config.set_prefetch(thinkterm_web::host::Prefetch::PHONE);
         let images = Arc::new(thinkterm_session::Lock::new(
             thinkterm_session::images::ImageStore::default(),
         ));

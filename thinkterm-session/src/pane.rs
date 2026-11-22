@@ -634,10 +634,22 @@ impl<H: SessionHost> PaneSession<H> {
 
         let band = (dims.viewport_rows.max(1) * config.scrollback_lookahead_screens())
             .max(config.scrollback_lookahead_rows()) as StableRowIndex;
+        // Behind a viewport at the bottom is what output scrolled past it,
+        // unsent. A host that has it fetched as it is scrolled back to gets
+        // one screen of it fetched, the one a first scroll back shows.
+        let behind = if painted.end >= highest && !config.fetch_scrolled_past() {
+            let screen = dims
+                .viewport_rows
+                .max(1)
+                .max(config.scrollback_lookahead_rows());
+            band.min(screen as StableRowIndex)
+        } else {
+            band
+        };
         if band > 0 && budget > 0 {
             let mut ahead = uncached(
                 st,
-                painted.start - band..painted.start,
+                painted.start - behind..painted.start,
                 budget / 2,
                 Nearest::End,
             );
@@ -663,15 +675,22 @@ impl<H: SessionHost> PaneSession<H> {
             }
         }
 
-        let grew = dims.physical_top - st.warmed_top >= dims.viewport_rows as StableRowIndex;
+        let grew = config.fetch_scrolled_past()
+            && dims.physical_top - st.warmed_top >= dims.viewport_rows as StableRowIndex;
         if config.warm_scrollback()
             && budget > 0
             && (st.warmed_epoch != Some(st.line_cache_epoch) || grew)
         {
             // Speculation must not scale to the user's entire history limit.
             // Bound the region as well as misses, so later paints do not
-            // gradually warm another 3,500 rows outside this recent window.
-            let warm = uncached(st, lowest..highest, budget.min(3500), Nearest::End);
+            // gradually warm another window's worth of rows outside this
+            // recent one.
+            let warm = uncached(
+                st,
+                lowest..highest,
+                budget.min(config.warm_scrollback_rows()),
+                Nearest::End,
+            );
             if !warm.is_empty() {
                 if !st.fetch_limiter.admit(rate, 1, now) {
                     log::trace!("scrollback warm refused by the rate limit");
@@ -1491,6 +1510,8 @@ mod tests {
         lookahead: Cell<usize>,
         lookahead_rows: Cell<usize>,
         warm: Cell<bool>,
+        warm_rows: Cell<usize>,
+        scrolled_past: Cell<bool>,
         rate: Cell<u32>,
     }
     impl Default for TestConfig {
@@ -1499,6 +1520,8 @@ mod tests {
                 lookahead: Cell::new(0),
                 lookahead_rows: Cell::new(0),
                 warm: Cell::new(false),
+                warm_rows: Cell::new(3500),
+                scrolled_past: Cell::new(true),
                 rate: Cell::new(100),
             }
         }
@@ -1518,6 +1541,12 @@ mod tests {
         }
         fn warm_scrollback(&self) -> bool {
             self.warm.get()
+        }
+        fn warm_scrollback_rows(&self) -> usize {
+            self.warm_rows.get()
+        }
+        fn fetch_scrolled_past(&self) -> bool {
+            self.scrolled_past.get()
         }
     }
 
@@ -2437,6 +2466,36 @@ mod tests {
         );
     }
 
+    /// A host that warms fewer rows than the default (the phone app) gets
+    /// that many of the most recent, not the default's.
+    #[test]
+    fn warming_fetches_as_many_recent_rows_as_the_host_asks() {
+        let rows: Vec<_> = (96_500..100_000).map(|r| (r, "row")).collect();
+        let (host, session) = session_with_cache(&rows, 100_000);
+        host.config.warm.set(true);
+        host.config.warm_rows.set(1000);
+        let mut tall = delta(1, false, false);
+        tall.dimensions.physical_top = 99_976;
+        tall.dimensions.scrollback_rows = 100_000;
+        session.queue_render_delta(tall);
+        host.spawner.run_all();
+
+        let _ = session.get_lines(99_976..100_000);
+        host.spawner.run_all();
+        assert_eq!(rows_requested(&host), 1000, "the most recent thousand");
+        assert!(
+            matches!(
+                session.state().lines.peek(&99_000),
+                Some(LineEntry::Line(_))
+            ),
+            "the oldest of them is on hand"
+        );
+        assert!(
+            session.state().lines.peek(&98_999).is_none(),
+            "and nothing before it"
+        );
+    }
+
     /// Output that scrolled past between two pushes was never sent; once
     /// the physical top has moved a viewport, the scrollback is warmed
     /// again for the rows that appeared.
@@ -2459,6 +2518,40 @@ mod tests {
         host.spawner.run_all();
         // The painted 48..72 plus the never-pushed 24..48; 0..24 is cached.
         assert_eq!(rows_requested(&host), 48);
+    }
+
+    /// A host that has output that scrolled past fetched as it is scrolled
+    /// back to (the phone app, with its three screens ahead) gets one screen
+    /// of it behind a viewport at the bottom, and no warming; the rest once
+    /// scrolled back from there.
+    #[test]
+    fn a_host_may_fetch_a_screen_only_of_output_that_scrolled_past() {
+        let (host, session) = session(&(0..120).map(|r| (r, "row")).collect::<Vec<_>>());
+        host.config.lookahead.set(3);
+        host.config.warm.set(true);
+        host.config.scrolled_past.set(false);
+        session.queue_render_delta(delta(1, false, false));
+        host.spawner.run_all();
+        let _ = session.get_lines(0..24);
+        host.spawner.run_all();
+        host.link.rows_asked.set(0);
+
+        let mut grown = delta(2, false, false);
+        grown.dimensions.physical_top = 96;
+        grown.dimensions.scrollback_rows = 120;
+        session.queue_render_delta(grown);
+        host.spawner.run_all();
+        let _ = session.get_lines(96..120);
+        host.spawner.run_all();
+        // The painted 96..120 and the screen behind, 72..96; the
+        // never-pushed 24..72 waits.
+        assert_eq!(rows_requested(&host), 48);
+
+        // A row back from the bottom, the whole band behind: 23..95, of
+        // which 24..72 is not on hand.
+        let _ = session.get_lines(95..119);
+        host.spawner.run_all();
+        assert_eq!(rows_requested(&host), 96);
     }
 
     /// Speculation never pushes a painted row out of the cache: with a

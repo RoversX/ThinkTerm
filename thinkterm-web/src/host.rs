@@ -83,8 +83,50 @@ impl SessionEvents for Events {
     fn input_recorded(&self) {}
 }
 
+/// How far past what is painted a pane's rows are fetched, and how much
+/// of its recent history once it is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefetch {
+    /// Screens fetched ahead on each side of what is painted.
+    pub screens: usize,
+    /// Rows of a pane's most recent history fetched once it is shown; none
+    /// fetches only what is painted and the screens around it.
+    pub warm_rows: usize,
+    /// Whether output streaming past a viewport at the bottom is fetched as
+    /// far as `screens` reach and warmed as it goes, or a screen of it only
+    /// and the rest as it is scrolled back to (see
+    /// HostConfig::fetch_scrolled_past).
+    pub fetch_scrolled_past: bool,
+    /// Fetch batches a pane may ask for a second.
+    pub per_second: u32,
+}
+
+impl Prefetch {
+    /// The browser page's: a screen on each side.
+    pub const PAGE: Self = Self {
+        screens: 1,
+        warm_rows: 0,
+        fetch_scrolled_past: false,
+        per_second: 10,
+    };
+    /// The phone app's. A flick goes through screens at a time, so three
+    /// are on hand on each side, and a pane's last thousand rows are there
+    /// from the start. Of output streaming by at the bottom, a screen is
+    /// fetched, the one a first scroll back shows, and the rest as it is
+    /// scrolled to, as a phone's data may cost; the desktop, which keeps
+    /// up with it, warms its own machine's sessions alone.
+    pub const PHONE: Self = Self {
+        screens: 3,
+        warm_rows: 1000,
+        fetch_scrolled_past: false,
+        per_second: 20,
+    };
+}
+
 pub struct Config {
     rules: Arc<Vec<termwiz::hyperlink::Rule>>,
+    /// The page's own unless its host says otherwise (`set_prefetch`).
+    prefetch: Cell<Prefetch>,
     /// The most rows the page has given its grid. A phone's soft keyboard
     /// cuts the grid to what shows above it, and the rows fetched ahead
     /// are kept to this many: the ones the keyboard gives back as it goes
@@ -97,6 +139,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rules: Arc::new(Vec::new()),
+            prefetch: Cell::new(Prefetch::PAGE),
             tallest_rows: Cell::new(0),
         }
     }
@@ -107,6 +150,11 @@ impl Config {
     pub fn saw_rows(&self, rows: usize) {
         self.tallest_rows.set(self.tallest_rows.get().max(rows));
     }
+
+    /// Fetch rows ahead as `prefetch` says, from now on.
+    pub fn set_prefetch(&self, prefetch: Prefetch) {
+        self.prefetch.set(prefetch);
+    }
 }
 
 impl HostConfig for Config {
@@ -114,16 +162,22 @@ impl HostConfig for Config {
         Arc::clone(&self.rules)
     }
     fn fetch_rate_per_second(&self) -> u32 {
-        10
+        self.prefetch.get().per_second
     }
     fn scrollback_lookahead_screens(&self) -> usize {
-        1
+        self.prefetch.get().screens
     }
     fn scrollback_lookahead_rows(&self) -> usize {
         self.tallest_rows.get()
     }
     fn warm_scrollback(&self) -> bool {
-        false
+        self.prefetch.get().warm_rows > 0
+    }
+    fn warm_scrollback_rows(&self) -> usize {
+        self.prefetch.get().warm_rows
+    }
+    fn fetch_scrolled_past(&self) -> bool {
+        self.prefetch.get().fetch_scrolled_past
     }
 }
 
@@ -529,5 +583,28 @@ mod tests {
         let request = GetImageCell { pane_id: 1, line_idx: 2, cell_idx: 3, data_hash: [7; 32], data_generation: 0, have_frames: 0 };
         assert!(matches!(versions.request(request.clone(), Some(0)), Pdu::GetImageCell(_)));
         assert!(matches!(versions.request(request, Some(1)), Pdu::GetKittyImage(_)));
+    }
+
+    /// The page fetches a screen each side and warms nothing; the phone
+    /// app, which sets its own, fetches further and warms recent rows.
+    #[test]
+    fn the_page_and_the_phone_fetch_ahead_each_as_far_as_its_own() {
+        let config = Config::default();
+        assert_eq!(config.scrollback_lookahead_screens(), 1);
+        assert_eq!(config.fetch_rate_per_second(), 10);
+        assert!(!config.warm_scrollback());
+
+        config.set_prefetch(Prefetch::PHONE);
+        assert_eq!(config.scrollback_lookahead_screens(), 3);
+        assert_eq!(config.fetch_rate_per_second(), 20);
+        assert!(config.warm_scrollback());
+        assert_eq!(config.warm_scrollback_rows(), 1000);
+        assert!(
+            !config.fetch_scrolled_past(),
+            "output streaming by is not all fetched"
+        );
+        // The soft keyboard's floor is kept whichever it is.
+        config.saw_rows(40);
+        assert_eq!(config.scrollback_lookahead_rows(), 40);
     }
 }

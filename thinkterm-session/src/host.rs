@@ -129,6 +129,22 @@ pub trait HostConfig {
     /// Whether a pane's whole scrollback is fetched once it is first shown,
     /// so scrolling never paints a row that is still on its way.
     fn warm_scrollback(&self) -> bool;
+    /// How many of a pane's most recent rows that warming fetches, the
+    /// line cache's room allowing: what one flick back through the history
+    /// is likely to reach, not the whole of a long one.
+    fn warm_scrollback_rows(&self) -> usize {
+        3500
+    }
+    /// Whether output that scrolls past a viewport at the bottom is fetched
+    /// as it goes: rows that went by between two pushes were never sent. On,
+    /// the screens fetched ahead take them in behind the viewport, and once
+    /// a viewport of them has gone by they are warmed as well. Off, a screen
+    /// of them is fetched there, the rows a first scroll back shows, the
+    /// rest only once scrolled back to; and a pane is warmed as it is first
+    /// shown and its cache made anew -- for a link whose data may cost.
+    fn fetch_scrolled_past(&self) -> bool {
+        true
+    }
 }
 
 /// Everything the session tells the host about a pane. Synchronous, and
