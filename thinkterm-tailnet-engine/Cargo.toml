@@ -23,11 +23,11 @@ serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, optional = true }
 url.workspace = true
 
-# The library runs where it has a network monitor: macOS and Linux, and
-# iOS by the vendored ts_netmon (deps/tailscale-rs/PATCHES.txt); on Android,
-# which to Rust is not Linux, without one (the same file). Elsewhere this
-# crate builds without it and SUPPORTED says so.
-[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "ios", target_os = "android"))'.dependencies]
+# The library runs where it has a network monitor: macOS, Linux and
+# Windows, and iOS by the vendored ts_netmon (deps/tailscale-rs/PATCHES.txt);
+# on Android, which to Rust is not Linux, without one (the same file).
+# Elsewhere this crate builds without it and SUPPORTED says so.
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", target_os = "ios", target_os = "android"))'.dependencies]
 tailscale = { version = "0.6.1", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 ts_control = { version = "0.6.1", optional = true }

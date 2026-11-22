@@ -69,7 +69,12 @@ fn node_answers() -> bool {
         crate::settings::socket_path()
             .is_ok_and(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::settings::socket_path()
+            .is_ok_and(|path| wezterm_uds::UnixStream::connect(path).is_ok())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         true
     }
@@ -86,7 +91,11 @@ fn process_is_running(pid: u32) -> bool {
             Err(_) => false,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::windows::process_is_running(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -96,7 +105,12 @@ fn process_is_running(pid: u32) -> bool {
 /// Private to this user: a login link in it would let whoever opens it
 /// first decide which tailnet this machine joins. Not waited onto the disk:
 /// it is rewritten as the node changes, and means nothing after a restart.
-#[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
+/// On Windows it takes the permissions of the folder it is in, as the
+/// settings do (see crate::settings).
+#[cfg(all(
+    feature = "node",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) fn write_report(report: &Report) {
     let result = serde_json::to_vec_pretty(report)
         .map_err(anyhow::Error::from)

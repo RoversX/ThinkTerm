@@ -153,15 +153,30 @@ fn changes(given: &Option<String>, saved: &Option<String>) -> bool {
 }
 
 /// One line from standard input. Typed at a terminal it is not echoed, and
-/// Ctrl-C gives up on it with the terminal as it was.
+/// Ctrl-C gives up on it with the terminal as it was; a terminal that
+/// would echo it is not read from.
 fn read_auth_key() -> anyhow::Result<String> {
     use std::io::{BufRead, IsTerminal, Read};
     let stdin = std::io::stdin();
     let line = if stdin.is_terminal() {
-        eprint!("Auth key: ");
         let typed = {
-            let _quiet = Quiet::new(&stdin);
-            typed_line(stdin.lock().bytes())
+            let quiet = Quiet::new(&stdin);
+            // Git Bash's and Cygwin's terminals reach a Windows program as
+            // pipes, whose echo is theirs to turn off, not this program's.
+            if !quiet.hides_typing() {
+                bail!(
+                    "not reading the auth key here: this terminal would show it as it is \
+                     typed. Give it on standard input instead: \
+                     `thinkterm tailnet up --auth-key-stdin < FILE`"
+                );
+            }
+            eprint!("Auth key: ");
+            let keys = stdin.lock().bytes();
+            // The console reads Ctrl-Z, Windows' Ctrl-D, as the input's
+            // end: giving up, as Ctrl-D does, not taking what was typed.
+            #[cfg(windows)]
+            let keys = keys.chain(std::iter::once(Ok(0x04)));
+            typed_line(keys)
         };
         eprintln!();
         typed?
@@ -199,10 +214,13 @@ fn typed_line(bytes: impl Iterator<Item = std::io::Result<u8>>) -> anyhow::Resul
 
 /// Turns the terminal's echo off for as long as it lives, with its line
 /// editing and Ctrl-C's signal: Ctrl-C would end the process with the echo
-/// still off, so it comes in as a key instead (see `typed_line`).
+/// still off, so it comes in as a key instead (see `typed_line`). On
+/// Windows the same goes for the console's input mode.
 struct Quiet {
     #[cfg(unix)]
     restore: Option<(std::os::fd::RawFd, termios::Termios)>,
+    #[cfg(windows)]
+    restore: Option<(std::os::windows::io::RawHandle, u32)>,
 }
 
 impl Quiet {
@@ -222,10 +240,37 @@ impl Quiet {
             });
             Self { restore }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+            use winapi::um::wincon::{
+                ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+            };
+            let handle = stdin.as_raw_handle();
+            let mut saved = 0;
+            let restore = (unsafe { GetConsoleMode(handle as _, &mut saved) } != 0)
+                .then(|| saved & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+                .filter(|&quiet| unsafe { SetConsoleMode(handle as _, quiet) } != 0)
+                .map(|_| (handle, saved));
+            Self { restore }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = stdin;
             Self {}
+        }
+    }
+
+    /// Whether what is typed is hidden: the echo did go off.
+    fn hides_typing(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        {
+            self.restore.is_some()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
         }
     }
 }
@@ -235,6 +280,10 @@ impl Drop for Quiet {
         #[cfg(unix)]
         if let Some((fd, saved)) = self.restore.take() {
             let _ = termios::tcsetattr(fd, termios::TCSANOW, &saved);
+        }
+        #[cfg(windows)]
+        if let Some((handle, saved)) = self.restore.take() {
+            unsafe { winapi::um::consoleapi::SetConsoleMode(handle as _, saved) };
         }
     }
 }

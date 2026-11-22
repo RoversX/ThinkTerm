@@ -13,7 +13,13 @@ mod status;
 
 #[cfg(all(
     feature = "node",
-    any(target_os = "macos", target_os = "linux", target_os = "ios", target_os = "android")
+    any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "ios",
+        target_os = "android"
+    )
 ))]
 pub mod node;
 
@@ -22,8 +28,14 @@ pub use status::{Family, Peer, Status, NOT_LET_IN};
 use anyhow::{Context, Result};
 
 /// Whether this build can hold a node: the library runs on macOS, Linux,
-/// iOS and Android only.
-pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux", target_os = "ios", target_os = "android"));
+/// Windows, iOS and Android only.
+pub const SUPPORTED: bool = cfg!(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "ios",
+    target_os = "android"
+));
 
 /// What a person types for a control server, as a URL: "https://" when no
 /// scheme is given.

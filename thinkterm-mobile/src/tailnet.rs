@@ -190,6 +190,9 @@ mod held {
         REVISION.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// The node is this crate's to hold here.
+    pub const SUPPORTED: bool = thinkterm_tailnet_engine::SUPPORTED;
+
     pub fn new_keys() -> Option<String> {
         node::new_node_keys().ok()
     }
@@ -512,6 +515,10 @@ mod held {
     use super::{TailnetConfig, TailnetStatus};
     use anyhow::Result;
 
+    /// No node here, wherever else the engine runs: on Windows the
+    /// desktop's own holds it.
+    pub const SUPPORTED: bool = false;
+
     pub fn new_keys() -> Option<String> {
         None
     }
@@ -533,10 +540,11 @@ mod held {
 
 pub use held::dial;
 
-/// Whether this build can join a tailnet by itself.
+/// Whether this build can join a tailnet by itself: what the backend it
+/// holds a node with says, not the engine alone.
 #[uniffi::export]
 pub fn tailnet_supported() -> bool {
-    thinkterm_tailnet_engine::SUPPORTED
+    held::SUPPORTED
 }
 
 /// The keys of a new node, for the shell to keep where secrets go and

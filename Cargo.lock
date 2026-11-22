@@ -9706,7 +9706,9 @@ name = "thinkterm-tailnet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-io",
  "config",
+ "filedescriptor 0.8.3",
  "http_req",
  "log",
  "nix 0.29.0",
@@ -9717,8 +9719,11 @@ dependencies = [
  "thinkterm-core",
  "thinkterm-tailnet-engine",
  "tokio",
+ "tokio-util",
  "url",
  "wezterm-ssh",
+ "wezterm-uds",
+ "winapi",
 ]
 
 [[package]]
@@ -9744,6 +9749,7 @@ dependencies = [
  "nix 0.29.0",
  "tempfile",
  "thinkterm-tailnet",
+ "winapi",
 ]
 
 [[package]]

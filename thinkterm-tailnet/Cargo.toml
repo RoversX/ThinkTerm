@@ -10,7 +10,7 @@ publish = false
 # settings, reads the node's reports, asks for connections through it, and
 # keeps it running -- all the app, `thinkterm` and the mux server need,
 # without the library in them.
-node = ["thinkterm-tailnet-engine/node", "dep:tokio"]
+node = ["thinkterm-tailnet-engine/node", "dep:tokio", "dep:async-io", "dep:tokio-util"]
 
 [dependencies]
 anyhow.workspace = true
@@ -29,9 +29,32 @@ wezterm-ssh.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "user"] }
 
-# The library runs on macOS and Linux only; elsewhere this crate builds
-# without it and SUPPORTED says so.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+[target.'cfg(windows)'.dependencies]
+# The node's socket is AF_UNIX on Windows too (see crate::proxy), through
+# the crate the mux server's own socket goes through there.
+wezterm-uds.workspace = true
+# Waiting for the node's answer without a receive timeout (see
+# crate::proxy).
+filedescriptor.workspace = true
+winapi = { workspace = true, features = [
+    "handleapi",
+    "processthreadsapi",
+    "securitybaseapi",
+    "synchapi",
+    "winbase",
+    "winerror",
+    "winnt",
+    "winsock2",
+] }
+# Tokio has no AF_UNIX on Windows: there the node's socket and the
+# connections it takes are async-io's, as the mux server's are, handed to
+# the node's Tokio side through tokio-util's compat.
+async-io = { workspace = true, optional = true }
+tokio-util = { version = "0.7", optional = true, features = ["compat"] }
+
+# The library runs on macOS, Linux and Windows only; elsewhere this crate
+# builds without it and SUPPORTED says so.
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
 http_req.workspace = true
 # For what runs beside the node on its runtime: the socket the machine's
 # other processes ask it on.

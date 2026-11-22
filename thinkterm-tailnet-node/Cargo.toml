@@ -20,6 +20,18 @@ config.workspace = true
 log = { workspace = true, features = ["std"] }
 thinkterm-tailnet = { workspace = true, features = ["node"] }
 
+# Watching the process it ends with (see main.rs).
+[target.'cfg(windows)'.dependencies]
+winapi = { workspace = true, features = [
+    "handleapi",
+    "minwindef",
+    "processthreadsapi",
+    "synchapi",
+    "tlhelp32",
+    "winerror",
+    "winnt",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 

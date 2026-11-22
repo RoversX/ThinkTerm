@@ -134,11 +134,14 @@ fn wait_while(flag: &AtomicBool, wait: Duration, cancelled: &dyn Fn() -> bool) -
 
 /// The program beside the server's executable: beside the file itself, not
 /// a link to it, as the command-line tools are linked into a bin directory
-/// from the app bundle.
+/// from the app bundle. On Windows, where the programs are installed side
+/// by side and linked nowhere, the path stays as it is: its canonical form
+/// there is a `\\?\` one.
 fn program() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
+    #[cfg(unix)]
     let exe = exe.canonicalize().unwrap_or(exe);
-    Ok(exe.with_file_name(PROGRAM))
+    Ok(exe.with_file_name(format!("{PROGRAM}{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// The program as this server runs it.
@@ -223,6 +226,7 @@ impl Keeper {
 /// own, so that a signal meant for the server's group is not meant for it.
 /// It ends with this process all the same, which it is told is its parent
 /// (see thinkterm-tailnet-node).
+#[cfg(unix)]
 fn start(program: &Path) -> std::io::Result<Child> {
     use std::os::unix::process::CommandExt;
     Command::new(program)
@@ -235,16 +239,53 @@ fn start(program: &Path) -> std::io::Result<Child> {
         .spawn()
 }
 
+/// Starts the program, on its own: no window, and a console of its own
+/// rather than the server's, so that a Ctrl-C meant for that is not meant
+/// for it, as the plugin host is started. It ends with this process all the
+/// same, which it is told is its parent (see thinkterm-tailnet-node).
+#[cfg(windows)]
+fn start(program: &Path) -> std::io::Result<Child> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new(program)
+        .arg("--parent")
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A program in `dir` that runs `script` as sh would.
+    #[cfg(unix)]
     fn program(dir: &Path, name: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A batch file in `dir` that does what `script` -- `sleep <secs>` or
+    /// `exit <code>`, as the tests here say it -- would.
+    #[cfg(windows)]
+    fn program(dir: &Path, name: &str, script: &str) -> PathBuf {
+        let path = dir.join(format!("{name}.cmd"));
+        let batch = match script.split_once(' ') {
+            // A ping a second, the first at once.
+            Some(("sleep", secs)) => {
+                let pings = secs.parse::<u32>().unwrap() + 1;
+                format!("@ping -n {pings} 127.0.0.1 >nul")
+            }
+            Some(("exit", code)) => format!("@exit /b {code}"),
+            _ => panic!("no batch file for {script:?}"),
+        };
+        std::fs::write(&path, format!("{batch}\r\n")).unwrap();
         path
     }
 

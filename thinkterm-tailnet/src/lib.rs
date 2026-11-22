@@ -18,58 +18,82 @@
 
 mod settings;
 mod status;
+#[cfg(windows)]
+mod windows;
 
-#[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "node",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod holder;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod keeper;
 // The node itself is thinkterm-tailnet-engine's: the one caller of the
 // library, which a phone's app holds too.
-#[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "node",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) use thinkterm_tailnet_engine::node;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod proxy;
 
-#[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "node",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub use holder::{follow, is_following, is_off};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use keeper::{keep_node, will_hold};
 pub use settings::{load, load_summary, Settings, Summary};
 pub(crate) use status::Family;
 pub use status::{read_live_report, Peer, Report, Status};
 
 /// Nothing to hold where the library does not run.
-#[cfg(all(feature = "node", not(any(target_os = "macos", target_os = "linux"))))]
+#[cfg(all(
+    feature = "node",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
 pub fn follow(changed: impl Fn() + Send + Sync + 'static) {
     let _ = changed;
 }
 
 /// Nothing is held where the library does not run, so nothing is to let go.
-#[cfg(all(feature = "node", not(any(target_os = "macos", target_os = "linux"))))]
+#[cfg(all(
+    feature = "node",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
 pub fn is_off() -> bool {
     true
 }
 
 /// Nothing follows the settings where the library does not run.
-#[cfg(all(feature = "node", not(any(target_os = "macos", target_os = "linux"))))]
+#[cfg(all(
+    feature = "node",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
 pub fn is_following() -> bool {
     false
 }
 
 /// Nothing to keep running where the library does not run.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn keep_node() {}
 
 /// Nothing to take over where the library does not run.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn will_hold() {}
 
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-/// Whether this build can join a tailnet: the library runs on macOS and
-/// Linux only.
-pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+/// Whether this build can join a tailnet: the library runs on macOS, Linux
+/// and Windows only.
+pub const SUPPORTED: bool = cfg!(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows"
+));
 
 /// How long a connection waits for the other machine when the caller sets
 /// no limit of its own.
@@ -78,7 +102,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a connection selecting the tailnet waits for `thinkterm-tailnet`
 /// to take up the node: just after the switch was turned on, or while it
 /// starts with the mux server at login.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const HOLDER_WAIT: Duration = Duration::from_secs(15);
 
 /// Tailscale's own control server, where a node goes when none is set.
@@ -87,7 +111,7 @@ const DEFAULT_CONTROL_SERVER: &str = "https://controlplane.tailscale.com";
 /// The capability version the key is asked for with: the one the library
 /// speaks (ts_control's `CapabilityVersion::CURRENT`). A control server
 /// sends its key the same way to every recent one.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const KEY_VERSION: &str = "130";
 
 /// Changes the settings file: reads it afresh, applies `change`, writes it
@@ -120,7 +144,10 @@ pub fn update(change: impl FnOnce(&mut Settings)) -> Result<Settings> {
         settings::save(&settings)?;
         settings
     };
-    #[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        feature = "node",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     holder::settings_changed();
     Ok(settings)
 }
@@ -157,7 +184,7 @@ pub fn check_control_server(text: &str) -> Result<()> {
     fetch_control_key(&url).with_context(|| format!("the control server at {url}"))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn fetch_control_key(url: &url::Url) -> Result<()> {
     use std::convert::TryFrom;
     let mut key_url = url.join("/key")?;
@@ -186,7 +213,7 @@ fn fetch_control_key(url: &url::Url) -> Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn fetch_control_key(_url: &url::Url) -> Result<()> {
     anyhow::bail!("joining a tailnet is not supported on this platform")
 }
@@ -232,7 +259,7 @@ pub(crate) fn dial(
     timeout: Option<Duration>,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<Result<socket2::Socket>> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         through_holder(
             host,
@@ -242,7 +269,7 @@ pub(crate) fn dial(
             cancelled,
         )
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (host, port, family, timeout, cancelled, DIAL_TIMEOUT);
         None
@@ -259,7 +286,7 @@ pub(crate) fn server_dial(
     timeout: Option<Duration>,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<Result<socket2::Socket>> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let timeout = timeout.unwrap_or(DIAL_TIMEOUT);
         let started = std::time::Instant::now();
@@ -269,7 +296,7 @@ pub(crate) fn server_dial(
         let left = timeout.saturating_sub(started.elapsed());
         through_holder(host, port, family, left, cancelled)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (host, port, family, timeout, cancelled);
         None
@@ -279,7 +306,7 @@ pub(crate) fn server_dial(
 /// A connection through the process holding the selected node. While
 /// nobody holds it, or the node it holds is on its way out, the connection
 /// waits for a holder within its timeout.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn through_holder(
     host: &str,
     port: u16,
@@ -295,7 +322,7 @@ fn through_holder(
 }
 
 /// `through_holder`, with where the holder listens passed in.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn through_holder_at(
     path: &std::path::Path,
     host: &str,
@@ -348,6 +375,12 @@ mod tests {
         assert!(control_url_as_kept("http://headscale.example.com:8080").is_err());
     }
 
+    // What a holder listens with: AF_UNIX on Windows too (see proxy).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::os::unix::net::UnixListener;
+    #[cfg(target_os = "windows")]
+    use wezterm_uds::UnixListener;
+
     /// Where a holder would listen, in a folder of its own: socket paths
     /// are short, and the default temp dir on macOS is not.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -360,7 +393,14 @@ mod tests {
         (dir, path)
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    fn temp_socket() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new().prefix("tt-").tempdir().unwrap();
+        let path = dir.path().join("tailnet.sock");
+        (dir, path)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn a_tailnet_host_waits_for_the_server_to_take_up_the_node() {
         use std::io::{Read, Write};
@@ -368,7 +408,7 @@ mod tests {
         let late = path.clone();
         let holder = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
-            let listener = std::os::unix::net::UnixListener::bind(&late).unwrap();
+            let listener = UnixListener::bind(&late).unwrap();
             let (mut stream, _) = listener.accept().unwrap();
             let mut byte = [0u8; 1];
             while stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {}
@@ -389,12 +429,12 @@ mod tests {
         holder.join().unwrap();
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn a_connection_is_asked_again_of_the_node_in_the_place_of_one_that_went() {
         use std::io::{Read, Write};
         let (_dir, path) = temp_socket();
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
         let holder = std::thread::spawn(move || {
             // The node on its way out takes the request and answers nothing.
             let (mut going, _) = listener.accept().unwrap();
@@ -423,7 +463,7 @@ mod tests {
         holder.join().unwrap();
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn a_closed_session_does_not_wait() {
         let (_dir, path) = temp_socket();

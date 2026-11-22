@@ -151,6 +151,23 @@ impl FromRawFd for UnixListener {
     }
 }
 
+#[cfg(windows)]
+impl AsRawSocket for UnixListener {
+    fn as_raw_socket(&self) -> RawSocket {
+        self.0.as_raw_socket()
+    }
+}
+
+/// So that a listener can be polled (async-io's `Async` wants this), as
+/// the streams it accepts can.
+#[cfg(windows)]
+impl AsSocket for UnixListener {
+    fn as_socket(&self) -> BorrowedSocket<'_> {
+        // The socket is this listener's own, and lives as long as it does.
+        unsafe { BorrowedSocket::borrow_raw(self.0.as_raw_socket()) }
+    }
+}
+
 impl UnixListener {
     pub fn bind<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         Ok(Self(ListenerImpl::bind(path)?))

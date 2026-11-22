@@ -3,6 +3,15 @@
 //! beside the SSH host catalog and its encryption key, and the auth key and
 //! the node's keys are encrypted with that key the same way host passwords
 //! are.
+//!
+//! On Windows that is in the local half of the profile
+//! (`%LOCALAPPDATA%\ThinkTerm\ssh`), which a roaming profile does not copy
+//! to the user's other machines: two machines on one node's keys would take
+//! the node from each other. Windows has no mode to give the files there,
+//! the node's socket among them: they take the permissions of the profile
+//! they are in, which let in this user, SYSTEM and the Administrators
+//! group, and nobody else, as ThinkTerm's other private files on Windows
+//! do.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -111,7 +120,7 @@ pub(crate) fn path() -> Result<PathBuf> {
 
 /// Where the process holding the node listens for the others (see
 /// crate::proxy): beside the settings, which only this user can open.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn socket_path() -> Result<PathBuf> {
     Ok(path()?.with_file_name("tailnet.sock"))
 }
@@ -170,7 +179,10 @@ pub(crate) fn lock_for_update() -> Result<File> {
 /// one node's keys would take the node from each other -- a debug build's
 /// `thinkterm-tailnet` beside the release one's. None while another process holds
 /// it. Released when dropped, or when the process ends.
-#[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "node",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) fn try_hold_node() -> Result<Option<File>> {
     let file = open_lock("tailnet-node.lock")?;
     match file.try_lock() {
@@ -214,17 +226,22 @@ fn open_lock(name: &str) -> Result<File> {
 
 /// What tells one version of the file from the next: a save puts a new
 /// file in place, so its inode tells even where the clock is too coarse to.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+/// Windows keeps a file's times to its clock's tick, which two saves of
+/// the same length can fall within, and Rust has no stable way to its file
+/// ids; the file is small, so what it says tells instead.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stamp {
     modified: Option<std::time::SystemTime>,
     len: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    digest: u64,
 }
 
 /// None while there is no file.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
     Some(Stamp {
@@ -232,6 +249,15 @@ pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
         len: meta.len(),
         #[cfg(unix)]
         inode: std::os::unix::fs::MetadataExt::ino(&meta),
+        // A read that fails tells as a change, and the next one as another:
+        // the settings are read again either way.
+        #[cfg(windows)]
+        digest: std::fs::read(path).map_or(0, |bytes| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        }),
     })
 }
 
