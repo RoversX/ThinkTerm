@@ -3,6 +3,7 @@ use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use window::bitmaps::Texture2d;
 use window::raw_window_handle::{
@@ -83,6 +84,10 @@ pub struct WebGpuState {
     /// the device up to 9 s behind. Waiting for the frame before last keeps
     /// at most two frames of uploads alive.
     in_flight_submissions: RefCell<std::collections::VecDeque<wgpu::SubmissionIndex>>,
+    /// How many validation errors the device's error handler has seen.
+    validation_errors: Arc<AtomicUsize>,
+    /// Frames wgpu has turned down since the last one it took.
+    rejected_frames: Cell<usize>,
     pub handle: RawHandlePair,
     /// Told of every present by WebGpuState::present.
     window: Window,
@@ -650,8 +655,12 @@ impl WebGpuState {
         // actual offender) and keep running. OutOfMemory/Internal are a
         // different story: the device is in no state to keep rendering, and
         // limping on would just be a silent blank window — die loudly.
-        device.on_uncaptured_error(Box::new(|err| match &err {
+        // Validation errors are counted for `submit_frame`.
+        let validation_errors = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&validation_errors);
+        device.on_uncaptured_error(Box::new(move |err| match &err {
             wgpu::Error::Validation { .. } => {
+                counted.fetch_add(1, Ordering::Relaxed);
                 log::error!("wgpu validation error (continuing): {err}");
             }
             _ => {
@@ -740,6 +749,8 @@ impl WebGpuState {
             in_flight_submissions: RefCell::new(std::collections::VecDeque::with_capacity(
                 MAX_FRAMES_IN_FLIGHT + 1,
             )),
+            validation_errors,
+            rejected_frames: Cell::new(0),
         })
     }
 
@@ -793,9 +804,42 @@ impl WebGpuState {
         }
     }
 
-    /// Record a frame's submission index so `wait_for_frame_slot` can wait on it.
-    pub fn note_submission(&self, index: wgpu::SubmissionIndex) {
-        self.in_flight_submissions.borrow_mut().push_back(index);
+    /// Submit a frame's commands, and keep its index for
+    /// `wait_for_frame_slot` unless wgpu turned the frame down.
+    ///
+    /// A frame that fails validation, in its commands or in the submit, is
+    /// not submitted, yet `Queue::submit` still hands back an index for it,
+    /// one the device never reaches. To `Device::poll` a wait on that index
+    /// is `WaitIdleError::WrongSubmissionIndex`, which it does not return
+    /// but panics on, and a panic in a paint callback aborts the app: two
+    /// frames turned down in a row did that. wgpu reports an error to the
+    /// device's handler as the call that made it returns, so a count that
+    /// moved over `finish` and `submit` is this frame's, or else one from
+    /// the callbacks `submit` runs for wgpu itself: a frame that did go out
+    /// then only goes without its wait.
+    pub fn submit_frame(&self, encoder: wgpu::CommandEncoder) {
+        let errors = self.validation_errors.load(Ordering::Relaxed);
+        let index = self.queue.submit(std::iter::once(encoder.finish()));
+        if self.validation_errors.load(Ordering::Relaxed) == errors {
+            let rejected = self.rejected_frames.replace(0);
+            if rejected > 0 {
+                log::warn!("wgpu turned down {rejected} frames in a row");
+            }
+            self.in_flight_submissions.borrow_mut().push_back(index);
+            return;
+        }
+        if self.rejected_frames.replace(self.rejected_frames.get() + 1) == 0 {
+            log::warn!("wgpu turned a frame down; it is not waited for");
+        }
+        // The frame's uploads are still queued: wgpu sends them with the
+        // next submission that goes out, and while frames keep being turned
+        // down they pile up at the frame rate. A submission of nothing sends
+        // them, and is a frame of its own to wait for.
+        let errors = self.validation_errors.load(Ordering::Relaxed);
+        let flushed = self.queue.submit(std::iter::empty());
+        if self.validation_errors.load(Ordering::Relaxed) == errors {
+            self.in_flight_submissions.borrow_mut().push_back(flushed);
+        }
     }
 
     /// Ask for a different swapchain frame latency. Applied lazily: the

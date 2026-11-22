@@ -621,8 +621,7 @@ pub(crate) fn draw_webgpu_layers(
     crate::perf::log_counter("webgpu_draw_calls", draw_calls);
     crate::perf::log_counter("webgpu_vertices", vertices_total);
     let submit_start = crate::perf::now();
-    let submission = webgpu.queue.submit(std::iter::once(encoder.finish()));
-    webgpu.note_submission(submission);
+    webgpu.submit_frame(encoder);
     if crate::framedump::should_dump(window_label) {
         if let Err(err) = crate::framedump::dump_texture(
             &webgpu.device,
