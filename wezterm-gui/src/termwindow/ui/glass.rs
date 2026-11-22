@@ -401,6 +401,37 @@ fn glass_shadow_above(depth: f32) -> f32 {
     )
 }
 
+/// The dark glass's coats over a see-through window (`ThroughGlass::coats`).
+#[derive(Clone, Debug)]
+struct Coats {
+    /// How much of the ground the fill keeps.
+    fill: f32,
+    /// The alpha of the white added over the whole capsule.
+    light: f32,
+    /// The edge's rings, outermost first.
+    rings: Vec<CoatRing>,
+}
+
+/// One ring of the edge, a pixel wide.
+#[derive(Clone, Copy, Debug)]
+struct CoatRing {
+    /// How far in from the edge, in pixels.
+    inset: f32,
+    /// How much of the ground it keeps: no more than the fill.
+    kept: f32,
+    /// The alpha of the white it adds over the fill's.
+    white: f32,
+}
+
+/// The coats worked out last, by their ground, mixing, corners and scale:
+/// the same few capsules are painted every frame.
+type CoatsKey = (bool, u32, u32, u32, u32, u32);
+
+thread_local! {
+    static COATS: std::cell::RefCell<Vec<(CoatsKey, Coats)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// What a see-through window's frame holds under a glass capsule, and how
 /// clearing and lighting it come out there (`TermWindow::paint_through_glass`).
 ///
@@ -417,6 +448,9 @@ struct ThroughGlass {
     /// How light the ground's own colour is: in linear light if the frame
     /// mixes in it, sRGB if not.
     colour: f32,
+    /// The ground's brightest channel, the same way: the one that runs out
+    /// of room first as light is added (`white_room`).
+    peak: f32,
 }
 
 impl ThroughGlass {
@@ -426,10 +460,12 @@ impl ThroughGlass {
         } else {
             lightness(ground)
         };
+        let peak = ground.0.max(ground.1).max(ground.2).clamp(0.0, 1.0);
         Self {
             linear,
             solid: ground.3.clamp(0.0, 1.0),
             colour,
+            peak: if linear { peak } else { encode(peak) },
         }
     }
 
@@ -440,6 +476,173 @@ impl ThroughGlass {
             return 1.0;
         }
         ((1.0 - (1.0 + more) * (1.0 - self.solid)) / self.solid).clamp(0.0, 1.0)
+    }
+
+    /// What the frame holds (sRGB) where `kept` of the ground is left and
+    /// white at `light`, as `light` gives it, is added over it.
+    fn lit(&self, kept: f32, light: f32) -> f32 {
+        let held = self.held(kept);
+        if self.linear {
+            encode((decode(held) + light).min(1.0))
+        } else {
+            (held + light).min(1.0)
+        }
+    }
+
+    /// How much white, as `light` gives it, the frame can still take where
+    /// `kept` of the ground is left, before its brightest channel holds more
+    /// than the frame is solid there. Below 0 the ground alone holds more,
+    /// as a light channel can once a frame mixing in linear light has
+    /// cleared most of it.
+    ///
+    /// The frame holds each colour times how solid it is, which the system
+    /// lays over what is behind the window. A colour past its solidity is no
+    /// such thing, and what a compositor makes of it is its own: the Mac's
+    /// drops the light, which made the straight edge of the glass go out
+    /// over a window 35% opaque while its round ends, cleared less, kept
+    /// theirs. The bound is taken on the values the frame stores, sRGB, so
+    /// that it holds whether the system mixes those or linear light.
+    fn white_room(&self, kept: f32) -> f32 {
+        let solid = self.solid * kept;
+        if self.linear {
+            decode(solid) - self.peak * solid
+        } else {
+            solid - self.peak * solid
+        }
+    }
+
+    /// The least of `low..=high` that `enough` holds for, it holding for
+    /// all above any it holds for; `None` if not even for `high`.
+    fn least(low: f32, high: f32, enough: impl Fn(f32) -> bool) -> Option<f32> {
+        if !enough(high) {
+            return None;
+        }
+        if enough(low) {
+            return Some(low);
+        }
+        let (mut low, mut high) = (low, high);
+        for _ in 0..16 {
+            let mid = (low + high) / 2.0;
+            if enough(mid) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        Some(high)
+    }
+
+    /// The dark glass's coats over a see-through window, as `Coats` says,
+    /// for a capsule of corners `radius` with `pixel` pixels to a point.
+    ///
+    /// Each is cleared as `glass_clear_through` asks and lit as
+    /// `glass_light_through` asks while the frame can carry that light
+    /// (`white_room`). Where it cannot, the light comes first: the fill
+    /// keeps back as much of the ground as the edge's brightest ring needs,
+    /// and a ring as much as its own light needs, so the glass is less
+    /// see-through than asked but keeps its edge. Over the usual dark
+    /// sidebar that is only the edge's rings, below 40% opacity; over a
+    /// sidebar as see-through as the window, the rings below 55% and the
+    /// fill too at 40% and below. Where not even all of the ground carries
+    /// the light, as over a tinted ground at the least opacity, only as much
+    /// light as fits is added, and the ground is kept back only as far as
+    /// the light it buys, so that one with no room at all is still cleared
+    /// as asked.
+    fn coats(&self, radius: f32, pixel: f32) -> Coats {
+        let key = (
+            self.linear,
+            self.solid.to_bits(),
+            self.colour.to_bits(),
+            self.peak.to_bits(),
+            radius.to_bits(),
+            pixel.to_bits(),
+        );
+        if let Some(coats) = COATS.with(|cache| {
+            cache
+                .borrow()
+                .iter()
+                .find(|(held, _)| *held == key)
+                .map(|(_, coats)| coats.clone())
+        }) {
+            return coats;
+        }
+        let coats = self.work_out_coats(radius, pixel);
+        COATS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= 8 {
+                cache.remove(0);
+            }
+            cache.push((key, coats.clone()));
+        });
+        coats
+    }
+
+    fn work_out_coats(&self, radius: f32, pixel: f32) -> Coats {
+        // Each ring of the edge, in from it, with how much more shows
+        // through there and how much lighter it is asked to be.
+        let mut asked = vec![];
+        let mut inset = 0.0_f32;
+        while radius - inset >= 1.0 {
+            let depth = inset / pixel;
+            let next = depth + 1.0 / pixel;
+            let clear = across_pixel(glass_clear_through, depth, next);
+            let lift = across_pixel(glass_light_through, depth, next);
+            if clear <= 0.0 && lift <= 0.0 {
+                break;
+            }
+            asked.push((inset, clear, lift));
+            inset += 1.0;
+        }
+        let fill_white = |kept: f32| self.light(self.held(kept), THROUGH_GLASS_LIFT);
+        let ring_white = |kept: f32, fill: f32, lift: f32| self.light(self.lit(kept, fill), lift);
+        let brightest = asked.iter().map(|&(_, _, lift)| lift).fold(0.0, f32::max);
+        let needs = |kept: f32| {
+            let fill = fill_white(kept);
+            fill + ring_white(kept, fill, brightest)
+        };
+        // Clearing never leaves the ground holding more than it is solid. In
+        // linear light a channel past 1/12.92 does once little is left, as
+        // sRGB's curve starts steeper than that, even though nothing at all
+        // left holds nothing: the least is looked for above that start.
+        let floor = if self.linear && self.peak * 12.92 > 1.0 {
+            let room = |kept: f32| self.white_room(kept) >= 0.0;
+            Self::least(f32::EPSILON, 1.0, room).unwrap_or(1.0)
+        } else {
+            0.0
+        };
+        let asked_fill = self.kept(THROUGH_GLASS_CLEAR).max(floor);
+        let fill = Self::least(asked_fill, 1.0, |kept| self.white_room(kept) >= needs(kept))
+            .unwrap_or_else(|| {
+                let buys = (self.white_room(1.0) / needs(1.0).max(f32::EPSILON)).clamp(0.0, 1.0);
+                asked_fill + (1.0 - asked_fill) * buys
+            });
+        let light = fill_white(fill).min(self.white_room(fill).max(0.0));
+        let rings = asked
+            .into_iter()
+            .map(|(inset, clear, lift)| {
+                // A fill kept back keeps its rings back with it, each as
+                // much more see-through than the fill as asked, so the edge
+                // meets the fill where its clearing runs out.
+                let (asked, plain) = (
+                    self.kept(THROUGH_GLASS_CLEAR + clear),
+                    self.kept(THROUGH_GLASS_CLEAR),
+                );
+                let asked = if fill > plain && plain > 0.0 {
+                    fill * asked / plain
+                } else {
+                    asked
+                };
+                let asked = asked.max(floor).min(fill);
+                let kept = Self::least(asked, fill, |kept| {
+                    self.white_room(kept) >= light + ring_white(kept, light, lift)
+                })
+                .unwrap_or(fill);
+                let white =
+                    ring_white(kept, light, lift).min((self.white_room(kept) - light).max(0.0));
+                CoatRing { inset, kept, white }
+            })
+            .collect();
+        Coats { fill, light, rings }
     }
 
     /// What the frame holds where `kept` of the ground is left, in sRGB.
@@ -720,28 +923,16 @@ impl crate::TermWindow {
             LinearRgba::with_components(ground.0, ground.1, ground.2, alpha.clamp(0.0, 1.0))
         };
         let light = |alpha: f32| LinearRgba::with_components(1.0, 1.0, 1.0, alpha);
-        // Each ring of the edge, in from it, with how much more shows
-        // through there and how much lighter it is than the fill.
-        let mut rings = vec![];
-        let mut inset = 0.0_f32;
-        while radius - inset >= 1.0 {
-            let depth = inset / pixel;
-            let next = depth + 1.0 / pixel;
-            let clear = across_pixel(glass_clear_through, depth, next);
-            let lift = across_pixel(glass_light_through, depth, next);
-            if clear <= 0.0 && lift <= 0.0 {
-                break;
-            }
-            rings.push((inset, clear, lift));
-            inset += 1.0;
-        }
-
-        let kept = through.kept(THROUGH_GLASS_CLEAR);
+        let Coats {
+            fill: kept,
+            light: fill_light,
+            rings,
+        } = through.coats(radius, pixel);
         let result = (|| {
             layers.set_blend(layer_num, QuadBlend::Clear);
             self.fill_rounded_rectangle(layers, layer_num, rect, clearing(1.0 - kept), radius)?;
-            for &(inset, clear, _) in &rings {
-                let ring_kept = through.kept(THROUGH_GLASS_CLEAR + clear) / kept.max(f32::EPSILON);
+            for ring in &rings {
+                let (inset, ring_kept) = (ring.inset, ring.kept / kept.max(f32::EPSILON));
                 self.paint_glass_edge_ring(
                     layers,
                     layer_num,
@@ -754,24 +945,15 @@ impl crate::TermWindow {
             }
 
             layers.set_blend(layer_num, QuadBlend::Add);
-            let held = through.held(kept);
-            self.fill_rounded_rectangle(
-                layers,
-                layer_num,
-                rect,
-                light(through.light(held, THROUGH_GLASS_LIFT)),
-                radius,
-            )?;
-            for &(inset, clear, lift) in &rings {
-                let held =
-                    through.held(through.kept(THROUGH_GLASS_CLEAR + clear)) + THROUGH_GLASS_LIFT;
+            self.fill_rounded_rectangle(layers, layer_num, rect, light(fill_light), radius)?;
+            for ring in &rings {
                 self.paint_glass_edge_ring(
                     layers,
                     layer_num,
                     rect,
                     radius,
-                    inset,
-                    light(through.light(held, lift)),
+                    ring.inset,
+                    light(ring.white),
                     GlassRing::Lit,
                 )?;
             }
@@ -1128,6 +1310,183 @@ mod test {
             let line = through.shade(LIGHT_GLASS_OUTLINE, held);
             let wanted = (1.0 - LIGHT_GLASS_OUTLINE) * held;
             assert!((after(line) - wanted).abs() < 1e-4, "linear {}", linear);
+        }
+    }
+
+    /// Dark grounds the dark glass is drawn on: the usual sidebar, a bluish
+    /// one, Nord's, Solarized's and a mid-dark grey.
+    const DARK_GROUNDS: [(u8, u8, u8); 5] = [
+        (18, 18, 20),
+        (40, 36, 70),
+        (46, 52, 64),
+        (7, 54, 66),
+        (90, 90, 90),
+    ];
+
+    /// `ground` as a see-through window `percent` opaque paints a sidebar
+    /// shaded `step` of the way to solid.
+    fn see_through(ground: (u8, u8, u8), percent: u32, step: f32) -> LinearRgba {
+        let window = percent as f32 / 100.0;
+        let solid = window + (1.0 - window) * step;
+        LinearRgba::with_srgba(ground.0, ground.1, ground.2, (solid * 255.0).round() as u8)
+    }
+
+    /// How much light (sRGB) each ring of the edge is asked for.
+    fn asked_lift(inset: f32, pixel: f32) -> f32 {
+        let depth = inset / pixel;
+        across_pixel(glass_light_through, depth, depth + 1.0 / pixel)
+    }
+
+    /// Down to opacities only a configuration file sets, with each sidebar
+    /// shade, no channel of the dark glass holds more than it is solid, as
+    /// the frame stores it once the fill and the rings are cleared and lit
+    /// as painted -- unless the ground itself already does, when the glass
+    /// adds nothing.
+    #[test]
+    fn through_glass_never_holds_more_light_than_it_is_solid() {
+        for linear in [false, true] {
+            for rgb in DARK_GROUNDS {
+                for percent in (5..=95).step_by(5) {
+                    for step in [0.0, 0.125, 0.25] {
+                        let ground = see_through(rgb, percent, step);
+                        let through = ThroughGlass::new(linear, ground);
+                        let solid = through.solid;
+                        // The brightest channel, stored, over how solid it is.
+                        let over = |kept: f32, white: f32| {
+                            [ground.0, ground.1, ground.2]
+                                .iter()
+                                .map(|&c| {
+                                    let stored = if linear {
+                                        encode((c * solid * kept + white).min(1.0))
+                                    } else {
+                                        encode(c) * solid * kept + white
+                                    };
+                                    stored - solid * kept
+                                })
+                                .fold(f32::MIN, f32::max)
+                        };
+                        for pixel in [1.5, 2.0] {
+                            let coats = through.coats(25.0, pixel);
+                            let what = format!(
+                                "linear {} ground {:?} at {}% shade {} pixel {}",
+                                linear, rgb, percent, step, pixel
+                            );
+                            if over(1.0, 0.0) > 1e-4 {
+                                assert_eq!(coats.light, 0.0, "{}", what);
+                                assert!(coats.rings.iter().all(|r| r.white == 0.0), "{}", what);
+                                continue;
+                            }
+                            assert!(over(coats.fill, coats.light) < 1e-4, "fill, {}", what);
+                            let asked_fill = through.kept(THROUGH_GLASS_CLEAR);
+                            for ring in &coats.rings {
+                                assert!(ring.kept <= coats.fill, "ring {}, {}", ring.inset, what);
+                                // Never more see-through than the fill than
+                                // it is asked to be.
+                                if asked_fill > 0.0 {
+                                    let depth = ring.inset / pixel;
+                                    let next = depth + 1.0 / pixel;
+                                    let clear = across_pixel(glass_clear_through, depth, next);
+                                    let asked =
+                                        through.kept(THROUGH_GLASS_CLEAR + clear) / asked_fill;
+                                    assert!(
+                                        ring.kept / coats.fill >= asked - 1e-4,
+                                        "ring {} clears too much, {}",
+                                        ring.inset,
+                                        what
+                                    );
+                                }
+                                assert!(
+                                    over(ring.kept, coats.light + ring.white) < 1e-4,
+                                    "ring {}, {}",
+                                    ring.inset,
+                                    what
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Over the usual dark sidebar at every opacity Settings offers, and
+    /// over one as see-through as the window down to 35% (40% bluish), the
+    /// edge has all
+    /// the light it is asked for: where it cannot also be cleared as asked,
+    /// it is cleared less.
+    #[test]
+    fn through_glass_keeps_its_edge_lit_where_it_has_to_clear_less() {
+        // Nord's ground, bluer, has room for all of it from 40%.
+        let mut cases = vec![];
+        for percent in (30..=95).step_by(5) {
+            cases.push(((18, 18, 20), percent, 0.25));
+            cases.push(((46, 52, 64), percent, 0.25));
+            if percent >= 35 {
+                cases.push(((18, 18, 20), percent, 0.0));
+            }
+            if percent >= 40 {
+                cases.push(((46, 52, 64), percent, 0.0));
+            }
+        }
+        for linear in [false, true] {
+            for &(rgb, percent, step) in &cases {
+                let through = ThroughGlass::new(linear, see_through(rgb, percent, step));
+                let pixel = 2.0;
+                let coats = through.coats(25.0, pixel);
+                let what = format!(
+                    "linear {} ground {:?} at {}% shade {}",
+                    linear, rgb, percent, step
+                );
+                let fill_white = through.light(through.held(coats.fill), THROUGH_GLASS_LIFT);
+                assert!((coats.light - fill_white).abs() < 1e-6, "fill, {}", what);
+                assert!(!coats.rings.is_empty(), "{}", what);
+                for ring in &coats.rings {
+                    let lift = asked_lift(ring.inset, pixel);
+                    let white = through.light(through.lit(ring.kept, coats.light), lift);
+                    let off = (ring.white - white).abs();
+                    assert!(off < 1e-6, "ring {}, {}", ring.inset, what);
+                }
+            }
+        }
+    }
+
+    /// A ground with no room for light at all is still cleared as asked,
+    /// and one with a little gets what fits, so the glass does not vanish.
+    #[test]
+    fn through_glass_without_room_for_its_light_is_still_cleared() {
+        let full = ThroughGlass::new(false, LinearRgba::with_components(1.0, 1.0, 1.0, 0.5));
+        let coats = full.coats(25.0, 2.0);
+        assert!(
+            (coats.fill - full.kept(THROUGH_GLASS_CLEAR)).abs() < 1e-5,
+            "{:?}",
+            coats
+        );
+        assert!(coats.light < 1e-6, "{:?}", coats);
+
+        let grey = ThroughGlass::new(false, see_through((90, 90, 90), 10, 0.0));
+        let coats = grey.coats(25.0, 2.0);
+        assert!(coats.fill < 1.0, "{:?}", coats);
+        assert!(coats.light > 0.0, "{:?}", coats);
+    }
+
+    /// Over a sidebar still fairly solid the glass is cleared and lit just
+    /// as asked.
+    #[test]
+    fn through_glass_is_as_asked_over_a_fairly_solid_window() {
+        for linear in [false, true] {
+            let through = ThroughGlass::new(linear, see_through_sidebar());
+            let pixel = 2.0;
+            let coats = through.coats(25.0, pixel);
+            assert_eq!(coats.fill, through.kept(THROUGH_GLASS_CLEAR));
+            assert!(!coats.rings.is_empty());
+            for ring in &coats.rings {
+                let depth = ring.inset / pixel;
+                let clear = across_pixel(glass_clear_through, depth, depth + 1.0 / pixel);
+                assert_eq!(ring.kept, through.kept(THROUGH_GLASS_CLEAR + clear));
+                let lift = asked_lift(ring.inset, pixel);
+                let white = through.light(through.lit(ring.kept, coats.light), lift);
+                assert_eq!(ring.white, white, "ring {}", ring.inset);
+            }
         }
     }
 
