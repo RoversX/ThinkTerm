@@ -343,6 +343,7 @@ case $OSTYPE in
       "$artifact_dir/thinkterm-gui.exe" \
       "$artifact_dir/thinkterm-connect-auth.exe" \
       "$artifact_dir/thinkterm-plugin-server.exe" \
+      "$artifact_dir/thinkterm-tailnet.exe" \
       "$artifact_dir/strip-ansi-escapes.exe" \
       $win_assets/conhost/conpty.dll \
       $win_assets/conhost/OpenConsole.exe \
