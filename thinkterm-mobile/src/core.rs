@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thinkterm_font_core::FontShaper as _;
 use thinkterm_font_web::{Face, FontSet};
+use thinkterm_agent_chat::view::Chat as ChatModel;
+use thinkterm_agent_chat::{Choice as ChatChoice, Op as ChatOp};
 use thinkterm_render::pipeline::GpuTexture;
 use thinkterm_web::app::{build_session, grid_for, App, PaneCell, Setup};
 use thinkterm_web::attach::{attach, Attached, ProtocolMismatch};
@@ -110,6 +112,8 @@ pub enum Cmd {
         path: String,
     },
     CancelUpload(u64),
+    /// An upload whose path goes elsewhere (a chat) than into a pane.
+    UploadUnpasted(u64),
     /// `Core::check_connection`.
     CheckConnection,
     /// `Core::forget_host_key`.
@@ -224,6 +228,39 @@ pub enum Cmd {
         head: (usize, usize),
         reply: Sender<Option<String>>,
     },
+    /// The chat with the agent in a pane (`Core::chat_*`).
+    Chat(ChatCmd),
+}
+
+/// What the shell asks of the chat on show.
+pub enum ChatCmd {
+    /// Show the chat with `agent` (its detection id) in `pane`, closing
+    /// one shown before.
+    Open { pane: u32, agent: String },
+    Close,
+    /// What to say, and the files sent with it (put on the host first).
+    Send {
+        text: String,
+        attachments: Vec<thinkterm_agent_chat::Attachment>,
+    },
+    /// Talk to another model, or think harder or less.
+    SetModel { model: String, effort: Option<String> },
+    Answer { ask: String, choice: String },
+    Interrupt,
+    Older,
+    Install,
+    /// Open its channel again, after it ended.
+    Retry,
+    /// Open or fold a row.
+    Toggle(String),
+}
+
+/// The chat on show: the pane it is with, the opening of its channel
+/// whose lines count, and what its bridge said.
+struct ChatSession {
+    pane: u32,
+    generation: u64,
+    model: ChatModel,
 }
 
 /// The surface currently lent, if any.
@@ -326,6 +363,19 @@ struct State {
     views_read: Arc<AtomicBool>,
     /// Something the views show changed since they were last made.
     views_dirty: Rc<Cell<bool>>,
+    /// The chat on show, if any (`Cmd::Chat`).
+    chat: Option<ChatSession>,
+    /// Openings of a chat's channel so far: each is numbered, and only the
+    /// latest one's lines count.
+    chat_openings: u64,
+    /// The panes whose agent waits on the person, as last told the shell
+    /// (`report_agents`).
+    agents_waiting: std::collections::HashSet<u32>,
+    /// The server those panes are of (`App::server_id`): another's, or one
+    /// started anew, has panes of the same numbers that are other agents.
+    agents_server: Option<String>,
+    /// The App's views changed since the agents were last looked at.
+    agents_dirty: Rc<Cell<bool>>,
     /// The shell's text input reads the rows: keep them current.
     screen_wanted: bool,
     /// The views are on show without the terminal (`Cmd::ListViews`): they
@@ -370,6 +420,7 @@ pub fn run(
         state.platform.fire_due();
         state.pool.run_until_stalled();
         state.report_link();
+        state.report_agents();
         state.publish_views();
     }
     state.disconnect();
@@ -428,6 +479,11 @@ impl State {
             published,
             views_read,
             views_dirty: Rc::new(Cell::new(true)),
+            chat: None,
+            chat_openings: 0,
+            agents_waiting: Default::default(),
+            agents_server: None,
+            agents_dirty: Rc::new(Cell::new(false)),
             screen_wanted: false,
             views_listed: false,
             icons,
@@ -520,6 +576,186 @@ impl State {
         }
     }
 
+    /// An agent that has begun to wait on the person, and one that no
+    /// longer does: told the shell on screen or off (`Notify::on_published`,
+    /// "agent_waiting" and "agent_resumed"), for a notification while the
+    /// app is away (Android's).
+    fn report_agents(&mut self) {
+        let Some(app) = self.app.clone() else {
+            return;
+        };
+        // A new connection (a redial) knows of no agent until the host has
+        // told: none has stopped waiting, nor begun to, before that. What
+        // changed meanwhile is looked at once it has.
+        if !app.agents_known() {
+            return;
+        }
+        if !self.agents_dirty.replace(false) {
+            return;
+        }
+        if let Some(server) = app.server_id() {
+            if self.agents_server.as_ref() != Some(&server) {
+                self.forget_agents();
+                self.agents_server = Some(server);
+            }
+        }
+        let view = app.agents_view();
+        let mut waiting = std::collections::HashSet::new();
+        for row in &view.rows {
+            if row.state != "blocked" {
+                continue;
+            }
+            let pane = row.pane as u32;
+            waiting.insert(pane);
+            if self.agents_waiting.contains(&pane) {
+                continue;
+            }
+            let said: Vec<&str> = [row.kind.as_deref(), row.said.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .collect();
+            let detail = if said.is_empty() { row.title.clone() } else { said.join(" · ") };
+            let told = serde_json::json!({
+                "pane": pane,
+                "agent": row.agent_id,
+                "name": row.name,
+                "place": row.place,
+                "detail": detail,
+                "chat": row.chat,
+            });
+            self.notify.on_published("agent_waiting".into(), told.to_string());
+        }
+        for pane in self.agents_waiting.difference(&waiting) {
+            self.notify.on_published("agent_resumed".into(), pane.to_string());
+        }
+        self.agents_waiting = waiting;
+    }
+
+    /// Every agent told as waiting is told as no longer: its notification
+    /// goes.
+    fn forget_agents(&mut self) {
+        for pane in std::mem::take(&mut self.agents_waiting) {
+            self.notify.on_published("agent_resumed".into(), pane.to_string());
+        }
+    }
+
+    fn chat_cmd(&mut self, cmd: ChatCmd) {
+        match cmd {
+            ChatCmd::Open { pane, agent } => {
+                if let Some(link) = &self.link {
+                    if self.chat.is_some() {
+                        link.chat_close();
+                    }
+                }
+                self.chat = Some(ChatSession {
+                    pane,
+                    generation: 0,
+                    model: ChatModel::new(pane, &agent),
+                });
+                self.chat_connect();
+            }
+            ChatCmd::Close => {
+                if self.chat.take().is_some() {
+                    if let Some(link) = &self.link {
+                        link.chat_close();
+                    }
+                }
+                return;
+            }
+            ChatCmd::Send { text, attachments } => {
+                self.chat_op_or_end(ChatOp::Send { text, attachments });
+            }
+            ChatCmd::SetModel { model, effort } => {
+                self.chat_op_or_end(ChatOp::SetModel { model, effort });
+            }
+            ChatCmd::Answer { ask, choice } => {
+                let choice = match choice.as_str() {
+                    "accept" => ChatChoice::Accept,
+                    "accept_for_session" => ChatChoice::AcceptForSession,
+                    _ => ChatChoice::Decline,
+                };
+                self.chat_op_or_end(ChatOp::Answer { ask, choice });
+            }
+            ChatCmd::Interrupt => {
+                self.chat_op_or_end(ChatOp::Interrupt);
+            }
+            ChatCmd::Older => {
+                let Some(chat) = self.chat.as_mut() else {
+                    return;
+                };
+                if !chat.model.has_more() {
+                    return;
+                }
+                chat.model.loading_older();
+                if !self.chat_op(ChatOp::Older) {
+                    if let Some(chat) = self.chat.as_mut() {
+                        chat.model.older_failed();
+                    }
+                }
+            }
+            ChatCmd::Install => {
+                self.chat_op(ChatOp::Install);
+            }
+            ChatCmd::Retry => self.chat_connect(),
+            ChatCmd::Toggle(row) => {
+                if let Some(chat) = self.chat.as_mut() {
+                    chat.model.toggle(&row);
+                }
+            }
+        }
+        self.publish_chat();
+    }
+
+    /// Open the chat's channel on the connection, for the chat on show:
+    /// an opening of its own, which lines of any before do not count in.
+    fn chat_connect(&mut self) {
+        let Some(chat) = self.chat.as_mut() else {
+            return;
+        };
+        self.chat_openings += 1;
+        chat.generation = self.chat_openings;
+        chat.model.reconnecting();
+        let opened = self.link.as_ref().is_some_and(|link| link.chat_open(chat.pane, chat.generation));
+        if !opened {
+            chat.model.ended(false, "not connected");
+        }
+    }
+
+    /// `op` for the chat's bridge; one that cannot go out leaves the chat
+    /// saying it is cut off, not seeming to have taken it.
+    fn chat_op_or_end(&mut self, op: ChatOp) {
+        if !self.chat_op(op) {
+            if let Some(chat) = self.chat.as_mut() {
+                chat.model.ended(false, "not connected");
+            }
+        }
+    }
+
+    /// Whether `op` went out to the chat's bridge.
+    fn chat_op(&mut self, op: ChatOp) -> bool {
+        if self.chat.is_none() {
+            return false;
+        }
+        match (&self.link, serde_json::to_string(&op)) {
+            (Some(link), Ok(line)) => link.chat_send(line),
+            _ => false,
+        }
+    }
+
+    /// The chat on show, as the shell draws it: its new small pictures
+    /// first ("chat_picture", each once, by the key its rows name them
+    /// by), then the view.
+    fn publish_chat(&mut self) {
+        if let Some(chat) = self.chat.as_mut() {
+            for (key, data) in chat.model.new_pictures() {
+                let picture = serde_json::json!({ "pane": chat.pane, "key": key, "data": data });
+                self.notify.on_published("chat_picture".into(), picture.to_string());
+            }
+            self.notify.on_published("chat".into(), json(&chat.model.view()));
+        }
+    }
+
     fn view_set(&self) -> ViewSet {
         ViewSet {
             revision: 0,
@@ -594,6 +830,10 @@ impl State {
             Cmd::Disconnect => {
                 self.disconnect();
                 self.set_status("disconnected");
+                // Asked for (not a redial, which `connect` makes): no word
+                // will come of the agents now, so none is left waiting.
+                self.forget_agents();
+                self.agents_server = None;
             }
             Cmd::Net { serial, dial, net } => self.on_net(serial, dial, net),
             Cmd::Dialed { serial, outcome } => self.on_dialed(serial, outcome),
@@ -711,6 +951,9 @@ impl State {
                     app.reconnect_now();
                 }
             }
+            Cmd::UploadUnpasted(id) => {
+                self.upload_panes.remove(&id);
+            }
             Cmd::CancelUpload(id) => {
                 // Its pane too, for one begun whose file never came.
                 self.upload_panes.remove(&id);
@@ -775,6 +1018,7 @@ impl State {
                     app.take_over();
                 }
             }
+            Cmd::Chat(cmd) => self.chat_cmd(cmd),
             Cmd::AgentToggleSubtasks(pane) => {
                 if let Some(app) = &self.app {
                     app.agent_toggle_subtasks(pane as usize);
@@ -1150,6 +1394,12 @@ impl State {
         // What was on its way goes with the connection: its word that it
         // ended would come from the old link, and be dropped below.
         self.end_unfinished_uploads("disconnected");
+        // A chat on show has no channel without it: it says so, rather than
+        // take words it cannot send. The next connection opens it again.
+        if let Some(chat) = self.chat.as_mut() {
+            chat.model.ended(false, "disconnected");
+            self.publish_chat();
+        }
         // Invalidate queued completions even if no new connection follows,
         // or the next connect fails before it can create its link.
         self.link_serial += 1;
@@ -1255,6 +1505,8 @@ impl State {
             // says of its transport is not the current dial's, and its close
             // would fail the dial now on its way. Its uploads end with it.
             Net::Connected | Net::Data(_) | Net::HostKeyRequired { .. } if earlier => {}
+            // A chat's channel of a dial before is no chat of this one's.
+            Net::ChatLine { .. } | Net::ChatEnded { .. } if earlier => {}
             Net::Closed(reason) if earlier => {
                 self.end_unfinished_uploads(&reason);
                 self.notify.on_log(format!("an earlier dial ended: {reason}"));
@@ -1264,6 +1516,28 @@ impl State {
                 // A scheme still untold for want of a link goes now.
                 if let Some(app) = self.app.clone() {
                     self.tell_palette(&app);
+                }
+                // A chat on show lost its channel with the last connection.
+                if self.chat.is_some() {
+                    self.chat_connect();
+                    self.publish_chat();
+                }
+            }
+            Net::ChatLine { generation, line } => {
+                if let Some(chat) = self.chat.as_mut().filter(|chat| chat.generation == generation) {
+                    if chat.model.line(&line) {
+                        self.publish_chat();
+                    }
+                }
+            }
+            Net::ChatEnded {
+                generation,
+                missing,
+                reason,
+            } => {
+                if let Some(chat) = self.chat.as_mut().filter(|chat| chat.generation == generation) {
+                    chat.model.ended(missing, &reason);
+                    self.publish_chat();
                 }
             }
             Net::Data(bytes) => {
@@ -1295,6 +1569,10 @@ impl State {
             Net::Closed(reason) => {
                 // What was on its way went with the connection.
                 self.end_unfinished_uploads(&reason);
+                if let Some(chat) = self.chat.as_mut() {
+                    chat.model.ended(false, &reason);
+                    self.publish_chat();
+                }
                 if self.app.is_none() {
                     self.conn = Conn::Disconnected(reason.clone());
                     self.set_status(&format!("disconnected: {reason}"));
@@ -1517,7 +1795,11 @@ impl State {
             // Inside the App's own call: only noted here, the views are
             // made between commands (`publish_views`).
             let dirty = Rc::clone(&self.views_dirty);
-            app.set_on_change(Rc::new(move || dirty.set(true)));
+            let agents = Rc::clone(&self.agents_dirty);
+            app.set_on_change(Rc::new(move || {
+                dirty.set(true);
+                agents.set(true);
+            }));
         }
         if !self.platform.shown() {
             // Made behind the screen (a reconnect while the app is in the

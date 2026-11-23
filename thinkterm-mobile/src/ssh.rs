@@ -80,6 +80,13 @@ pub enum Out {
     /// one that does not is ended at once, rather than when the
     /// keep-alives have gone unanswered long enough.
     Probe,
+    /// Open the chat with the agent in `pane`, on a channel of its own
+    /// running the host's bridge (`thinkterm cli agent chat`); one open
+    /// before is closed.
+    ChatOpen { pane: u32, generation: u64 },
+    /// A line for the chat's bridge.
+    ChatLine(String),
+    ChatClose,
     Close,
 }
 
@@ -108,6 +115,15 @@ pub enum Net {
     Uploaded {
         id: u64,
         result: Result<String, String>,
+    },
+    /// A line from the chat's bridge, under the opening it came from.
+    ChatLine { generation: u64, line: String },
+    /// The chat's channel ended; `missing` when the host's ThinkTerm has
+    /// no bridge (an older one).
+    ChatEnded {
+        generation: u64,
+        missing: bool,
+        reason: String,
     },
     Closed(String),
 }
@@ -153,6 +169,222 @@ const PROBE: &str = "for b in thinkterm wezterm; do \
 /// A word for the remote shell, whatever is in it.
 fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// What the network thread is asked of the chat (`Out::Chat*`).
+enum ChatAsk {
+    Open { pane: u32, generation: u64 },
+    Line(String),
+    Close,
+}
+
+/// The chat's channel: the host's bridge between the phone's chat and the
+/// agent in a pane (`thinkterm cli agent chat`), one JSON object a line.
+struct Chat {
+    /// Which opening of the chat this is: what it says is said under it,
+    /// and an opening since makes it old news.
+    generation: u64,
+    reader: russh::ChannelReadHalf,
+    writer: russh::ChannelWriteHalf<client::Msg>,
+    /// What came of a line not yet ended.
+    partial: Vec<u8>,
+    /// The end of what the command said on stderr, and how it ended.
+    err: String,
+    exit: Option<u32>,
+}
+
+/// Longest line taken from the bridge; a longer one is dropped whole.
+const CHAT_LINE: usize = 8 << 20;
+/// Of the bridge's stderr this much of the end is kept: enough for clap's
+/// "unrecognized subcommand" over the usage and help lines it prints after.
+const CHAT_ERR_KEPT: usize = 4 << 10;
+
+impl Chat {
+    async fn open(session: &client::Handle<HostKeyCheck>, command: String, generation: u64) -> Result<Self> {
+        let channel = bounded("opening the chat's channel", session.channel_open_session()).await?;
+        bounded("starting the chat", channel.exec(true, command)).await?;
+        let (reader, writer) = channel.split();
+        Ok(Self {
+            generation,
+            reader,
+            writer,
+            partial: Vec::new(),
+            err: String::new(),
+            exit: None,
+        })
+    }
+
+    async fn send(&mut self, line: &str) -> Result<()> {
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        self.writer.data(&bytes[..]).await.context("writing to the chat")?;
+        Ok(())
+    }
+
+    async fn close(self) {
+        let _ = self.writer.eof().await;
+        let _ = self.writer.close().await;
+    }
+
+    /// Takes in what the channel said: its lines go on as they end; its
+    /// end comes back, to be said once the chat is let go.
+    fn take(&mut self, msg: Option<ChannelMsg>, deliver: &dyn Fn(Net)) -> Option<Net> {
+        match msg {
+            Some(ChannelMsg::Data { data }) => {
+                self.partial.extend_from_slice(&data);
+                while let Some(at) = self.partial.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = self.partial.drain(..=at).collect();
+                    let line = String::from_utf8_lossy(&line[..line.len() - 1]).trim_end().to_string();
+                    if !line.is_empty() {
+                        deliver(Net::ChatLine {
+                            generation: self.generation,
+                            line,
+                        });
+                    }
+                }
+                if self.partial.len() > CHAT_LINE {
+                    self.partial.clear();
+                }
+                None
+            }
+            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                self.err.push_str(&String::from_utf8_lossy(&data));
+                if self.err.len() > CHAT_ERR_KEPT {
+                    let mut cut = self.err.len() - CHAT_ERR_KEPT;
+                    while !self.err.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    self.err.drain(..cut);
+                }
+                None
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                self.exit = Some(exit_status);
+                None
+            }
+            Some(ChannelMsg::Close) | None => {
+                let (missing, said) = chat_ended(self.exit, &self.err);
+                let mut reason = String::from("the chat ended");
+                if let Some(code) = self.exit.filter(|c| *c != 0) {
+                    reason.push_str(&format!(" with status {code}"));
+                }
+                if let Some(said) = said {
+                    reason.push_str(&format!(": {said}"));
+                }
+                Some(Net::ChatEnded {
+                    generation: self.generation,
+                    missing,
+                    reason,
+                })
+            }
+            Some(_) => None,
+        }
+    }
+}
+
+/// Whether the bridge was missing (an older ThinkTerm, whose CLI knows no
+/// `agent chat`: clap names the subcommand it does not know and exits with
+/// 2), and the line of stderr that says what went wrong: clap's `error:`
+/// line, else the last there is.
+fn chat_ended(exit: Option<u32>, err: &str) -> (bool, Option<String>) {
+    let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let error = lines.iter().find(|l| l.starts_with("error:")).or(lines.last());
+    let missing = exit == Some(2)
+        && lines
+            .iter()
+            .any(|l| l.contains("unrecognized subcommand") || l.contains("unexpected argument"));
+    (missing, error.map(|l| l.to_string()))
+}
+
+/// What runs the chat's bridge for `pane`: the CLI the protocol runs, when
+/// it was found; the remote command set by hand, with the chat in place of
+/// its proxy, when it is the CLI's proxy (its mux options kept, so the pane
+/// is the same mux's); else whatever CLI the login shell finds.
+fn chat_command(cli: Option<&str>, remote_command: &str, pane: u32) -> String {
+    if let Some(cli) = cli {
+        return format!("exec {} cli --prefer-mux agent chat --pane {pane}", shell_quote(cli));
+    }
+    let set = remote_command.trim();
+    if let Some(head) = set.strip_suffix(" proxy") {
+        if head.split_whitespace().any(|word| word == "cli") {
+            return format!("{head} agent chat --pane {pane}");
+        }
+    }
+    chat_by_login_shell(pane)
+}
+
+/// The chat's bridge, run by the login shell from wherever it finds the
+/// CLI, the places the probe looks.
+fn chat_by_login_shell(pane: u32) -> String {
+    let run = format!("exec \"$p\" cli --prefer-mux agent chat --pane {pane}");
+    let find = format!(
+        "for b in thinkterm wezterm; do p=$(command -v \"$b\" 2>/dev/null) && {run}; done; \
+         for p in \"$HOME/.local/bin/thinkterm\" /usr/local/bin/thinkterm /opt/homebrew/bin/thinkterm \
+         /Applications/ThinkTerm.app/Contents/MacOS/thinkterm; do [ -x \"$p\" ] && {run}; done; exit 127"
+    );
+    format!("exec \"${{SHELL:-/bin/sh}}\" -lc '{find}'")
+}
+
+/// The chat's next message, or never while none is open.
+async fn chat_wait(chat: &mut Option<Chat>) -> Option<ChannelMsg> {
+    match chat {
+        Some(chat) => chat.reader.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The chat's channel, run beside the protocol's and polled with it: its
+/// opening, its writes and its close wait here, never in the loop that
+/// reads the protocol, whose reading must not stop (`run`).
+async fn run_chat(
+    session: &client::Handle<HostKeyCheck>,
+    cli: Option<String>,
+    remote_command: String,
+    mut asks: UnboundedReceiver<ChatAsk>,
+    deliver: &dyn Fn(Net),
+) {
+    let mut chat: Option<Chat> = None;
+    loop {
+        tokio::select! {
+            ask = asks.recv() => match ask {
+                None => break,
+                Some(ChatAsk::Open { pane, generation }) => {
+                    if let Some(old) = chat.take() {
+                        old.close().await;
+                    }
+                    let command = chat_command(cli.as_deref(), &remote_command, pane);
+                    match Chat::open(session, command, generation).await {
+                        Ok(opened) => chat = Some(opened),
+                        Err(err) => deliver(Net::ChatEnded { generation, missing: false, reason: format!("{err:#}") }),
+                    }
+                }
+                Some(ChatAsk::Line(line)) => {
+                    if let Some(open) = chat.as_mut() {
+                        if let Err(err) = open.send(&line).await {
+                            let generation = open.generation;
+                            chat = None;
+                            deliver(Net::ChatEnded { generation, missing: false, reason: format!("{err:#}") });
+                        }
+                    }
+                }
+                Some(ChatAsk::Close) => {
+                    if let Some(old) = chat.take() {
+                        old.close().await;
+                    }
+                }
+            },
+            msg = chat_wait(&mut chat) => {
+                let open = chat.as_mut().expect("waited on an open chat");
+                if let Some(ended) = open.take(msg, deliver) {
+                    chat = None;
+                    deliver(ended);
+                }
+            }
+        }
+    }
+    if let Some(old) = chat.take() {
+        old.close().await;
+    }
 }
 
 /// The CLI's path on the host, from the probe. Only the probe runs in
@@ -636,9 +868,13 @@ async fn run(
     sign_in(&mut session, &params.user, &params.auth, "the host").await?;
 
     let mut channel = bounded("opening a session channel", session.channel_open_session()).await?;
+    // The CLI's path, when found, runs the chat's bridge too.
+    let mut cli = None;
     let command = if params.remote_command.trim().is_empty() {
-        let cli = find_cli(&session).await?;
-        format!("exec {} cli --prefer-mux proxy", shell_quote(&cli))
+        let found = find_cli(&session).await?;
+        let command = format!("exec {} cli --prefer-mux proxy", shell_quote(&found));
+        cli = Some(found);
+        command
     } else {
         params.remote_command.clone()
     };
@@ -660,7 +896,12 @@ async fn run(
                     .data(&bytes[..])
                     .await
                     .context("writing to the channel")?,
-                beside @ (Out::Upload { .. } | Out::CancelUpload(_) | Out::Probe) => {
+                beside @ (Out::Upload { .. }
+                | Out::CancelUpload(_)
+                | Out::Probe
+                | Out::ChatOpen { .. }
+                | Out::ChatLine(_)
+                | Out::ChatClose) => {
                     let _ = upload_tx.send(beside);
                 }
                 Out::Close => break,
@@ -692,6 +933,11 @@ async fn run(
     // A look at whether the connection still carries anything: a channel
     // opened and closed again, which needs the host's answer.
     let mut probes = futures::stream::FuturesUnordered::new();
+    // The chat's channel, in a future of its own polled with the protocol.
+    let (chat_tx, chat_rx) = unbounded_channel::<ChatAsk>();
+    let chats = run_chat(&session, cli.clone(), params.remote_command.clone(), chat_rx, deliver);
+    tokio::pin!(chats);
+    let mut chats_done = false;
     let start = |id: u64, name: String, path: String, cancels: &mut std::collections::HashMap<u64, tokio::sync::watch::Sender<bool>>| {
         let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
         cancels.insert(id, cancel_tx);
@@ -764,8 +1010,18 @@ async fn run(
                         let _ = cancel.send(true);
                     }
                 }
+                Out::ChatOpen { pane, generation } => {
+                    let _ = chat_tx.send(ChatAsk::Open { pane, generation });
+                }
+                Out::ChatLine(line) => {
+                    let _ = chat_tx.send(ChatAsk::Line(line));
+                }
+                Out::ChatClose => {
+                    let _ = chat_tx.send(ChatAsk::Close);
+                }
                 _ => {}
             },
+            () = &mut chats, if !chats_done => chats_done = true,
             Some(alive) = futures::StreamExt::next(&mut probes), if !probes.is_empty() => {
                 if !alive {
                     // Gone without a word, as a connection is that a
@@ -826,6 +1082,37 @@ async fn run(
                 Some(_) => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn an_older_cli_is_told_by_what_clap_says() {
+        let err = "error: unrecognized subcommand 'chat'\n\nUsage: thinkterm cli agent <COMMAND>\n\nFor more information, try '--help'.\n";
+        let (missing, said) = chat_ended(Some(2), err);
+        assert!(missing);
+        assert_eq!(said.as_deref(), Some("error: unrecognized subcommand 'chat'"));
+        let (missing, said) = chat_ended(Some(1), "something broke\n");
+        assert!(!missing);
+        assert_eq!(said.as_deref(), Some("something broke"));
+        assert_eq!(chat_ended(None, ""), (false, None));
+    }
+
+    #[test]
+    fn the_chat_runs_where_the_proxy_does() {
+        assert_eq!(
+            chat_command(Some("/opt/tt/thinkterm"), "", 3),
+            "exec '/opt/tt/thinkterm' cli --prefer-mux agent chat --pane 3"
+        );
+        assert_eq!(
+            chat_command(None, "thinkterm cli --unix-socket /run/me/mux2 proxy", 4),
+            "thinkterm cli --unix-socket /run/me/mux2 agent chat --pane 4"
+        );
+        assert!(chat_command(None, "/usr/local/bin/my-wrapper", 5).contains("agent chat --pane 5"));
+        assert!(chat_command(None, "/usr/local/bin/my-wrapper", 5).starts_with("exec \"${SHELL"));
     }
 }
 

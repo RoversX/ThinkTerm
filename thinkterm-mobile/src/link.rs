@@ -195,6 +195,33 @@ impl SshLink {
         }
     }
 
+    /// Open the chat with the agent in `pane` on a channel beside the
+    /// protocol's; its lines come back as `Net::ChatLine`, its end as
+    /// `Net::ChatEnded`. False when there is no connection to open it on.
+    pub fn chat_open(&self, pane: u32, generation: u64) -> bool {
+        let out = self.0.out.borrow();
+        match out.as_ref().filter(|_| self.0.open.get()) {
+            Some(out) => out.send(Out::ChatOpen { pane, generation }).is_ok(),
+            None => false,
+        }
+    }
+
+    /// A line for the open chat's bridge; false when there is no
+    /// connection to send it on.
+    pub fn chat_send(&self, line: String) -> bool {
+        let out = self.0.out.borrow();
+        match out.as_ref().filter(|_| self.0.open.get()) {
+            Some(out) => out.send(Out::ChatLine(line)).is_ok(),
+            None => false,
+        }
+    }
+
+    pub fn chat_close(&self) {
+        if let Some(out) = self.0.out.borrow().as_ref() {
+            let _ = out.send(Out::ChatClose);
+        }
+    }
+
     /// See whether the open connection still carries anything; one that
     /// does not closes as it would have on its own, only now.
     pub fn probe(&self) {

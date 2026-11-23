@@ -31,6 +31,8 @@ termwiz = { workspace = true, features = ["use_serde"] }
 thinkterm-font-core.workspace = true
 thinkterm-font-web.workspace = true
 thinkterm-i18n.workspace = true
+# Which agents a chat can be had with (the Agents panel's rows say so).
+thinkterm-agent-chat.workspace = true
 thinkterm-plugin-channel.workspace = true
 thinkterm-plugin-panel.workspace = true
 thinkterm-proto.workspace = true

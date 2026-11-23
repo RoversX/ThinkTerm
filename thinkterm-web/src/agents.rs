@@ -43,6 +43,8 @@ pub struct AgentRow {
     /// While it is open: the sub-tasks listed, and how many more there are.
     pub subtasks: Vec<AgentSubtask>,
     pub more_subtasks: usize,
+    /// Its conversation can be shown as a chat (the phone's).
+    pub chat: bool,
 }
 
 /// One of a program's sub-tasks, as the desktop's panel lists them.
@@ -305,6 +307,7 @@ pub fn rows(
                     })
                     .collect(),
                 more_subtasks: listed.len().saturating_sub(SUBTASKS_SHOWN),
+                chat: thinkterm_agent_chat::chat_agent(agent_id),
             }
         })
         .collect();
@@ -380,6 +383,7 @@ mod tests {
             subtasks_open: false,
             subtasks: Vec::new(),
             more_subtasks: 0,
+            chat: thinkterm_agent_chat::chat_agent(agent),
         }
     }
 

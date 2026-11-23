@@ -709,6 +709,10 @@ pub struct Inner<P: Platform, L: Link> {
     /// the default, as on the desktop. Each look at the panel drops the
     /// ones with no sub-tasks left.
     open_subtasks: std::collections::HashSet<PaneId>,
+    /// The host has told what each agent is doing (`GetAgentStatuses`,
+    /// after the tree): until then a connection knows of no agent, and
+    /// none can be taken to have stopped waiting.
+    agents_known: bool,
     /// The plugin panel on show in the right panel, while one is.
     plugin_panel: Option<crate::plugin_panel::PanelModel>,
     /// What the page last said of the room a plugin panel has: its size,
@@ -1023,6 +1027,7 @@ impl<P: Platform, L: Link> App<P, L> {
             right_panel: "agents".to_string(),
             right_panel_shown: false,
             open_subtasks: Default::default(),
+            agents_known: false,
             plugin_panel: None,
             plugin_panel_env: None,
             plugin_extended: None,
@@ -3889,6 +3894,7 @@ impl<P: Platform, L: Link> App<P, L> {
                         inner.tree.apply_agent(e.pane_id, Some(&e.status));
                         inner.tree.record_agent_details(e.pane_id, &e.status.agent_id, &e.title);
                     }
+                    inner.agents_known = true;
                 }
                 Err(err) => log::warn!("fetching agent statuses: {err:#}"),
             }
@@ -5143,6 +5149,11 @@ impl<P: Platform, L: Link> App<P, L> {
             _ => None,
         };
         menu.unwrap_or_default()
+    }
+
+    /// Whether the host has told what its agents are doing yet.
+    pub fn agents_known(&self) -> bool {
+        self.inner.borrow().agents_known
     }
 
     /// The Agents panel: every pane an agent runs in, and the summary line.

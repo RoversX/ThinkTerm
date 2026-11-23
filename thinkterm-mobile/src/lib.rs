@@ -327,6 +327,19 @@ pub struct UploadStatus {
     pub error: String,
 }
 
+/// A file sent with what is said in a chat: one uploaded first
+/// (`upload_file`), by where it is on the host.
+#[derive(uniffi::Record, Clone, Default)]
+pub struct ChatAttachment {
+    /// Its name, as the person picked it.
+    pub name: String,
+    /// A picture, which the agent is shown as one; else a file whose
+    /// path it is told.
+    pub image: bool,
+    /// Where it is on the host (`UploadStatus::path`).
+    pub path: String,
+}
+
 /// What the core thread last published for the shell to read. The lock
 /// is held only to copy in or out, never while anything is made.
 pub(crate) struct Published {
@@ -839,6 +852,74 @@ impl Core {
     /// Agents panel (`agents`: a row's `subtasks_open`).
     pub fn agent_toggle_subtasks(&self, pane: u32) {
         let _ = self.tx.send(core::Cmd::AgentToggleSubtasks(pane));
+    }
+
+    /// Show the agent in `pane` as a chat: `agent` is its row's
+    /// `agent_id`. The chat comes, and comes again whenever it changes, as
+    /// JSON through `Notify::on_published` under "chat"
+    /// (`thinkterm_agent_chat::view::ChatView`). One chat at a time: this
+    /// closes the one before.
+    pub fn chat_open(&self, pane: u32, agent: String) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Open { pane, agent }));
+    }
+
+    pub fn chat_close(&self) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Close));
+    }
+
+    /// Say `text` to the agent, with the files uploaded for it: a turn of
+    /// its own, or added to the running one.
+    pub fn chat_send(&self, text: String, attachments: Vec<ChatAttachment>) {
+        let attachments = attachments
+            .into_iter()
+            .map(|file| thinkterm_agent_chat::Attachment {
+                name: file.name,
+                image: file.image,
+                path: Some(file.path),
+                thumb: None,
+            })
+            .collect();
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Send { text, attachments }));
+    }
+
+    /// Talk to another model (an id of the view's `model.models`), or
+    /// think harder or less (an id of its `model.efforts`).
+    pub fn chat_set_model(&self, model: String, effort: Option<String>) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::SetModel { model, effort }));
+    }
+
+    /// Upload `id` is for a chat: its path is not pasted into a pane.
+    pub fn upload_unpasted(&self, id: u64) {
+        let _ = self.tx.send(core::Cmd::UploadUnpasted(id));
+    }
+
+    /// Answer the question on show (its `ask.id`) with one of its
+    /// `choices` (a choice's `id`).
+    pub fn chat_answer(&self, ask: String, choice: String) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Answer { ask, choice }));
+    }
+
+    pub fn chat_interrupt(&self) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Interrupt));
+    }
+
+    /// History from before the first row, when the chat says there is more.
+    pub fn chat_older(&self) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Older));
+    }
+
+    /// The chat's problem's action: "install" or "retry".
+    pub fn chat_action(&self, action: String) {
+        let cmd = match action.as_str() {
+            "install" => core::ChatCmd::Install,
+            _ => core::ChatCmd::Retry,
+        };
+        let _ = self.tx.send(core::Cmd::Chat(cmd));
+    }
+
+    /// Open or fold the chat's row `row` (a fold's `id`).
+    pub fn chat_toggle(&self, row: String) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Toggle(row)));
     }
 
     /// A touch on the terminal, in points: "down", "move" or "up".

@@ -38,6 +38,8 @@ shlex.workspace = true
 qrcode.workspace = true
 termwiz = { workspace = true, features = ["use_serde"] }
 thinkterm-font-core.workspace = true
+# An agent's conversation as a chat: the bridge's lines and the view of them.
+thinkterm-agent-chat = { workspace = true, features = ["view"] }
 # The app's own node in a tailnet (`tailnet`), where the library runs: a
 # phone has no mux server to hold one for it, as a desktop has.
 thinkterm-tailnet-engine = { workspace = true, features = ["node"] }
