@@ -80,6 +80,11 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(chatFirst, forKey: "chat.first") }
     }
 
+    /// How large the chat's text is: "s", "m", "l" or "xl".
+    @Published var chatText: String {
+        didSet { defaults.set(chatText, forKey: "chat.text") }
+    }
+
     /// How the sidebar shows the Spaces: "list", every Space a row that
     /// folds, or "menu", the Space on show with the others in its menu,
     /// as the desktop's sidebar has them.
@@ -160,6 +165,7 @@ final class AppSettings: ObservableObject {
         resizeMode = d.string(forKey: "resize.mode") ?? "auto"
         paneBars = d.object(forKey: "ui.panebars") as? Bool ?? true
         chatFirst = d.object(forKey: "chat.first") as? Bool ?? false
+        chatText = d.string(forKey: "chat.text") ?? "m"
         spaces = d.string(forKey: "ui.spaces") ?? "list"
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
         autoKeyPanel = d.object(forKey: "key.autopanel") as? Bool ?? false

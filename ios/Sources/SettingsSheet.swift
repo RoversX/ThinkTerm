@@ -227,6 +227,12 @@ struct SettingsPageView: View {
             }
             Section {
                 Toggle(tr("chat.first"), isOn: $settings.chatFirst)
+                push(tr("chat.text"), selection: $settings.chatText, options: [
+                    PickerOption("s", tr("chat.text.s")),
+                    PickerOption("m", tr("chat.text.m")),
+                    PickerOption("l", tr("chat.text.l")),
+                    PickerOption("xl", tr("chat.text.xl")),
+                ])
             } footer: {
                 Text(tr("chat.first.note"))
             }

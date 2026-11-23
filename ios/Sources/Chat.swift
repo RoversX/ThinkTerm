@@ -171,6 +171,9 @@ struct ChatGroup: Decodable {
     var id: String
     var icon: String
     var label: String
+    /// For one change done, the lines it added and took out.
+    var added: Int?
+    var removed: Int?
     /// "running", "stopped", "done".
     var state: String
     var badge: String?
@@ -310,6 +313,28 @@ struct ChatNotice: Decodable, Equatable {
 
 // MARK: the page
 
+/// How large the chat's text is drawn, as its setting says.
+func chatTextScale(_ setting: String) -> CGFloat {
+    switch setting {
+    case "s": return 0.9
+    case "l": return 1.12
+    case "xl": return 1.25
+    default: return 1
+    }
+}
+
+private struct ChatTextScaleKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 1
+}
+
+extension EnvironmentValues {
+    /// How large the chat's text is drawn (`chatTextScale`).
+    var chatTextScale: CGFloat {
+        get { self[ChatTextScaleKey.self] }
+        set { self[ChatTextScaleKey.self] = newValue }
+    }
+}
+
 private let working = Color(red: 0.20, green: 0.78, blue: 0.35)
 private let waiting = Color(red: 1.0, green: 0.62, blue: 0.04)
 
@@ -339,6 +364,8 @@ struct ChatPage: View {
     @State private var known: Set<String> = []
     /// The context's sheet, risen from the bottom.
     @State private var showContext = false
+    /// The chat's text size is one of its settings.
+    @ObservedObject private var settings = AppSettings.shared
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -404,6 +431,9 @@ struct ChatPage: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
+                // The chat's text as large as its setting makes it; the bars
+                // keep theirs.
+                .environment(\.chatTextScale, chatTextScale(settings.chatText))
             }
             .scrollDismissesKeyboard(.interactively)
             // What scrolls under the bars blurs and fades into them, softly:
@@ -422,9 +452,9 @@ struct ChatPage: View {
                             Image(systemName: "arrow.down")
                                 .font(.system(size: 15, weight: .semibold))
                                 .foregroundStyle(.primary)
-                                .frame(width: 36, height: 36)
+                                .frame(width: 40, height: 40)
                                 .glassEffect(.regular.interactive(), in: .circle)
-                                .frame(width: 44, height: 44)
+                                .frame(width: 46, height: 46)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -435,10 +465,22 @@ struct ChatPage: View {
                 }
                 .animation(.snappy(duration: 0.16), value: atEnd)
             }
-            .onScrollGeometryChange(for: Bool.self) { geometry in
-                geometry.visibleRect.maxY >= geometry.contentSize.height - 120
-            } action: { _, near in
-                atEnd = near
+            // Whether the person reads the end: as their last scroll (or
+            // the last one made here) left the list, once it came to rest.
+            // What comes in below does not change it: rows that came in a
+            // burst once read as a scroll away from it.
+            .onScrollPhaseChange { _, phase, context in
+                switch phase {
+                // The person's own scroll (a fling up from the end): what
+                // comes in meanwhile does not pull the list back.
+                case .interacting:
+                    atEnd = false
+                case .idle:
+                    let geometry = context.geometry
+                    atEnd = geometry.visibleRect.maxY >= geometry.contentSize.height - 120
+                default:
+                    break
+                }
             }
             .onChange(of: chat?.rows.map(\.id) ?? []) { _, ids in
                 known.formUnion(ids)
@@ -500,9 +542,9 @@ struct ChatPage: View {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(.primary)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 40, height: 40)
                     .glassEffect(.regular.interactive(), in: .circle)
-                    .frame(width: 44, height: 44)
+                    .frame(width: 46, height: 46)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -542,11 +584,11 @@ struct ChatPage: View {
                     .stroke(contextLevelColor(context.level), style: StrokeStyle(lineWidth: 2.6, lineCap: .round))
                     .rotationEffect(.degrees(-90))
             }
-            .frame(width: 19, height: 19)
+            .frame(width: 21, height: 21)
             .animation(.smooth(duration: 0.5), value: fill)
-            .frame(width: 36, height: 36)
+            .frame(width: 40, height: 40)
             .glassEffect(.regular.interactive(), in: .circle)
-            .frame(width: 44, height: 44)
+            .frame(width: 46, height: 46)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -575,7 +617,7 @@ struct ChatPage: View {
                     HStack {
                         Spacer(minLength: 48)
                         Text(text)
-                            .font(.system(size: 16))
+                            .font(.system(size: 16 * chatTextScale(settings.chatText)))
                             .lineSpacing(3)
                             .textSelection(.enabled)
                             .padding(.horizontal, 14)
@@ -589,10 +631,11 @@ struct ChatPage: View {
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case let .text(_, blocks):
-            // Grows smoothly as more of what it says comes.
+            // Grows as more of what it says comes, at once: an animated
+            // growth a few times a second kept the list moving under the
+            // words.
             MarkdownBlocks(blocks: blocks)
                 .textSelection(.enabled)
-                .animation(.easeOut(duration: 0.18), value: blocks)
         case let .fold(fold):
             FoldView(fold: fold) { model.chatToggle(fold.id) }
         case let .group(group):
@@ -622,13 +665,17 @@ struct ChatPage: View {
                         .glassEffect(.regular, in: .capsule)
                         .transition(.opacity)
                 }
+                // Cards over the field rise in and drop away.
                 if let outdated = chat?.outdated {
                     outdatedCard(outdated)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
                 if let problem = chat?.problem {
                     problemCard(problem)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 } else if let ask = chat?.ask {
                     askCard(ask)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
                 // Drawn again only when what it shows changes: not as rows
                 // come, nor as the list scrolls.
@@ -645,6 +692,9 @@ struct ChatPage: View {
                 )
                 .equatable()
             }
+            .animation(.snappy(duration: 0.24), value: chat?.ask?.id)
+            .animation(.snappy(duration: 0.24), value: chat?.problem?.text)
+            .animation(.snappy(duration: 0.24), value: chat?.outdated != nil)
         }
         .padding(.horizontal, 10)
         .padding(.top, 8)
@@ -1017,6 +1067,7 @@ private struct ChatComposer: View, Equatable {
                     PickedFiles(files: files) { model.chatDetach($0) }
                         .padding(.horizontal, 10)
                         .padding(.top, 10)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
                 TextField(placeholder, text: $text, axis: .vertical)
                     .lineLimit(1...6)
@@ -1044,6 +1095,7 @@ private struct ChatComposer: View, Equatable {
             .overlay { card.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5) }
         }
         .animation(.snappy(duration: 0.18), value: offer?.commands.map(\.name))
+        .animation(.snappy(duration: 0.22), value: files.count)
     }
 
     /// A command picked: one that runs as it is goes now, as typed; one
@@ -1075,11 +1127,11 @@ private struct ChatComposer: View, Equatable {
                 .font(.system(size: stop ? 12 : 15, weight: .bold))
                 .foregroundStyle(stop ? Color(uiColor: .systemBackground) : canSend ? .white : .secondary)
                 .contentTransition(.symbolEffect(.replace))
-                .frame(width: 34, height: 34)
+                .frame(width: 40, height: 40)
                 .background(
                     Circle().fill(stop ? Color.primary : canSend ? Color.accentColor : Color.primary.opacity(0.1))
                 )
-                .frame(width: 44, height: 44)
+                .frame(width: 46, height: 46)
                 .contentShape(Rectangle())
                 .animation(.easeOut(duration: 0.16), value: canSend)
                 .animation(.easeOut(duration: 0.16), value: stop)
@@ -1106,9 +1158,9 @@ private struct ChatComposer: View, Equatable {
             Image(systemName: "plus")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.primary)
-                .frame(width: 34, height: 34)
+                .frame(width: 40, height: 40)
                 .background(Circle().fill(Color.primary.opacity(0.07)))
-                .frame(width: 44, height: 44)
+                .frame(width: 46, height: 46)
                 .contentShape(Rectangle())
         }
         .menuStyle(.button)
@@ -1514,16 +1566,25 @@ private struct BusyLine: View {
 private struct FoldView: View {
     let fold: ChatFold
     let toggle: () -> Void
+    /// Turned at the tap, before the core's view comes back with what
+    /// opens; following that view when it says otherwise.
+    @State private var turned: Bool?
+
+    private var open: Bool { turned ?? fold.open }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button(action: toggle) {
+            Button {
+                withAnimation(.snappy(duration: 0.2)) { turned = !open }
+                toggle()
+            } label: {
                 HStack(spacing: 7) {
                     if fold.state == "running" {
                         ProgressView().controlSize(.mini)
                     } else {
-                        Image(systemName: fold.open ? "chevron.down" : "chevron.right")
+                        Image(systemName: "chevron.right")
                             .font(.system(size: 11, weight: .semibold))
+                            .rotationEffect(.degrees(open ? 90 : 0))
                             .frame(width: 12)
                     }
                     Image(systemName: symbol)
@@ -1551,10 +1612,16 @@ private struct FoldView: View {
             }
             .buttonStyle(.plain)
             .disabled(!fold.can_open)
+            // What opens slides open and fades in, and closes the same way.
             if fold.open, let body = fold.body {
-                FoldBodyView(shown: body).padding(.leading, 20)
+                FoldBodyView(shown: body)
+                    .padding(.leading, 20)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .clipped()
+        .animation(.snappy(duration: 0.22), value: fold.open)
+        .onChange(of: fold.open) { turned = nil }
     }
 
     private var symbol: String { foldSymbol(fold.icon) }
@@ -1576,16 +1643,24 @@ private struct GroupView: View {
     let group: ChatGroup
     let toggle: () -> Void
     let toggleFold: (String) -> Void
+    /// Turned at the tap, before the core's view comes back.
+    @State private var turned: Bool?
+
+    private var open: Bool { turned ?? group.open }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button(action: toggle) {
+            Button {
+                withAnimation(.snappy(duration: 0.2)) { turned = !open }
+                toggle()
+            } label: {
                 HStack(spacing: 7) {
                     if group.state == "running" {
                         ProgressView().controlSize(.mini)
                     } else {
-                        Image(systemName: group.open ? "chevron.down" : "chevron.right")
+                        Image(systemName: "chevron.right")
                             .font(.system(size: 11, weight: .semibold))
+                            .rotationEffect(.degrees(open ? 90 : 0))
                             .frame(width: 12)
                     }
                     Image(systemName: foldSymbol(group.icon))
@@ -1593,8 +1668,15 @@ private struct GroupView: View {
                     Text(group.label)
                         .font(.subheadline)
                         .lineLimit(1)
+                    if let added = group.added, added > 0 {
+                        Text("+\(added)").font(.footnote).foregroundStyle(ChatColors.added)
+                    }
+                    if let removed = group.removed, removed > 0 {
+                        Text("−\(removed)").font(.footnote).foregroundStyle(ChatColors.removed)
+                    }
                     if let badge = group.badge {
-                        Text(badge).font(.caption).foregroundStyle(ChatColors.removed)
+                        Text(badge).font(.caption)
+                            .foregroundStyle(group.state == "declined" ? ChatColors.waiting : ChatColors.removed)
                     }
                 }
                 .foregroundStyle(.secondary)
@@ -1611,8 +1693,12 @@ private struct GroupView: View {
                     }
                 }
                 .padding(.leading, 20)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .clipped()
+        .animation(.snappy(duration: 0.22), value: group.open)
+        .onChange(of: group.open) { turned = nil }
     }
 }
 
@@ -1625,6 +1711,9 @@ private enum ChatColors {
 private struct FoldBodyView: View {
     let shown: FoldBody
     @Environment(\.colorScheme) private var scheme
+    /// Output, lists and diffs grow with the chat's text; the boxes
+    /// around them do not.
+    @Environment(\.chatTextScale) private var scale
 
     var body: some View {
         switch shown {
@@ -1633,7 +1722,7 @@ private struct FoldBodyView: View {
         case let .output(text):
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(text)
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: 12 * scale, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .fixedSize()
                     .textSelection(.enabled)
@@ -1645,7 +1734,7 @@ private struct FoldBodyView: View {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                     Text(line)
-                        .font(.system(size: 12.5, design: .monospaced))
+                        .font(.system(size: 12.5 * scale, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -1655,7 +1744,7 @@ private struct FoldBodyView: View {
                 ForEach(files, id: \.self) { file in
                     VStack(alignment: .leading, spacing: 0) {
                         Text(file.path)
-                            .font(.system(size: 11.5, design: .monospaced))
+                            .font(.system(size: 11.5 * scale, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
@@ -1685,7 +1774,7 @@ private struct FoldBodyView: View {
         default: (.clear, .secondary, "  ")
         }
         return Text(mark + line.s)
-            .font(.system(size: 11.5, design: .monospaced))
+            .font(.system(size: 11.5 * scale, design: .monospaced))
             .foregroundStyle(ink)
             .fixedSize()
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1701,6 +1790,7 @@ private struct TableBlock: View {
     let align: [String]
     let head: [[MdSpan]]
     let rows: [[[MdSpan]]]
+    @Environment(\.chatTextScale) private var scale
 
     var body: some View {
         let columns = max(head.count, rows.map(\.count).max() ?? 0)
@@ -1723,7 +1813,7 @@ private struct TableBlock: View {
         case "right": (.topTrailing, .trailing)
         default: (.topLeading, .leading)
         }
-        return Text(MarkdownBlocks.attributed(spans, size: 14.5, weight: row == 0 ? .semibold : .regular))
+        return Text(MarkdownBlocks.attributed(spans, size: 14.5 * scale, weight: row == 0 ? .semibold : .regular))
             .lineSpacing(2)
             .multilineTextAlignment(text)
             .fixedSize(horizontal: false, vertical: true)
@@ -1795,6 +1885,7 @@ private struct TableLayout: Layout {
 struct MarkdownBlocks: View {
     let blocks: [MdBlock]
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.chatTextScale) private var scale
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1808,18 +1899,18 @@ struct MarkdownBlocks: View {
     private func blockView(_ block: MdBlock, first: Bool) -> some View {
         switch block {
         case let .para(spans):
-            Text(Self.attributed(spans, size: 16))
+            Text(Self.attributed(spans, size: 16 * scale))
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
         case let .heading(level, spans):
-            Text(Self.attributed(spans, size: level == 1 ? 20 : level == 2 ? 18 : 16.5, weight: .semibold))
+            Text(Self.attributed(spans, size: (level == 1 ? 20 : level == 2 ? 18 : 16.5) * scale, weight: .semibold))
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, !first && level <= 2 ? 6 : 0)
         case let .item(depth, mark, spans):
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(mark).font(.system(size: 16)).foregroundStyle(.secondary.opacity(0.8)).frame(minWidth: 16, alignment: .leading)
-                Text(Self.attributed(spans, size: 16))
+                Text(mark).font(.system(size: 16 * scale)).foregroundStyle(.secondary.opacity(0.8)).frame(minWidth: 16, alignment: .leading)
+                Text(Self.attributed(spans, size: 16 * scale))
                     .lineSpacing(4)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1827,7 +1918,7 @@ struct MarkdownBlocks: View {
         case let .quote(spans):
             HStack(spacing: 12) {
                 Capsule().fill(Color.secondary.opacity(0.3)).frame(width: 3)
-                Text(Self.attributed(spans, size: 16))
+                Text(Self.attributed(spans, size: 16 * scale))
                     .lineSpacing(4)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1837,14 +1928,14 @@ struct MarkdownBlocks: View {
             VStack(alignment: .leading, spacing: 4) {
                 if !lang.trimmingCharacters(in: .whitespaces).isEmpty {
                     Text(lang)
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 11.5 * scale))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     Text(text)
-                        .font(.system(size: 13, design: .monospaced))
+                        .font(.system(size: 13 * scale, design: .monospaced))
                         .lineSpacing(2)
                         .fixedSize()
                         .padding(.horizontal, 12)

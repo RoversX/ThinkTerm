@@ -1485,7 +1485,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
                 self?.endBackgroundTask()
             }
         } else if !connection.hasPrefix("idle"), !connection.hasPrefix("disconnected"), !connection.hasPrefix("failed") {
-            // Attached or still on the way: torn down for the background,
+            // Attached or still on the way (a failed dial waiting to be made
+            // again reads "connecting" too): torn down for the background,
             // and dialled again on the way back -- whatever the status
             // reads by then.
             pausedForBackground = true
