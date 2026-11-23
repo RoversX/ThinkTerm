@@ -1,5 +1,5 @@
 use bytes::{Buf, BufMut, BytesMut};
-use ts_hexdump::{AsHexExt, Case};
+use ts_util::fmt::{AsHexExt, HexCase};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::frame::{Header, RawFrame, RawHeader};
@@ -30,7 +30,7 @@ impl<'a, 'b> tokio_util::codec::Encoder<(RawFrame<'a>, &'b [u8])> for Codec {
         tracing::trace!(
             len = dst.len(),
             "dst:\n{}",
-            dst.iter().hexdump_string(Case::Lower)
+            dst.iter().hexdump_string(HexCase::Lower)
         );
 
         Ok(())

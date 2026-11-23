@@ -36,6 +36,8 @@ impl RouteSocket {
             );
         }
 
+        // ThinkTerm (older tokio): was `unsafe { AsyncFd::register(sock) }?`, here and below;
+        // tokio has `register` from 1.53.3 on, and the workspace's is older.
         let fd = AsyncFd::new(sock)?;
         Ok(Self { fd })
     }

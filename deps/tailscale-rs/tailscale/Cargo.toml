@@ -9,14 +9,14 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 #
-# ThinkTerm (build): the [[example]], [[test]] and [profile.bench] sections are
+# ThinkTerm (build): the [[example]], [[test]] and [profile.*] sections are
 # removed: the vendored copy carries no examples or tests.
 
 [package]
 edition = "2024"
 rust-version = "1.92.0"
 name = "tailscale"
-version = "0.6.1"
+version = "0.7.1"
 build = false
 autolib = false
 autobins = false
@@ -69,7 +69,7 @@ version = "0.30"
 optional = true
 
 [dependencies.russh]
-version = "0.60"
+version = "0.65"
 features = [
     "flate2",
     "aws-lc-rs",
@@ -103,17 +103,17 @@ features = ["attributes"]
 default-features = false
 
 [dependencies.ts_control]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_keys]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_netstack_smoltcp]
-version = "0.6.1"
+version = "0.7.1"
 features = ["tokio"]
 
 [dependencies.ts_runtime]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.url]
 version = "2"

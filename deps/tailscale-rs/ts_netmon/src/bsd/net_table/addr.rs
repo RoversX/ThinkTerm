@@ -24,6 +24,7 @@ use nom::{
     number::{Endianness, u8, u16, u32},
     sequence::{preceded, terminated},
 };
+use ts_util::fmt::IterFmt;
 
 use crate::bsd::{
     net_table,
@@ -384,10 +385,7 @@ impl Debug for LinkAddr {
         if self.addr.is_empty() {
             fmt.field("addr", &format_args!("<empty>"));
         } else {
-            fmt.field(
-                "addr",
-                &ts_hexdump::IterFmt::delimited(self.addr.iter(), ":"),
-            );
+            fmt.field("addr", &IterFmt::delimited(self.addr.iter(), ":"));
         }
 
         fmt.finish()

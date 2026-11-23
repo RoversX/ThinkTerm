@@ -6,6 +6,7 @@ use kameo::{
 use ts_disco_protocol::{MessageType, Ping, Pong};
 use ts_keys::{DiscoKeyPair, DiscoPublicKey};
 use ts_transport::DynEndpoint;
+use ts_util::fmt::IterFmt;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::{dataplane::IncomingDiscoMsg, env::Env};
@@ -67,7 +68,7 @@ impl Message<IncomingDiscoMsg> for Disco {
                     tracing::debug!(
                         %addr,
                         ?ep,
-                        tx_id = ?format_args!("{:x?}", ts_hexdump::IterFmt::contiguous(&tx_id)),
+                        tx_id = ?format_args!("{:x?}", IterFmt::contiguous(&tx_id)),
                         "sent callmemaybe response ping"
                     );
 

@@ -40,6 +40,7 @@ use ts_dataplane::async_tokio::ActivePeers;
 use ts_disco_protocol::{CallMeMaybe, Ping, Pong};
 use ts_keys::DiscoPublicKey;
 use ts_transport::{DynEndpoint, PeerId, UnderlayTransportId};
+use ts_util::fmt::IterFmt;
 
 use crate::{
     Error,
@@ -366,10 +367,8 @@ impl PeerPd {
         //   can correlate it to a possible returned pong
 
         let tx_id = rand::random();
-        tracing::Span::current().record(
-            "tx_id",
-            tracing::field::debug(ts_hexdump::IterFmt::contiguous(&tx_id)),
-        );
+        tracing::Span::current()
+            .record("tx_id", tracing::field::debug(IterFmt::contiguous(&tx_id)));
 
         let ping_buf = Disco::mk_pkt::<Ping>(
             Ping::size_with_padding(0),
@@ -397,7 +396,7 @@ impl PeerPd {
         );
         tx_lookup.insert(tx_id, ep);
 
-        tracing::trace!(tx_id = ?format_args!("{:x?}", ts_hexdump::IterFmt::contiguous(&tx_id)), "sent disco ping");
+        tracing::trace!(tx_id = ?format_args!("{:x?}", IterFmt::contiguous(&tx_id)), "sent disco ping");
     }
 
     fn gc_seen_endpoints(&mut self) {
@@ -559,7 +558,7 @@ impl Message<IncomingDiscoMsg> for PeerPd {
         tracing::trace!("got pong");
 
         let Some(ep) = self.tx_lookup.remove(&pong.tx_id) else {
-            tracing::trace!(tx_id = ?format_args!("{:x?}", ts_hexdump::IterFmt::contiguous(&pong.tx_id)), "no pong known with this tx id");
+            tracing::trace!(tx_id = ?format_args!("{:x?}", IterFmt::contiguous(&pong.tx_id)), "no pong known with this tx id");
             return;
         };
 

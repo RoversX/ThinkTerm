@@ -5,7 +5,7 @@ use kameo::{
     message::{Context, Message},
 };
 use ts_bart::RoutingTable;
-use ts_overlay_router::{
+use ts_dataplane::overlay_router::{
     inbound::RouteAction as InboundRouteAction, outbound::RouteAction as OutboundRouteAction,
 };
 use ts_transport::{DynEndpoint, OverlayTransportId, PeerId, UnderlayTransportId};

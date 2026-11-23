@@ -28,6 +28,6 @@ url.workspace = true
 # on Android, which to Rust is not Linux, without one (the same file).
 # Elsewhere this crate builds without it and SUPPORTED says so.
 [target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", target_os = "ios", target_os = "android"))'.dependencies]
-tailscale = { version = "0.6.1", optional = true }
+tailscale = { version = "0.7.1", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
-ts_control = { version = "0.6.1", optional = true }
+ts_control = { version = "0.7.1", optional = true }

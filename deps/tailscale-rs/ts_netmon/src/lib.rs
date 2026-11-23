@@ -2,7 +2,7 @@
 // ThinkTerm (build): was `#![doc = include_str!("../README.md")]`; the README is not vendored.
 //
 // ThinkTerm (ios): every `target_os = "macos"` in this crate is `target_vendor = "apple"`:
-// iOS has the same route socket and the same sysctl dumps, and 0.6.1 has no monitor for it.
+// iOS has the same route socket and the same sysctl dumps, and upstream has no monitor for it.
 
 use std::net::IpAddr;
 
@@ -18,8 +18,6 @@ pub mod windows;
 
 pub use family::{Family, FamilyOrBoth};
 pub use id::{InterfaceId, MonType};
-// ThinkTerm (android): `PlatformMon` only where there is one; on Android, which has none
-// here, `platform_mon` is None and the runtime runs without a monitor.
 #[cfg(any(windows, target_os = "linux", target_vendor = "apple"))]
 pub use netmon::PlatformMon;
 pub use netmon::{BoxStream, Netmon, platform_mon};

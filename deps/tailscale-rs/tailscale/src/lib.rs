@@ -136,7 +136,7 @@ pub use ts_control::Node as NodeInfo;
 // has not let in.
 pub use ts_runtime::control_runner::NOT_LET_IN as REGISTRATION_NOT_LET_IN;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
-use ts_runtime::Spawn;
+use ts_runtime::{Spawn, control_runner::AuthResponse};
 
 #[cfg(feature = "axum")]
 pub mod axum;
@@ -168,6 +168,18 @@ pub enum AuthState {
     /// if the node's authorization has expired, or if it was registered as ephemeral and has been
     /// offline long enough to be deleted.
     NotAuthorized(url::Url),
+}
+
+impl TryFrom<AuthResponse> for AuthState {
+    type Error = Error;
+
+    fn try_from(value: AuthResponse) -> Result<Self, Error> {
+        match value {
+            AuthResponse::InteractiveAuthRequired(url) => Ok(AuthState::NotAuthorized(url)),
+            AuthResponse::Authorized => Ok(AuthState::Authorized),
+            AuthResponse::KeyRejected => Err(Error::AuthKeyRejected),
+        }
+    }
 }
 
 impl Device {
@@ -222,16 +234,11 @@ impl Device {
     /// The future waits until the control server has been successfully contacted before returning,
     /// i.e. it will remain pending in a network-down scenario.
     pub async fn is_authorized(&self) -> Result<AuthState, Error> {
-        let ret = self
-            .runtime
+        self.runtime
             .ask(ts_runtime::control_runner::AuthUrl)
             .await
-            .map_err(ts_runtime::Error::from)?;
-
-        Ok(match ret {
-            Some(url) => AuthState::NotAuthorized(url),
-            None => AuthState::Authorized,
-        })
+            .map_err(ts_runtime::Error::from)?
+            .try_into()
     }
 
     // ThinkTerm (sign-in state): the next three methods are ours.
@@ -249,7 +256,8 @@ impl Device {
         }))
     }
 
-    /// Why control turned this device away, once it has: it does not try again by itself.
+    /// Why control turned this device away, while it has: the runtime asks it again after a
+    /// while, and [`REGISTRATION_NOT_LET_IN`] is what it says of a machine control has not let in.
     pub async fn registration_error(&self) -> Result<Option<String>, Error> {
         self.runtime
             .ask(ts_runtime::CurrentRegistrationError)

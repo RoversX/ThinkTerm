@@ -3,12 +3,12 @@ Patches to the vendored tailscale-rs crates
 
 What is here
 ------------
-The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp_core, ts_derp and
-ts_netmon -- are copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
-ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at them
-([patch.crates-io]) and keeps them out of the workspace (exclude). Every other tailscale-rs
-crate (ts_keys, ts_tunnel, ...) still comes from crates.io, held at the same version by
-Cargo.lock.
+The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp, ts_derp and
+ts_netmon -- are copies of the tailscale-rs crates of the same names, version 0.7.1 from
+crates.io, with ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at
+them ([patch.crates-io]) and keeps them out of the workspace (exclude). Every other
+tailscale-rs crate (ts_keys, ts_tunnel, ...) still comes from crates.io, held at the same
+version by Cargo.lock.
 
 Only thinkterm-tailnet-engine/src/node.rs calls the library; the rest of ThinkTerm goes
 through it: thinkterm-tailnet on a desktop or a server, thinkterm-mobile on a phone.
@@ -20,44 +20,41 @@ below:
 
     grep -rn "ThinkTerm (" deps/tailscale-rs --exclude=PATCHES.txt
 
-The whole difference from upstream, at any time, against a fresh copy of 0.6.1:
+The whole difference from upstream, at any time, against a fresh copy of 0.7.1:
 
-    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp ts_netmon; do
-        curl -sL "https://static.crates.io/crates/$c/$c-0.6.1.crate" | tar xz -C /tmp
-        diff -ru "/tmp/$c-0.6.1" "deps/tailscale-rs/$c"
+    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp ts_derp ts_netmon; do
+        curl -sL "https://static.crates.io/crates/$c/$c-0.7.1.crate" | tar xz -C /tmp
+        diff -ru "/tmp/$c-0.7.1" "deps/tailscale-rs/$c"
     done
 
-Upstream files this copy does not carry (README.md, examples, tests, Cargo.lock,
-Cargo.toml.orig, .cargo_vcs_info.json) show up as "Only in", and so do the LICENSE and
-PATENTS that ts_runtime, ts_control, ts_netstack_smoltcp_core, ts_derp and ts_netmon got
-from the tailscale crate, as they ship without them. All of that is expected.
+Upstream files this copy does not carry (README.md, examples, tests, benches, Cargo.lock,
+Cargo.toml.orig, .cargo_vcs_info.json, and the rest of the repository the tailscale crate
+ships) show up as "Only in", and so do the LICENSE and PATENTS that ts_runtime, ts_control,
+ts_netstack_smoltcp, ts_derp and ts_netmon got from the tailscale crate, as they ship
+without them. All of that is expected.
 
 The changes
 -----------
 ios (ts_netmon)
     The network monitor's macOS code is for every Apple system: each `target_os = "macos"`
     in the crate's sources and its Cargo.toml is `target_vendor = "apple"`, and nothing
-    else is changed. iOS has the same route socket and sysctl dumps; 0.6.1 has a monitor
+    else is changed. iOS has the same route socket and sysctl dumps; upstream has a monitor
     for macOS, Linux and Windows only, so the library does not build for a phone.
     Redoing it on a new version, from a fresh copy of the crate:
-        grep -rl 'target_os = "macos"' src Cargo.toml | xargs sed -i '' \
+        grep -rl 'target_os = "macos"' src Cargo.toml | xargs perl -pi -e \
             's/target_os = "macos"/target_vendor = "apple"/g'
     Used by: the phone app, which holds a node of its own (thinkterm-mobile's tailnet.rs).
     Drop when: upstream's monitor builds for iOS.
 
-android (ts_netmon)
-    `PlatformMon` is re-exported only where the crate has one (Windows, Linux, Apple); 0.6.1
-    re-exports it everywhere, so the crate does not build for Android, which Rust counts as
-    a system of its own rather than Linux. There `platform_mon()` is None, as upstream
-    already has it for systems with no monitor, and the runtime runs without one: no
-    local-network endpoints are offered and a change of network is not seen, while DERP
-    and the STUN-found address carry the connections. The Linux monitor is not borrowed
-    for Android: it binds NETLINK_ROUTE, which apps targeting Android 11 and up may not.
-    Used by: the phone app on Android (thinkterm-mobile's tailnet.rs).
-    Drop when: upstream builds for Android, or a monitor for it is written.
+older tokio (ts_netmon)
+    The route socket is registered with tokio's AsyncFd::new, as 0.6.1 did. 0.7.1 calls
+    AsyncFd::register, which tokio has from 1.53.3 on, while its Cargo.toml asks for any
+    tokio 1; the workspace's tokio (Cargo.lock) is older, and macOS and iOS did not build.
+    Only Apple systems compile this code, so a Linux build does not show it; see Upgrading.
+    Drop when: the workspace's tokio is 1.53.3 or newer.
 
 peer list (tailscale, ts_runtime)
-    Device::peers lists every peer in the tailnet; 0.6.1 only looks one up by name or
+    Device::peers lists every peer in the tailnet; upstream only looks one up by name or
     address. The peer tracker also answers at once when a netmap shows the tailnet has no
     other peers, instead of leaving the question waiting.
     Used by: the Tailscale group on the Remote Hosts page.
@@ -65,21 +62,24 @@ peer list (tailscale, ts_runtime)
 
 device info (ts_control; struct literals in ts_runtime's peer_db tests)
     Node keeps, as DeviceInfo, the system, distribution and device model a peer reports in
-    its Hostinfo; 0.6.1 drops them.
+    its Hostinfo; upstream drops them.
     Used by: the machine icons and subtitles on the Remote Hosts page.
     Drop when: upstream keeps this on Node.
 
 sign-in state (tailscale, ts_runtime)
     Device::current_auth_state, current_self_node and registration_error answer at once with
-    where signing in stands; 0.6.1's questions wait until it is done. When control turns the
-    device away, the control runner stays in a Failed state that says why, instead of
-    stopping with the reason only in the log. What it says of a machine control knows and
-    has not let in -- one waiting for an admin's approval, as a rule -- is a constant
-    (ts_runtime's control_runner::NOT_LET_IN, tailscale::REGISTRATION_NOT_LET_IN), so that
-    whoever shows the device can tell that wait from an error.
+    where signing in stands; upstream's questions wait until it is done. When a registration
+    fails, the control runner stays in a Failed state that says why, instead of stopping
+    with the reason only in the log. A machine control knows and has not let in -- one
+    waiting for an admin's approval, as a rule, or one whose auth key is wrong -- is
+    upstream's own AuthKeyRejected state (since 0.7.0, which answers AuthUrl with it); what
+    registration_error says of it is a constant (ts_runtime's control_runner::NOT_LET_IN,
+    tailscale::REGISTRATION_NOT_LET_IN), so that whoever shows the device can tell that wait
+    from an error. Upstream's docs of the state call it final; notes beside them say that
+    the runner asks again (sign-in retry), and the machine may still get in.
     Used by: the Tailscale panel's status, login link and error message.
-    Drop when: upstream offers status queries that do not wait, and reports a refused
-    registration.
+    Drop when: upstream offers status queries that do not wait, and keeps the reason a
+    registration failed.
 
 sign-in retry (ts_runtime)
     A registration that fails is asked again after a while, as tailscaled does, instead of
@@ -103,13 +103,14 @@ no panic (ts_runtime)
     kameo 0.21 panics in Context::forward and try_forward when the target's mailbox is full
     or closed. The registry and Env::forward ask from a task instead, so those cases come
     back as errors. Env::ask backs off from 10 ms to 1 s when it retries an actor that has
-    stopped, instead of spinning.
+    stopped, instead of spinning; its Cargo.toml gains tokio's "time" feature for that.
     Drop when: upstream moves to a kameo without the panic, or stops forwarding this way.
 
-lost peers (ts_netstack_smoltcp_core)
+lost peers (ts_netstack_smoltcp)
     TCP sockets get a 10-minute timeout and a 2-minute keep-alive, so a peer that disappears
     without a word (a laptop put to sleep) ends the connection instead of leaving it
-    retrying forever.
+    retrying forever. The change is in the crate's netcore module, which was the
+    ts_netstack_smoltcp_core crate up to 0.6.1.
     Drop when: upstream sets a timeout and a keep-alive on its sockets.
 
 derp dial (ts_derp, ts_runtime)
@@ -137,7 +138,8 @@ derp reads (ts_derp)
     server sends a keep-alive whenever it has had nothing else to send for a minute, and Go's
     client allows as long. 0.6.1 waited for good, so a connection that died while nothing was
     sent on it -- the machine slept, the network changed -- held its runner, often the home
-    region's, and the node got nothing more through it.
+    region's, and the node got nothing more through it. Its Cargo.toml gains tokio's "time"
+    feature for that, and "io-util", as its tests run over tokio::io::duplex.
     Drop when: upstream's client times its reads out.
 
 derp runner (ts_runtime)
@@ -175,59 +177,88 @@ derp regions (ts_runtime)
     could put its transport in first, and out it went.
     Drop when: upstream's Multiderp outlives a region it gave up and starts it again.
 
-build (all five)
-    #![doc = include_str!("../README.md")] became a one-line //! doc: the READMEs are not
-    vendored (the root .gitignore drops *.md). In Cargo.toml, tailscale loses its
-    [[example]], [[test]] and [profile.bench] sections, ts_netstack_smoltcp_core its
-    [dev-dependencies], and ts_runtime gains tokio's "time" feature. Upstream's proptest
-    module in ts_runtime/src/peer_tracker/peer_db.rs is switched off, as proptest is not a
-    dependency here. ts_derp loses its [[example]] sections, as the examples are not vendored,
-    and gains tokio's "time" and "io-util" features.
+build (all six)
+    #![doc = include_str!("../README.md")] became a one-line //! doc in the lib.rs of
+    ts_runtime, ts_control, ts_derp, ts_netmon and ts_netstack_smoltcp, and so did
+    include_str!("README.md") in ts_netstack_smoltcp's netcore/mod.rs and netsock/mod.rs: the
+    READMEs are not vendored (the root .gitignore drops *.md). In Cargo.toml, tailscale loses
+    its [[example]], [[test]] and [profile.*] sections, ts_netmon its [[example]] and [[test]]
+    sections, ts_derp its [[example]] sections, and ts_netstack_smoltcp its [[example]],
+    [[test]] and [[bench]] sections and its [dev-dependencies] (cargo will not test a crate
+    outside the workspace that has any): the vendored copy carries no examples, tests or
+    benches. Upstream's proptest module in ts_runtime/src/peer_tracker/peer_db.rs is switched
+    off, as proptest is not a dependency here.
+
+Gone
+----
+android (ts_netmon), until 0.6.1
+    PlatformMon was re-exported everywhere, so the crate did not build for Android, which
+    Rust counts as a system of its own rather than Linux. 0.7.0 re-exports it only where the
+    crate has one (tailscale-rs #467). On Android platform_mon() is None and the runtime runs
+    without a monitor: no local-network endpoints are offered and a change of network is not
+    seen; the phone app makes its node anew when the network changes (thinkterm-mobile's
+    tailnet::restart). The address STUN finds is the node's endpoint for direct paths there.
+    The Linux monitor is not to be borrowed for Android: it binds NETLINK_ROUTE, which apps
+    targeting Android 11 and up may not.
 
 Tests
 -----
 The additions above are called from thinkterm-tailnet, so losing one in a merge fails the
 build. The changes in behaviour have tests:
 
-    cargo test -p ts_runtime -p ts_control -p ts_netstack_smoltcp_core -p ts_derp --lib
+    cargo test -p ts_runtime -p ts_control -p ts_netstack_smoltcp -p ts_derp --lib
 
-    lost peers     socket_impl::tcp::tests (connect and listen)
-    device info    node::tests
-    sign-in state  control_runner::tests (the reason given)
-    no panic       env::tests
-    derp dial      multiderp::uniderp::tests (an unreachable region, becoming home, a
-                   connection that does not come up, the next server)
-    derp reads     client::tests in ts_derp (a connection gone quiet, keep-alives)
-    derp runner    multiderp::uniderp::tests (a runner whose Uniderp is gone, whose queue
-                   is closed, that ended; a region given up; the transport of a Uniderp
-                   gone; a Uniderp restarted in the home region)
-    derp regions   multiderp::tests (the waits); multiderp::uniderp::tests (a region given
-                   up, waiting out its wait, getting one Uniderp, dropped from the map and
-                   put back)
+    lost peers      netcore::socket_impl::tcp::tests (connect and listen)
+    device info     node::tests
+    sign-in state   control_runner::tests (the reason given, a machine not let in)
+    no panic        env::tests
+    derp dial       multiderp::uniderp::tests (an unreachable region, becoming home, a
+                    connection that does not come up, the next server)
+    derp reads      client::tests in ts_derp (a connection gone quiet, keep-alives)
+    derp runner     multiderp::uniderp::tests (a runner whose Uniderp is gone, whose queue
+                    is closed, that ended; a region given up; the transport of a Uniderp
+                    gone; a Uniderp restarted in the home region)
+    derp regions    multiderp::tests (the waits); multiderp::uniderp::tests (a region given
+                    up, waiting out its wait, getting one Uniderp, dropped from the map and
+                    put back)
 
 Not covered by a test: the peer tracker's answer for an empty tailnet, and the Failed state
 taking the place of the stop. Signing in to a real tailnet after an upgrade checks the
-first; signing in with a wrong auth key checks the second. Nor are the parts of derp dial
-and derp frames that need a working DERP server (the waits starting over after a connection
-that held, frames the server sends).
+first; signing in while the control server cannot be reached checks the second. Nor are the
+parts of derp dial and derp frames that need a working DERP server (the waits starting over
+after a connection that held, frames the server sends).
 
 Upgrading
 ---------
 1. Read upstream's CHANGELOG.md for the new version: its security fixes, and anything that
    touches the groups above. A group upstream now covers can be dropped instead of merged.
-2. For each of the five crates, merge three ways, file by file: the base is upstream's old
-   version, ours is deps/tailscale-rs/<crate>, theirs is upstream's new version. With both
-   versions unpacked in /tmp as above:
+   A crate upstream no longer publishes under its name (0.7.0 made ts_netstack_smoltcp_core
+   the netcore module of ts_netstack_smoltcp) is moved by hand first: vendor the crate that
+   holds it now, carry our changes over, and update [patch.crates-io].
+2. For each crate here, merge three ways, file by file: the base is upstream's old version,
+   ours is deps/tailscale-rs/<crate>, theirs is upstream's new version. With both versions
+   unpacked in /tmp as above:
 
        git merge-file deps/tailscale-rs/<crate>/src/<file> /tmp/<crate>-<old>/src/<file> \
            /tmp/<crate>-<new>/src/<file>
 
    Changes that do not overlap merge by themselves; overlapping ones are left between
    conflict markers. Copy files upstream added; move by hand our changes in a file upstream
-   removed or renamed. For Cargo.toml, take upstream's new one and redo the build changes.
-3. Bump the version: the five entries under [patch.crates-io] in the root Cargo.toml and
-   the two in thinkterm-tailnet/Cargo.toml, then `cargo update` the other tailscale-rs
-   crates to the same version. All tailscale-rs crates move together.
-4. Build, run the tests above and thinkterm-tailnet's and thinkterm-tailnet-node's, then
-   sign in to a real tailnet and connect to a machine by name and by address.
+   removed or renamed. Cargo.toml merges the same way; check that no section the build group
+   removes came back. Then make every `target_os = "macos"` left in ts_netmon, new ones
+   included, `target_vendor = "apple"` (ios), and every README include a one-line doc (build).
+3. Bump the version: the six entries under [patch.crates-io] in the root Cargo.toml and the
+   two in thinkterm-tailnet-engine/Cargo.toml. The next cargo command (`cargo metadata
+   --format-version 1 >/dev/null` will do) brings the other tailscale-rs crates in
+   Cargo.lock to the same version; all tailscale-rs crates move together. Check that nothing
+   else in Cargo.lock moved but what the new crates need.
+4. Build, run the tests above and thinkterm-tailnet's, thinkterm-tailnet-engine's (with
+   --features node) and thinkterm-tailnet-node's (with -- --test-threads=1: thinkterm-tailnet's
+   keeper tests write a script and run it at once, and race each other in parallel). Check the systems a Linux build does not
+   compile: Android (`cargo ndk -t arm64-v8a check -p thinkterm-mobile --lib`), Windows
+   (`cargo check --target x86_64-pc-windows-gnu -p thinkterm-tailnet -p
+   thinkterm-tailnet-node`), and Apple's network monitor, which builds without the Apple SDK
+   (`cargo check -p ts_netmon --target aarch64-apple-ios`, then aarch64-apple-darwin;
+   `rustup target add` them first). Then sign in to a real tailnet and connect to a machine
+   by name and by address.
 5. Update this file: the version above, and every group that changed or went away.

@@ -37,18 +37,68 @@ pub struct ControlRunner {
     pending_node_requests: Vec<PendingNodeRequest>,
 }
 
+/// The response to [`AuthUrl`]: what the state of control server auth is.
+#[derive(Debug, Clone, PartialEq, Eq, kameo::Reply)]
+pub enum AuthResponse {
+    /// The device is authorized.
+    Authorized,
+    /// The device is not authorized and an interactive auth URL is provided.
+    InteractiveAuthRequired(url::Url),
+    /// The device is not authorized because the key was rejected.
+    ///
+    /// Interactive auth is impossible (control server doesn't supply a URL in this case).
+    // ThinkTerm (sign-in state): control answers a machine waiting for an admin's approval the
+    // same way, and the runner asks again every 10 seconds (sign-in retry): it may still get in.
+    KeyRejected,
+}
+
 enum RegState {
     NotRegistered {
-        pending_auth_requests: Vec<ReplySender<Option<url::Url>>>,
+        pending_auth_requests: Vec<ReplySender<AuthResponse>>,
     },
     AuthRequired(url::Url),
     Registered(HttpConn),
+    AuthKeyRejected,
     // ThinkTerm (sign-in state): added.
-    /// The registration failed, or control turned the device away, for the reason given. The
-    /// runner stays to say why (see `current_registration_error`) rather than stopping, which
-    /// would leave every question to it unanswered and the reason only in the log; the
-    /// registration is asked again after a while (sign-in retry, `register_again`).
+    /// The registration failed for the reason given (a machine control knows and has not let
+    /// in is `AuthKeyRejected` instead). The runner stays to say why (see
+    /// `current_registration_error`) rather than stopping, which would leave every question to
+    /// it unanswered and the reason only in the log; the registration is asked again after a
+    /// while (sign-in retry, `register_again`).
     Failed(String),
+}
+
+impl RegState {
+    /// Update this to `new_state`, sending `value_for_pending` to any pending auth
+    /// requests.
+    fn update(&mut self, new_state: Self, value_for_pending: AuthResponse) {
+        let old_state = core::mem::replace(self, new_state);
+
+        if let RegState::NotRegistered {
+            pending_auth_requests,
+        } = old_state
+        {
+            for req in pending_auth_requests {
+                req.send(value_for_pending.clone());
+            }
+        }
+    }
+}
+
+// ThinkTerm (sign-in state): added.
+impl RegState {
+    /// Why control turned the device away, in this state.
+    fn turned_away(&self) -> Option<String> {
+        match self {
+            RegState::Failed(reason) => Some(reason.clone()),
+            // Upstream takes such a machine for one whose auth key was rejected; it may as well
+            // be waiting for an admin's approval.
+            RegState::AuthKeyRejected => Some(NOT_LET_IN.to_string()),
+            RegState::NotRegistered { .. }
+            | RegState::AuthRequired(_)
+            | RegState::Registered(_) => None,
+        }
+    }
 }
 
 /// Control runner args.
@@ -172,10 +222,10 @@ impl kameo::Actor for ControlRunner {
                             return;
                         };
                         // ThinkTerm (sign-in retry): a registration that failed is told (the
-                        // runner's Failed state, which says why) and asked again after a while,
-                        // as tailscaled does, rather than given up: a control server out of
-                        // reach for a moment, a device waiting for an admin's approval, each
-                        // gets in once it can, without a new runner.
+                        // runner's Failed or AuthKeyRejected state, which says why) and asked
+                        // again after a while, as tailscaled does, rather than given up: a
+                        // control server out of reach for a moment, a device waiting for an
+                        // admin's approval, each gets in once it can, without a new runner.
                         let again = register_again(result.as_ref().err(), wait);
                         let refreshed = matches!(
                             result,
@@ -297,28 +347,29 @@ impl ControlRunner {
         match &self.state {
             RegState::Registered(..) => Some(None),
             RegState::AuthRequired(url) => Some(Some(url.clone())),
-            RegState::NotRegistered { .. } | RegState::Failed(..) => None,
+            RegState::NotRegistered { .. } | RegState::AuthKeyRejected | RegState::Failed(..) => {
+                None
+            }
         }
     }
 
     /// Why control turned this device away, once it has.
     #[message]
     pub fn current_registration_error(&mut self) -> Option<String> {
-        match &self.state {
-            RegState::Failed(reason) => Some(reason.clone()),
-            _ => None,
-        }
+        self.state.turned_away()
     }
 
     /// Wait for a report of whether interactive auth is needed, and if so, what the URL is.
     #[message(ctx)]
     pub fn auth_url(
         &mut self,
-        ctx: &mut Context<Self, DelegatedReply<Option<url::Url>>>,
-    ) -> DelegatedReply<Option<url::Url>> {
+        ctx: &mut Context<Self, DelegatedReply<AuthResponse>>,
+    ) -> DelegatedReply<AuthResponse> {
         match &mut self.state {
-            RegState::Registered(..) => ctx.reply(None),
-            RegState::AuthRequired(u) => ctx.reply(Some(u.clone())),
+            RegState::Registered(..) => ctx.reply(AuthResponse::Authorized),
+            RegState::AuthRequired(u) => {
+                ctx.reply(AuthResponse::InteractiveAuthRequired(u.clone()))
+            }
             RegState::NotRegistered {
                 pending_auth_requests,
             } => {
@@ -329,8 +380,9 @@ impl ControlRunner {
 
                 deleg
             }
+            RegState::AuthKeyRejected => ctx.reply(AuthResponse::KeyRejected),
             // ThinkTerm (sign-in state): added.
-            // Turned away: no answer will come, and the request goes with its reply.
+            // Failed: no answer will come, and the request goes with its reply.
             RegState::Failed(..) => ctx.reply_sender().0,
         }
     }
@@ -423,7 +475,7 @@ impl Message<AuthRequired> for ControlRunner {
         };
 
         for req in pending_auth_requests.into_iter() {
-            req.send(Some(auth_url.clone()));
+            req.send(AuthResponse::InteractiveAuthRequired(auth_url.clone()));
         }
     }
 }
@@ -440,6 +492,13 @@ impl Message<RegisterResult> for ControlRunner {
 
         let conn = match msg.0 {
             Ok(conn) => conn,
+            Err(RegistrationError::MachineNotAuthorized(None)) => {
+                tracing::error!("auth key rejected");
+                self.state
+                    .update(RegState::AuthKeyRejected, AuthResponse::KeyRejected);
+
+                return;
+            }
             Err(e) => {
                 tracing::error!(error = %e, "unable to register with control server");
                 // ThinkTerm (sign-in state): was `ctx.stop()`.
@@ -449,16 +508,8 @@ impl Message<RegisterResult> for ControlRunner {
             }
         };
 
-        let old_state = core::mem::replace(&mut self.state, RegState::Registered(conn.clone()));
-
-        if let RegState::NotRegistered {
-            pending_auth_requests,
-        } = old_state
-        {
-            for req in pending_auth_requests {
-                req.send(None);
-            }
-        }
+        self.state
+            .update(RegState::Registered(conn.clone()), AuthResponse::Authorized);
 
         let reader = self
             .with_map_request(true, async |req| {
@@ -680,7 +731,8 @@ mod tests {
     use ts_control::RegistrationError;
 
     use super::{
-        REGISTER_APPROVAL_POLL, REGISTER_RETRY_FIRST, register_again, registration_failure,
+        NOT_LET_IN, REGISTER_APPROVAL_POLL, REGISTER_RETRY_FIRST, RegState, register_again,
+        registration_failure,
     };
 
     #[test]
@@ -707,5 +759,24 @@ mod tests {
         assert!(refused.contains("auth key"), "{refused}");
         let unreachable = registration_failure(&RegistrationError::NetworkError);
         assert!(unreachable.contains("could not be reached"), "{unreachable}");
+    }
+
+    #[test]
+    fn a_machine_not_let_in_says_so() {
+        // What upstream calls a rejected auth key is how control leaves a machine waiting for
+        // an admin's approval too: whoever shows the device tells that wait by NOT_LET_IN.
+        assert_eq!(
+            RegState::AuthKeyRejected.turned_away().as_deref(),
+            Some(NOT_LET_IN)
+        );
+        let failed = RegState::Failed("signing in failed: no".to_string());
+        assert_eq!(
+            failed.turned_away().as_deref(),
+            Some("signing in failed: no")
+        );
+        let signing_in = RegState::NotRegistered {
+            pending_auth_requests: vec![],
+        };
+        assert_eq!(signing_in.turned_away(), None);
     }
 }

@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.92.0"
 name = "ts_runtime"
-version = "0.6.1"
+version = "0.7.1"
 build = false
 autolib = false
 autobins = false
@@ -110,57 +110,55 @@ features = ["attributes"]
 default-features = false
 
 [dependencies.ts_bart]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_bart_packetfilter]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_control]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_dataplane]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_derp]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_disco_protocol]
-version = "0.6.1"
-
-[dependencies.ts_hexdump]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_keys]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_netcheck]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_netmon]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_netstack_smoltcp]
-version = "0.6.1"
+version = "0.7.1"
 features = ["tokio"]
 
-[dependencies.ts_overlay_router]
-version = "0.6.1"
-
 [dependencies.ts_packet]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_packetfilter]
-version = "0.6.1"
+version = "0.7.1"
 features = ["checking-filter"]
 
 [dependencies.ts_packetfilter_state]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_transport]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_tunnel]
-version = "0.6.1"
+version = "0.7.1"
+
+[dependencies.ts_util]
+version = "0.7.1"
+default-features = false
 
 [dependencies.url]
 version = "2"

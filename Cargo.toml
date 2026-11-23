@@ -464,27 +464,29 @@ zvariant = "4.0"
 cairo-sys-rs = {path="deps/cairo", version="0.18.0"}
 # Vendored to bound allocations by the bytes present, not by declared lengths.
 varbincode = {path="deps/varbincode", version="0.1.0"}
-# Vendored to list every peer in the tailnet (Device::peers), which 0.6.1
+# Vendored to list every peer in the tailnet (Device::peers), which upstream
 # only offers as lookups by name or address, so that a forward to an actor
 # that is gone is an error rather than a panic, and so that a DERP region's
 # client goes with its actor, waits out a failure and moves on to the
-# region's next server instead of spinning or giving up (see
-# deps/tailscale-rs/PATCHES.txt).
-tailscale = {path="deps/tailscale-rs/tailscale", version="0.6.1"}
-ts_runtime = {path="deps/tailscale-rs/ts_runtime", version="0.6.1"}
+# region's next server instead of spinning or giving up; these and the rest
+# of ThinkTerm's changes are in deps/tailscale-rs/PATCHES.txt.
+tailscale = {path="deps/tailscale-rs/tailscale", version="0.7.1"}
+ts_runtime = {path="deps/tailscale-rs/ts_runtime", version="0.7.1"}
 # Vendored so that a connection notices a peer gone without a word, and a
-# connect nobody waits for any more ends: 0.6.1 sets neither a timeout nor
+# connect nobody waits for any more ends: upstream sets neither a timeout nor
 # keep-alives on its TCP sockets.
-ts_netstack_smoltcp_core = {path="deps/tailscale-rs/ts_netstack_smoltcp_core", version="0.6.1"}
+ts_netstack_smoltcp = {path="deps/tailscale-rs/ts_netstack_smoltcp", version="0.7.1"}
 # Vendored so that a peer keeps what it says about its device -- its system,
-# distribution and model -- which 0.6.1 drops: Remote Hosts draws a machine
+# distribution and model -- which upstream drops: Remote Hosts draws a machine
 # of the tailnet by it.
-ts_control = {path="deps/tailscale-rs/ts_control", version="0.6.1"}
+ts_control = {path="deps/tailscale-rs/ts_control", version="0.7.1"}
 # Vendored so that neither a DERP region nobody can reach nor a frame too
-# short for what it carries panics its client (0.6.1 unwraps the outcome of
+# short for what it carries panics its client (upstream unwraps the outcome of
 # the dial and the frame's parse), and so that a connection gone quiet is
 # noticed rather than waited on for good.
-ts_derp = {path="deps/tailscale-rs/ts_derp", version="0.6.1"}
-# Vendored so that the library builds for iOS: 0.6.1 watches the network on
-# macOS, Linux and Windows only, and iOS has what the macOS monitor uses.
-ts_netmon = {path="deps/tailscale-rs/ts_netmon", version="0.6.1"}
+ts_derp = {path="deps/tailscale-rs/ts_derp", version="0.7.1"}
+# Vendored so that the library builds for iOS: upstream watches the network on
+# macOS, Linux and Windows only, and iOS has what the macOS monitor uses; and
+# for macOS and iOS both, with the workspace's tokio, older than the 1.53.3
+# upstream's monitor needs there ("older tokio" in PATCHES.txt).
+ts_netmon = {path="deps/tailscale-rs/ts_netmon", version="0.7.1"}

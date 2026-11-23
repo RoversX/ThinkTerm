@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.92.0"
 name = "ts_control"
-version = "0.6.1"
+version = "0.7.1"
 build = false
 autolib = false
 autobins = false
@@ -100,42 +100,42 @@ features = ["attributes"]
 default-features = false
 
 [dependencies.ts_bitset]
-version = "0.6.1"
+version = "0.7.1"
 default-features = false
 
 [dependencies.ts_capabilityversion]
-version = "0.6.1"
+version = "0.7.1"
 features = ["serde"]
 
 [dependencies.ts_control_noise]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_control_serde]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_derp]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_dynbitset]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_http_util]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_keys]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_packet]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_packetfilter]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_packetfilter_state]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.ts_tls_util]
-version = "0.6.1"
+version = "0.7.1"
 
 [dependencies.url]
 version = "2"

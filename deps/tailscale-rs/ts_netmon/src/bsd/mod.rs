@@ -28,7 +28,7 @@ use std::{
 use futures_util::{StreamExt, TryStreamExt};
 use ipnet::IpNet;
 use nom::Parser;
-use ts_future_util::DebounceExt;
+use ts_util::futures::DebounceExt;
 
 mod message;
 pub mod net_table;

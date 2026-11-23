@@ -12,9 +12,9 @@ use ts_dataplane::async_tokio::{
     ActivePeers, DiscoBatch, FromOverlay, FromUnderlay, Rx, StunBatch, ToOverlay, ToUnderlay, Tx,
 };
 use ts_disco_protocol::{Packet, Plaintext};
-use ts_hexdump::{AsHexExt, Case};
 use ts_packet::PacketMut;
 use ts_transport::{DynEndpoint, OverlayTransportId, UnderlayTransportId};
+use ts_util::fmt::{AsHexExt, HexCase};
 
 use crate::{
     Error, Task,
@@ -166,7 +166,7 @@ impl Message<StreamMessage<DiscoInternal, (), ()>> for DataplaneActor {
                     Ok(pkt) => pkt,
                     Err(e) => {
                         tracing::error!(error = %e, "parsing disco message:\n{}",
-                            buf.iter().hexdump_string(Case::Lower)
+                            buf.iter().hexdump_string(HexCase::Lower)
                         );
                         return None;
                     }
