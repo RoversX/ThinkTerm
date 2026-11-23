@@ -106,7 +106,12 @@ struct ThreadsHome: View {
 
     private var list: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2) {
+            // Not lazy: a host's whole tree is one view in it, which grows
+            // and shrinks while the list is off screen (a terminal over it),
+            // and a lazy stack came back from one with the scroll's height
+            // of before -- the list stuck short of its end. A handful of
+            // hosts has no need of laziness.
+            VStack(alignment: .leading, spacing: 2) {
                 if entries.isEmpty {
                     HostsEmptyState { adding = true }
                         .padding(.top, 40)
