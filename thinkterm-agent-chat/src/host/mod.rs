@@ -6,6 +6,7 @@
 
 mod codex;
 pub mod pi;
+mod rollout;
 mod thumb;
 mod ws;
 

@@ -9,8 +9,9 @@
 //! The daemon listens on a Unix socket under `CODEX_HOME` and speaks
 //! JSON-RPC (without the `jsonrpc` member) in WebSocket text messages.
 
+use super::rollout::Rollout;
 use super::{head, now, read_ops, tail, ws, Input, Out, Target};
-use crate::{AgentState, Ask, AskKind, Attachment, Choice, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need, NoteKind, Op, Status};
+use crate::{AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need, NoteKind, Op, Status};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -34,6 +35,23 @@ const TEXT_KEPT: usize = 256 << 10;
 const ASK_KEPT: usize = 16 << 10;
 /// The loaded threads looked at, at most: each costs a call.
 const THREADS_LOOKED_AT: usize = 64;
+/// What is shown of a skill's description.
+const DESCRIPTION_KEPT: usize = 300;
+/// How often what the agent is writing is sent as it grows.
+const WRITING_EVERY: Duration = Duration::from_millis(150);
+/// Codex's own commands the chat runs, as Codex words them: name, what it
+/// does, what follows it.
+const OWN_COMMANDS: [(&str, &str, Option<&str>); 3] = [
+    ("/compact", "Summarize the conversation to free up context", None),
+    ("/review", "Review the current changes and find issues", Some("[instructions]")),
+    ("/rename", "Rename the conversation", Some("<name>")),
+];
+/// Codex's own commands that need its terminal: said so, rather than sent
+/// to the model as words.
+const TERMINAL_COMMANDS: [&str; 22] = [
+    "new", "resume", "fork", "init", "diff", "mention", "status", "mcp", "apps", "skills", "approvals",
+    "permissions", "personality", "plan", "collab", "agent", "logout", "quit", "exit", "feedback", "undo", "statusline",
+];
 
 /// Codex's folder: as the Codex in the pane has it, where that can be
 /// read, else as this process's environment says.
@@ -104,8 +122,20 @@ impl Daemon {
         }
     }
 
-    fn next(&mut self) -> Option<Input<Value>> {
-        self.later.pop_front().or_else(|| self.rx.recv().ok())
+    /// The next input; `Some(None)` when `wait` (if given) passes first,
+    /// `None` once nothing more can come.
+    fn next(&mut self, wait: Option<Duration>) -> Option<Option<Input<Value>>> {
+        if let Some(input) = self.later.pop_front() {
+            return Some(Some(input));
+        }
+        match wait {
+            None => self.rx.recv().ok().map(Some),
+            Some(wait) => match self.rx.recv_timeout(wait) {
+                Ok(input) => Some(Some(input)),
+                Err(mpsc::RecvTimeoutError::Timeout) => Some(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            },
+        }
     }
 
     fn close(&self) {
@@ -172,6 +202,8 @@ struct Found {
     name: Option<String>,
     status: Value,
     guessed: bool,
+    /// The file Codex keeps of the thread.
+    path: Option<PathBuf>,
 }
 
 fn find_thread(daemon: &mut Daemon, cwd: Option<&Path>) -> Result<Option<Found>> {
@@ -220,6 +252,7 @@ fn find_thread(daemon: &mut Daemon, cwd: Option<&Path>) -> Result<Option<Found>>
         name: thread["name"].as_str().map(str::to_string),
         status: thread["status"].clone(),
         guessed,
+        path: thread["path"].as_str().map(PathBuf::from),
     }))
 }
 
@@ -269,9 +302,125 @@ struct Chat {
     /// than the page, and newer than what `older` points to, so sent first
     /// when more is asked for.
     held: Vec<Item>,
+    /// The skills Codex has where the pane is, enabled, as `$name` takes
+    /// them in.
+    skills: Vec<Skill>,
+    /// Where skills are looked for.
+    cwd: Option<PathBuf>,
+    /// What the agent is writing now, as far as it has come: its item,
+    /// the words, when they were last sent, and whether more came since.
+    writing: Option<Writing>,
+    /// How full the context is: read from the thread's file, once Codex
+    /// says where that is, and from what it reports as turns go on.
+    rollout: Rollout,
+}
+
+struct Writing {
+    id: String,
+    text: String,
+    sent: Instant,
+    owed: bool,
+}
+
+/// A skill, as `skills/list` gives it.
+#[derive(Clone, Debug, PartialEq)]
+struct Skill {
+    name: String,
+    path: String,
+    description: String,
 }
 
 impl Chat {
+    /// More of what the agent writes: sent as it grows, a few times a
+    /// second.
+    fn wrote(&mut self, out: &Out, id: &str, delta: &str) -> Result<()> {
+        match &mut self.writing {
+            Some(writing) if writing.id == id => writing.text.push_str(delta),
+            _ => {
+                self.writing = Some(Writing {
+                    id: id.to_string(),
+                    text: delta.to_string(),
+                    // The first words go at once.
+                    sent: Instant::now().checked_sub(WRITING_EVERY).unwrap_or_else(Instant::now),
+                    owed: false,
+                })
+            }
+        }
+        let due = self.writing.as_ref().is_some_and(|w| w.sent.elapsed() >= WRITING_EVERY);
+        if due {
+            self.send_writing(out)?;
+        } else if let Some(writing) = &mut self.writing {
+            writing.owed = true;
+        }
+        Ok(())
+    }
+
+    /// How long until what was written and not sent is due.
+    fn writing_due(&self) -> Option<Duration> {
+        self.writing
+            .as_ref()
+            .filter(|w| w.owed)
+            .map(|w| WRITING_EVERY.saturating_sub(w.sent.elapsed()))
+    }
+
+    fn send_writing(&mut self, out: &Out) -> Result<()> {
+        let Some(writing) = &mut self.writing else {
+            return Ok(());
+        };
+        writing.sent = Instant::now();
+        writing.owed = false;
+        if writing.text.trim().is_empty() {
+            return Ok(());
+        }
+        out.send(&Ev::Item {
+            item: Item::Text {
+                id: writing.id.clone(),
+                text: head(&writing.text, TEXT_KEPT),
+            },
+        })?;
+        Ok(())
+    }
+
+    /// How full the context is now, read on from the thread's file.
+    fn send_context(&mut self, out: &Out) -> Result<()> {
+        self.rollout.read_on();
+        out.send(&Ev::Context {
+            context: self.rollout.info(),
+        })?;
+        Ok(())
+    }
+
+    /// The commands the chat offers: Codex's own it runs, then the skills.
+    fn commands(&self) -> Ev {
+        let own = OWN_COMMANDS.iter().map(|(name, description, args)| CommandInfo {
+            name: name.to_string(),
+            description: description.to_string(),
+            args: args.map(str::to_string),
+        });
+        let skills = self.skills.iter().map(|skill| CommandInfo {
+            name: format!("${}", skill.name),
+            description: skill.description.clone(),
+            // What the skill is for follows it.
+            args: Some(String::new()),
+        });
+        Ev::Commands {
+            commands: own.chain(skills).collect(),
+        }
+    }
+
+    fn list_skills(&mut self, daemon: &mut Daemon) -> Result<()> {
+        let id = daemon.request("skills/list", self.skills_params())?;
+        self.pending.insert(id, Pending::Skills);
+        Ok(())
+    }
+
+    fn skills_params(&self) -> Value {
+        match &self.cwd {
+            Some(cwd) => json!({ "cwds": [cwd], "forceReload": true }),
+            None => json!({ "forceReload": true }),
+        }
+    }
+
     fn models(&self) -> Ev {
         Ev::Models {
             current: self.model.clone(),
@@ -327,6 +476,9 @@ enum Pending {
     /// the request fails.
     Older(Value),
     Join,
+    Skills,
+    /// One of Codex's own commands, run from the chat: refused or not.
+    Command,
 }
 
 pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> Result<()> {
@@ -376,6 +528,10 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> R
         models: Vec::new(),
         next: None,
         held: Vec::new(),
+        skills: Vec::new(),
+        cwd: target.cwd.clone(),
+        writing: None,
+        rollout: Rollout::new(found.path.clone()),
     };
     // A thread whose first turn has not run has nothing on disk yet and
     // cannot be joined; it is joined as soon as it starts.
@@ -389,6 +545,10 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> R
     match daemon.call("model/list", json!({})) {
         Ok(listed) => chat.models = models_of(&listed),
         Err(err) => log::info!("agent chat: no models: {err:#}"),
+    }
+    match daemon.call("skills/list", chat.skills_params()) {
+        Ok(listed) => chat.skills = skills_of(&listed),
+        Err(err) => log::info!("agent chat: no skills: {err:#}"),
     }
     let turns = if chat.joined {
         history(&mut daemon, &chat.thread, None)?
@@ -408,8 +568,14 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> R
         since: None,
     })?;
     out.send(&chat.models())?;
+    out.send(&chat.commands())?;
+    chat.send_context(&out)?;
 
-    while let Some(input) = daemon.next() {
+    while let Some(input) = daemon.next(chat.writing_due()) {
+        let Some(input) = input else {
+            chat.send_writing(&out)?;
+            continue;
+        };
         let going = match input {
             Input::ClientGone => false,
             Input::AgentGone(why) => {
@@ -500,7 +666,10 @@ fn handle_op(daemon: &mut Daemon, chat: &mut Chat, out: &Out, op: Op) -> Result<
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(());
             }
-            let input = user_input(&text, &attachments);
+            if attachments.is_empty() && own_command(daemon, chat, out, &text)? {
+                return Ok(());
+            }
+            let input = user_input(&text, &attachments, &chat.skills);
             match chat.turn.clone() {
                 Some(turn) => {
                     let id = daemon.request(
@@ -605,6 +774,9 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                 }
                 (Pending::Join, None) => {
                     chat.joined = true;
+                    if let Some(path) = message["result"]["thread"]["path"].as_str() {
+                        chat.rollout.found(PathBuf::from(path));
+                    }
                     settings_of(chat, &message["result"]);
                     out.send(&chat.models())?;
                     let turns = history(daemon, &chat.thread, None)?;
@@ -617,6 +789,14 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                     chat.ask_again(out)?;
                 }
                 (Pending::Join, Some(err)) => log::info!("agent chat: joining failed: {err}"),
+                (Pending::Skills, None) => {
+                    let skills = skills_of(&message["result"]);
+                    if skills != chat.skills {
+                        chat.skills = skills;
+                        out.send(&chat.commands())?;
+                    }
+                }
+                (Pending::Skills, Some(err)) => log::info!("agent chat: no skills: {err}"),
                 (Pending::Start(choice), Some(err)) => {
                     // The model asked for goes with the next turn instead,
                     // unless another was asked for meanwhile.
@@ -667,14 +847,28 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
             }
             Ok(true)
         }
+        // Skills changed on disk: of every thread, so said without one.
+        (Some("skills/changed"), None) => {
+            chat.list_skills(daemon)?;
+            Ok(true)
+        }
         (Some(method), None) => {
             let params = &message["params"];
             if params["threadId"].as_str() != Some(chat.thread.as_str()) {
                 return Ok(true);
             }
             match method {
+                "item/agentMessage/delta" => {
+                    if let (Some(id), Some(delta)) = (params["itemId"].as_str(), params["delta"].as_str()) {
+                        chat.wrote(out, id, delta)?;
+                    }
+                }
                 "item/started" | "item/completed" => {
                     let item = &params["item"];
+                    // Written whole: the words as they came are done with.
+                    if method == "item/completed" && chat.writing.as_ref().is_some_and(|w| Some(w.id.as_str()) == item["id"].as_str()) {
+                        chat.writing = None;
+                    }
                     if item["type"].as_str() == Some("fileChange") {
                         if let Some(id) = item["id"].as_str() {
                             let files = item["changes"]
@@ -694,8 +888,18 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                     chat.turn = params["turn"]["id"].as_str().map(str::to_string);
                     set_state(chat, out, AgentState::Working)?;
                 }
+                // What a turn's model call took of the context.
+                // The file first: what it holds may be older than this.
+                "thread/tokenUsage/updated" => {
+                    chat.rollout.read_on();
+                    chat.rollout.reported(&params["tokenUsage"]);
+                    out.send(&Ev::Context {
+                        context: chat.rollout.info(),
+                    })?;
+                }
                 "turn/completed" => {
                     chat.turn = None;
+                    chat.send_context(out)?;
                     if let Some(note) = turn_note(&params["turn"]) {
                         out.send(&Ev::Item { item: note })?;
                     }
@@ -920,6 +1124,17 @@ fn to_item(item: &Value) -> Option<Item> {
             note: NoteKind::Compacted,
             text: String::new(),
         },
+        // What a review found, said as the agent's answer.
+        "exitedReviewMode" => {
+            let text = item["review"].as_str().unwrap_or_default();
+            if text.trim().is_empty() {
+                return None;
+            }
+            Item::Text {
+                id,
+                text: tail(text, TEXT_KEPT),
+            }
+        }
         _ => return None,
     })
 }
@@ -965,9 +1180,114 @@ fn looks_of(actions: &[Value]) -> Vec<Look> {
     looks
 }
 
+/// A command of Codex's own, sent as words: run as the terminal would, or
+/// said to need the terminal. False for words to send on.
+fn own_command(daemon: &mut Daemon, chat: &mut Chat, out: &Out, text: &str) -> Result<bool> {
+    let text = text.trim();
+    let Some(rest) = text.strip_prefix('/') else {
+        return Ok(false);
+    };
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let args = args.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':') {
+        return Ok(false);
+    }
+    let idle = |out: &Out| -> Result<bool> {
+        if chat.turn.is_none() {
+            return Ok(true);
+        }
+        out.refused(format!("/{name} waits until Codex is done (or stopped)"))?;
+        Ok(false)
+    };
+    let (method, params) = match name {
+        "compact" => {
+            if !idle(out)? {
+                return Ok(true);
+            }
+            ("thread/compact/start", json!({ "threadId": chat.thread }))
+        }
+        "review" => {
+            if !idle(out)? {
+                return Ok(true);
+            }
+            let target = if args.is_empty() {
+                json!({ "type": "uncommittedChanges" })
+            } else {
+                json!({ "type": "custom", "instructions": args })
+            };
+            ("review/start", json!({ "threadId": chat.thread, "target": target }))
+        }
+        "rename" => {
+            if args.is_empty() {
+                out.refused("/rename needs a name")?;
+                return Ok(true);
+            }
+            ("thread/name/set", json!({ "threadId": chat.thread, "name": args }))
+        }
+        "model" => {
+            if args.is_empty() {
+                out.refused("/model takes a model's id: pick one from /model in the list")?;
+            } else {
+                handle_op(
+                    daemon,
+                    chat,
+                    out,
+                    Op::SetModel {
+                        model: args.to_string(),
+                        effort: None,
+                    },
+                )?;
+            }
+            return Ok(true);
+        }
+        _ if TERMINAL_COMMANDS.contains(&name) => {
+            out.refused(format!("/{name} works in the terminal only"))?;
+            return Ok(true);
+        }
+        _ => return Ok(false),
+    };
+    let id = daemon.request(method, params)?;
+    chat.pending.insert(id, Pending::Command);
+    Ok(true)
+}
+
+/// The enabled skills `skills/list` gives, of every folder it was asked
+/// about, each once.
+fn skills_of(listed: &Value) -> Vec<Skill> {
+    let mut skills: Vec<Skill> = Vec::new();
+    for entry in listed["data"].as_array().into_iter().flatten() {
+        for skill in entry["skills"].as_array().into_iter().flatten() {
+            if skill["enabled"].as_bool() == Some(false) {
+                continue;
+            }
+            let (Some(name), Some(path)) = (skill["name"].as_str(), skill["path"].as_str()) else {
+                continue;
+            };
+            if skills.iter().any(|known| known.name == name) {
+                continue;
+            }
+            let description = skill["interface"]["shortDescription"]
+                .as_str()
+                .or(skill["shortDescription"].as_str())
+                .or(skill["description"].as_str())
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            skills.push(Skill {
+                name: name.to_string(),
+                path: path.to_string(),
+                description: head(&description, DESCRIPTION_KEPT),
+            });
+        }
+    }
+    skills
+}
+
 /// What the person said, as Codex takes it in: the words, the paths of
-/// the files sent with them, and the pictures as pictures.
-fn user_input(text: &str, attachments: &[Attachment]) -> Value {
+/// the files sent with them, the pictures as pictures, and each skill
+/// named (`$name`) as that skill.
+fn user_input(text: &str, attachments: &[Attachment], skills: &[Skill]) -> Value {
     let mut words = text.to_string();
     for file in attachments.iter().filter(|file| !file.image) {
         if let Some(path) = &file.path {
@@ -983,7 +1303,22 @@ fn user_input(text: &str, attachments: &[Attachment]) -> Value {
             input.push(json!({ "type": "localImage", "path": path }));
         }
     }
+    for skill in skills.iter().filter(|skill| names_skill(text, &skill.name)) {
+        input.push(json!({ "type": "skill", "name": skill.name, "path": skill.path }));
+    }
     Value::Array(input)
+}
+
+/// Whether `text` names the skill as a word of its own: `$name`, not
+/// followed by more of a name.
+fn names_skill(text: &str, name: &str) -> bool {
+    let mention = format!("${name}");
+    text.match_indices(&mention).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + mention.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':')
+    })
 }
 
 /// The model a thread talks to and how hard it thinks, as Codex reports
@@ -1114,6 +1449,7 @@ mod tests {
                     thumb: None,
                 },
             ],
+            &[],
         );
         assert_eq!(
             input,
@@ -1122,6 +1458,90 @@ mod tests {
                 { "type": "localImage", "path": "/u/ThinkTerm_Uploads/b.png" }
             ])
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Sink {
+        fn texts(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter_map(|line| match serde_json::from_str::<Ev>(line).unwrap() {
+                    Ev::Item { item: Item::Text { text, .. } } => Some(text),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn what_is_written_goes_as_it_grows_a_few_times_a_second() {
+        let sink = Sink::default();
+        let out = Out::new(Box::new(sink.clone()));
+        let mut chat = Chat {
+            thread: "t".into(),
+            joined: true,
+            turn: None,
+            state: AgentState::Working,
+            older: None,
+            asks: HashMap::new(),
+            edits: HashMap::new(),
+            pending: HashMap::new(),
+            model: None,
+            effort: None,
+            models: Vec::new(),
+            next: None,
+            held: Vec::new(),
+            skills: Vec::new(),
+            cwd: None,
+            writing: None,
+            rollout: Rollout::new(None),
+        };
+        // The first words go at once; those right after wait their turn.
+        chat.wrote(&out, "m1", "Hello").unwrap();
+        chat.wrote(&out, "m1", ", world").unwrap();
+        assert_eq!(sink.texts(), ["Hello"]);
+        let due = chat.writing_due().expect("more is owed");
+        assert!(due <= WRITING_EVERY);
+        chat.send_writing(&out).unwrap();
+        assert_eq!(sink.texts(), ["Hello", "Hello, world"]);
+        assert_eq!(chat.writing_due(), None, "nothing owed once sent");
+        // Another item starts afresh.
+        chat.wrote(&out, "m2", "Next").unwrap();
+        assert_eq!(sink.texts().last().map(String::as_str), Some("Next"));
+    }
+
+    #[test]
+    fn a_skill_named_goes_as_that_skill() {
+        let listed = json!({ "data": [
+            { "cwd": "/w", "skills": [
+                { "name": "review", "description": "Review  code\nwell", "path": "/s/review/SKILL.md", "enabled": true, "scope": "user" },
+                { "name": "off", "description": "", "path": "/s/off/SKILL.md", "enabled": false, "scope": "user" },
+                { "name": "review-pr", "shortDescription": "PRs", "description": "long", "path": "/s/pr/SKILL.md", "enabled": true, "scope": "repo" }
+            ], "errors": [] },
+            { "cwd": "/w2", "skills": [
+                { "name": "review", "description": "again", "path": "/s2/review/SKILL.md", "enabled": true, "scope": "user" }
+            ], "errors": [] }
+        ]});
+        let skills = skills_of(&listed);
+        assert_eq!(skills.iter().map(|s| (s.name.as_str(), s.description.as_str())).collect::<Vec<_>>(), [("review", "Review code well"), ("review-pr", "PRs")]);
+        let input = user_input("please $review-pr now", &[], &skills);
+        assert_eq!(input[1], json!({ "type": "skill", "name": "review-pr", "path": "/s/pr/SKILL.md" }));
+        assert_eq!(input.as_array().unwrap().len(), 2, "$review-pr is not $review");
+        assert!(names_skill("$review", "review") && names_skill("go ($review)", "review"));
+        assert!(!names_skill("a$review", "review") && !names_skill("$reviewer", "review"));
     }
 
     #[test]
@@ -1140,6 +1560,10 @@ mod tests {
             models: Vec::new(),
             next: None,
             held: Vec::new(),
+            skills: Vec::new(),
+            cwd: None,
+            writing: None,
+            rollout: Rollout::new(None),
         };
         let big = |n: usize| Item::Text {
             id: n.to_string(),
@@ -1181,6 +1605,10 @@ mod tests {
             models,
             next: None,
             held: Vec::new(),
+            skills: Vec::new(),
+            cwd: None,
+            writing: None,
+            rollout: Rollout::new(None),
         };
         settings_of(&mut chat, &json!({ "model": "gpt-5.5", "reasoningEffort": "high" }));
         assert_eq!((chat.model.as_deref(), chat.effort.as_deref()), (Some("gpt-5.5"), Some("high")));

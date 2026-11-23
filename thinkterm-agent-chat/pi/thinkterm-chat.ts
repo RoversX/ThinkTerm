@@ -19,9 +19,11 @@ import * as path from "node:path";
 
 /// Raised with every change: ThinkTerm puts a newer one in place of an
 /// older one when a chat opens.
-const EXTENSION_VERSION = 7;
+const EXTENSION_VERSION = 9;
 /// 2: what is said may carry files and pictures; the model can be changed.
-const PROTOCOL = 2;
+/// 3: the commands the session takes are listed (`commands`), and how full
+/// its context is said (`context`).
+const PROTOCOL = 3;
 const MAX_LINE = 8 << 20;
 const OUTPUT_KEPT = 6 << 10;
 const DIFF_KEPT = 24 << 10;
@@ -44,6 +46,33 @@ const PICTURES_KEPT_MS = 30 * 24 * 3600 * 1000;
 /// How hard a model can think, as Pi words it, least first: Pi's own
 /// rule is asked (`getSupportedThinkingLevels`); this, where it cannot be.
 const LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// Pi's own commands the chat runs, as Pi words them.
+const OWN_COMMANDS = [
+  { name: "/new", description: "Start a new session" },
+  { name: "/compact", description: "Manually compact the session context", args: "[instructions]" },
+  { name: "/name", description: "Set session display name", args: "<name>" },
+  { name: "/reload", description: "Reload keybindings, extensions, skills, prompts, themes, and context files" },
+];
+/// Pi's (and OMP's) own commands that need its terminal: said so, rather
+/// than sent to the model as words.
+const TERMINAL_COMMANDS = new Set([
+  "settings", "tree", "scoped-models", "export", "import", "share", "bug", "copy", "session", "changelog",
+  "hotkeys", "fork", "clone", "trust", "login", "logout", "resume", "quit", "exit",
+]);
+/// The command this extension runs `/new` and `/reload` through: only a
+/// command is given what starts a session or reloads one.
+const RUN = "thinkterm-chat";
+/// What is shown of a command's description.
+const DESCRIPTION_KEPT = 300;
+/// How often what Pi is writing is sent as it grows, in milliseconds.
+const WRITING_EVERY = 150;
+/// How long after a change the context is reckoned again, in milliseconds.
+const CONTEXT_AFTER = 400;
+/// What a picture is reckoned to take of the context, in tokens.
+const PICTURE_TOKENS = 1200;
+/// Pi's own room kept free before it compacts by itself, when its
+/// settings do not say.
+const RESERVE_TOKENS = 16384;
 
 type State = "working" | "idle" | "blocked";
 
@@ -72,6 +101,14 @@ export default function (pi: ExtensionAPI) {
   let settling: ReturnType<typeof setTimeout> | undefined;
   // The model in use, as last chosen (here or in the terminal).
   let model: any;
+  // What Pi is writing now (the message, as it grows), and the send of it
+  // waiting its turn.
+  let writing: { id: string; message: any } | undefined;
+  let writingTimer: ReturnType<typeof setTimeout> | undefined;
+  // The context reckoned again, a moment after it changed.
+  let contextTimer: ReturnType<typeof setTimeout> | undefined;
+  // The command `/new` and `/reload` go through was taken (`RUN`).
+  let registered = false;
   // Where each picture of the sessions read is, as a file, by the message
   // part it is in: worked out once (a picture is hashed to name its copy).
   const pictureFiles = new Map<string, string>();
@@ -154,6 +191,11 @@ export default function (pi: ExtensionAPI) {
     // Pi's to use (Pi throws for one used after the session is replaced).
     clearTimeout(settling);
     settling = undefined;
+    clearTimeout(writingTimer);
+    writingTimer = undefined;
+    writing = undefined;
+    clearTimeout(contextTimer);
+    contextTimer = undefined;
     // What this session asked goes with it.
     withdraw();
     for (const client of clients) client.destroy();
@@ -172,6 +214,238 @@ export default function (pi: ExtensionAPI) {
     send({ ev: "state", state, since }, client);
     for (const ask of asking.values()) send({ ev: "ask", ask }, client);
     sendModels(client);
+    sendCommands(client);
+    try {
+      sendContext(client);
+    } catch {}
+  }
+
+  // The context said again a moment after it changed: once for a burst.
+  function contextSoon() {
+    if (!server || !clients.size || contextTimer) return;
+    contextTimer = setTimeout(() => {
+      contextTimer = undefined;
+      try {
+        sendContext();
+      } catch {}
+    }, CONTEXT_AFTER);
+  }
+
+  // Roughly what `text` takes of a model's context: a token for four
+  // characters, one for each of a wide script's.
+  function tokensIn(text: string): number {
+    let wide = 0;
+    let other = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) >= 0x2e80) wide++;
+      else other++;
+    }
+    return wide + other / 4;
+  }
+
+  function partsOf(content: any, kind: string, add: (kind: string, tokens: number) => void) {
+    if (typeof content === "string") return add(kind, tokensIn(content));
+    for (const part of Array.isArray(content) ? content : []) {
+      if (part?.type === "image") add(kind, PICTURE_TOKENS);
+      else if (typeof part?.text === "string") add(kind, tokensIn(part.text));
+    }
+  }
+
+  // What one message the model is sent takes, by what it is.
+  function countMessage(message: any, add: (kind: string, tokens: number) => void) {
+    switch (message?.role) {
+      case "user":
+        return partsOf(message.content, "user", add);
+      case "assistant":
+        for (const block of Array.isArray(message.content) ? message.content : []) {
+          if (block?.type === "text") add("assistant", tokensIn(String(block.text ?? "")));
+          else if (block?.type === "thinking") add("thinking", tokensIn(String(block.thinking ?? "")));
+          else if (block?.type === "toolCall") add("tool_use", tokensIn(String(block.name ?? "") + JSON.stringify(block.arguments ?? {})));
+        }
+        return;
+      case "toolResult":
+        return partsOf(message.content, "tool_use", add);
+      case "bashExecution":
+        return add("tool_use", tokensIn(String(message.command ?? "") + String(message.output ?? "")));
+      case "compactionSummary":
+      case "branchSummary":
+        return add("summary", tokensIn(String(message.summary ?? "")));
+      default:
+        return partsOf(message?.content ?? JSON.stringify(message ?? ""), "other", add);
+    }
+  }
+
+  // How full the model's context is: the total as Pi reckons it, and what
+  // it is made of -- the system prompt, the tools, each message the model
+  // is sent -- each counted, then scaled to that total. With what the
+  // session has used so far, every turn's.
+  function sendContext(to?: net.Socket) {
+    const parts = new Map<string, number>();
+    const add = (kind: string, tokens: number) => {
+      if (tokens > 0) parts.set(kind, (parts.get(kind) ?? 0) + tokens);
+    };
+    try {
+      add("system", tokensIn(String(ctx?.getSystemPrompt?.() ?? "")));
+    } catch {}
+    try {
+      const active = new Set<string>(pi.getActiveTools?.() ?? []);
+      for (const tool of (pi.getAllTools?.() ?? []) as any[]) {
+        if (active.size && !active.has(tool?.name)) continue;
+        add("tools", tokensIn(JSON.stringify({ name: tool?.name, description: tool?.description, parameters: tool?.parameters })));
+      }
+    } catch {}
+    let messages: any[] = [];
+    try {
+      const sessions = ctx?.sessionManager;
+      messages = sessions?.buildSessionProjection?.()?.messages ?? sessions?.buildSessionContext?.()?.messages ?? [];
+    } catch {}
+    for (const message of messages) countMessage(message, add);
+    const counted = [...parts.values()].reduce((a, b) => a + b, 0);
+    let usage: any;
+    try {
+      usage = ctx?.getContextUsage?.();
+    } catch {}
+    const current = model ?? ctx?.model;
+    const window: number | null = usage?.contextWindow || current?.contextWindow || null;
+    // Not known just after a compaction, until the next answer: the parts
+    // are then as counted.
+    const used = typeof usage?.tokens === "number" ? usage.tokens : null;
+    const scale = used && counted ? used / counted : 1;
+    let compactsAt: number | null = null;
+    try {
+      const compaction: any = pi.getSettings?.()?.compaction;
+      if (window && compaction?.enabled !== false) compactsAt = window - (compaction?.reserveTokens ?? RESERVE_TOKENS);
+    } catch {}
+    const totals: any = {};
+    for (const entry of (ctx?.sessionManager?.getBranch?.() ?? []) as any[]) {
+      const spent = entry?.type === "message" && entry.message?.role === "assistant" ? entry.message.usage : undefined;
+      if (!spent) continue;
+      totals.input = (totals.input ?? 0) + (spent.input ?? 0);
+      totals.output = (totals.output ?? 0) + (spent.output ?? 0);
+      totals.cache_read = (totals.cache_read ?? 0) + (spent.cacheRead ?? 0);
+      totals.cache_write = (totals.cache_write ?? 0) + (spent.cacheWrite ?? 0);
+      totals.cost = (totals.cost ?? 0) + (spent.cost?.total ?? 0);
+    }
+    send(
+      {
+        ev: "context",
+        context: {
+          used,
+          window,
+          parts: [...parts].map(([kind, tokens]) => ({ kind, tokens: Math.round(tokens * scale) })),
+          compacts_at: compactsAt && compactsAt > 0 ? compactsAt : null,
+          totals,
+        },
+      },
+      to,
+    );
+  }
+
+  // What can be typed for the session to do: Pi's own the chat runs,
+  // then the extensions', prompt templates and skills, as Pi lists them.
+  function sendCommands(to?: net.Socket) {
+    // `/new` and `/reload` only where the command they go through is
+    // there to run them.
+    const commands: object[] = OWN_COMMANDS.filter((c) => runs() || (c.name !== "/new" && c.name !== "/reload"));
+    let listed: any[] = [];
+    try {
+      listed = typeof pi.getCommands === "function" ? pi.getCommands() : [];
+    } catch {}
+    const seen = new Set(commands.map((c: any) => c.name));
+    for (const command of listed) {
+      const name = `/${String(command?.name ?? "")}`;
+      if (name === "/" || name === `/${RUN}` || seen.has(name)) continue;
+      seen.add(name);
+      const description = String(command?.description ?? "").replace(/\s+/g, " ").trim();
+      // What these take is not said: each is given room to be followed.
+      commands.push({ name, description: description.slice(0, DESCRIPTION_KEPT), args: "" });
+    }
+    send({ ev: "commands", commands }, to);
+  }
+
+  // A command of Pi's own, sent as words: run here as the terminal would,
+  // or said to need the terminal. False for words to send on.
+  function ownCommand(text: string, refuse: (message: string) => void): boolean {
+    const match = /^\/([\w:-]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
+    if (!match) return false;
+    const [, name, rest = ""] = match;
+    const args = rest.trim();
+    // Another extension's command of the same name is its own.
+    if (listedCommand(name)) return false;
+    const idle = () => {
+      if (!busy()) return true;
+      refuse(`/${name} waits until ${agent} is done (or stopped)`);
+      return false;
+    };
+    switch (name) {
+      case "new":
+      case "reload":
+        if (!runs()) refuse(`/${name} works in the terminal only`);
+        else if (idle()) run(`/${RUN} ${name}`, refuse);
+        return true;
+      case "compact":
+        if (!idle()) return true;
+        if (typeof ctx?.compact !== "function") {
+          refuse(`${agent} cannot compact from here`);
+          return true;
+        }
+        ctx.compact({
+          customInstructions: args || undefined,
+          onError: (err: unknown) => refuse(String((err as any)?.message ?? err)),
+        });
+        return true;
+      case "name":
+        if (!args) refuse("/name needs a name");
+        else if (typeof pi.setSessionName === "function") pi.setSessionName(args);
+        else refuse(`${agent} cannot be named from here`);
+        return true;
+      case "model":
+        if (args) setModel(args, undefined, refuse);
+        else refuse("/model takes a model's id: pick one from /model in the list");
+        return true;
+      case "thinking": {
+        const levels = levelsOf(model ?? ctx?.model);
+        if (typeof pi.setThinkingLevel !== "function") refuse(`${agent} cannot change how hard it thinks from here`);
+        else if (!args) refuse("/thinking needs a level");
+        else if (levels.length && !levels.includes(args)) refuse(`${agent} has no thinking level ${args} for this model`);
+        else {
+          pi.setThinkingLevel(args as any);
+          sendModels();
+        }
+        return true;
+      }
+      default:
+        if (!TERMINAL_COMMANDS.has(name)) return false;
+        refuse(`/${name} works in the terminal only`);
+        return true;
+    }
+  }
+
+  // Whether the command `/new` and `/reload` go through is registered: an
+  // agent that took it lists it.
+  function runs(): boolean {
+    try {
+      return registered && typeof pi.getCommands === "function" && pi.getCommands().some((c: any) => c?.name === RUN);
+    } catch {
+      return false;
+    }
+  }
+
+  function listedCommand(name: string): boolean {
+    try {
+      return typeof pi.getCommands === "function" && pi.getCommands().some((c: any) => c?.name === name && c?.source === "extension");
+    } catch {
+      return false;
+    }
+  }
+
+  // Words Pi takes as typed: commands run, templates and skills expand.
+  function run(text: string, refuse: (message: string) => void) {
+    try {
+      Promise.resolve(pi.sendUserMessage(text, { expandPromptTemplates: true } as any)).catch((err: unknown) => refuse(String(err)));
+    } catch (err) {
+      refuse(String(err));
+    }
   }
 
   // The models this session may use: those it is scoped to, else all with
@@ -228,6 +502,36 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  function setModel(wanted: string, effort: string | undefined, refuse: (message: string) => void) {
+    const found = usable().find((m) => idOf(m) === wanted) ?? (idOf(model ?? ctx?.model) === wanted ? (model ?? ctx?.model) : undefined);
+    if (!found) {
+      refuse(`${agent} has no model ${wanted}`);
+      return;
+    }
+    const level = () => {
+      if (effort && typeof pi.setThinkingLevel === "function") pi.setThinkingLevel(effort as any);
+      sendModels();
+    };
+    if (wanted === idOf(model ?? ctx?.model)) {
+      level();
+      return;
+    }
+    if (typeof pi.setModel !== "function") {
+      refuse(`${agent} cannot change its model from here`);
+      return;
+    }
+    Promise.resolve(pi.setModel(found))
+      .then((ok: boolean) => {
+        if (ok === false) {
+          refuse(`no key for ${wanted}`);
+          return;
+        }
+        model = found;
+        level();
+      })
+      .catch((err: unknown) => refuse(String(err)));
+  }
+
   function welcome(client: net.Socket) {
     clients.add(client);
     client.setEncoding("utf8");
@@ -279,6 +583,7 @@ export default function (pi: ExtensionAPI) {
         const text = String(op.text ?? "");
         const files: any[] = Array.isArray(op.attachments) ? op.attachments.filter((f: any) => f?.path) : [];
         if (!text.trim() && !files.length) return;
+        if (!files.length && ownCommand(text, refuse)) return;
         // Pictures go as pictures; files, and pictures too large to read,
         // by their paths after the words.
         // A model that takes no pictures is told their paths instead.
@@ -304,38 +609,9 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
-      case "set_model": {
-        const wanted = String(op.model ?? "");
-        const effort = typeof op.effort === "string" ? op.effort : undefined;
-        const found = usable().find((m) => idOf(m) === wanted) ?? (idOf(model ?? ctx?.model) === wanted ? (model ?? ctx?.model) : undefined);
-        if (!found) {
-          refuse(`${agent} has no model ${wanted}`);
-          return;
-        }
-        const level = () => {
-          if (effort && typeof pi.setThinkingLevel === "function") pi.setThinkingLevel(effort as any);
-          sendModels();
-        };
-        if (wanted === idOf(model ?? ctx?.model)) {
-          level();
-          return;
-        }
-        if (typeof pi.setModel !== "function") {
-          refuse(`${agent} cannot change its model from here`);
-          return;
-        }
-        Promise.resolve(pi.setModel(found))
-          .then((ok: boolean) => {
-            if (ok === false) {
-              refuse(`no key for ${wanted}`);
-              return;
-            }
-            model = found;
-            level();
-          })
-          .catch((err: unknown) => refuse(String(err)));
+      case "set_model":
+        setModel(String(op.model ?? ""), typeof op.effort === "string" ? op.effort : undefined, refuse);
         return;
-      }
       case "interrupt":
         if (busy() && typeof ctx?.abort === "function") ctx.abort();
         else refuse("nothing is running");
@@ -735,6 +1011,21 @@ export default function (pi: ExtensionAPI) {
     asking.clear();
   }
 
+  // `/new` and `/reload` sent from the chat, run as typed in the terminal.
+  // An agent that takes commands otherwise (a fork) goes on without them.
+  try {
+    if (typeof pi.registerCommand !== "function") throw new Error("no commands");
+    pi.registerCommand(RUN, {
+      description: "Runs /new or /reload for ThinkTerm's chat",
+      handler: async (args: string, command: any) => {
+        const what = args.trim();
+        if (what === "new" && typeof command?.newSession === "function") await command.newSession();
+        else if (what === "reload" && typeof command?.reload === "function") await command.reload();
+      },
+    });
+    registered = true;
+  } catch {}
+
   pi.on("session_start", async (_event: any, context: any) => {
     ctx = context;
     // Only the Pi a person works in, in the terminal: not one it runs for a
@@ -761,12 +1052,15 @@ export default function (pi: ExtensionAPI) {
     ctx = context;
     const id = event?.compactionEntry?.id;
     send({ ev: "item", item: compacted(id ?? `c${Date.now()}`) });
+    contextSoon();
   });
   // A model chosen in the terminal, or here: the phone's button follows.
   pi.on("model_select", async (event: any, context: any) => {
     ctx = context;
     if (event?.model) model = event.model;
     sendModels();
+    // Another model, another window.
+    contextSoon();
   });
   pi.on("thinking_level_select", async (_event: any, context: any) => {
     ctx = context;
@@ -816,9 +1110,33 @@ export default function (pi: ExtensionAPI) {
     // Others asked at the same time may wait still.
     setState(asking.size ? "blocked" : "working");
   });
-  pi.on("message_end", async (event: any, context: any) => {
+  // What Pi writes, sent as it grows: its words and its thinking, a few
+  // times a second. Its tool calls come as they run.
+  pi.on("message_update", async (event: any, context: any) => {
     ctx = context;
     const message = event?.message;
+    if (!server || !clients.size || message?.role !== "assistant" || message.timestamp === undefined) return;
+    writing = { id: `m${message.timestamp}`, message };
+    if (writingTimer) return;
+    writingTimer = setTimeout(() => {
+      writingTimer = undefined;
+      const now = writing;
+      if (!now) return;
+      try {
+        for (const item of fromMessage(now.message, now.id) as any[]) {
+          if (item.kind === "text" || item.kind === "thinking") send({ ev: "item", item });
+        }
+      } catch {}
+    }, WRITING_EVERY);
+  });
+  pi.on("message_end", async (event: any, context: any) => {
+    ctx = context;
+    // Written whole: what came as it grew is done with.
+    clearTimeout(writingTimer);
+    writingTimer = undefined;
+    writing = undefined;
+    const message = event?.message;
+    contextSoon();
     if (!message || message.role === "toolResult") return;
     const id = `m${message.timestamp ?? Date.now()}`;
     for (const item of fromMessage(message, id)) send({ ev: "item", item });
