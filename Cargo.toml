@@ -466,10 +466,11 @@ cairo-sys-rs = {path="deps/cairo", version="0.18.0"}
 varbincode = {path="deps/varbincode", version="0.1.0"}
 # Vendored to list every peer in the tailnet (Device::peers), which upstream
 # only offers as lookups by name or address, so that a forward to an actor
-# that is gone is an error rather than a panic, and so that a DERP region's
+# that is gone is an error rather than a panic, so that a DERP region's
 # client goes with its actor, waits out a failure and moves on to the
-# region's next server instead of spinning or giving up; these and the rest
-# of ThinkTerm's changes are in deps/tailscale-rs/PATCHES.txt.
+# region's next server instead of spinning or giving up, and so that traffic
+# to a peer goes back to DERP once its direct path stops answering; these and
+# the rest of ThinkTerm's changes are in deps/tailscale-rs/PATCHES.txt.
 tailscale = {path="deps/tailscale-rs/tailscale", version="0.7.1"}
 ts_runtime = {path="deps/tailscale-rs/ts_runtime", version="0.7.1"}
 # Vendored so that a connection notices a peer gone without a word, and a

@@ -168,6 +168,12 @@ const PROBE_PERIOD: Duration = Duration::from_millis(5_000);
 /// Duration after which peers' "seen endpoints" are cleaned up if they haven't sent traffic.
 const SEEN_ENDPOINTS_TIMEOUT: Duration = Duration::from_millis(30_000);
 
+// ThinkTerm (direct fallback): added.
+/// Probing rounds in a row in which no path answered, after which a peer's direct path is given
+/// up and its traffic goes back to DERP. One lost ping or pong does not move traffic; a path
+/// that went away is left 10 to 15 s after (a round is [`PROBE_PERIOD`]).
+const UNANSWERED_ROUNDS_BEFORE_DERP: u32 = 2;
+
 enum ProbeState {
     /// This probe is in-flight with the given transaction id. It was sent at `sent`.
     InFlight { transaction: TxId, sent: Instant },
@@ -239,6 +245,10 @@ struct PeerPd {
     /// sent by control or in a `CallMeMaybe`.
     seen_peer_endpoints: HashMap<DynEndpoint, Instant>,
 
+    // ThinkTerm (direct fallback): added.
+    /// Probing rounds in a row in which no path answered.
+    unanswered_rounds: u32,
+
     env: Env,
 }
 
@@ -248,6 +258,16 @@ impl PeerPd {
     }
 
     async fn start_probes(&mut self) {
+        // ThinkTerm (direct fallback): added. A round that cannot probe -- the peer's disco key
+        // or coordinator endpoints unknown, this node with no endpoint to offer -- is one in
+        // which no path answered.
+        if self.disco_key.is_none()
+            || self.coord_endpoints_ctrl.is_empty()
+            || self.this_node_endpoints.is_empty()
+        {
+            self.unanswered_round().await;
+        }
+
         let Some(disco_key) = self.disco_key else {
             tracing::trace!("no disco key known for peer, can't send pings");
             return;
@@ -268,8 +288,14 @@ impl PeerPd {
         self.tx_lookup.clear();
         self.previous_probe_latencies.clear();
 
-        let latencies_was_empty = self.previous_probe_latencies.is_empty();
-
+        // ThinkTerm (direct fallback): `let latencies_was_empty =
+        // self.previous_probe_latencies.is_empty();` stood here, and the publish below was
+        // under `if latencies_was_empty != self.previous_probe_latencies.is_empty()`. Read after
+        // the clear above, it was always true: a round in which no path answered published
+        // nothing, and traffic to the peer stayed on a direct path that had stopped answering
+        // (a phone gone from Wi-Fi to cellular) until another one answered. A round with an
+        // answer publishes the best path, as before; one without counts towards giving the
+        // path up (unanswered_round).
         for (ep, state) in self.current_probes.drain() {
             let ProbeState::Success { latency, transport } = state else {
                 tracing::trace!(?ep, "probe did not succeed before next start_probe");
@@ -281,7 +307,11 @@ impl PeerPd {
                 .insert((transport, ep), latency);
         }
 
-        if latencies_was_empty != self.previous_probe_latencies.is_empty() {
+        if self.previous_probe_latencies.is_empty() {
+            self.unanswered_round().await;
+        } else {
+            self.unanswered_rounds = 0;
+
             let best = self
                 .previous_probe_latencies
                 .iter()
@@ -399,6 +429,23 @@ impl PeerPd {
         tracing::trace!(tx_id = ?format_args!("{:x?}", IterFmt::contiguous(&tx_id)), "sent disco ping");
     }
 
+    // ThinkTerm (direct fallback): added.
+    /// Counts a round in which no path answered. The UNANSWERED_ROUNDS_BEFORE_DERP-th in a row
+    /// gives the peer's direct path up, and its traffic goes back to DERP; the rest of the streak
+    /// has nothing more to say.
+    async fn unanswered_round(&mut self) {
+        self.unanswered_rounds = self.unanswered_rounds.saturating_add(1);
+        if self.unanswered_rounds == UNANSWERED_ROUNDS_BEFORE_DERP {
+            self.env
+                .publish_noretain(PeerBestPath {
+                    peer: self.peer_id,
+                    ep: None,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
     fn gc_seen_endpoints(&mut self) {
         let now = Instant::now();
 
@@ -450,6 +497,7 @@ impl kameo::Actor for PeerPd {
             coord_endpoints_ctrl: Default::default(),
             endpoints_ctrl: Default::default(),
             seen_peer_endpoints: Default::default(),
+            unanswered_rounds: 0, // ThinkTerm (direct fallback)
         })
     }
 }
@@ -580,5 +628,163 @@ impl Message<IncomingDiscoMsg> for PeerPd {
             latency: elapsed,
             transport: msg.transport,
         };
+    }
+}
+
+// ThinkTerm (direct fallback): added.
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use kameo::{
+        actor::{ActorRef, Spawn},
+        message::{Context, Message},
+    };
+    use ts_control::{Endpoint, EndpointType};
+    use ts_keys::{DiscoPublicKey, NodePublicKey};
+    use ts_transport::{DynEndpoint, PeerId, UnderlayTransportId};
+
+    use super::{BestPaths, PathDiscoverer, PeerBestPath, PeerPd, ProbeState};
+    use crate::{env::Env, retained_bus::GetRetained};
+
+    /// A PeerPd as PathDiscoverer spawns one for `peer`, without the timer: its rounds are the
+    /// test's. The peer is known as a netmap would have it, and this node has an endpoint.
+    fn peer_pd(env: &Env, peer: PeerId) -> PeerPd {
+        PeerPd {
+            peer_id: peer,
+            disco_key: Some(DiscoPublicKey::random()),
+            started_probing: false,
+            current_probes: Default::default(),
+            tx_lookup: Default::default(),
+            previous_probe_latencies: Default::default(),
+            this_node_endpoints: Arc::new([Endpoint {
+                endpoint: "192.0.2.1:41641".parse().unwrap(),
+                ty: EndpointType::Stun,
+            }]),
+            coord_endpoints_ctrl: [DynEndpoint::derp(NodePublicKey::random())].into(),
+            endpoints_ctrl: Default::default(),
+            endpoints_cmm: Default::default(),
+            seen_peer_endpoints: Default::default(),
+            unanswered_rounds: 0,
+            env: env.clone(),
+        }
+    }
+
+    /// Ends a probing round in which `answered` (or no path at all) answered.
+    async fn round(pd: &mut PeerPd, answered: Option<&DynEndpoint>) {
+        if let Some(ep) = answered {
+            pd.current_probes.insert(
+                ep.clone(),
+                ProbeState::Success {
+                    latency: Duration::from_millis(20),
+                    transport: UnderlayTransportId(1),
+                },
+            );
+        }
+        pd.start_probes().await;
+    }
+
+    /// Every path a PeerPd publishes, in order.
+    struct Published(Vec<Option<DynEndpoint>>);
+
+    impl kameo::Actor for Published {
+        type Args = Env;
+        type Error = crate::Error;
+
+        async fn on_start(env: Env, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+            env.subscribe::<PeerBestPath>(&slf).await?;
+            Ok(Self(vec![]))
+        }
+    }
+
+    impl Message<PeerBestPath> for Published {
+        type Reply = ();
+
+        async fn handle(&mut self, msg: PeerBestPath, _: &mut Context<Self, Self::Reply>) {
+            self.0.push(msg.ep.map(|(_, ep)| ep));
+        }
+    }
+
+    struct SoFar;
+
+    impl Message<SoFar> for Published {
+        type Reply = Vec<Option<DynEndpoint>>;
+
+        async fn handle(&mut self, _: SoFar, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
+            self.0.clone()
+        }
+    }
+
+    /// The direct path the routes give `peer` (None: DERP) once it is `want`, or the one they
+    /// give after five seconds without that.
+    async fn path_of(env: &Env, peer: PeerId, want: Option<&DynEndpoint>) -> Option<DynEndpoint> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let path = env
+                .bus
+                .ask(GetRetained::<BestPaths>::new())
+                .await
+                .unwrap()
+                .and_then(|BestPaths(paths)| paths.get(&peer).map(|(_, ep)| ep.clone()));
+            if path.as_ref() == want || tokio::time::Instant::now() >= deadline {
+                return path;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_direct_path_that_stops_answering_gives_way_to_derp() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        PathDiscoverer::spawn(env.clone())
+            .wait_for_startup_result()
+            .await
+            .unwrap();
+        let published = Published::spawn(env.clone());
+        published.wait_for_startup_result().await.unwrap();
+        let peer = PeerId(7);
+        let mut pd = peer_pd(&env, peer);
+
+        let wifi = DynEndpoint::udp("192.168.1.20:41641".parse().unwrap());
+        let cellular = DynEndpoint::udp("203.0.113.9:3478".parse().unwrap());
+
+        // A path answered: traffic to the peer goes over it.
+        round(&mut pd, Some(&wifi)).await;
+        assert_eq!(path_of(&env, peer, Some(&wifi)).await, Some(wifi.clone()));
+
+        // One round without an answer, as a lost ping or pong leaves, and it answers again.
+        round(&mut pd, None).await;
+        round(&mut pd, Some(&wifi)).await;
+
+        // Two rounds in a row without one, as when the phone left the Wi-Fi: back on DERP.
+        round(&mut pd, None).await;
+        round(&mut pd, None).await;
+        assert_eq!(path_of(&env, peer, None).await, None);
+
+        // Another path answers: direct again, over that one.
+        round(&mut pd, Some(&cellular)).await;
+        assert_eq!(
+            path_of(&env, peer, Some(&cellular)).await,
+            Some(cellular.clone())
+        );
+
+        // This node has no endpoint left to offer: rounds that cannot probe count too.
+        pd.this_node_endpoints = Arc::new([]);
+        for _ in 0..3 {
+            round(&mut pd, None).await;
+        }
+        assert_eq!(path_of(&env, peer, None).await, None);
+
+        // A single round without an answer published nothing, so traffic stayed on the Wi-Fi
+        // path through it, and a streak of them gave the path up once. What the rounds publish
+        // reaches the bus in order: once the count is in, so is all of it.
+        let want = [Some(wifi.clone()), Some(wifi), None, Some(cellular), None];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut so_far = published.ask(SoFar).await.unwrap();
+        while so_far.len() < want.len() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            so_far = published.ask(SoFar).await.unwrap();
+        }
+        assert_eq!(so_far, want);
     }
 }

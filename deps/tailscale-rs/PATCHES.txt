@@ -113,6 +113,25 @@ lost peers (ts_netstack_smoltcp)
     ts_netstack_smoltcp_core crate up to 0.6.1.
     Drop when: upstream sets a timeout and a keep-alive on its sockets.
 
+direct fallback (ts_runtime)
+    A peer's direct path that stops answering is given up: once two probing rounds of
+    path_discoverer's PeerPd in a row had no path answer (UNANSWERED_ROUNDS_BEFORE_DERP), it
+    publishes None, once for the streak, which puts the peer back on DERP. A round that
+    cannot probe at all -- the peer's disco key or coordinator endpoints unknown, this node
+    with no endpoint to offer -- counts as one without an answer. Upstream publishes only a
+    round with an answer (its `latencies_was_empty` is read after the map is cleared, so it
+    is always true), and traffic stayed on a direct path that had stopped answering -- a
+    phone gone from Wi-Fi to cellular, a laptop that changed networks -- until another path
+    answered. A round is PROBE_PERIOD, 5 s, with one ping per path: two rounds, so that a
+    ping or a pong lost does not send traffic over DERP for a round (nor, with the peer's
+    DERP region down, nowhere), and traffic is back on DERP 10 to 15 s after its path stops
+    answering.
+    Used by: every connection over the tailnet, now that nodes find direct paths: since
+    0.7.0 a node sends STUN from its own UDP socket and offers the address it learns
+    (tailscale-rs #434), where 0.6.1 never did, so only peers on the same network went
+    direct.
+    Drop when: upstream withdraws a direct path that stops answering.
+
 derp dial (ts_derp, ts_runtime)
     A DERP region whose servers cannot be reached, or whose TLS handshake fails, is an error
     for its client; 0.6.1 unwraps the outcome of the dial and panics. A connection gets 15 s
@@ -212,6 +231,8 @@ build. The changes in behaviour have tests:
     device info     node::tests
     sign-in state   control_runner::tests (the reason given, a machine not let in)
     no panic        env::tests
+    direct fallback path_discoverer::tests (a direct path that stops answering, one that
+                    misses a round, rounds that cannot probe)
     derp dial       multiderp::uniderp::tests (an unreachable region, becoming home, a
                     connection that does not come up, the next server)
     derp reads      client::tests in ts_derp (a connection gone quiet, keep-alives)
