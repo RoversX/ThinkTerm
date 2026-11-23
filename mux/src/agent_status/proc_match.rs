@@ -66,6 +66,11 @@ const KNOWN_PACKAGE_PATHS: &[(&[&str], &str)] = &[
         ],
         "pi",
     ),
+    // OMP after its own `/restart`, which runs again as `bun <its cli.js>`.
+    (
+        &["node_modules", "@oh-my-pi", "pi-coding-agent", "dist", "cli"],
+        "omp",
+    ),
 ];
 
 /// Process names herdr recognizes in its code-side table that our
@@ -428,6 +433,7 @@ mod tests {
             "kimi" => Some("kimi".to_string()),
             "opencode" => Some("opencode".to_string()),
             "pi" => Some("pi".to_string()),
+            "omp" => Some("omp".to_string()),
             _ => None,
         }
     }
@@ -650,6 +656,20 @@ mod tests {
             )
             .as_deref(),
             Some("pi")
+        );
+        // OMP as its `/restart` runs it again: Bun and the package's cli.js.
+        assert_eq!(
+            identify_with_argv(
+                "/home/me/.nvm/versions/node/v24/lib/node_modules/bun/bin/bun.exe",
+                &[
+                    "/home/me/.nvm/versions/node/v24/lib/node_modules/bun/bin/bun.exe",
+                    "/home/me/.nvm/versions/node/v24/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+                    "--model",
+                    "x/y",
+                ]
+            )
+            .as_deref(),
+            Some("omp")
         );
         // A random cli.js does not.
         assert_eq!(
