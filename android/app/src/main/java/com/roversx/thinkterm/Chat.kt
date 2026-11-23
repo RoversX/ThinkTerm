@@ -175,7 +175,12 @@ data class ChatView(
     /// How full the model's context is: the ring in the bar and its sheet;
     /// null when the agent does not say.
     val context: ChatContext?,
+    /// The agent runs an older ThinkTerm extension than the one in its
+    /// folder: said over the field, with the button that loads the new one.
+    val outdated: ChatOutdated?,
 )
+
+data class ChatOutdated(val text: String, val action: ChatAction)
 
 /// How full the context is (`fill` 0 to 1, null while not known; `level`
 /// "ok", "high" or "full"), what fills it, and the session's totals.
@@ -363,6 +368,9 @@ object ChatViews {
             },
             commands = o.optJSONArray("commands").objects().map {
                 ChatCommand(it.optString("name"), it.optString("description"), it.optStringOrNull("args"), it.optStringOrNull("here"))
+            },
+            outdated = o.optJSONObject("outdated")?.let { u ->
+                u.optJSONObject("action")?.let { a -> ChatOutdated(u.optString("text"), ChatAction(a.optString("id"), a.optString("label"))) }
             },
             context = o.optJSONObject("context")?.let { c ->
                 ChatContext(
@@ -749,6 +757,7 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             // the ones shown is the chat's own.
             key(target.pane) { Notice(chat?.notice, backdrop, dark) }
             chat?.problem?.let { ProblemCard(it, model, backdrop, dark) }
+            chat?.outdated?.let { OutdatedCard(it, model, backdrop, dark) }
             chat?.ask?.let { AskCard(it, model, backdrop, dark, onTerminal = onBack) }
             ChatField(chat, target, model, backdrop, dark, onSend = { follow = true })
         }
@@ -1289,6 +1298,36 @@ private fun ProblemCard(problem: ChatProblem, model: TerminalModel, backdrop: Ba
     }
 }
 
+/// The agent runs an older extension than the one in its folder: a line
+/// over the field, and the button that has it take the new one in.
+@Composable
+private fun OutdatedCard(outdated: ChatOutdated, model: TerminalModel, backdrop: Backdrop, dark: Boolean) {
+    val ink = LocalChrome.current.ink
+    val shape = RoundedCornerShape(18.dp)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .glass(backdrop, dark, shape)
+            .padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(outdated.text, fontSize = 13.sp, lineHeight = 18.sp, color = ink.copy(alpha = 0.85f), modifier = Modifier.weight(1f))
+        Text(
+            outdated.action.label,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White,
+            maxLines = 1,
+            modifier = Modifier
+                .clip(CircleShape)
+                .background(LeadBlue)
+                .clickable(role = Role.Button) { model.chatAction(outdated.action.id) }
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+        )
+    }
+}
+
 /// What each part of the context is drawn in.
 private fun partColor(kind: String, ink: Color): Color = when (kind) {
     "system" -> Color(0xFFAF52DE)
@@ -1536,7 +1575,7 @@ private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: 
         Column(
             Modifier
                 .fillMaxWidth()
-                .glass(backdrop, dark, shape, tint = cardTint(dark))
+                .glass(backdrop, dark, shape)
                 .border(0.5.dp, ink.copy(alpha = if (dark) 0.12f else 0.08f), shape)
                 .padding(horizontal = 4.dp, vertical = 2.dp),
         ) {
@@ -1581,10 +1620,6 @@ private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: 
         }
     }
 }
-
-/// The field's card: glass, but enough of the ground in it that what
-/// passes under it never reads through the words typed.
-private fun cardTint(dark: Boolean) = if (dark) Color(0xFF1C1C1E).copy(alpha = 0.93f) else Color.White.copy(alpha = 0.94f)
 
 /// Send, or stop: the one round button at the field's end, small, with
 /// all of a finger's room around it.
@@ -1660,7 +1695,7 @@ private fun CommandPalette(
     Column(
         Modifier
             .fillMaxWidth()
-            .glass(backdrop, dark, shape, tint = cardTint(dark))
+            .glass(backdrop, dark, shape)
             .border(0.5.dp, ink.copy(alpha = if (dark) 0.12f else 0.08f), shape)
             .heightIn(max = 292.dp)
             .verticalScroll(rememberScrollState())
