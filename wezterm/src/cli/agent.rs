@@ -214,6 +214,27 @@ impl thinkterm_agent_chat::host::PaneControl for MuxPane {
         })
     }
 
+    fn title(&self) -> Option<String> {
+        smol::block_on(async {
+            let listed = self.client.list_panes().await.ok()?;
+            for tabroot in listed.tabs {
+                let mut cursor = tabroot.into_tree().cursor();
+                loop {
+                    if let Some(stack) = cursor.leaf_mut() {
+                        if let Some(entry) = stack.panes.iter().find(|entry| entry.pane_id == self.pane) {
+                            return Some(entry.title.clone());
+                        }
+                    }
+                    match cursor.preorder_next() {
+                        Ok(c) => cursor = c,
+                        Err(_) => break,
+                    }
+                }
+            }
+            None
+        })
+    }
+
     fn type_line(&self, line: &str) -> anyhow::Result<()> {
         use termwiz::input::{KeyCode, KeyEvent, Modifiers};
         smol::block_on(async {
