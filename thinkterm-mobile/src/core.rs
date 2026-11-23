@@ -43,6 +43,10 @@ pub type MobileApp = App<MobilePlatform, SshLink>;
 /// The views are made again at most this often: a burst of output is
 /// one publication per frame, not one per change.
 const VIEWS_EVERY: Duration = Duration::from_millis(16);
+/// The chat's view is made again at most this often from what its bridge
+/// sends: words written as they come are a few refreshes a second, and
+/// the lines of a chat opening one.
+const CHAT_EVERY: Duration = Duration::from_millis(60);
 
 pub struct ConnectParams {
     pub ssh: SshParams,
@@ -368,6 +372,9 @@ struct State {
     /// Openings of a chat's channel so far: each is numbered, and only the
     /// latest one's lines count.
     chat_openings: u64,
+    /// The bridge said something the chat on show has not been sent yet.
+    chat_owed: bool,
+    chat_made: Instant,
     /// The panes whose agent waits on the person, as last told the shell
     /// (`report_agents`).
     agents_waiting: std::collections::HashSet<u32>,
@@ -421,6 +428,7 @@ pub fn run(
         state.pool.run_until_stalled();
         state.report_link();
         state.report_agents();
+        state.publish_chat_owed();
         state.publish_views();
     }
     state.disconnect();
@@ -481,6 +489,8 @@ impl State {
             views_dirty: Rc::new(Cell::new(true)),
             chat: None,
             chat_openings: 0,
+            chat_owed: false,
+            chat_made: Instant::now(),
             agents_waiting: Default::default(),
             agents_server: None,
             agents_dirty: Rc::new(Cell::new(false)),
@@ -504,6 +514,9 @@ impl State {
         }
         if let Some(due) = self.platform.next_deadline() {
             wait = wait.min(due.saturating_duration_since(now));
+        }
+        if self.chat_owed {
+            wait = wait.min((self.chat_made + CHAT_EVERY).saturating_duration_since(now));
         }
         let owed = self.views_dirty.get() || (self.screen_dirty && self.screen_wanted);
         if owed && (self.platform.shown() || (self.views_listed && self.views_dirty.get())) {
@@ -654,6 +667,7 @@ impl State {
                     model: ChatModel::new(pane, &agent),
                 });
                 self.chat_connect();
+                self.probe_for_chat();
             }
             ChatCmd::Close => {
                 if self.chat.take().is_some() {
@@ -697,7 +711,10 @@ impl State {
             ChatCmd::Install => {
                 self.chat_op(ChatOp::Install);
             }
-            ChatCmd::Retry => self.chat_connect(),
+            ChatCmd::Retry => {
+                self.chat_connect();
+                self.probe_for_chat();
+            }
             ChatCmd::Toggle(row) => {
                 if let Some(chat) = self.chat.as_mut() {
                     chat.model.toggle(&row);
@@ -719,6 +736,17 @@ impl State {
         let opened = self.link.as_ref().is_some_and(|link| link.chat_open(chat.pane, chat.generation));
         if !opened {
             chat.model.ended(false, "not connected");
+        }
+    }
+
+    /// See whether the connection a chat opens on still carries: after the
+    /// phone was away (in the background, on another network) it may be
+    /// gone without having said so, and the chat's channel would wait on it
+    /// in vain. A dead one is found in seconds and dialled again, and the
+    /// chat opens again on the new one (`Net::Connected`).
+    fn probe_for_chat(&self) {
+        if let Some(link) = &self.link {
+            link.probe();
         }
     }
 
@@ -747,12 +775,21 @@ impl State {
     /// first ("chat_picture", each once, by the key its rows name them
     /// by), then the view.
     fn publish_chat(&mut self) {
+        self.chat_owed = false;
+        self.chat_made = Instant::now();
         if let Some(chat) = self.chat.as_mut() {
             for (key, data) in chat.model.new_pictures() {
                 let picture = serde_json::json!({ "pane": chat.pane, "key": key, "data": data });
                 self.notify.on_published("chat_picture".into(), picture.to_string());
             }
             self.notify.on_published("chat".into(), json(&chat.model.view()));
+        }
+    }
+
+    /// The chat as its bridge left it, once its time has come.
+    fn publish_chat_owed(&mut self) {
+        if self.chat_owed && self.chat_made.elapsed() >= CHAT_EVERY {
+            self.publish_chat();
         }
     }
 
@@ -1526,7 +1563,9 @@ impl State {
             Net::ChatLine { generation, line } => {
                 if let Some(chat) = self.chat.as_mut().filter(|chat| chat.generation == generation) {
                     if chat.model.line(&line) {
-                        self.publish_chat();
+                        // Lines close together are shown together.
+                        self.chat_owed = true;
+                        self.publish_chat_owed();
                     }
                 }
             }
@@ -1538,6 +1577,11 @@ impl State {
                 if let Some(chat) = self.chat.as_mut().filter(|chat| chat.generation == generation) {
                     chat.model.ended(missing, &reason);
                     self.publish_chat();
+                    // A channel that never opened is most often a connection
+                    // gone quiet: looked at, and dialled again if it is.
+                    if reason.contains("timed out") {
+                        self.probe_for_chat();
+                    }
                 }
             }
             Net::Data(bytes) => {
