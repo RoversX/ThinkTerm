@@ -128,7 +128,7 @@ struct KeyBar: View {
 
     /// "Photo 2026-01-02 at 03.04.05.jpg", as the desktop names a pasted
     /// picture ("Pasted ... .png").
-    private static func stamped(_ word: String, _ ext: String) -> String {
+    static func stamped(_ word: String, _ ext: String) -> String {
         let format = DateFormatter()
         format.locale = Locale(identifier: "en_US_POSIX")
         format.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
@@ -137,7 +137,7 @@ struct KeyBar: View {
 
     /// What a picture's bytes say it is; the picker's word for it is the
     /// format it was in before it was made one anything reads.
-    private static func pictureExtension(_ data: Data, else fallback: String) -> String {
+    static func pictureExtension(_ data: Data, else fallback: String) -> String {
         let head = [UInt8](data.prefix(12))
         if head.starts(with: [0xFF, 0xD8]) { return "jpg" }
         if head.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }

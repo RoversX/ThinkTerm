@@ -69,6 +69,10 @@ struct AgentsView: Decodable, Hashable {
 /// One pane an agent runs in.
 struct AgentRow: Decodable, Hashable, Identifiable {
     var pane: Int
+    /// The agent as its detection names it: "codex", "pi".
+    var agent_id: String
+    /// Its conversation can be shown as a chat.
+    var chat: Bool?
     var name: String
     var title: String
     /// "working", "blocked", "error", "done", "idle" or "unknown".

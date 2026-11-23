@@ -225,6 +225,11 @@ struct SettingsPageView: View {
                     PickerOption("menu", tr("i.spaces.menu")),
                 ])
             }
+            Section {
+                Toggle(tr("chat.first"), isOn: $settings.chatFirst)
+            } footer: {
+                Text(tr("chat.first.note"))
+            }
         case .keyboard:
             Section {
                 NavigationLink {

@@ -154,7 +154,17 @@ struct TerminalScreen: View {
                         : showRight ? -drawerWidth
                         : min(edgePull, drawerWidth) - min(rightPull, drawerWidth)
                 )
+                if model.chatWith != nil {
+                    // The chat with an agent, over the whole screen and its
+                    // pane's terminal, which going back shows.
+                    // Its own state for each chat: a notice count, a draft.
+                    ChatPage(model: model)
+                        .id(model.chatWith?.pane)
+                        .transition(.move(edge: .trailing))
+                        .zIndex(10)
+                }
             }
+            .animation(Self.slide, value: model.chatWith)
             .simultaneousGesture(
                 // A swipe right from the left edge opens the drawer, the
                 // screen following the finger; one from further in is the
@@ -277,6 +287,7 @@ struct TerminalScreen: View {
             edgeDrag.start = drag.startLocation
             edgeDrag.pulls = drag.startLocation.x < Self.edgeWidth && move.width > abs(move.height)
                 && terminalSpan.contains(drag.startLocation.y) && model.inputView?.holdsSelection != true
+                && model.chatWith == nil
         }
         return edgeDrag.pulls
     }
@@ -290,6 +301,7 @@ struct TerminalScreen: View {
             rightDrag.start = drag.startLocation
             rightDrag.pulls = drag.startLocation.x > right - Self.edgeWidth && -move.width > abs(move.height)
                 && terminalSpan.contains(drag.startLocation.y) && model.inputView?.holdsSelection != true
+                && model.chatWith == nil
         }
         return rightDrag.pulls
     }

@@ -101,14 +101,22 @@ struct RightPanel: View {
         let said = [row.kind, row.said].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
         let detail = [said, row.title].first { !$0.isEmpty }
         let more = row.progress != nil || !row.subtasks_summary.isEmpty
+        let chats = row.chat == true
         return SidebarRow(
             lead: AnyView(ThreadCards(core: model.core, icons: [row.pane_card ?? model.tabs?.icon].compactMap { $0 }, revision: model.iconsRevision)),
             mark: AnyView(ThreadMark(status: Self.status(row.state), dot: "Open", size: 9)),
             title: row.place.isEmpty ? row.name : row.place,
             subtitle: detail,
+            // An agent a chat can be had with: its own button opens the
+            // chat, whatever a tap on the row does.
+            trailing: chats ? AnyView(chatButton(row)) : nil,
             below: more ? AnyView(agentMore(row)) : nil
         ) {
-            model.chromeClick("pane", pane: row.pane)
+            if chats && AppSettings.shared.chatFirst {
+                model.openChat(row)
+            } else {
+                model.chromeClick("pane", pane: row.pane)
+            }
             done()
         }
         // The row is one element to VoiceOver: the fold is one of its
@@ -118,6 +126,24 @@ struct RightPanel: View {
                 Button(row.subtasks_summary) { model.toggleSubtasks(pane: row.pane) }
             }
         }
+    }
+
+    /// The round button that opens an agent's chat, lit while it waits on you.
+    private func chatButton(_ row: AgentRow) -> some View {
+        let waiting = row.state == "blocked"
+        return Button {
+            model.openChat(row)
+            done()
+        } label: {
+            Image(systemName: "bubble.left")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(waiting ? Color.accentColor : Color.secondary)
+                .frame(width: 32, height: 32)
+                .background((waiting ? Color.accentColor : Color.secondary).opacity(waiting ? 0.16 : 0.1), in: Circle())
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(tr("chat.open"))
     }
 
     /// What an agent said of its progress under its row, as the web's

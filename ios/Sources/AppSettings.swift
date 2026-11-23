@@ -74,6 +74,12 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(paneBars, forKey: "ui.panebars") }
     }
 
+    /// A tap on an agent in the Agents list opens its chat (Codex, Pi)
+    /// rather than its terminal; off, its chat button still does.
+    @Published var chatFirst: Bool {
+        didSet { defaults.set(chatFirst, forKey: "chat.first") }
+    }
+
     /// How the sidebar shows the Spaces: "list", every Space a row that
     /// folds, or "menu", the Space on show with the others in its menu,
     /// as the desktop's sidebar has them.
@@ -153,6 +159,7 @@ final class AppSettings: ObservableObject {
         bell = d.object(forKey: "bell") as? Bool ?? false
         resizeMode = d.string(forKey: "resize.mode") ?? "auto"
         paneBars = d.object(forKey: "ui.panebars") as? Bool ?? true
+        chatFirst = d.object(forKey: "chat.first") as? Bool ?? false
         spaces = d.string(forKey: "ui.spaces") ?? "list"
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
         autoKeyPanel = d.object(forKey: "key.autopanel") as? Bool ?? false

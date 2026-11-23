@@ -886,9 +886,30 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
 
     fileprivate func corePublished(_ key: String, _ value: String) {
-        guard key == "bg", let color = Color(hex: value) else { return }
-        DispatchQueue.main.async {
-            if self.background != color { self.background = color }
+        switch key {
+        case "bg":
+            guard let color = Color(hex: value) else { return }
+            DispatchQueue.main.async {
+                if self.background != color { self.background = color }
+            }
+        case "chat_picture":
+            // Each small picture once, decoded here, off the main thread.
+            struct Picture: Decodable { let pane: Int; let key: String; let data: String }
+            guard let picture = ViewJSON.decode(Picture.self, value),
+                  let bytes = Data(base64Encoded: picture.data),
+                  let image = UIImage(data: bytes) else { return }
+            DispatchQueue.main.async {
+                if self.chatWith?.pane == picture.pane { self.chatThumbs[picture.key] = image }
+            }
+        case "chat":
+            // Read here, off the main thread: a long chat is a long text.
+            guard let chat = ViewJSON.decode(ChatState.self, value) else { return }
+            // Only the chat on show: a late view of the one before is dropped.
+            DispatchQueue.main.async {
+                if self.chatWith?.pane == chat.pane { self.chat = chat }
+            }
+        default:
+            return
         }
     }
 
@@ -1067,6 +1088,208 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     /// Open or fold the sub-task list of the agent in `pane`.
     func toggleSubtasks(pane: Int) { core.agentToggleSubtasks(pane: UInt32(pane)) }
+
+    // MARK: an agent's conversation as a chat
+
+    /// Whom the chat on show is with: the pane, the agent as its detection
+    /// names it, and where it is ("Project · Thread").
+    struct ChatTarget: Equatable {
+        let pane: Int
+        let agent: String
+        let place: String
+    }
+
+    /// The chat on show, over the terminal of its agent's pane; nil when
+    /// none is (`chat` is nil too until its first view comes).
+    @Published private(set) var chatWith: ChatTarget?
+    @Published private(set) var chat: ChatState?
+
+    /// Show `row`'s agent as a chat. The terminal under it goes to the
+    /// agent's pane first, as a tap on the row always did: going back from
+    /// the chat is going to that terminal.
+    func openChat(_ row: AgentRow) {
+        chromeClick("pane", pane: row.pane)
+        chat = nil
+        chatThumbs = [:]
+        chatWith = ChatTarget(pane: row.pane, agent: row.agent_id, place: row.place.isEmpty ? row.name : row.place)
+        core.chatOpen(pane: UInt32(row.pane), agent: row.agent_id)
+    }
+
+    func closeChat() {
+        guard chatWith != nil else { return }
+        chatWith = nil
+        chat = nil
+        core.chatClose()
+        for file in chatFiles { chatDetach(file) }
+    }
+
+    // MARK: files sent in the chat
+
+    /// A file picked to go with what is said next: on its way to the host's
+    /// uploads folder, there (`path`), or not (`error`).
+    struct ChatFile: Identifiable, Equatable {
+        let id: UInt64
+        let name: String
+        let image: Bool
+        /// Its size, in bytes.
+        let size: Int64
+        /// A small picture of it, for a picture.
+        let preview: UIImage?
+        /// The app's own copy, until it is sent.
+        let file: URL
+        var sent: UInt64 = 0
+        var total: UInt64 = 0
+        var path: String?
+        var error: String?
+    }
+
+    /// What goes with what is said next.
+    @Published private(set) var chatFiles: [ChatFile] = []
+    /// The phone's own copies of the pictures sent, by where they are on
+    /// the host: what a tap shows big, and what shows before the host's
+    /// small picture comes.
+    @Published private(set) var chatPictures: [String: URL] = [:]
+    /// The host's small pictures of what was sent, by the key the chat's
+    /// rows name them by: each comes once ("chat_picture").
+    @Published private(set) var chatThumbs: [String: UIImage] = [:]
+    private var chatFilesTimer: Timer?
+
+    /// Put what the phone has -- a photo, the clipboard's picture -- in the
+    /// host's uploads folder, to go with what is said next.
+    func chatAttach(name: String, data: Data, image: Bool) {
+        let id = core.uploadBegin()
+        guard let file = Self.chatFile(named: name), (try? data.write(to: file)) != nil else {
+            core.cancelUpload(id: id)
+            return note(tr("upload.unread", name))
+        }
+        startChatFile(id: id, name: name, image: image, file: file)
+    }
+
+    /// The same for a file elsewhere (the Files app's), copied as a
+    /// coordinated read, off the main thread.
+    func chatAttach(copying url: URL) {
+        let name = url.lastPathComponent
+        let id = core.uploadBegin()
+        guard let file = Self.chatFile(named: name) else {
+            core.cancelUpload(id: id)
+            return note(tr("upload.unread", name))
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var copied = false
+            let scoped = url.startAccessingSecurityScopedResource()
+            var refused: NSError?
+            NSFileCoordinator().coordinate(readingItemAt: url, options: .withoutChanges, error: &refused) { readable in
+                copied = (try? FileManager.default.copyItem(at: readable, to: file)) != nil
+            }
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            DispatchQueue.main.async {
+                guard let self, copied else {
+                    try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+                    self?.core.cancelUpload(id: id)
+                    self?.note(tr("upload.unread", name))
+                    return
+                }
+                let kind = file.pathExtension.lowercased()
+                // A HEIF made a JPEG, as a photo is; pictures agents read go
+                // as pictures; anything else (an SVG, a TIFF) by its path.
+                if kind == "heic" || kind == "heif" {
+                    let jpeg = UIImage(contentsOfFile: file.path)?.jpegData(compressionQuality: 0.92)
+                    try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+                    guard let jpeg else {
+                        self.core.cancelUpload(id: id)
+                        self.note(tr("upload.unread", name))
+                        return
+                    }
+                    self.core.cancelUpload(id: id)
+                    self.chatAttach(name: (name as NSString).deletingPathExtension + ".jpg", data: jpeg, image: true)
+                    return
+                }
+                let image = ["png", "jpg", "jpeg", "gif", "webp"].contains(kind)
+                self.startChatFile(id: id, name: name, image: image, file: file)
+            }
+        }
+    }
+
+    /// Take a picked file off what goes next; one still on its way is
+    /// given up.
+    func chatDetach(_ file: ChatFile) {
+        if file.path == nil && file.error == nil { core.cancelUpload(id: file.id) }
+        chatFiles.removeAll { $0.id == file.id }
+        try? FileManager.default.removeItem(at: file.file.deletingLastPathComponent())
+    }
+
+    private static var chatFilesFolder: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("chat-files", isDirectory: true)
+    }
+
+    /// What a process before this one left: cleared once, before the
+    /// first copy is made.
+    private static let clearedChatFiles: Void = {
+        try? FileManager.default.removeItem(at: chatFilesFolder)
+    }()
+
+    private static func chatFile(named name: String) -> URL? {
+        _ = clearedChatFiles
+        let folder = chatFilesFolder.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        guard (try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)) != nil else { return nil }
+        return folder.appendingPathComponent(name.isEmpty ? "file" : name.replacingOccurrences(of: "/", with: "_"))
+    }
+
+    private func startChatFile(id: UInt64, name: String, image: Bool, file: URL) {
+        core.uploadFile(id: id, name: file.lastPathComponent, path: file.path)
+        let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
+        let preview = image ? UIImage(contentsOfFile: file.path)?.preparingThumbnail(of: CGSize(width: 240, height: 240)) : nil
+        chatFiles.append(ChatFile(id: id, name: file.lastPathComponent, image: image, size: size, preview: preview, file: file))
+        guard chatFilesTimer == nil else { return }
+        chatFilesTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.pollChatFiles() }
+    }
+
+    private func pollChatFiles() {
+        var going = false
+        for index in chatFiles.indices where chatFiles[index].path == nil && chatFiles[index].error == nil {
+            guard let status = core.uploadStatus(id: chatFiles[index].id) else {
+                chatFiles[index].error = "cancelled"
+                continue
+            }
+            (chatFiles[index].sent, chatFiles[index].total) = (status.sent, status.total)
+            guard status.done else {
+                going = true
+                continue
+            }
+            // Its path goes with what is said, not into a pane.
+            core.uploadUnpasted(id: chatFiles[index].id)
+            if status.error.isEmpty {
+                chatFiles[index].path = status.path
+            } else {
+                chatFiles[index].error = status.error
+            }
+        }
+        if !going {
+            chatFilesTimer?.invalidate()
+            chatFilesTimer = nil
+        }
+    }
+
+    /// Say `text`, with the files picked that have reached the host.
+    func chatSend(_ text: String) {
+        let ready = chatFiles.filter { $0.path != nil }
+        for file in ready {
+            if file.image, let path = file.path {
+                chatPictures[path] = file.file
+            } else {
+                try? FileManager.default.removeItem(at: file.file.deletingLastPathComponent())
+            }
+        }
+        chatFiles.removeAll { $0.path != nil }
+        core.chatSend(text: text, attachments: ready.map { ChatAttachment(name: $0.name, image: $0.image, path: $0.path ?? "") })
+    }
+
+    func chatSetModel(_ model: String, effort: String?) { core.chatSetModel(model: model, effort: effort) }
+    func chatAnswer(ask: String, choice: String) { core.chatAnswer(ask: ask, choice: choice) }
+    func chatInterrupt() { core.chatInterrupt() }
+    func chatOlder() { core.chatOlder() }
+    func chatAction(_ action: String) { core.chatAction(action: action) }
+    func chatToggle(_ row: String) { core.chatToggle(row: row) }
 
     /// The text between two visible cells of the focused pane, for the
     /// clipboard, as the core reads it from the cells; the pane's own
