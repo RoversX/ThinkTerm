@@ -41,7 +41,8 @@ object DesktopIcons {
     }
 
     private val element = Regex("""<(path|circle|ellipse|rect|line|polyline|polygon)\b([^>]*)/?>""")
-    private val attribute = Regex("""([a-zA-Z-]+)="([^"]*)"""")
+    // Names may hold digits: a line's ends are `x1`, `y2`.
+    private val attribute = Regex("""([a-zA-Z][a-zA-Z0-9-]*)="([^"]*)"""")
     private val viewBox = Regex("""viewBox="([^"]+)"""")
 
     /// Lucide's icons are strokes two units wide on a 24-unit square,
