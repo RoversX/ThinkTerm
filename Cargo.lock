@@ -11882,6 +11882,7 @@ dependencies = [
  "termwiz 0.24.0",
  "termwiz-funcs",
  "textwrap",
+ "thinkterm-agent-chat",
  "thinkterm-file-index",
  "thinkterm-plugin-channel",
  "thinkterm-plugin-panel",

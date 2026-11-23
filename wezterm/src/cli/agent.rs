@@ -25,10 +25,23 @@ enum AgentSubCommand {
     /// setup` installs runs this; outside a pane it prints nothing.
     #[command(name = "context")]
     Context(AgentContextCommand),
+
+    /// Talk with the coding agent in a pane as a chat: one JSON object a
+    /// line, ops on stdin and what happens on stdout. ThinkTerm's phone
+    /// app runs this on the machine the pane is on.
+    #[command(name = "chat", hide = true)]
+    Chat(AgentChatCommand),
 }
 
 #[derive(Debug, Parser, Clone)]
 struct AgentContextCommand {}
+
+#[derive(Debug, Parser, Clone)]
+struct AgentChatCommand {
+    /// The pane whose agent to talk with.
+    #[arg(long)]
+    pane: mux::pane::PaneId,
+}
 
 #[derive(Debug, Parser, Clone)]
 struct AgentListCommand {
@@ -47,8 +60,151 @@ impl AgentCommand {
         match &self.sub {
             AgentSubCommand::List(cmd) => cmd.run(client).await,
             AgentSubCommand::Context(cmd) => cmd.run(client).await,
+            AgentSubCommand::Chat(cmd) => cmd.run(client).await,
         }
     }
+}
+
+impl AgentChatCommand {
+    #[cfg(unix)]
+    async fn run(&self, client: Client) -> anyhow::Result<()> {
+        use thinkterm_agent_chat::host::{Out, Target};
+        use thinkterm_agent_chat::Need;
+
+        let out = Out::stdout();
+        let statuses = client.get_agent_statuses().await?;
+        let Some(agent) = statuses
+            .statuses
+            .iter()
+            .find(|entry| entry.pane_id == self.pane)
+            .map(|entry| entry.status.agent_id.clone())
+        else {
+            out.error(Some(Need::Unsupported), format!("no agent found in pane {}", self.pane))?;
+            return Ok(());
+        };
+        // An agent the pane reaches over ssh runs on another machine: what
+        // the bridge can reach is this one's.
+        let programs = client.get_foreground_programs().await?;
+        if let Some(remote) = programs
+            .programs
+            .iter()
+            .find(|entry| entry.pane_id == self.pane)
+            .map(|entry| entry.program.executable.as_str())
+            .filter(|program| REMOTE_SHELLS.contains(program))
+        {
+            out.error(Some(Need::NotHere), format!("pane {} runs {remote}", self.pane))?;
+            return Ok(());
+        }
+        let listed = client.list_panes().await?;
+        let mut working_dir = None;
+        for tabroot in listed.tabs {
+            let mut cursor = tabroot.into_tree().cursor();
+            loop {
+                if let Some(stack) = cursor.leaf_mut() {
+                    if let Some(entry) = stack.panes.iter().find(|entry| entry.pane_id == self.pane) {
+                        working_dir = entry.working_dir.as_ref().map(|dir| dir.url.clone());
+                    }
+                }
+                match cursor.preorder_next() {
+                    Ok(c) => cursor = c,
+                    Err(_) => break,
+                }
+            }
+        }
+        if let Some(host) = working_dir.as_ref().and_then(|url| url.host_str()).filter(|host| !this_machine(host)) {
+            out.error(Some(Need::NotHere), format!("pane {} is on {host}", self.pane))?;
+            return Ok(());
+        }
+        let cwd = working_dir.as_ref().and_then(local_path);
+        // The mux the pane belongs to, which its programs know it by.
+        let mux_socket = client.unix_socket_path().map(|path| path.to_string_lossy().into_owned());
+        // The mux is not needed again: the agent is talked with directly.
+        drop(client);
+        let target = Target {
+            pane: self.pane as u64,
+            agent,
+            cwd,
+            mux_socket,
+        };
+        smol::unblock(move || {
+            thinkterm_agent_chat::host::run(target, std::io::BufReader::new(std::io::stdin()), out)
+        })
+        .await
+    }
+
+    #[cfg(not(unix))]
+    async fn run(&self, _client: Client) -> anyhow::Result<()> {
+        anyhow::bail!("agent chat is not available on this system")
+    }
+}
+
+/// Programs whose pane is a window onto another machine.
+#[cfg(unix)]
+const REMOTE_SHELLS: [&str; 6] = ["ssh", "mosh", "mosh-client", "et", "autossh", "tsh"];
+
+/// Whether a host OSC 7 names is this machine: empty, localhost, this
+/// machine's name (with or without its domain), or one of its addresses
+/// (an IPv6 one in a URL's brackets).
+#[cfg(unix)]
+fn this_machine(host: &str) -> bool {
+    let short = |name: &str| name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if bare.is_empty() || bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(address) = bare.parse::<std::net::IpAddr>() {
+        return address.is_loopback() || own_addresses().contains(&address);
+    }
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .is_none_or(|name| short(&name) == short(bare))
+}
+
+/// The addresses of this machine's own network interfaces.
+#[cfg(unix)]
+fn own_addresses() -> Vec<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut found = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list` with a list it allocates, read here
+    // while it lives and given back to freeifaddrs once.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return found;
+        }
+        let mut at = list;
+        while !at.is_null() {
+            let entry = &*at;
+            if !entry.ifa_addr.is_null() {
+                match i32::from((*entry.ifa_addr).sa_family) {
+                    libc::AF_INET => {
+                        let v4 = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                        found.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let v6 = &*(entry.ifa_addr as *const libc::sockaddr_in6);
+                        found.push(IpAddr::V6(Ipv6Addr::from(v6.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            at = entry.ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    found
+}
+
+/// The path of a `file://` URL, whatever host OSC 7 put in it.
+#[cfg(unix)]
+fn local_path(url: &url::Url) -> Option<std::path::PathBuf> {
+    if url.scheme() != "file" {
+        return None;
+    }
+    let mut url = url.clone();
+    let _ = url.set_host(None);
+    url.to_file_path().ok()
 }
 
 /// A pane as the context describes it.
@@ -290,6 +446,19 @@ impl AgentListCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn this_machine_by_name_or_address() {
+        assert!(this_machine(""));
+        assert!(this_machine("localhost"));
+        assert!(this_machine("127.0.0.1"));
+        // As a URL writes an IPv6 host.
+        assert!(this_machine("[::1]"));
+        // TEST-NET-3: nobody's own.
+        assert!(!this_machine("203.0.113.9"));
+        assert!(!this_machine("[2001:db8::1]"));
+    }
 
     fn pane(pane_id: mux::pane::PaneId, tab_id: mux::tab::TabId, title: &str, label: Option<&str>) -> ContextPane {
         ContextPane {

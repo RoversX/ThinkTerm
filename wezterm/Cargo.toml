@@ -55,6 +55,8 @@ textwrap.workspace  =true
 thinkterm-plugin-channel = { workspace = true, features = ["native"] }
 thinkterm-plugin-panel.workspace = true
 thinkterm-proto.workspace = true
+# `cli agent chat`: the bridge between a phone's chat and the agent in a pane.
+thinkterm-agent-chat = { workspace = true, features = ["host"] }
 thinkterm-tui = { path = "../thinkterm-tui" }
 thinkterm-update.workspace = true
 thinkterm-file-index.workspace = true
