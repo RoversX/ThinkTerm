@@ -130,17 +130,62 @@ pub fn forget_pane(pane_id: crate::pane::PaneId) {
     }
 }
 
-/// On Linux, `/proc/<pid>/exe` reads as `/path/to/bin (deleted)` once the
-/// binary has been replaced on disk — routine for self-updating agents.
-/// Normalizing here, at the module's single entry point for the path,
-/// keeps both identification and the contract's leader-path equality
-/// working across an in-place update. macOS resolves via `proc_pidpath`,
+/// On Linux, `/proc/<pid>/exe` reports what the running process still
+/// maps, not what the directory now holds, so two update shapes reach
+/// this function where the path no longer names the agent:
+///
+/// * replaced in place — the path reads as `/path/to/bin (deleted)`;
+/// * renamed aside — an updater that cannot write over a running
+///   executable moves it to `/path/to/bin.<mtime-ms>.<pid>.<attempt>.bak`
+///   first (omp's does), and every probe keeps reporting the renamed
+///   path until the process exits.
+///
+/// Normalizing both here, at the module's single entry point for the
+/// path, keeps identification working (the basename reaches the
+/// manifest alias table again) and keeps the contract's leader-path
+/// equality true across the update. macOS resolves via `proc_pidpath`,
 /// which never decorates the path, so this is a no-op there.
 pub(crate) fn normalize_executable_path(path: String) -> String {
-    match path.strip_suffix(" (deleted)") {
+    let path = match path.strip_suffix(" (deleted)") {
+        Some(stripped) => stripped.to_string(),
+        None => path,
+    };
+    match strip_update_stamp(&path) {
         Some(stripped) => stripped.to_string(),
         None => path,
     }
+}
+
+/// Collapse a trailing `.<digits>(.<digits>)*.bak` update stamp — the
+/// aside-rename shape above. At least one digit group is required, and
+/// the surviving stem must still name something (a letter in it): a
+/// file genuinely named `foo.bak`, or a launcher's version-style name
+/// stamped down to bare digits, keeps its name.
+fn strip_update_stamp(path: &str) -> Option<&str> {
+    let stem = path.strip_suffix(".bak")?;
+    let bytes = stem.as_bytes();
+    let mut end = bytes.len();
+    let mut groups = 0usize;
+    loop {
+        let mut digits_end = end;
+        while digits_end > 0 && bytes[digits_end - 1].is_ascii_digit() {
+            digits_end -= 1;
+        }
+        if digits_end == end || digits_end == 0 || bytes[digits_end - 1] != b'.' {
+            break;
+        }
+        end = digits_end - 1;
+        groups += 1;
+    }
+    let stripped = stem.get(..end)?;
+    if groups == 0
+        || !super::proc_match::basename(stripped)
+            .chars()
+            .any(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(stripped)
 }
 
 #[cfg(test)]
@@ -158,6 +203,54 @@ mod tests {
         assert_eq!(
             super::normalize_executable_path("/usr/local/bin/claude".to_string()),
             "/usr/local/bin/claude"
+        );
+    }
+
+    /// omp's updater moves the running binary aside as
+    /// `omp.<mtime-ms>.<pid>.<attempt>.bak` before putting the new one in
+    /// place; the running process keeps reporting that path. Both the
+    /// deleted decoration and the stamp collapse, and the normalized
+    /// basename reaches the alias table again.
+    #[test]
+    fn renamed_aside_binaries_keep_their_agent_name() {
+        assert_eq!(
+            super::normalize_executable_path(
+                "/home/mirro/bin/omp.1795438578597.2330537.0.bak (deleted)".to_string()
+            ),
+            "/home/mirro/bin/omp"
+        );
+        // One digit group suffices.
+        assert_eq!(
+            super::normalize_executable_path("/usr/local/bin/agent.12.bak".to_string()),
+            "/usr/local/bin/agent"
+        );
+        // A file genuinely named `.bak`, or stamped down to nothing, keeps
+        // its name.
+        assert_eq!(
+            super::normalize_executable_path("/usr/local/bin/foo.bak".to_string()),
+            "/usr/local/bin/foo.bak"
+        );
+        assert_eq!(
+            super::normalize_executable_path("/usr/local/bin/1.2.3.bak".to_string()),
+            "/usr/local/bin/1.2.3.bak"
+        );
+    }
+
+    /// End to end: a leader renamed aside identifies through the manifest
+    /// alias table exactly as it did before the update.
+    #[test]
+    fn a_renamed_aside_leader_identifies_as_its_agent() {
+        let path = super::normalize_executable_path(
+            "/home/mirro/bin/omp.1795438578597.2330537.0.bak (deleted)".to_string(),
+        );
+        let mut no_argv = || None;
+        assert_eq!(
+            super::super::proc_match::identify(
+                &path,
+                &mut no_argv,
+                &|name| matches!(name, "omp").then(|| "omp".to_string()),
+            ),
+            Some("omp".to_string())
         );
     }
 }
