@@ -19,7 +19,7 @@ import * as path from "node:path";
 
 /// Raised with every change: ThinkTerm puts a newer one in place of an
 /// older one when a chat opens.
-const EXTENSION_VERSION = 9;
+const EXTENSION_VERSION = 10;
 /// 2: what is said may carry files and pictures; the model can be changed.
 /// 3: the commands the session takes are listed (`commands`), and how full
 /// its context is said (`context`).
@@ -109,6 +109,10 @@ export default function (pi: ExtensionAPI) {
   let contextTimer: ReturnType<typeof setTimeout> | undefined;
   // The command `/new` and `/reload` go through was taken (`RUN`).
   let registered = false;
+  // When the run on its way began, and the last item sent of it: how long
+  // it worked is said after that.
+  let runStarted: number | undefined;
+  let lastItem: string | undefined;
   // Where each picture of the sessions read is, as a file, by the message
   // part it is in: worked out once (a picture is hashed to name its copy).
   const pictureFiles = new Map<string, string>();
@@ -138,6 +142,8 @@ export default function (pi: ExtensionAPI) {
   };
 
   function send(ev: object, to?: net.Socket) {
+    const told: any = ev;
+    if (!to && told.ev === "item" && told.item?.id) lastItem = told.item.id;
     const line = JSON.stringify(ev) + "\n";
     for (const client of to ? [to] : clients) {
       if (!client.destroyed) client.write(line);
@@ -617,7 +623,8 @@ export default function (pi: ExtensionAPI) {
         else refuse("nothing is running");
         return;
       case "older": {
-        const items = allItems();
+        const all = reckon();
+        const items = all.items;
         const mark = oldest.get(client);
         const at = mark === undefined ? -1 : items.findIndex((item) => item.id === mark);
         if (at < 0) {
@@ -627,7 +634,7 @@ export default function (pi: ExtensionAPI) {
         }
         const { items: older, more } = page(items, at);
         if (older.length) oldest.set(client, older[0].id);
-        send({ ev: "history", items: older, more, reset: false }, client);
+        sendPage(client, older, more, false, all.worked);
         return;
       }
       default:
@@ -638,6 +645,12 @@ export default function (pi: ExtensionAPI) {
   // The conversation so far, as chat items: the branch shown, its tool
   // calls met with their results.
   function allItems(): any[] {
+    return reckon().items;
+  }
+
+  // The conversation as chat items, and how long each turn worked (each
+  // said after its turn's last item, as a line of its own).
+  function reckon(): { items: any[]; worked: any[] } {
     const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? [];
     const results = new Map<string, any>();
     for (const entry of entries) {
@@ -645,12 +658,63 @@ export default function (pi: ExtensionAPI) {
       if (entry?.type === "message" && message?.role === "toolResult") results.set(message.toolCallId, message);
     }
     const items: any[] = [];
+    const worked: any[] = [];
+    // A turn works from what was said to the last of what the agent made
+    // of it (its replies and its tools', not a command the person ran
+    // later, nor a summary made long after).
+    // Said after the turn's own last item: not after a command the person
+    // ran later, nor a compaction.
+    let turn: { id: string; from: number; to: number; after?: string } | undefined;
+    let midRun = false;
+    const ended = () => {
+      if (turn?.after && turn.to > turn.from)
+        worked.push({ ev: "worked", id: `w-${turn.id}`, after: turn.after, seconds: Math.round((turn.to - turn.from) / 1000) });
+    };
     for (const entry of entries) {
       if (entry?.type === "compaction") items.push(compacted(entry.id));
       if (entry?.type !== "message") continue;
-      items.push(...fromMessage(entry.message, entry.id, results));
+      const role = entry.message?.role;
+      const at = timeOf(entry);
+      // Said while the agent worked (steering it): the same turn.
+      if (role === "user" && !midRun) {
+        ended();
+        turn = at === undefined ? undefined : { id: entry.id, from: at, to: at };
+      } else if ((role === "assistant" || role === "toolResult") && turn && at !== undefined) {
+        turn.to = at;
+      }
+      if (role === "assistant") midRun = entry.message?.stopReason === "toolUse";
+      else if (role === "toolResult") midRun = true;
+      const made = fromMessage(entry.message, entry.id, results) as any[];
+      items.push(...made);
+      if (turn && made.length && (role === "assistant" || role === "toolResult")) turn.after = made[made.length - 1].id;
     }
-    return items;
+    // The turn on its way has not ended.
+    if (!busy()) ended();
+    return { items, worked };
+  }
+
+  // A page of history, then how long its turns worked.
+  function sendPage(client: net.Socket, items: any[], more: boolean, reset: boolean, worked: any[]) {
+    send({ ev: "history", items, more, reset }, client);
+    const ids = new Set(items.map((item) => item.id));
+    for (const ev of worked) if (ids.has(ev.after)) send(ev, client);
+  }
+
+  // When an entry was written, in milliseconds.
+  function timeOf(entry: any): number | undefined {
+    const at = Date.parse(String(entry?.timestamp ?? ""));
+    if (!Number.isNaN(at)) return at;
+    const told = entry?.message?.timestamp;
+    return typeof told === "number" ? told : undefined;
+  }
+
+  // The run just over: how long it worked, from its start, after the last
+  // item sent.
+  function sendWorked() {
+    const from = runStarted;
+    runStarted = undefined;
+    if (from === undefined || !lastItem) return;
+    send({ ev: "worked", id: `w-run-${from}`, after: lastItem, seconds: Math.round((Date.now() - from) / 1000) });
   }
 
   function compacted(id: string): object {
@@ -673,10 +737,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   function sendHistory(client: net.Socket) {
-    const { items, more } = page(allItems());
+    const all = reckon();
+    const { items, more } = page(all.items);
     if (items.length) oldest.set(client, items[0].id);
     else oldest.delete(client);
-    send({ ev: "history", items, more, reset: true }, client);
+    sendPage(client, items, more, true, all.worked);
   }
 
   function fromMessage(message: any, id: string, results?: Map<string, any>): object[] {
@@ -1071,11 +1136,20 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("agent_start", async (_event: any, context: any) => {
     ctx = context;
+    // A retry goes on the run's time, not a time of its own.
+    runStarted ??= Date.now();
     setState("working");
   });
+  // Pi settles once its retries and follow-ups are over: the run's time is
+  // said then, after all of it.
   pi.on("agent_settled", async (_event: any, context: any) => {
     ctx = context;
     setState("idle");
+    if (server) {
+      try {
+        sendWorked();
+      } catch {}
+    }
   });
   // OMP has no `agent_settled`: the run is over once it is idle after its
   // end (Pi settles later still, on retries and follow-ups, and says so).
@@ -1085,6 +1159,12 @@ export default function (pi: ExtensionAPI) {
     // Only where a phone may be told (a Pi in its terminal): a print or
     // json run is over, its context gone, by the time a look would come.
     if (!server) return;
+    // OMP, which does not settle: the run's time now.
+    if (agent === "omp") {
+      try {
+        sendWorked();
+      } catch {}
+    }
     clearTimeout(settling);
     settling = setTimeout(() => {
       settling = undefined;

@@ -313,6 +313,12 @@ struct Chat {
     /// How full the context is: read from the thread's file, once Codex
     /// says where that is, and from what it reports as turns go on.
     rollout: Rollout,
+    /// How long the turns read worked (`Ev::Worked`): each said after the
+    /// page holding what it follows.
+    worked: Vec<Ev>,
+    /// The last item sent, which a turn that ends is said to have worked
+    /// after.
+    last_item: Option<String>,
 }
 
 struct Writing {
@@ -445,6 +451,26 @@ impl Chat {
         Ok(())
     }
 
+    /// A page of history, then how long its turns worked.
+    fn send_page(&mut self, out: &Out, items: Vec<Item>, reset: bool) -> Result<()> {
+        let (items, more) = self.page(items);
+        let ids: std::collections::HashSet<&str> = items.iter().map(Item::id).collect();
+        let worked: Vec<&Ev> = self
+            .worked
+            .iter()
+            .filter(|ev| matches!(ev, Ev::Worked { after, .. } if ids.contains(after.as_str())))
+            .collect();
+        out.send(&Ev::History {
+            items: items.clone(),
+            more,
+            reset,
+        })?;
+        for ev in worked {
+            out.send(ev)?;
+        }
+        Ok(())
+    }
+
     /// A page of history as one line holds it, the rest held back for
     /// the next ask: `(items, more)`.
     fn page(&mut self, items: Vec<Item>) -> (Vec<Item>, bool) {
@@ -532,6 +558,8 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> R
         cwd: target.cwd.clone(),
         writing: None,
         rollout: Rollout::new(found.path.clone()),
+        worked: Vec::new(),
+        last_item: None,
     };
     // A thread whose first turn has not run has nothing on disk yet and
     // cannot be joined; it is joined as soon as it starts.
@@ -557,12 +585,13 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> R
             items: Vec::new(),
             older: None,
             running: None,
+            worked: Vec::new(),
         }
     };
     chat.older = turns.older;
     chat.turn = turns.running;
-    let (items, more) = chat.page(turns.items);
-    out.send(&Ev::History { items, more, reset: true })?;
+    chat.worked = turns.worked;
+    chat.send_page(&out, turns.items, true)?;
     out.send(&Ev::State {
         state: chat.state,
         since: None,
@@ -616,6 +645,9 @@ struct Turns {
     items: Vec<Item>,
     older: Option<Value>,
     running: Option<String>,
+    /// How long each turn that ended worked (`Ev::Worked`), after its
+    /// last item.
+    worked: Vec<Ev>,
 }
 
 fn turns_to_items(listed: &Value) -> Turns {
@@ -628,7 +660,9 @@ fn turns_to_items(listed: &Value) -> Turns {
         .map(str::to_string);
     turns.reverse();
     let mut items = Vec::new();
+    let mut worked = Vec::new();
     for turn in turns {
+        let first = items.len();
         for item in turn["items"].as_array().into_iter().flatten() {
             if let Some(item) = to_item(item) {
                 items.push(item);
@@ -637,9 +671,32 @@ fn turns_to_items(listed: &Value) -> Turns {
         if let Some(note) = turn_note(turn) {
             items.push(note);
         }
+        if let (Some(last), Some((id, seconds))) = (items[first..].last(), worked_of(turn)) {
+            worked.push(Ev::Worked {
+                id,
+                after: last.id().to_string(),
+                seconds,
+            });
+        }
     }
     let older = listed.get("nextCursor").filter(|c| !c.is_null()).cloned();
-    Turns { items, older, running }
+    Turns {
+        items,
+        older,
+        running,
+        worked,
+    }
+}
+
+/// How long a turn that ended worked, as Codex timed it: the id its
+/// note goes by, and the seconds.
+fn worked_of(turn: &Value) -> Option<(String, u64)> {
+    let id = turn["id"].as_str()?;
+    let ms = turn["durationMs"].as_u64().or_else(|| {
+        let (start, end) = (turn["startedAt"].as_u64()?, turn["completedAt"].as_u64()?);
+        end.checked_sub(start).map(|seconds| seconds * 1000)
+    })?;
+    Some((format!("{id}-worked"), ms / 1000))
 }
 
 /// How a turn ended, when it did not simply end.
@@ -714,8 +771,7 @@ fn handle_op(daemon: &mut Daemon, chat: &mut Chat, out: &Out, op: Op) -> Result<
         // turns before it.
         Op::Older if !chat.held.is_empty() => {
             let held = std::mem::take(&mut chat.held);
-            let (items, more) = chat.page(held);
-            out.send(&Ev::History { items, more, reset: false })?;
+            chat.send_page(out, held, false)?;
         }
         Op::Older => match chat.older.take() {
             Some(cursor) => {
@@ -766,8 +822,8 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                 (Pending::Older(_), None) => {
                     let turns = turns_to_items(&message["result"]);
                     chat.older = turns.older;
-                    let (items, more) = chat.page(turns.items);
-                    out.send(&Ev::History { items, more, reset: false })?;
+                    chat.worked.extend(turns.worked);
+                    chat.send_page(out, turns.items, false)?;
                 }
                 (Pending::Older(cursor), Some(err)) => {
                     chat.older = Some(cursor);
@@ -785,8 +841,8 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                     if chat.turn.is_none() {
                         chat.turn = turns.running;
                     }
-                    let (items, more) = chat.page(turns.items);
-                    out.send(&Ev::History { items, more, reset: true })?;
+                    chat.worked = turns.worked;
+                    chat.send_page(out, turns.items, true)?;
                     chat.ask_again(out)?;
                 }
                 (Pending::Join, Some(err)) => log::info!("agent chat: joining failed: {err}"),
@@ -882,6 +938,7 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                         }
                     }
                     if let Some(item) = to_item(item) {
+                        chat.last_item = Some(item.id().to_string());
                         out.send(&Ev::Item { item })?;
                     }
                 }
@@ -902,7 +959,11 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                     chat.turn = None;
                     chat.send_context(out)?;
                     if let Some(note) = turn_note(&params["turn"]) {
+                        chat.last_item = Some(note.id().to_string());
                         out.send(&Ev::Item { item: note })?;
+                    }
+                    if let (Some(after), Some((id, seconds))) = (chat.last_item.clone(), worked_of(&params["turn"])) {
+                        out.send(&Ev::Worked { id, after, seconds })?;
                     }
                 }
                 "thread/status/changed" => {
@@ -1509,6 +1570,8 @@ mod tests {
             cwd: None,
             writing: None,
             rollout: Rollout::new(None),
+            worked: Vec::new(),
+            last_item: None,
         };
         // The first words go at once; those right after wait their turn.
         chat.wrote(&out, "m1", "Hello").unwrap();
@@ -1522,6 +1585,28 @@ mod tests {
         // Another item starts afresh.
         chat.wrote(&out, "m2", "Next").unwrap();
         assert_eq!(sink.texts().last().map(String::as_str), Some("Next"));
+    }
+
+    #[test]
+    fn a_turn_says_how_long_it_worked() {
+        let turn = json!({ "id": "t1", "status": "completed", "durationMs": 12_400 });
+        assert_eq!(worked_of(&turn), Some(("t1-worked".into(), 12)));
+        let timed = json!({ "id": "t2", "startedAt": 100, "completedAt": 165 });
+        assert_eq!(worked_of(&timed).map(|(_, s)| s), Some(65));
+        assert_eq!(worked_of(&json!({ "id": "t3", "status": "inProgress" })), None);
+        // Said after the turn's last item, as a line of its own.
+        let listed = json!({ "data": [{ "id": "t1", "status": "completed", "durationMs": 9_000,
+            "items": [{ "type": "agentMessage", "id": "m1", "text": "done" }] }] });
+        let turns = turns_to_items(&listed);
+        assert!(turns.items.iter().all(|item| !matches!(item, Item::Note { .. })));
+        assert_eq!(
+            turns.worked,
+            [Ev::Worked {
+                id: "t1-worked".into(),
+                after: "m1".into(),
+                seconds: 9
+            }]
+        );
     }
 
     #[test]
@@ -1565,6 +1650,8 @@ mod tests {
             cwd: None,
             writing: None,
             rollout: Rollout::new(None),
+            worked: Vec::new(),
+            last_item: None,
         };
         let big = |n: usize| Item::Text {
             id: n.to_string(),
@@ -1610,6 +1697,8 @@ mod tests {
             cwd: None,
             writing: None,
             rollout: Rollout::new(None),
+            worked: Vec::new(),
+            last_item: None,
         };
         settings_of(&mut chat, &json!({ "model": "gpt-5.5", "reasoningEffort": "high" }));
         assert_eq!((chat.model.as_deref(), chat.effort.as_deref()), (Some("gpt-5.5"), Some("high")));
