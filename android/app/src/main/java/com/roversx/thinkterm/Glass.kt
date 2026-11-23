@@ -10,6 +10,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.drawBackdrop
@@ -63,13 +64,16 @@ fun Modifier.glass(backdrop: Backdrop?, dark: Boolean, shape: CornerBasedShape, 
 /// the ground, the more the nearer it comes to the screen's edge -- `top`
 /// for a bar at the top, else at the bottom. Drawn from `backdrop`, the
 /// list that scrolls under it, which must not hold the bar itself.
-fun Modifier.progressiveBlur(backdrop: Backdrop, ground: Color, top: Boolean): Modifier = drawPlainBackdrop(
+/// `solid`, from the screen's edge, stays as the edge is: for a bar whose
+/// words reach far into it (two lines), which nothing may read through.
+fun Modifier.progressiveBlur(backdrop: Backdrop, ground: Color, top: Boolean, solid: Dp = 0.dp): Modifier = drawPlainBackdrop(
     backdrop = backdrop,
     shape = { RectangleShape },
     effects = {
         blur(8.dp.toPx())
         val shader = obtainRuntimeShader(if (top) "SoftEdgeTop" else "SoftEdgeBottom", softEdge(top)).apply {
             setFloatUniform("size", size.width, size.height)
+            setFloatUniform("solid", solid.toPx().coerceAtMost(size.height - 1f).coerceAtLeast(0f))
             setColorUniform("tint", ground.toArgb())
         }
         effect(RenderEffect.createRuntimeShaderEffect(shader, "content"))
@@ -77,14 +81,17 @@ fun Modifier.progressiveBlur(backdrop: Backdrop, ground: Color, top: Boolean): M
 )
 
 /// The edge's mask: the blur whole near the screen's edge and gone at the
-/// bar's far side; over it the ground, strongest at the edge.
+/// bar's far side; over it the ground, strongest at the edge. Up to
+/// `solid` from the edge, all is as at the edge.
 private fun softEdge(top: Boolean): String = """
 uniform shader content;
 uniform float2 size;
+uniform float solid;
 layout(color) uniform half4 tint;
 
 half4 main(float2 coord) {
-    float t = ${if (top) "coord.y / size.y" else "1.0 - coord.y / size.y"};
+    float d = ${if (top) "coord.y" else "size.y - coord.y"};
+    float t = clamp((d - solid) / (size.y - solid), 0.0, 1.0);
     float blurAlpha = 1.0 - smoothstep(0.5, 1.0, t);
     float tintAlpha = (1.0 - smoothstep(0.0, 0.85, t)) * 0.8;
     half4 blurred = content.eval(coord) * blurAlpha;

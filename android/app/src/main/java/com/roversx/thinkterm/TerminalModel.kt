@@ -18,10 +18,13 @@ import android.util.Log
 import android.view.Choreographer
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
+import com.roversx.thinkterm.core.ChatAttachment
 import com.roversx.thinkterm.core.Core
 import com.roversx.thinkterm.core.JumpHost
 import com.roversx.thinkterm.core.Notify
@@ -862,6 +865,167 @@ class TerminalModel(
     /// Open or fold the sub-task list of the agent in `pane`.
     fun toggleSubtasks(pane: Int) = core.agentToggleSubtasks(pane.toUInt())
 
+    // MARK: an agent's conversation as a chat
+
+    /// Whom the chat on show is with: the pane, the agent as its detection
+    /// names it, and where it is ("Project · Thread").
+    data class ChatTarget(val pane: Int, val agent: String, val place: String)
+
+    /// The chat on show, over the terminal of its agent's pane; null when
+    /// none is (`chat` is null too until its first view comes).
+    var chatWith by mutableStateOf<ChatTarget?>(null)
+        private set
+    var chat by mutableStateOf<ChatView?>(null)
+        private set
+
+    /// Show `row`'s agent as a chat. The terminal under it goes to the
+    /// agent's pane first, as a tap on the row always did: going back from
+    /// the chat is going to that terminal.
+    fun openChat(row: AgentRow) = openChat(row.pane, row.agentId, row.place.ifEmpty { row.name })
+
+    fun openChat(pane: Int, agent: String, place: String) {
+        chromeClick("pane", pane = pane)
+        chat = null
+        chatThumbs.clear()
+        chatWith = ChatTarget(pane, agent, place.ifEmpty { agent })
+        core.chatOpen(pane.toUInt(), agent)
+    }
+
+    /// The agent a notification was about: its chat when it has one, else
+    /// its pane.
+    fun showAgent(link: AgentLink) {
+        if (link.chat) {
+            openChat(link.pane, link.agent, link.place)
+        } else {
+            closeChat()
+            chromeClick("pane", pane = link.pane)
+        }
+    }
+
+    fun closeChat() {
+        if (chatWith == null) return
+        chatWith = null
+        chat = null
+        core.chatClose()
+        for (file in chatFiles.toList()) chatDetach(file)
+    }
+
+    // MARK: files sent in the chat
+
+    /// A file picked to go with what is said next: on its way to the host's
+    /// uploads folder, there (`path`), or not (`error`).
+    data class ChatFile(
+        val id: ULong,
+        val name: String,
+        val image: Boolean,
+        /// Its size, in bytes.
+        val size: Long,
+        /// A small picture of it, for a picture.
+        val preview: ImageBitmap?,
+        val sent: ULong = 0uL,
+        val total: ULong = 0uL,
+        val path: String? = null,
+        val error: String? = null,
+    )
+
+    /// What goes with what is said next.
+    val chatFiles = mutableStateListOf<ChatFile>()
+
+    /// The phone's own copies of the pictures sent, by where they are on
+    /// the host: what a tap shows big, and what shows before the host's
+    /// small picture comes.
+    val chatPictures = mutableStateMapOf<String, File>()
+
+    /// The app's copy of each file picked, by upload, until it is sent.
+    private val chatCopies = HashMap<ULong, File>()
+
+    /// The host's small pictures of what was sent, by the key the chat's
+    /// rows name them by: each comes once ("chat_picture").
+    val chatThumbs = mutableStateMapOf<String, ImageBitmap>()
+
+    /// Put a file the phone has -- a photo, a file, the clipboard's
+    /// picture -- in the host's uploads folder, to go with what is said
+    /// next. `write` fills the app's own copy, off the main thread.
+    fun chatAttach(name: String, image: Boolean, write: (File) -> Unit) {
+        val clean = name.ifEmpty { "file" }.replace('/', '_')
+        val id = core.uploadBegin()
+        copier.execute {
+            ChatFilesFolder.clearOnce(context.cacheDir)
+            val folder = File(context.cacheDir, "chat-files/" + UUID.randomUUID())
+            val file = File(folder, clean)
+            val made = runCatching {
+                folder.mkdirs()
+                write(file)
+                file.exists()
+            }.getOrDefault(false)
+            val preview = if (made && image) runCatching { pictureOf(file, 360) }.getOrNull() else null
+            main.post {
+                if (!made) {
+                    folder.deleteRecursively()
+                    core.cancelUpload(id)
+                    note(tr("upload.unread", clean))
+                } else {
+                    core.uploadFile(id, clean, file.path)
+                    chatCopies[id] = file
+                    chatFiles.add(ChatFile(id, clean, image, file.length(), preview))
+                    main.removeCallbacks(pollChatFiles)
+                    main.postDelayed(pollChatFiles, 150)
+                }
+            }
+        }
+    }
+
+    /// Take a picked file off what goes next; one still on its way is
+    /// given up.
+    fun chatDetach(file: ChatFile) {
+        if (file.path == null && file.error == null) core.cancelUpload(file.id)
+        chatFiles.removeAll { it.id == file.id }
+        chatCopies.remove(file.id)?.parentFile?.deleteRecursively()
+    }
+
+    private val pollChatFiles: Runnable = object : Runnable {
+        override fun run() {
+            var going = false
+            for (i in chatFiles.indices) {
+                val file = chatFiles[i]
+                if (file.path != null || file.error != null) continue
+                val status = core.uploadStatus(file.id)
+                if (status == null) {
+                    chatFiles[i] = file.copy(error = "cancelled")
+                    continue
+                }
+                var next = file.copy(sent = status.sent, total = status.total)
+                if (status.done) {
+                    // Its path goes with what is said, not into a pane.
+                    core.uploadUnpasted(file.id)
+                    next = if (status.error.isEmpty()) next.copy(path = status.path) else next.copy(error = status.error)
+                } else {
+                    going = true
+                }
+                if (next != file) chatFiles[i] = next
+            }
+            if (going) main.postDelayed(this, 150)
+        }
+    }
+
+    /// Say `text`, with the files picked that have reached the host.
+    fun chatSend(text: String) {
+        val ready = chatFiles.filter { it.path != null }
+        for (file in ready) {
+            val copy = chatCopies.remove(file.id) ?: continue
+            if (file.image) chatPictures[file.path!!] = copy else copy.parentFile?.deleteRecursively()
+        }
+        chatFiles.removeAll { it.path != null }
+        core.chatSend(text, ready.map { ChatAttachment(it.name, it.image, it.path!!) })
+    }
+
+    fun chatSetModel(model: String, effort: String?) = core.chatSetModel(model, effort)
+    fun chatAnswer(ask: String, choice: String) = core.chatAnswer(ask, choice)
+    fun chatInterrupt() = core.chatInterrupt()
+    fun chatOlder() = core.chatOlder()
+    fun chatAction(action: String) = core.chatAction(action)
+    fun chatToggle(row: String) = core.chatToggle(row)
+
     /// The selected text to the clipboard, and the selection put away.
     fun copySelection() {
         core.selectedText()?.takeIf { it.isNotEmpty() }?.let { copyToClipboard(it) }
@@ -1305,6 +1469,27 @@ class TerminalModel(
                     main.post { if (background != color) background = color }
                 }
                 "link" -> main.post { linkIs(down = value == "down") }
+                "chat_picture" -> {
+                    // Each small picture once, decoded here, off the screen's thread.
+                    val picture = runCatching {
+                        val o = org.json.JSONObject(value)
+                        val bytes = android.util.Base64.decode(o.getString("data"), android.util.Base64.DEFAULT)
+                        val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                        Triple(o.getInt("pane"), o.getString("key"), bitmap)
+                    }.getOrNull()
+                    if (picture != null) {
+                        val (pane, key, bitmap) = picture
+                        if (bitmap != null) main.post { if (chatWith?.pane == pane) chatThumbs[key] = bitmap }
+                    }
+                }
+                "chat" -> {
+                    val parsed = ChatViews.parse(value)
+                    // Only the chat on show: a late view of the one before
+                    // is dropped.
+                    main.post { if (parsed != null && chatWith?.pane == parsed.pane) chat = parsed }
+                }
+                "agent_waiting" -> main.post { AgentAlerts.waiting(context, host, value) }
+                "agent_resumed" -> main.post { AgentAlerts.resumed(context, host, value) }
             }
         }
 
@@ -1374,6 +1559,19 @@ object Assets {
 /// The uploads folder as a process finds it holds only what one before it
 /// left, stopped in the middle of an upload: cleared once, before this
 /// one's first upload makes its own copy there.
+/// The app's copies of the files picked for a chat, from a run before
+/// this one: gone once, before the first is made.
+private object ChatFilesFolder {
+    private var cleared = false
+
+    @Synchronized
+    fun clearOnce(cache: File) {
+        if (cleared) return
+        File(cache, "chat-files").deleteRecursively()
+        cleared = true
+    }
+}
+
 private object UploadsFolder {
     private var cleared = false
 

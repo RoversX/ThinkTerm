@@ -60,6 +60,10 @@ object Sessions {
     /// it would wait out a timeout before finding so.
     private const val TAILNET_STALE_AFTER_MS = 120_000L
 
+    /// The app is off the screen: what waits on the person is told by a
+    /// notification (`AgentAlerts`).
+    val away: Boolean get() = leftAt != null
+
     /// The app left the screen or came back: every connection hears.
     fun enteredBackground() {
         leftAt = SystemClock.elapsedRealtime()

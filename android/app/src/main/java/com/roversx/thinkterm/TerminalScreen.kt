@@ -130,6 +130,16 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     // `Sessions` and is picked up again on the way back.
     val model = remember(host.id) { Sessions.get(context, store, host) }
     val settings = model.settings
+    // A notification's agent on this host, shown once there is a pane to
+    // go to: at once on a terminal already up, after the dial on one not.
+    val link = AgentLinks.pending
+    LaunchedEffect(link, model.attached) {
+        val wanted = link ?: return@LaunchedEffect
+        if (wanted.hostId != host.id || !model.attached) return@LaunchedEffect
+        AgentLinks.pending = null
+        model.onHideKeyboard?.invoke()
+        model.showAgent(wanted)
+    }
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val lang = AppLanguage.tag
@@ -595,6 +605,11 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                             }
                         }
                     }
+                }
+                if (model.chatWith != null) {
+                    // The chat with an agent, over the whole screen and its
+                    // pane's terminal, which going back shows.
+                    ChatPage(model) { model.closeChat() }
                 }
                 if (moved) {
                     // What shows of the screen takes it back; fainter on a

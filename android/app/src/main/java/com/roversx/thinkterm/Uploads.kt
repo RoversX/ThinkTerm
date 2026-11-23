@@ -173,10 +173,10 @@ fun UploadStrip(model: TerminalModel, glass: Backdrop?) {
 
 /// "Photo 2026-01-02 at 03.04.05.jpg", as the desktop names a pasted
 /// picture ("Pasted ... .png").
-private fun stamped(word: String, ext: String): String =
+internal fun stamped(word: String, ext: String): String =
     "$word ${SimpleDateFormat("yyyy-MM-dd 'at' HH.mm.ss", Locale.US).format(Date())}.$ext"
 
-private fun extension(mime: String?, fallback: String): String = when (mime) {
+internal fun extension(mime: String?, fallback: String): String = when (mime) {
     "image/jpeg" -> "jpg"
     "image/png" -> "png"
     "image/gif" -> "gif"
@@ -199,25 +199,40 @@ private fun sendPhoto(context: Context, model: TerminalModel, uri: Uri) {
     }
 }
 
-private fun copy(context: Context, uri: Uri, to: File) {
+/// A photo for the chat, made readable as for the terminal (a HEIF
+/// becomes a JPEG).
+internal fun attachPhoto(context: Context, model: TerminalModel, uri: Uri) {
+    val mime = context.contentResolver.getType(uri)
+    if (mime == "image/heic" || mime == "image/heif") {
+        model.chatAttach(stamped("Photo", "jpg"), true) { file ->
+            val bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, uri))
+            file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+            bitmap.recycle()
+        }
+    } else {
+        model.chatAttach(stamped("Photo", extension(mime, "jpg")), true) { copy(context, uri, it) }
+    }
+}
+
+internal fun copy(context: Context, uri: Uri, to: File) {
     val input = context.contentResolver.openInputStream(uri) ?: error("unreadable")
     input.use { from -> to.outputStream().use { from.copyTo(it) } }
 }
 
-private fun displayName(context: Context, uri: Uri): String? =
+internal fun displayName(context: Context, uri: Uri): String? =
     context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
         if (c.moveToFirst()) c.getString(0) else null
     }
 
 /// Whether the clipboard holds a picture, from its description alone.
-private fun clipboardHasPicture(context: Context): Boolean {
+internal fun clipboardHasPicture(context: Context): Boolean {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     val description = clipboard.primaryClipDescription ?: return false
     return (0 until description.mimeTypeCount).any { description.getMimeType(it).startsWith("image/") }
 }
 
 /// The clipboard's picture: its address and type.
-private fun clipboardPicture(context: Context): Pair<Uri, String?>? {
+internal fun clipboardPicture(context: Context): Pair<Uri, String?>? {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     val uri = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri ?: return null
     return uri to context.contentResolver.getType(uri)

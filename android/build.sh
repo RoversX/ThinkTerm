@@ -78,7 +78,8 @@ mkdir -p android/app/src/main/assets/lucide
 for name in app-window archive bot check hand laptop-minimal monitor-smartphone smartphone chevron-down circle-check clipboard clipboard-paste copy lock shield-off triangle-alert chevron-left panel-left panel-right chevron-right chevrons-up-down circle-plus folder \
   folder-open globe grid-2x2 key-round keyboard layers link-2 paperclip plus rotate-ccw search server \
   settings square-pen x cloud laptop hard-drive monitor cpu package square-terminal power \
-  palette panels-top-left wifi info stethoscope git-branch scale arrow-up-right; do
+  palette panels-top-left wifi info stethoscope git-branch scale arrow-up-right \
+  message-circle arrow-up lightbulb file-text terminal pencil wrench image; do
   [ -f "third_party/lucide/icons/$name.svg" ] && cp "third_party/lucide/icons/$name.svg" android/app/src/main/assets/lucide/
 done
 # The desktop's own "new project", which is not one of Lucide's.

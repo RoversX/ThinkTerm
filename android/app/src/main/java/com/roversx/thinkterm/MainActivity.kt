@@ -3,6 +3,7 @@ package com.roversx.thinkterm
 import android.Manifest
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -38,6 +39,8 @@ class MainActivity : ComponentActivity() {
         AppLanguage.tag = AppSettings.get(this).language
         val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         GlassProbe.on = debuggable && intent.getBooleanExtra("glass_probe", false)
+        // Opened from an agent's notification: it is shown once the app is up.
+        if (savedInstanceState == null) AgentLinks.take(intent)
         val store = HostStore.get(this)
         // The tailnet ThinkTerm joins by itself is up before any host of it
         // is dialled.
@@ -62,6 +65,13 @@ class MainActivity : ComponentActivity() {
                 ) { Root(store, debuggable) }
             }
         }
+    }
+
+    /// A notification's tap while the app is up: its agent is shown.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        AgentLinks.take(intent)
     }
 }
 
@@ -102,6 +112,18 @@ private fun Root(store: HostStore, debuggable: Boolean) {
     }
     var page by remember { mutableStateOf(Page.THREADS) }
     var open by remember { mutableStateOf<Host?>(null) }
+    // A notification's agent is on a host: its terminal opens, wherever the
+    // app was. A host since removed leaves the link with nowhere to go.
+    val link = AgentLinks.pending
+    LaunchedEffect(link) {
+        val wanted = link ?: return@LaunchedEffect
+        val host = store.hosts.firstOrNull { it.id == wanted.hostId }
+        if (host == null) {
+            AgentLinks.pending = null
+        } else if (open?.id != host.id) {
+            open = host
+        }
+    }
     // The host whose own page is up on the hosts' screen: kept here, so the
     // way back from its terminal comes back to it, as iOS's stack does.
     var hostPage by remember { mutableStateOf<String?>(null) }

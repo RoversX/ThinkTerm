@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.progressSemantics
@@ -36,6 +37,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -151,13 +154,43 @@ private fun Agents(model: TerminalModel, dark: Boolean, done: () -> Unit) {
                     mark = { ThreadMark(status(row.state), "Open", true, 9.dp, dark) },
                     title = row.place.ifEmpty { row.name },
                     subtitle = detail,
+                    // An agent a chat can be had with: its own button opens
+                    // the chat, whatever a tap on the row does.
+                    trailing = if (row.chat) ({
+                        ChatButton(waiting = row.state == "blocked") {
+                            model.openChat(row)
+                            done()
+                        }
+                    }) else null,
                     below = if (more) ({ AgentMore(model, row, dark) }) else null,
                 ) {
-                    model.chromeClick("pane", pane = row.pane)
+                    if (row.chat && model.settings.chatFirst) {
+                        model.openChat(row)
+                    } else {
+                        model.chromeClick("pane", pane = row.pane)
+                    }
                     done()
                 }
             }
         }
+    }
+}
+
+/// The round button that opens an agent's chat, lit while it waits on you.
+@Composable
+private fun ChatButton(waiting: Boolean, onClick: () -> Unit) {
+    val tint = if (waiting) LeadBlue else MaterialTheme.colorScheme.onSurfaceVariant
+    val label = tr("chat.open")
+    Box(
+        Modifier
+            .size(32.dp)
+            .clip(CircleShape)
+            .background(tint.copy(alpha = if (waiting) 0.16f else 0.1f))
+            .clickable(role = Role.Button, onClickLabel = label, onClick = onClick)
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        DesktopIcon("message-circle", size = 16.dp, tint = tint)
     }
 }
 

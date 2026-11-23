@@ -27,6 +27,14 @@
     "card.connecting": "Verbinde mit %@",
     "card.failed": "Keine Verbindung zu %@",
     "card.reconnecting": "Neu verbinden mit %@…",
+    "chat.first": "Agent antippen öffnet den Chat",
+    "chat.first.note": "In der Agents-Liste öffnet ein Tipp auf Codex oder Pi den Chat. Aus: Es öffnet sich wie bisher das Terminal; der Chat-Knopf öffnet weiterhin den Chat.",
+    "chat.notify.channel": "Agents, die auf dich warten",
+    "chat.notify.title": "%@ wartet auf dich",
+    "chat.open": "Chat",
+    "chat.secs": "%d s",
+    "chat.send": "Senden",
+    "chat.stop": "Stoppen",
     "closepane": "Bereich schließen",
     "closetab": "Tab schließen",
     "conn.attaching": "ThinkTerm wird gestartet auf",
@@ -303,7 +311,10 @@
     "hostkey.approve.body": "Bevor Sie ein Passwort senden oder sich mit einem Schlüssel authentifizieren, gleichen Sie diesen SHA-256-Fingerabdruck über einen vertrauenswürdigen Kanal mit dem Serveradministrator ab. Brechen Sie bei einer Abweichung ab.",
     "hostkey.approve.accept": "Vertrauen und verbinden",
     "thread.find": "Thread finden",
-    "thread.find.none": "Kein Thread passt"
+    "thread.find.none": "Kein Thread passt",
+    "chat.attach": "Anhängen",
+    "chat.attach.remove": "Entfernen",
+    "chat.model": "Modell"
   },
   "en-US": {
     "about.build": "Build",
@@ -333,6 +344,14 @@
     "card.connecting": "Connecting to %@",
     "card.failed": "Couldn’t connect to %@",
     "card.reconnecting": "Reconnecting to %@…",
+    "chat.first": "Tap an agent to open its chat",
+    "chat.first.note": "In the Agents list, tapping Codex or Pi opens its chat. Off: it opens the terminal, as before; the chat button still opens the chat.",
+    "chat.notify.channel": "Agents waiting for you",
+    "chat.notify.title": "%@ is waiting for you",
+    "chat.open": "Chat",
+    "chat.secs": "%ds",
+    "chat.send": "Send",
+    "chat.stop": "Stop",
     "closepane": "Close pane",
     "closetab": "Close tab",
     "conn.attaching": "Starting ThinkTerm on",
@@ -609,7 +628,10 @@
     "hostkey.approve.body": "Before sending a password or authenticating with a key, verify this SHA-256 fingerprint with the server administrator over a trusted channel. Cancel if it differs.",
     "hostkey.approve.accept": "Trust and connect",
     "thread.find": "Find Thread",
-    "thread.find.none": "No thread matches"
+    "thread.find.none": "No thread matches",
+    "chat.attach": "Attach",
+    "chat.attach.remove": "Remove",
+    "chat.model": "Model"
   },
   "fr-FR": {
     "about.build": "Compilation",
@@ -639,6 +661,14 @@
     "card.connecting": "Connexion à %@",
     "card.failed": "Connexion impossible à %@",
     "card.reconnecting": "Reconnexion à %@…",
+    "chat.first": "Toucher un agent ouvre sa discussion",
+    "chat.first.note": "Dans la liste des agents, toucher Codex ou Pi ouvre sa discussion. Désactivé : le terminal s’ouvre, comme avant ; le bouton de discussion ouvre toujours la discussion.",
+    "chat.notify.channel": "Agents qui vous attendent",
+    "chat.notify.title": "%@ vous attend",
+    "chat.open": "Discussion",
+    "chat.secs": "%d s",
+    "chat.send": "Envoyer",
+    "chat.stop": "Arrêter",
     "closepane": "Fermer le volet",
     "closetab": "Fermer l’onglet",
     "conn.attaching": "Démarrage de ThinkTerm sur",
@@ -915,7 +945,10 @@
     "hostkey.approve.body": "Avant d’envoyer un mot de passe ou de vous authentifier avec une clé, vérifiez cette empreinte SHA-256 auprès de l’administrateur du serveur via un canal de confiance. Annulez si elle ne correspond pas.",
     "hostkey.approve.accept": "Faire confiance et se connecter",
     "thread.find": "Rechercher une session",
-    "thread.find.none": "Aucune session ne correspond"
+    "thread.find.none": "Aucune session ne correspond",
+    "chat.attach": "Joindre",
+    "chat.attach.remove": "Retirer",
+    "chat.model": "Modèle"
   },
   "ja-JP": {
     "about.build": "ビルド",
@@ -945,6 +978,14 @@
     "card.connecting": "%@ に接続中",
     "card.failed": "%@ に接続できません",
     "card.reconnecting": "%@ に再接続中…",
+    "chat.first": "エージェントをタップしてチャットを開く",
+    "chat.first.note": "Agents リストで Codex や Pi をタップするとチャットを開きます。オフのときは従来どおりターミナルを開き、チャットボタンからチャットを開けます。",
+    "chat.notify.channel": "あなたを待っているエージェント",
+    "chat.notify.title": "%@ があなたを待っています",
+    "chat.open": "チャット",
+    "chat.secs": "%d秒",
+    "chat.send": "送信",
+    "chat.stop": "停止",
     "closepane": "ペインを閉じる",
     "closetab": "タブを閉じる",
     "conn.attaching": "ThinkTerm を起動中:",
@@ -1221,7 +1262,10 @@
     "hostkey.approve.body": "パスワードを送信したり鍵で認証したりする前に、信頼できる通信手段でサーバー管理者にこの SHA-256 フィンガープリントを確認してください。一致しない場合はキャンセルしてください。",
     "hostkey.approve.accept": "信頼して接続",
     "thread.find": "セッションを検索",
-    "thread.find.none": "一致するセッションはありません"
+    "thread.find.none": "一致するセッションはありません",
+    "chat.attach": "添付",
+    "chat.attach.remove": "削除",
+    "chat.model": "モデル"
   },
   "zh-CN": {
     "about.build": "构建",
@@ -1251,6 +1295,14 @@
     "card.connecting": "正在连接 %@",
     "card.failed": "无法连接 %@",
     "card.reconnecting": "正在重连 %@…",
+    "chat.first": "点 agent 先打开聊天",
+    "chat.first.note": "在 Agents 列表里点 Codex 或 Pi，先打开聊天。关掉时点它还是进终端，聊天按钮照样能打开聊天。",
+    "chat.notify.channel": "等你确认的 agent",
+    "chat.notify.title": "%@ 在等你",
+    "chat.open": "聊天",
+    "chat.secs": "%d 秒",
+    "chat.send": "发送",
+    "chat.stop": "停止",
     "closepane": "关闭 pane",
     "closetab": "关闭标签",
     "conn.attaching": "正在启动 ThinkTerm:",
@@ -1527,6 +1579,9 @@
     "hostkey.approve.body": "发送密码或进行密钥认证前，请通过可信渠道与服务器管理员核对以上 SHA-256 指纹。不一致请取消。",
     "hostkey.approve.accept": "信任并连接",
     "thread.find": "查找会话",
-    "thread.find.none": "没有匹配的会话"
+    "thread.find.none": "没有匹配的会话",
+    "chat.attach": "添加附件",
+    "chat.attach.remove": "移除",
+    "chat.model": "模型"
   }
 }

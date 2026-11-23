@@ -73,6 +73,9 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     var spaces by pref("ui.spaces", "list")
     /// On a wide screen, whether the sidebar stays beside the terminal.
     var sidebarPinned by pref("sidebar.pinned", true)
+    /// A tap on an agent in the Agents list opens its chat (Codex, Pi)
+    /// rather than its terminal; off, its chat button still does.
+    var chatFirst by pref("chat.first", false)
 
     // MARK: keyboard
 

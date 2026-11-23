@@ -55,6 +55,10 @@ data class AgentsView(val rows: List<AgentRow>, val summary: String)
 /// workspace when no thread claims it.
 data class AgentRow(
     val pane: Int,
+    /// The agent as its detection names it: "codex", "pi".
+    val agentId: String,
+    /// Its conversation can be shown as a chat.
+    val chat: Boolean,
     val name: String,
     val title: String,
     val state: String,
@@ -376,6 +380,8 @@ object Views {
             rows = root.optJSONArray("rows").map { r ->
                 AgentRow(
                     pane = r.optInt("pane"),
+                    agentId = r.optString("agent_id"),
+                    chat = r.optBoolean("chat"),
                     name = r.optString("name"),
                     title = r.optString("title"),
                     state = r.optString("state"),
