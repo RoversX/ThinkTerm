@@ -27,8 +27,10 @@ pub fn chat_agent(agent_id: &str) -> bool {
 
 /// Bumped when a line changes meaning. Either side ignores the fields it
 /// does not know. 2: what is said may carry attachments, and the model
-/// can be changed ([`Op::SetModel`], [`Ev::Models`]).
-pub const PROTOCOL: u32 = 2;
+/// can be changed ([`Op::SetModel`], [`Ev::Models`]). 3: the agent says
+/// what commands it takes ([`Ev::Commands`]), sent as what is said, and
+/// how full its context is ([`Ev::Context`]).
+pub const PROTOCOL: u32 = 3;
 /// The longest line either side takes in.
 pub const MAX_LINE: usize = 8 << 20;
 
@@ -102,6 +104,11 @@ pub enum Ev {
     },
     /// The agent waits for an answer.
     Ask { ask: Ask },
+    /// What can be typed for the agent to do rather than read: `/compact`,
+    /// a prompt template, a skill (`$review`). Sent as what is said
+    /// ([`Op::Send`]); the bridge runs the ones the agent only takes in its
+    /// terminal.
+    Commands { commands: Vec<CommandInfo> },
     /// The model the agent talks to, how hard it thinks, and the others
     /// it could talk to.
     Models {
@@ -112,6 +119,8 @@ pub enum Ev {
         #[serde(default)]
         models: Vec<ModelChoice>,
     },
+    /// How full the model's context is, and what fills it.
+    Context { context: ContextInfo },
     /// What was asked was answered, here or anywhere else.
     Resolved { id: String },
     /// Something done that the client may want to tell (installed, sent).
@@ -213,6 +222,91 @@ pub struct Attachment {
     /// A small picture of it (JPEG, base64), made by the bridge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb: Option<String>,
+}
+
+/// How full the model's context is: what the conversation takes of its
+/// window, what that is made of, and what the session has used so far.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextInfo {
+    /// Tokens the conversation takes of the window now; none while not
+    /// known (before the first answer, just after a compaction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<u64>,
+    /// The model's window, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+    /// What fills it, in tokens: estimated from what it holds, and adding
+    /// up to `used` where that is known.
+    #[serde(default)]
+    pub parts: Vec<ContextPart>,
+    /// Where the agent sums up older turns by itself, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacts_at: Option<u64>,
+    /// The session's tokens so far, every turn's.
+    #[serde(default)]
+    pub totals: Usage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPart {
+    pub kind: PartKind,
+    pub tokens: u64,
+}
+
+/// What a part of the context is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartKind {
+    /// The agent's own instructions.
+    System,
+    /// What the tools it may call are and take.
+    Tools,
+    /// The project's instructions (`AGENTS.md`) and what it is told of
+    /// where it runs.
+    Instructions,
+    /// What the person said.
+    User,
+    /// What the agent said.
+    Assistant,
+    Thinking,
+    /// Its tool calls and what came of them.
+    ToolUse,
+    /// Earlier turns, summed up.
+    Summary,
+    #[serde(other)]
+    Other,
+}
+
+/// Tokens used, every turn's together; each none when the agent does not
+/// say.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u64>,
+    /// What it cost, in US dollars, as the agent reckons it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+}
+
+/// A command the agent takes, as typed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInfo {
+    /// As typed, its sign included: `/compact`, `$skill`.
+    pub name: String,
+    /// What it does, in the agent's own words.
+    #[serde(default)]
+    pub description: String,
+    /// What follows it ("<name>"); none for one that runs as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
 }
 
 /// A model the agent can be switched to.

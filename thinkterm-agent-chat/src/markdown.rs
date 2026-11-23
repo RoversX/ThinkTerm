@@ -1,9 +1,9 @@
-//! Markdown, as agents write it, cut into blocks a phone draws with its own
-//! text views: paragraphs, headings, list items, quotes, code, rules, and
-//! tables (as code, their columns lined up). Within a block, runs of text
-//! that are bold, italic, code, struck through or a link.
+//! Markdown, as agents write it (GitHub's flavour), cut into blocks a phone
+//! draws with its own text views: paragraphs, headings, list items, quotes,
+//! code, rules, and tables. Within a block, runs of text that are bold,
+//! italic, code, struck through or a link.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -16,6 +16,30 @@ pub enum Block {
     Quote { spans: Vec<Span> },
     Code { lang: String, text: String },
     Rule,
+    /// A table: how each column lines up, its header's cells, then its
+    /// rows', each cell its runs of text.
+    Table {
+        align: Vec<Align>,
+        head: Vec<Vec<Span>>,
+        rows: Vec<Vec<Vec<Span>>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Align {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// A table being read: what is known of it so far.
+struct TableRead {
+    align: Vec<Align>,
+    head: Vec<Vec<Span>>,
+    rows: Vec<Vec<Vec<Span>>>,
+    row: Vec<Vec<Span>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -37,8 +61,8 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Widest a table is drawn, in characters, before its cells are cut.
-const TABLE_CELL: usize = 40;
+/// The most of a table cell kept, in characters.
+const CELL_KEPT: usize = 400;
 
 #[derive(Default)]
 struct Style {
@@ -65,8 +89,7 @@ pub fn blocks(markdown: &str) -> Vec<Block> {
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut quotes = 0u32;
     let mut code: Option<(String, String)> = None;
-    let mut table: Option<Vec<Vec<String>>> = None;
-    let mut cell = String::new();
+    let mut table: Option<TableRead> = None;
 
     fn flush(out: &mut Vec<Block>, open: &mut Option<Open>, spans: &mut Vec<Span>, quotes: u32) {
         let taken = std::mem::take(spans);
@@ -125,23 +148,41 @@ pub fn blocks(markdown: &str) -> Vec<Block> {
             }
             continue;
         }
-        if let Some(rows) = table.as_mut() {
+        if let Some(read) = table.as_mut() {
             match event {
-                Event::Start(Tag::TableHead) | Event::Start(Tag::TableRow) => rows.push(Vec::new()),
-                Event::End(TagEnd::TableCell) => {
-                    if let Some(row) = rows.last_mut() {
-                        row.push(std::mem::take(&mut cell).trim().to_string());
-                    }
-                }
-                Event::Text(t) | Event::Code(t) => cell.push_str(&t),
-                Event::SoftBreak | Event::HardBreak => cell.push(' '),
+                Event::Start(Tag::TableHead) | Event::Start(Tag::TableRow) => read.row.clear(),
+                Event::Start(Tag::TableCell) => spans.clear(),
+                Event::End(TagEnd::TableCell) => read.row.push(cell_of(std::mem::take(&mut spans))),
+                Event::End(TagEnd::TableHead) => read.head = std::mem::take(&mut read.row),
+                Event::End(TagEnd::TableRow) => read.rows.push(std::mem::take(&mut read.row)),
                 Event::End(TagEnd::Table) => {
-                    let rows = table.take().unwrap();
-                    out.push(Block::Code {
-                        lang: String::new(),
-                        text: lay_out(&rows),
+                    let read = table.take().unwrap();
+                    out.push(Block::Table {
+                        align: read.align,
+                        head: read.head,
+                        rows: read.rows,
                     });
                 }
+                Event::Start(Tag::Emphasis) => style.italic += 1,
+                Event::End(TagEnd::Emphasis) => style.italic = style.italic.saturating_sub(1),
+                Event::Start(Tag::Strong) => style.bold += 1,
+                Event::End(TagEnd::Strong) => style.bold = style.bold.saturating_sub(1),
+                Event::Start(Tag::Strikethrough) => style.strike += 1,
+                Event::End(TagEnd::Strikethrough) => style.strike = style.strike.saturating_sub(1),
+                Event::Start(Tag::Link { dest_url, .. }) => style.link.push(dest_url.to_string()),
+                Event::End(TagEnd::Link) => {
+                    style.link.pop();
+                }
+                Event::Text(t) => push(&mut spans, &style, &t, false),
+                // A cell's line break is written `<br>`; other tags are
+                // left out.
+                Event::Html(t) | Event::InlineHtml(t) => {
+                    if is_break(&t) {
+                        push(&mut spans, &style, "\n", false);
+                    }
+                }
+                Event::Code(t) | Event::InlineMath(t) => push(&mut spans, &style, &t, true),
+                Event::SoftBreak | Event::HardBreak => push(&mut spans, &style, " ", false),
                 _ => {}
             }
             continue;
@@ -211,9 +252,22 @@ pub fn blocks(markdown: &str) -> Vec<Block> {
                 };
                 code = Some((lang, String::new()));
             }
-            Event::Start(Tag::Table(_)) => {
+            Event::Start(Tag::Table(aligns)) => {
                 flush(&mut out, &mut open, &mut spans, quotes);
-                table = Some(Vec::new());
+                table = Some(TableRead {
+                    align: aligns
+                        .iter()
+                        .map(|a| match a {
+                            Alignment::None => Align::None,
+                            Alignment::Left => Align::Left,
+                            Alignment::Center => Align::Center,
+                            Alignment::Right => Align::Right,
+                        })
+                        .collect(),
+                    head: Vec::new(),
+                    rows: Vec::new(),
+                    row: Vec::new(),
+                });
             }
             Event::Start(Tag::Emphasis) => style.italic += 1,
             Event::End(TagEnd::Emphasis) => style.italic = style.italic.saturating_sub(1),
@@ -263,61 +317,35 @@ fn heading(level: HeadingLevel) -> u8 {
     }
 }
 
-/// A table's rows as lines of text, each column as wide as its widest
-/// cell (counted in characters, a wide one as two).
-fn lay_out(rows: &[Vec<String>]) -> String {
-    let cut = |cell: &str| -> String {
-        let mut out = String::new();
-        let mut width = 0;
-        for c in cell.chars() {
-            let w = char_width(c);
-            if width + w > TABLE_CELL {
-                out.push('…');
-                break;
-            }
-            out.push(c);
-            width += w;
-        }
-        out
-    };
-    let rows: Vec<Vec<String>> = rows.iter().map(|row| row.iter().map(|c| cut(c)).collect()).collect();
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let widths: Vec<usize> = (0..columns)
-        .map(|i| {
-            rows.iter()
-                .filter_map(|row| row.get(i))
-                .map(|c| text_width(c))
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    let mut lines = Vec::new();
-    for (n, row) in rows.iter().enumerate() {
-        let line: Vec<String> = (0..columns)
-            .map(|i| {
-                let cell = row.get(i).map(String::as_str).unwrap_or("");
-                format!("{cell}{}", " ".repeat(widths[i].saturating_sub(text_width(cell))))
-            })
-            .collect();
-        lines.push(line.join("  ").trim_end().to_string());
-        if n == 0 && rows.len() > 1 {
-            lines.push(widths.iter().map(|w| "─".repeat(*w)).collect::<Vec<_>>().join("  "));
-        }
-    }
-    lines.join("\n")
+/// `<br>`, `<br/>`, `<br />`, in any case.
+fn is_break(html: &str) -> bool {
+    let tag: String = html.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    matches!(tag.as_str(), "<br>" | "<br/>")
 }
 
-fn text_width(text: &str) -> usize {
-    text.chars().map(char_width).sum()
-}
-
-/// Two columns for the wide scripts a monospaced phone font draws wide.
-fn char_width(c: char) -> usize {
-    match c as u32 {
-        0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F | 0x1F900..=0x1F9FF | 0x20000..=0x3FFFD => 2,
-        _ => 1,
+/// A cell's runs, trimmed at their ends and kept to [`CELL_KEPT`].
+fn cell_of(mut spans: Vec<Span>) -> Vec<Span> {
+    if let Some(first) = spans.first_mut() {
+        first.text = first.text.trim_start().to_string();
     }
+    if let Some(last) = spans.last_mut() {
+        last.text = last.text.trim_end().to_string();
+    }
+    let mut left = CELL_KEPT;
+    spans.retain_mut(|span| {
+        if left == 0 {
+            return false;
+        }
+        if let Some((at, _)) = span.text.char_indices().nth(left) {
+            span.text.truncate(at);
+            span.text.push('…');
+            left = 0;
+        } else {
+            left -= span.text.chars().count();
+        }
+        !span.text.is_empty()
+    });
+    spans
 }
 
 #[cfg(test)]
@@ -375,7 +403,28 @@ mod tests {
         );
         assert!(matches!(&got[1], Block::Quote { spans } if plain(spans) == "quoted"));
         assert_eq!(got[2], Block::Rule);
-        let Block::Code { text, .. } = &got[3] else { panic!("{got:?}") };
-        assert_eq!(text, "a   bb\n──  ──\n汉  x");
+        let Block::Table { align, head, rows } = &got[3] else { panic!("{got:?}") };
+        assert_eq!(align, &[Align::None, Align::None]);
+        assert_eq!(head.iter().map(|c| plain(c)).collect::<Vec<_>>(), ["a", "bb"]);
+        assert_eq!(rows.iter().map(|r| r.iter().map(|c| plain(c)).collect::<Vec<_>>()).collect::<Vec<_>>(), [["汉", "x"]]);
+    }
+
+    #[test]
+    fn tables_keep_their_alignment_and_styles() {
+        let got = blocks("Before\n\n| Name | Size |\n|:-----|-----:|\n| **core** | `12 KB` |\n| [web](https://w) | 3 |\n\nAfter");
+        assert_eq!(got.len(), 3);
+        assert!(matches!(&got[0], Block::Para { spans } if plain(spans) == "Before"));
+        assert!(matches!(&got[2], Block::Para { spans } if plain(spans) == "After"));
+        let Block::Table { align, head, rows } = &got[1] else { panic!("{got:?}") };
+        assert_eq!(align, &[Align::Left, Align::Right]);
+        assert_eq!(head.len(), 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0][0].iter().any(|s| s.bold && s.text == "core"));
+        assert!(rows[0][1].iter().any(|s| s.code && s.text == "12 KB"));
+        assert_eq!(rows[1][0][0].link.as_deref(), Some("https://w"));
+
+        let got = blocks("| a |\n|---|\n| one<br>two <b>bold</b> |\n");
+        let Block::Table { rows, .. } = &got[0] else { panic!("{got:?}") };
+        assert_eq!(plain(&rows[0][0]), "one\ntwo bold");
     }
 }

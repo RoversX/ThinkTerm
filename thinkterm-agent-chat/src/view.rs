@@ -4,7 +4,10 @@
 //! in -- worded in the language the app shows.
 
 use crate::markdown::{blocks, Block};
-use crate::{diff, AgentState, Ask, AskKind, Attachment, Choice, Done, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need, NoteKind, Status};
+use crate::{
+    diff, AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, ContextInfo, Done, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need,
+    NoteKind, PartKind, Status,
+};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use thinkterm_i18n::{tr, tr_args, FluentArgs};
@@ -48,6 +51,10 @@ pub struct Chat {
     /// with every view.
     pictures: HashMap<String, String>,
     given: HashSet<String>,
+    /// The commands the agent takes, as it said.
+    commands: Vec<CommandInfo>,
+    /// How full the context is, as the agent last said.
+    context: Option<ContextInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +91,70 @@ pub struct ChatView {
     /// The model it talks to, and what it could be switched to; none when
     /// the agent does not say.
     pub model: Option<ModelView>,
+    /// What a `/` (or `$`) in the field offers.
+    pub commands: Vec<CommandView>,
+    /// How full the model's context is: the ring in the bar, and the sheet
+    /// it opens. None when the agent does not say.
+    pub context: Option<ContextView>,
+}
+
+/// How full the context is, and what fills it.
+#[derive(Debug, Serialize)]
+pub struct ContextView {
+    /// How much of the window is used, 0 to 1; none while not known.
+    pub fill: Option<f32>,
+    /// "ok", "high" (from 80%) or "full" (from 95%): the ring's colour.
+    pub level: &'static str,
+    /// "37%"; "–" while not known.
+    pub percent: String,
+    pub heading: String,
+    /// "74.1k / 200k tokens".
+    pub amount: String,
+    /// What fills it, largest first, then what is free: shown on a tap of
+    /// the row that says so (`breakdown`).
+    pub parts: Vec<PartView>,
+    pub breakdown: String,
+    /// "Compacts by itself at 92%".
+    pub compacts_at: Option<String>,
+    /// How the parts were reckoned, or what the amount waits for.
+    pub note: Option<String>,
+    pub totals_heading: String,
+    pub totals: Vec<StatView>,
+    /// The button that compacts now, when the agent takes `/compact`.
+    pub compact: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartView {
+    /// What it is ("system", "user", ... or "free"): its colour.
+    pub kind: &'static str,
+    pub label: String,
+    /// "12.3k".
+    pub amount: String,
+    /// Its share of the window (of what is used, when the window is not
+    /// known), 0 to 1.
+    pub share: f32,
+    /// That share, as said: "6%".
+    pub percent: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatView {
+    pub label: String,
+    pub value: String,
+}
+
+/// A command the field offers as it is typed.
+#[derive(Debug, Serialize)]
+pub struct CommandView {
+    /// As typed: `/compact`.
+    pub name: String,
+    pub description: String,
+    /// What follows it (`<name>`, or nothing said), when something may:
+    /// a pick puts the command in the field for it rather than run it.
+    pub args: Option<String>,
+    /// Done by the client rather than sent: `model` opens the model menu.
+    pub here: Option<&'static str>,
 }
 
 /// The model button and its menu: the models, each opening on how hard it
@@ -326,6 +397,8 @@ impl Chat {
                 self.state = Some(state);
             }
             Ev::Models { current, effort, models } => self.models = Some((current, effort, models)),
+            Ev::Commands { commands } => self.commands = commands,
+            Ev::Context { context } => self.context = Some(context),
             Ev::Ask { ask } => {
                 self.asks.retain(|held| held.id != ask.id);
                 self.asks.push(ask);
@@ -368,6 +441,9 @@ impl Chat {
         self.asks.clear();
         self.loading_older = false;
         self.guessed = false;
+        // The channel to come says them again, if its agent still does.
+        self.commands.clear();
+        self.context = None;
     }
 
     /// The small pictures in `item`, kept by key and taken out of it.
@@ -546,6 +622,8 @@ impl Chat {
             can_send: self.problem.is_none() && self.state.is_some(),
             can_stop: self.problem.is_none() && self.state == Some(AgentState::Working),
             can_attach: self.problem.is_none() && self.protocol >= 2,
+            commands: self.command_views(),
+            context: self.context_view(),
             model: self.model_view(),
             agent,
         }
@@ -569,6 +647,114 @@ impl Chat {
             i += 1;
         }
         rows
+    }
+
+    /// The ring and its sheet, once the agent has said how full it is.
+    fn context_view(&self) -> Option<ContextView> {
+        let context = self.context.as_ref()?;
+        let window = context.window.filter(|&w| w > 0);
+        let fill = context.used.zip(window).map(|(used, window)| (used as f32 / window as f32).clamp(0.0, 1.0));
+        let level = match fill {
+            Some(f) if f >= 0.95 => "full",
+            Some(f) if f >= 0.8 => "high",
+            _ => "ok",
+        };
+        let mut parts: Vec<_> = context.parts.iter().filter(|part| part.tokens > 0).copied().collect();
+        parts.sort_by_key(|part| std::cmp::Reverse(part.tokens));
+        let whole = window.or(context.used).unwrap_or_else(|| parts.iter().map(|p| p.tokens).sum()).max(1);
+        let part = |kind: &'static str, label: String, tokens: u64| {
+            let share = (tokens as f32 / whole as f32).clamp(0.0, 1.0);
+            PartView {
+                kind,
+                label,
+                amount: token_count(tokens),
+                share,
+                percent: percent_of(share),
+            }
+        };
+        let mut views: Vec<_> = parts.iter().map(|p| part(part_kind(p.kind), tr(part_label(p.kind)), p.tokens)).collect();
+        if let (Some(used), Some(window)) = (context.used, window) {
+            if window > used {
+                views.push(part("free", tr("chat-context-free"), window - used));
+            }
+        }
+        let amount = match (context.used, window) {
+            (Some(used), Some(window)) => {
+                let mut args = FluentArgs::new();
+                args.set("used", token_count(used));
+                args.set("window", token_count(window));
+                tr_args("chat-context-amount", &args)
+            }
+            (Some(used), None) => {
+                let mut args = FluentArgs::new();
+                args.set("used", token_count(used));
+                tr_args("chat-context-amount-alone", &args)
+            }
+            _ => tr("chat-context-unknown"),
+        };
+        let compacts_at = context.compacts_at.zip(window).map(|(at, window)| {
+            let mut args = FluentArgs::new();
+            args.set("percent", percent_of(at as f32 / window as f32));
+            tr_args("chat-context-compacts-at", &args)
+        });
+        let note = (context.used.is_some() && !parts.is_empty()).then(|| tr("chat-context-estimated"));
+        let totals = &context.totals;
+        let mut stats = Vec::new();
+        let mut stat = |key: &str, value: Option<String>| {
+            if let Some(value) = value {
+                stats.push(StatView { label: tr(key), value });
+            }
+        };
+        // What an agent leaves at nothing (a model that does not count,
+        // a cache never used) is not said.
+        let some = |n: Option<u64>| n.filter(|&n| n > 0).map(token_count);
+        stat("chat-context-input", some(totals.input));
+        stat("chat-context-output", some(totals.output));
+        stat("chat-context-cache-read", some(totals.cache_read));
+        stat("chat-context-cache-write", some(totals.cache_write));
+        stat("chat-context-reasoning", some(totals.reasoning));
+        stat("chat-context-cost", totals.cost.filter(|c| *c > 0.0).map(dollars));
+        let compact = (self.problem.is_none() && self.commands.iter().any(|c| c.name == "/compact")).then(|| tr("chat-context-compact"));
+        Some(ContextView {
+            fill,
+            level,
+            percent: fill.map_or_else(|| "–".to_string(), percent_of),
+            heading: tr("chat-context-heading"),
+            amount,
+            parts: views,
+            breakdown: tr("chat-context-breakdown"),
+            compacts_at,
+            note,
+            totals_heading: tr("chat-context-totals"),
+            totals: stats,
+            compact,
+        })
+    }
+
+    /// What the field offers on `/`: the model menu, when there is one, and
+    /// the agent's commands, in its own order.
+    fn command_views(&self) -> Vec<CommandView> {
+        let mut views = Vec::new();
+        if self.models.as_ref().is_some_and(|(current, _, _)| current.is_some()) {
+            views.push(CommandView {
+                name: "/model".into(),
+                description: tr("chat-command-model"),
+                args: None,
+                here: Some("model"),
+            });
+        }
+        views.extend(
+            self.commands
+                .iter()
+                .filter(|command| command.name != "/model")
+                .map(|command| CommandView {
+                    name: command.name.clone(),
+                    description: command.description.clone(),
+                    args: command.args.clone(),
+                    here: None,
+                }),
+        );
+        views
     }
 
     /// The model button and what it opens on, once the agent has said.
@@ -1239,6 +1425,65 @@ fn diff_files(files: &[FileEdit]) -> Vec<DiffFile> {
         .collect()
 }
 
+/// Tokens, short: 950, 1.2k, 74k, 1.3M.
+fn token_count(n: u64) -> String {
+    let short = |value: f64, unit: &str| {
+        let shown = if value < 10.0 { format!("{value:.1}") } else { format!("{value:.0}") };
+        format!("{}{unit}", shown.trim_end_matches(".0"))
+    };
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_499 => short(n as f64 / 1_000.0, "k"),
+        _ => short(n as f64 / 1_000_000.0, "M"),
+    }
+}
+
+/// A share as said: "37%"; "<1%" for a little.
+fn percent_of(share: f32) -> String {
+    let percent = (share * 100.0).round();
+    if percent < 1.0 && share > 0.0 {
+        "<1%".to_string()
+    } else {
+        format!("{percent:.0}%")
+    }
+}
+
+fn dollars(cost: f64) -> String {
+    if cost < 0.01 {
+        format!("${cost:.3}")
+    } else {
+        format!("${cost:.2}")
+    }
+}
+
+fn part_kind(kind: PartKind) -> &'static str {
+    match kind {
+        PartKind::System => "system",
+        PartKind::Tools => "tools",
+        PartKind::Instructions => "instructions",
+        PartKind::User => "user",
+        PartKind::Assistant => "assistant",
+        PartKind::Thinking => "thinking",
+        PartKind::ToolUse => "tool_use",
+        PartKind::Summary => "summary",
+        PartKind::Other => "other",
+    }
+}
+
+fn part_label(kind: PartKind) -> &'static str {
+    match kind {
+        PartKind::System => "chat-context-system",
+        PartKind::Tools => "chat-context-tools",
+        PartKind::Instructions => "chat-context-instructions",
+        PartKind::User => "chat-context-user",
+        PartKind::Assistant => "chat-context-assistant",
+        PartKind::Thinking => "chat-context-thinking",
+        PartKind::ToolUse => "chat-context-tool-use",
+        PartKind::Summary => "chat-context-summary",
+        PartKind::Other => "chat-context-other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1677,6 +1922,84 @@ mod tests {
         let model = chat.view().model.unwrap();
         assert_eq!(model.label, "custom");
         assert!(model.models[0].current && model.models[0].efforts.is_empty());
+    }
+
+    #[test]
+    fn the_field_offers_the_agents_commands_and_the_model_menu() {
+        let mut chat = Chat::new(1, "pi");
+        assert!(chat.view().commands.is_empty());
+        chat.apply(Ev::Commands {
+            commands: vec![
+                CommandInfo {
+                    name: "/compact".into(),
+                    description: "Compact the context".into(),
+                    args: None,
+                },
+                CommandInfo {
+                    name: "/name".into(),
+                    description: "Name the session".into(),
+                    args: Some("<name>".into()),
+                },
+            ],
+        });
+        chat.apply(Ev::Models {
+            current: Some("m".into()),
+            effort: None,
+            models: vec![],
+        });
+        let names: Vec<_> = chat.view().commands.iter().map(|c| (c.name.clone(), c.here, c.args.is_some())).collect();
+        assert_eq!(
+            names,
+            [
+                ("/model".to_string(), Some("model"), false),
+                ("/compact".to_string(), None, false),
+                ("/name".to_string(), None, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_context_says_how_full_and_of_what() {
+        let mut chat = Chat::new(1, "pi");
+        assert!(chat.view().context.is_none(), "no ring until the agent says");
+        chat.apply(Ev::Commands {
+            commands: vec![CommandInfo {
+                name: "/compact".into(),
+                description: String::new(),
+                args: None,
+            }],
+        });
+        chat.apply(Ev::Context {
+            context: ContextInfo {
+                used: Some(50_000),
+                window: Some(200_000),
+                parts: vec![
+                    crate::ContextPart { kind: PartKind::User, tokens: 10_000 },
+                    crate::ContextPart { kind: PartKind::System, tokens: 40_000 },
+                ],
+                compacts_at: Some(183_616),
+                totals: crate::Usage {
+                    input: Some(1_234_567),
+                    output: Some(950),
+                    cost: Some(0.4251),
+                    ..Default::default()
+                },
+            },
+        });
+        let view = chat.view().context.unwrap();
+        assert_eq!(view.fill, Some(0.25));
+        assert_eq!(view.percent, "25%");
+        assert_eq!(view.level, "ok");
+        let parts: Vec<_> = view.parts.iter().map(|p| (p.kind, p.amount.as_str(), p.percent.as_str())).collect();
+        assert_eq!(parts, [("system", "40k", "20%"), ("user", "10k", "5%"), ("free", "150k", "75%")]);
+        assert!(view.compacts_at.unwrap().contains("92%"));
+        let totals: Vec<_> = view.totals.iter().map(|s| s.value.as_str()).collect();
+        assert_eq!(totals, ["1.2M", "950", "$0.43"]);
+        assert!(view.compact.is_some());
+        assert_eq!(token_count(1_200), "1.2k");
+        assert_eq!(token_count(74_100), "74k");
+        assert_eq!(token_count(999_999), "1M");
+        assert_eq!(percent_of(0.001), "<1%");
     }
 
     #[test]
