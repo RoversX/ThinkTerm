@@ -43,6 +43,14 @@ pub type MobileApp = App<MobilePlatform, SshLink>;
 /// The views are made again at most this often: a burst of output is
 /// one publication per frame, not one per change.
 const VIEWS_EVERY: Duration = Duration::from_millis(16);
+/// A dial that failed before its connection was up is made again by
+/// itself: first after this long, the wait doubling to `REDIAL_MOST`, for
+/// `REDIAL_TRIES` tries (some minutes); then once the phone comes back to
+/// the app or its network changes (`Cmd::CheckConnection`), or a tap.
+const REDIAL_FIRST: Duration = Duration::from_secs(1);
+const REDIAL_MOST: Duration = Duration::from_secs(15);
+const REDIAL_TRIES: u32 = 20;
+
 /// The chat's view is made again at most this often from what its bridge
 /// sends: words written as they come are a few refreshes a second, and
 /// the lines of a chat opening one.
@@ -374,6 +382,19 @@ struct State {
     /// Openings of a chat's channel so far: each is numbered, and only the
     /// latest one's lines count.
     chat_openings: u64,
+    /// Where the last connect went, for a failed dial to be made again.
+    ssh: Option<SshParams>,
+    /// A failed dial is made again by itself: from a connect until a
+    /// disconnect asked for.
+    redialing: bool,
+    /// When it is, and how long the wait after it, and how many were made.
+    redial_at: Option<Instant>,
+    /// The last dial failed in a way that fails again (the login refused,
+    /// the host's key changed): not made again until a connect, whatever
+    /// the network does.
+    redial_lasting: bool,
+    redial_wait: Duration,
+    redial_tries: u32,
     /// The bridge said something the chat on show has not been sent yet.
     chat_owed: bool,
     chat_made: Instant,
@@ -431,6 +452,7 @@ pub fn run(
         state.report_link();
         state.report_agents();
         state.publish_chat_owed();
+        state.redial_if_due();
         state.publish_views();
     }
     state.disconnect();
@@ -493,6 +515,12 @@ impl State {
             chat_openings: 0,
             chat_owed: false,
             chat_made: Instant::now(),
+            ssh: None,
+            redialing: false,
+            redial_at: None,
+            redial_lasting: false,
+            redial_wait: REDIAL_FIRST,
+            redial_tries: 0,
             agents_waiting: Default::default(),
             agents_server: None,
             agents_dirty: Rc::new(Cell::new(false)),
@@ -519,6 +547,9 @@ impl State {
         }
         if self.chat_owed {
             wait = wait.min((self.chat_made + CHAT_EVERY).saturating_duration_since(now));
+        }
+        if let Some(at) = self.redial_at {
+            wait = wait.min(at.saturating_duration_since(now));
         }
         let owed = self.views_dirty.get() || (self.screen_dirty && self.screen_wanted);
         if owed && (self.platform.shown() || (self.views_listed && self.views_dirty.get())) {
@@ -973,17 +1004,32 @@ impl State {
                     }
                 }
             }
+            // Forgotten for the dials made again by itself too: they ask
+            // for the key the host has now.
             Cmd::ForgetHostKey => {
                 if let Some(link) = &self.link {
                     link.forget_host_key();
+                }
+                if let Some(ssh) = self.ssh.as_mut() {
+                    ssh.known_host = None;
                 }
             }
             Cmd::ForgetJumpHostKey => {
                 if let Some(link) = &self.link {
                     link.forget_jump_host_key();
                 }
+                if let Some(jump) = self.ssh.as_mut().and_then(|ssh| ssh.jump.as_mut()) {
+                    jump.known_host = None;
+                }
             }
             Cmd::CheckConnection => {
+                // A dial that failed is made again now, its waits forgiven:
+                // the phone came back to the app, or to a network.
+                if self.redialing && !self.redial_lasting && self.app.is_none() && matches!(self.conn, Conn::Disconnected(_)) {
+                    self.redial_tries = 0;
+                    self.redial_wait = REDIAL_FIRST;
+                    self.redial_at = Some(Instant::now());
+                }
                 if let Some(link) = &self.link {
                     link.probe();
                 }
@@ -1177,6 +1223,25 @@ impl State {
             Cmd::SetSetting { key, value } => {
                 self.settings.retain(|(k, _)| k != &key);
                 self.settings.push((key.clone(), value.clone()));
+                // A dial waiting to be made again follows the setting.
+                if key == "auto-reconnect" && self.app.is_none() && self.ssh.is_some() {
+                    self.redialing = self.auto_reconnect();
+                    if !self.redialing {
+                        // A wait shown as "connecting" is a failure now.
+                        if self.redial_at.take().is_some() {
+                            if let Conn::Disconnected(reason) = &self.conn {
+                                let status = format!("failed: {reason}");
+                                self.set_status(&status);
+                            }
+                        }
+                    } else if !self.redial_lasting && matches!(self.conn, Conn::Disconnected(_)) {
+                        // Back on: what failed is made again now, as the
+                        // App does for a connection it had.
+                        self.redial_tries = 0;
+                        self.redial_wait = REDIAL_FIRST;
+                        self.redial_at = Some(Instant::now());
+                    }
+                }
                 if let Some(app) = self.app.clone() {
                     if let Err(err) = app.set_setting(&key, &value) {
                         self.notify.on_log(format!("setting {key}: {err}"));
@@ -1398,7 +1463,17 @@ impl State {
         self.fonts = Some(Rc::new(FontSet::new(faces)?));
         self.size_pt = params.size_pt;
         self.glyph_platform = Some(Rc::new(GlyphSeams::new(painter)));
+        self.ssh = Some(params.ssh.clone());
+        // As the App's own redial: only where the person lets it.
+        self.redialing = self.auto_reconnect();
+        self.redial_lasting = false;
+        self.redial_wait = REDIAL_FIRST;
+        self.redial_tries = 0;
+        self.dial(params.ssh)
+    }
 
+    /// Dial `ssh` on a link of its own; what comes of it is `Cmd::Dialed`.
+    fn dial(&mut self, ssh: SshParams) -> Result<()> {
         let tx = self.cmd_tx.clone();
         let serial = self.link_serial;
         let deliver: Box<dyn Fn(u64) -> Box<dyn Fn(Net) + Send>> = Box::new(move |dial| {
@@ -1407,14 +1482,11 @@ impl State {
                 let _ = tx.send(Cmd::Net { serial, dial, net });
             })
         });
-        let link = SshLink::new(params.ssh.clone(), deliver);
+        let link = SshLink::new(ssh.clone(), deliver);
         let dial = link.connect();
         self.link = Some(link);
         self.conn = Conn::Connecting;
-        self.set_status(&format!(
-            "connecting to {}@{}:{}",
-            params.ssh.user, params.ssh.host, params.ssh.port
-        ));
+        self.set_status(&format!("connecting to {}@{}:{}", ssh.user, ssh.host, ssh.port));
         let tx = self.cmd_tx.clone();
         self.pool
             .spawner()
@@ -1444,6 +1516,11 @@ impl State {
         // or the next connect fails before it can create its link.
         self.link_serial += 1;
         self.attaching = false;
+        // Nothing is dialled again by itself after this: a connect arms it,
+        // and gives the login again (none is kept meanwhile).
+        self.redialing = false;
+        self.redial_at = None;
+        self.ssh = None;
         if let Some(link) = self.link.take() {
             link.shutdown();
         }
@@ -1506,6 +1583,94 @@ impl State {
         }
     }
 
+    /// Whether a lost connection is dialled again by itself: the shell's
+    /// `auto-reconnect` setting, on unless it says otherwise.
+    fn auto_reconnect(&self) -> bool {
+        self.settings
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "auto-reconnect")
+            .is_none_or(|(_, value)| value != "false")
+    }
+
+    /// A dial that came to nothing before its App was up: made again after
+    /// a wait, unless what failed would fail again (the login refused, the
+    /// host's key to approve, no ThinkTerm there), or it was tried enough;
+    /// then a tap makes it again, or (when it was only tried enough) the
+    /// phone coming back.
+    /// True when it is to be made again: the status then reads as a dial on
+    /// its way ("connecting to …"), so a phone keeps its connection up
+    /// meanwhile, and takes it through the background as a dial.
+    fn dial_failed(&mut self, reason: &str) -> bool {
+        if !self.redialing || self.app.is_some() {
+            return false;
+        }
+        // A dial's failure is told twice (its link closes, its dial ends):
+        // once is counted.
+        if self.redial_at.is_some() {
+            return true;
+        }
+        let said = reason.to_ascii_lowercase();
+        let lasting = [
+            "refused the login",
+            "host key",
+            "key changed",
+            "authentication",
+            "permission denied",
+            "no thinkterm on the host",
+            "runs a newer thinkterm",
+            "runs an older thinkterm",
+            "private key",
+            "loading the key",
+            "passphrase",
+        ]
+        .iter()
+        .any(|word| said.contains(word));
+        if lasting {
+            self.redial_lasting = true;
+        }
+        if lasting || self.redial_tries >= REDIAL_TRIES {
+            self.redial_at = None;
+            return false;
+        }
+        self.redial_tries += 1;
+        self.redial_at = Some(Instant::now() + self.redial_wait);
+        if let Some(ssh) = &self.ssh {
+            // As the dial itself reads (the card names an unsaved host by
+            // it); why it failed goes to the log.
+            self.set_status(&format!("connecting to {}@{}:{}", ssh.user, ssh.host, ssh.port));
+        }
+        self.notify
+            .on_log(format!("dialling again in {} s: {reason}", self.redial_wait.as_secs()));
+        self.redial_wait = (self.redial_wait * 2).min(REDIAL_MOST);
+        true
+    }
+
+    /// The failed dial made again, once its wait is over.
+    fn redial_if_due(&mut self) {
+        if self.redial_at.is_none_or(|at| Instant::now() < at) {
+            return;
+        }
+        self.redial_at = None;
+        let Some(ssh) = self.ssh.clone() else {
+            return;
+        };
+        if self.app.is_some() || !matches!(self.conn, Conn::Disconnected(_)) {
+            return;
+        }
+        // What the last link may still say is not this one's.
+        self.link_serial += 1;
+        self.attaching = false;
+        if let Some(link) = self.link.take() {
+            link.shutdown();
+        }
+        if let Err(err) = self.dial(ssh) {
+            self.fail(format!("redial: {err:#}"));
+            self.conn = Conn::Disconnected(format!("{err:#}"));
+            self.set_status(&format!("failed: {err:#}"));
+        }
+    }
+
     fn on_dialed(&mut self, serial: u64, outcome: Result<(), String>) {
         if serial != self.link_serial {
             return;
@@ -1519,8 +1684,10 @@ impl State {
             Err(err) => {
                 self.fail(format!("dial: {err}"));
                 self.conn = Conn::Disconnected(err.clone());
-                self.set_status(&format!("failed: {err}"));
                 self.link = None;
+                if !self.dial_failed(&err) {
+                    self.set_status(&format!("failed: {err}"));
+                }
             }
         }
     }
@@ -1622,7 +1789,11 @@ impl State {
                 }
                 if self.app.is_none() {
                     self.conn = Conn::Disconnected(reason.clone());
-                    self.set_status(&format!("disconnected: {reason}"));
+                    // Gone before its App was up, which would have dialled
+                    // again: this dial is made again here.
+                    if !self.dial_failed(&reason) {
+                        self.set_status(&format!("disconnected: {reason}"));
+                    }
                 }
                 // With an App up, its close handler takes it from here:
                 // it schedules the redial and reattaches on the same pane.
@@ -1735,13 +1906,19 @@ impl State {
                     _ => err.clone(),
                 };
                 self.conn = Conn::Disconnected(reason.clone());
-                self.set_status(&format!("failed: {reason}"));
                 if let Some(link) = self.link.take() {
                     link.shutdown();
+                }
+                if !self.dial_failed(&reason) {
+                    self.set_status(&format!("failed: {reason}"));
                 }
                 return;
             }
         };
+        // Up: its App dials again from here on, its waits its own.
+        self.redial_at = None;
+        self.redial_tries = 0;
+        self.redial_wait = REDIAL_FIRST;
         // The GPU state is taken only once the rest is known to be there:
         // taken inside a pattern that then fails to match, it would be
         // dropped with the match, and the target left over it would draw
@@ -2293,6 +2470,80 @@ mod tests {
         state.views_made = Instant::now() - VIEWS_EVERY;
         state.publish_views();
         assert_eq!(state.published.lock().unwrap().views.revision, 1, "and wait again once the list is gone");
+    }
+
+    #[test]
+    fn a_dial_that_failed_is_made_again_unless_it_would_fail_again() {
+        let mut state = state();
+        state.redialing = true;
+        state.ssh = Some(SshParams {
+            request_id: String::new(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: crate::ssh::Auth::Password(String::new()),
+            known_host: Some("SHA256:old".into()),
+            remote_command: String::new(),
+            keepalive_secs: 0,
+            jump: None,
+        });
+        state.conn = Conn::Disconnected("connection refused".into());
+        assert!(state.dial_failed("ssh transport: Connection refused (os error 111)"));
+        assert!(state.redial_at.is_some(), "a host not there yet is dialled again");
+        // Still on its way, so the app keeps it up and the background
+        // takes it as a dial.
+        assert_eq!(state.status, "connecting to u@h:22");
+        // The same failure told again (the link closed too) counts once.
+        assert!(state.dial_failed("disconnected: the link closed"));
+        assert_eq!((state.redial_tries, state.redial_wait), (1, REDIAL_FIRST * 2));
+        for _ in 0..10 {
+            state.redial_at = None;
+            state.dial_failed("timed out");
+        }
+        assert_eq!(state.redial_wait, REDIAL_MOST, "the wait stops growing");
+
+        // Tried enough: until the phone comes back, or a tap.
+        state.redial_at = None;
+        state.redial_tries = REDIAL_TRIES;
+        assert!(!state.dial_failed("timed out"));
+        assert!(state.redial_at.is_none());
+        state.handle(Cmd::CheckConnection);
+        assert!(state.redial_at.is_some() && state.redial_tries == 0, "back to the app: at once");
+
+        // A login refused fails the same way again: a tap, not a wait, and
+        // not the network coming back either.
+        state.redial_at = None;
+        assert!(!state.dial_failed("ssh: the host refused the login for user"));
+        assert!(state.redial_at.is_none() && state.redial_lasting);
+        state.handle(Cmd::CheckConnection);
+        assert!(state.redial_at.is_none(), "what fails again is not made again");
+
+        // The auto-reconnect setting turned off: no wait for a dial.
+        state.redial_lasting = false;
+        assert!(state.dial_failed("timed out"));
+        state.handle(Cmd::SetSetting {
+            key: "auto-reconnect".into(),
+            value: "false".into(),
+        });
+        assert!(!state.redialing && state.redial_at.is_none());
+        assert!(!state.dial_failed("timed out"), "off: it says failed");
+        // And on again: what failed is dialled at once.
+        state.handle(Cmd::SetSetting {
+            key: "auto-reconnect".into(),
+            value: "true".into(),
+        });
+        assert!(state.redialing && state.redial_at.is_some() && state.redial_tries == 0);
+        // A host key forgotten is forgotten for the next dial too.
+        state.handle(Cmd::ForgetHostKey);
+        assert_eq!(state.ssh.as_ref().unwrap().known_host, None);
+
+        // Disconnected when asked: nothing is dialled again by itself, and
+        // no login is kept.
+        state.handle(Cmd::Disconnect);
+        assert!(state.ssh.is_none());
+        assert!(state.redial_at.is_none() && !state.redialing);
+        assert!(!state.dial_failed("timed out"));
+        assert!(state.redial_at.is_none());
     }
 
     #[test]
