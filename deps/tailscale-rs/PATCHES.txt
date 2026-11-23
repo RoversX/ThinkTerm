@@ -13,6 +13,8 @@ version by Cargo.lock.
 Only thinkterm-tailnet-engine/src/node.rs calls the library; the rest of ThinkTerm goes
 through it: thinkterm-tailnet on a desktop or a server, thinkterm-mobile on a phone.
 
+merge-upstream.sh, beside this file, merges a new release into these copies (see Upgrading).
+
 Finding our changes
 -------------------
 Every change is marked with a comment starting "ThinkTerm (<group>)", one of the groups
@@ -288,18 +290,19 @@ Upgrading
    A crate upstream no longer publishes under its name (0.7.0 made ts_netstack_smoltcp_core
    the netcore module of ts_netstack_smoltcp) is moved by hand first: vendor the crate that
    holds it now, carry our changes over, and update [patch.crates-io].
-2. For each crate here, merge three ways, file by file: the base is upstream's old version,
-   ours is deps/tailscale-rs/<crate>, theirs is upstream's new version. With both versions
-   unpacked in /tmp as above:
+2. From the repository's root, merge three ways, file by file, for each crate here:
 
-       git merge-file deps/tailscale-rs/<crate>/src/<file> /tmp/<crate>-<old>/src/<file> \
-           /tmp/<crate>-<new>/src/<file>
+       deps/tailscale-rs/merge-upstream.sh <old> <new>
 
-   Changes that do not overlap merge by themselves; overlapping ones are left between
-   conflict markers. Copy files upstream added; move by hand our changes in a file upstream
-   removed or renamed. Cargo.toml merges the same way; check that no section the build group
-   removes came back. Then make every `target_os = "macos"` left in ts_netmon, new ones
-   included, `target_vendor = "apple"` (ios), and every README include a one-line doc (build).
+   The base is upstream's old version, ours is deps/tailscale-rs/<crate>, theirs is
+   upstream's new version; the script stops if a crate here is not at <old>. A file we did
+   not change takes upstream's new one; changes that do not overlap merge by themselves (git
+   merge-file), and overlapping ones are left between conflict markers; files upstream added
+   are copied in. What is left by hand is listed at the end: the conflicts, files we changed
+   that upstream removed or renamed, README includes to make one-line docs, and every
+   `target_os = "macos"` in ts_netmon, new ones included, to make `target_vendor = "apple"`
+   (ios). Cargo.toml is merged the same way; check that no section the build group removes
+   came back.
 3. Bump the version: the six entries under [patch.crates-io] in the root Cargo.toml and the
    two in thinkterm-tailnet-engine/Cargo.toml. The next cargo command (`cargo metadata
    --format-version 1 >/dev/null` will do) brings the other tailscale-rs crates in
