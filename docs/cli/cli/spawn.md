@@ -58,7 +58,7 @@ made the thread "fix the build" (thread-1795262878025-34ea9001) in the project "
 A thread is a row of the ThinkTerm sidebar (Space > project > thread), and its
 terminals live in a mux workspace that the thread names. A window in a
 workspace that no thread names still runs, but no sidebar shows it, which is
-why `--workspace` warns about one and refuses a `thinkterm:...` name. Two
+why `--workspace` warns about one and refuses a `thinkterm:...` name. These
 commands deal with threads directly:
 
 * `thinkterm cli thread list` - the threads of the projects that are not
@@ -70,6 +70,14 @@ commands deal with threads directly:
   workspace. It shows in the sidebar at once, and its terminal starts when it
   is first opened there or when `spawn --thread` opens it to put a program in
   it. The default project is the one of the current pane's thread.
+* `thinkterm cli thread rename THREAD --name NAME [--project PROJECT]` -
+  renames a thread, named by its id or its name, and prints the name it
+  took: a name another thread of its project has comes back numbered, as
+  the sidebar numbers them. A name is looked for in every project that is
+  not archived, or only in `--project`; when several threads have it they
+  are listed (Space, project, thread and id) and nothing is renamed. A name
+  that leaves the thread as it is changes nothing. `--json` prints the
+  thread's id, name, project and workspace.
 
 The threads are those of the server the command reaches. A mux server keeps
 its own: on a remote host, the ones every device connected to it shows. On

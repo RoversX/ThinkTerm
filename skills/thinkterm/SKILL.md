@@ -27,7 +27,8 @@ threads have the name, or only other projects' threads do, it lists them and
 starts nothing: name the one you mean by its id. `--workspace` alone makes no
 thread, and the sidebar shows no window in a workspace without one.
 `thinkterm cli thread list` shows the threads, and `thinkterm cli list` which
-thread each pane is in.
+thread each pane is in; `thinkterm cli thread rename THREAD --name NAME` renames
+one (by its id when several share the name).
 
 Some commands affect what the user or other agents are using, such as typing into a
 pane you did not open, closing panes or stopping the server; you may want to ask the

@@ -1,5 +1,5 @@
 //! `thinkterm cli thread`: the threads the sidebar shows, as the server that
-//! keeps them has them, and new ones made there.
+//! keeps them has them, new ones made there, and their names changed.
 //!
 //! A thread is a row of the server's ThinkTerm tree (Space -> Project ->
 //! Thread) that names a mux workspace. Windows in a workspace no thread
@@ -33,6 +33,13 @@ enum ThreadSubCommand {
     /// when `thinkterm cli spawn --thread` opens it to put a program in it.
     #[command(name = "create")]
     Create(CreateThread),
+
+    /// Rename a thread: the name the sidebar shows for it, on every device
+    /// that shows the server's threads. A name another thread of its project
+    /// has already comes back numbered, as the sidebar numbers them; the name
+    /// the thread took is printed.
+    #[command(name = "rename")]
+    Rename(RenameThread),
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -69,6 +76,27 @@ struct CreateThread {
     json: bool,
 }
 
+#[derive(Debug, Parser, Clone)]
+struct RenameThread {
+    /// The thread: its id, or its name in a project that is not archived. A
+    /// name several threads have is not taken for any of them: they are
+    /// listed, with their ids.
+    thread: String,
+
+    /// The thread's new name.
+    #[arg(long)]
+    name: String,
+
+    /// Look for the thread's name in this project alone: its name or its id.
+    #[arg(long)]
+    project: Option<String>,
+
+    /// Print the renamed thread as JSON (id, name, project and workspace)
+    /// rather than its name alone.
+    #[arg(long)]
+    json: bool,
+}
+
 impl ThreadCommand {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
         let server = thread_server(client).await?;
@@ -76,6 +104,7 @@ impl ThreadCommand {
         match self.sub {
             ThreadSubCommand::List(cmd) => cmd.run(&server, &tree),
             ThreadSubCommand::Create(cmd) => cmd.run(&server, &tree).await,
+            ThreadSubCommand::Rename(cmd) => cmd.run(&server, &tree).await,
         }
     }
 }
@@ -182,6 +211,107 @@ impl CreateThread {
             print_out(format!("{}\n", printable(&thread.id)).as_bytes())
         }
     }
+}
+
+impl RenameThread {
+    async fn run(&self, server: &ThreadServer, tree: &ThinkTermTree) -> anyhow::Result<()> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err(UsageError("a thread needs a name".to_string()).into());
+        }
+        let project = match &self.project {
+            Some(spec) => Some(find_project(tree, spec, caller_space(tree, &server.caller))?),
+            None => None,
+        };
+        let thread = thread_to_rename(tree, &self.thread, project)?;
+        // A name that leaves it as it is (its own, or one that is numbered
+        // back to it) is not sent, as the sidebar sends none: the server
+        // would mark the thread as just used, and a window closing or a
+        // Space opening would then go to it.
+        let renamed = if changes_its_name(tree, thread, name) {
+            rename_thread(&server.server, thread, name).await?
+        } else {
+            thread.clone()
+        };
+        if self.json {
+            #[derive(serde::Serialize)]
+            struct Renamed<'a> {
+                thread_id: &'a str,
+                name: &'a str,
+                project_id: &'a str,
+                workspace: String,
+            }
+            crate::cli::print_json(&Renamed {
+                thread_id: &renamed.id,
+                name: &renamed.name,
+                project_id: &renamed.project_id,
+                workspace: thread_workspace(&renamed),
+            })
+        } else {
+            print_out(format!("{}\n", printable(&renamed.name)).as_bytes())
+        }
+    }
+}
+
+/// The thread `spec` names for a rename: its id, or else its name, looked for
+/// in `project` alone or else in every live project -- not first in the
+/// caller's own, so that a name several threads have is never taken for one
+/// of them, and the thread renamed is never a guess.
+fn thread_to_rename<'a>(
+    tree: &'a ThinkTermTree,
+    spec: &str,
+    project: Option<&'a TtProject>,
+) -> anyhow::Result<&'a TtThread> {
+    let scope = project.map_or(Scope::Anywhere, Scope::Given);
+    find_thread(tree, spec, scope)?.ok_or_else(|| no_thread(spec, scope))
+}
+
+/// Whether naming `thread` `name` changes its name, by the server's own rule
+/// (`apply_op`): a name another thread of its project has is numbered, and
+/// may be numbered back to the one it has.
+fn changes_its_name(tree: &ThinkTermTree, thread: &TtThread, name: &str) -> bool {
+    let mut after = tree.clone();
+    // With the stamp it has, only its name can change.
+    codec::apply_op(&mut after, &rename_op(&thread.id, name, thread.last_active_at))
+}
+
+/// That no thread is `spec`, where it was looked for.
+fn no_thread(spec: &str, scope: Scope) -> anyhow::Error {
+    let place = match scope.project() {
+        Some(project) => format!(" in the project {}", quoted(&project.name)),
+        None => String::new(),
+    };
+    NoSuchTarget(format!(
+        "there is no thread {}{place}; `thinkterm cli thread list` shows them",
+        quoted(spec.trim())
+    ))
+    .into()
+}
+
+/// The op that names `thread_id` `name`: renaming touches the thread, as it
+/// does in the sidebar.
+fn rename_op(thread_id: &str, name: &str, now: i64) -> TreeOp {
+    TreeOp::RenameThread {
+        thread_id: thread_id.to_string(),
+        name: name.to_string(),
+        last_active_at: now,
+    }
+}
+
+/// Rename `thread` on `server` to `name`, and return it as the server took
+/// it: a name another thread of its project has comes back numbered.
+async fn rename_thread(server: &Client, thread: &TtThread, name: &str) -> anyhow::Result<TtThread> {
+    let op = rename_op(&thread.id, name, chrono::Utc::now().timestamp());
+    let state = server
+        .mutate_thinkterm_tree(MutateThinkTermTree { ops: vec![op] })
+        .await
+        .context("renaming the thread")?;
+    state.tree.thread(&thread.id).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the server did not rename the thread: {} may have been removed meanwhile",
+            quoted(&thread.name)
+        )
+    })
 }
 
 /// `bytes` on stdout; a reader that went away ends the command quietly
@@ -1268,6 +1398,74 @@ mod test {
         let text = shared.to_string();
         assert!(!text.contains('\u{1b}'), "{:?}", text);
         assert!(text.contains("thread-\\u{1b}[2J"), "{:?}", text);
+    }
+
+    #[test]
+    fn a_rename_takes_a_name_its_project_has_numbered_and_sends_none_that_changes_nothing() {
+        let mut tree = tree();
+        for (id, name) in [("thread-5", "review"), ("thread-6", "review 2")] {
+            assert!(codec::apply_op(
+                &mut tree,
+                &TreeOp::CreateThread {
+                    thread_id: id.into(),
+                    project_id: "project-1".into(),
+                    name: name.into(),
+                    workspace: None,
+                    created_at: 5,
+                }
+            ));
+        }
+        let agent = tree.thread("thread-1").unwrap().clone();
+        assert!(!changes_its_name(&tree, &agent, "agent"));
+        assert!(!changes_its_name(&tree, &agent, " agent "));
+        assert!(changes_its_name(&tree, &agent, "fix"));
+        // "review 2" asked to be "review", which its project has: numbered
+        // back to the name it has, so nothing is sent.
+        let second = tree.thread("thread-6").unwrap().clone();
+        assert!(!changes_its_name(&tree, &second, "review"));
+
+        assert!(codec::apply_op(&mut tree, &rename_op("thread-1", " fix ", 7)));
+        let renamed = tree.thread("thread-1").unwrap();
+        assert_eq!((renamed.name.as_str(), renamed.last_active_at), ("fix", 7));
+        // Another thread of its project has the name: the server numbers it.
+        assert!(codec::apply_op(&mut tree, &rename_op("thread-1", "review", 8)));
+        assert_eq!(tree.thread("thread-1").unwrap().name, "review 3");
+        // Only another project's thread has it: taken as is.
+        assert!(codec::apply_op(&mut tree, &rename_op("thread-2", "review", 9)));
+        assert_eq!(tree.thread("thread-2").unwrap().name, "review");
+    }
+
+    #[test]
+    fn the_thread_renamed_is_never_a_guess() {
+        let tree = tree();
+        let home = tree.project("project-2").unwrap();
+        // "agent" is in two projects: listed, with their ids, and neither
+        // taken -- not even the one of a project given elsewhere.
+        let shared = thread_to_rename(&tree, "agent", None).unwrap_err();
+        assert!(shared.downcast_ref::<NoSuchTarget>().is_some(), "{:#}", shared);
+        let text = shared.to_string();
+        for part in ["thread-1", "thread-2", "--project"] {
+            assert!(text.contains(part), "{} in {}", part, text);
+        }
+        assert_eq!(thread_to_rename(&tree, "agent", Some(home)).unwrap().id, "thread-2");
+        // A name only one thread has, in whatever project.
+        assert_eq!(thread_to_rename(&tree, "solo", None).unwrap().id, "thread-4");
+        // An id names its thread, but not in another project than the one given.
+        assert_eq!(thread_to_rename(&tree, "thread-1", None).unwrap().name, "agent");
+        let elsewhere = thread_to_rename(&tree, "thread-1", Some(home)).unwrap_err();
+        assert!(elsewhere.downcast_ref::<UsageError>().is_some(), "{:#}", elsewhere);
+        // None of the name: said, and where it was looked for.
+        let missing = thread_to_rename(&tree, " nope ", Some(home)).unwrap_err();
+        assert!(missing.downcast_ref::<NoSuchTarget>().is_some(), "{:#}", missing);
+        let text = missing.to_string();
+        assert!(text.contains("\"nope\" in the project \"Home\""), "{}", text);
+        let anywhere = thread_to_rename(&tree, "nope", None).unwrap_err().to_string();
+        assert!(!anywhere.contains("in the project"), "{}", anywhere);
+        // An archived project's threads are not renamed: by name they are
+        // not found, by id their project is said to be archived.
+        assert!(thread_to_rename(&tree, "kept", None).is_err());
+        let archived = thread_to_rename(&tree, "thread-3", None).unwrap_err();
+        assert!(archived.to_string().contains("archived"), "{:#}", archived);
     }
 
     #[test]
