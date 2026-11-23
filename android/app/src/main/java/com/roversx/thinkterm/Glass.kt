@@ -66,7 +66,8 @@ fun Modifier.glass(backdrop: Backdrop?, dark: Boolean, shape: CornerBasedShape, 
 /// list that scrolls under it, which must not hold the bar itself.
 /// `solid`, from the screen's edge, stays as the edge is: for a bar whose
 /// words reach far into it (two lines), which nothing may read through.
-fun Modifier.progressiveBlur(backdrop: Backdrop, ground: Color, top: Boolean, solid: Dp = 0.dp): Modifier = drawPlainBackdrop(
+/// `cover`: how much of the ground is over what passes, at the edge.
+fun Modifier.progressiveBlur(backdrop: Backdrop, ground: Color, top: Boolean, solid: Dp = 0.dp, cover: Float = 0.8f): Modifier = drawPlainBackdrop(
     backdrop = backdrop,
     shape = { RectangleShape },
     effects = {
@@ -75,6 +76,7 @@ fun Modifier.progressiveBlur(backdrop: Backdrop, ground: Color, top: Boolean, so
             setFloatUniform("size", size.width, size.height)
             setFloatUniform("solid", solid.toPx().coerceAtMost(size.height - 1f).coerceAtLeast(0f))
             setColorUniform("tint", ground.toArgb())
+            setFloatUniform("cover", cover)
         }
         effect(RenderEffect.createRuntimeShaderEffect(shader, "content"))
     },
@@ -87,13 +89,14 @@ private fun softEdge(top: Boolean): String = """
 uniform shader content;
 uniform float2 size;
 uniform float solid;
+uniform float cover;
 layout(color) uniform half4 tint;
 
 half4 main(float2 coord) {
     float d = ${if (top) "coord.y" else "size.y - coord.y"};
     float t = clamp((d - solid) / (size.y - solid), 0.0, 1.0);
     float blurAlpha = 1.0 - smoothstep(0.5, 1.0, t);
-    float tintAlpha = (1.0 - smoothstep(0.0, 0.85, t)) * 0.8;
+    float tintAlpha = (1.0 - smoothstep(0.0, 0.85, t)) * cover;
     half4 blurred = content.eval(coord) * blurAlpha;
     return mix(blurred, tint * blurAlpha, tintAlpha);
 }"""

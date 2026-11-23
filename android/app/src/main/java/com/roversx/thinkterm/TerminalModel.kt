@@ -1019,6 +1019,10 @@ class TerminalModel(
         core.chatSend(text, ready.map { ChatAttachment(it.name, it.image, it.path!!) })
     }
 
+    /// A command picked from the field's list, sent as typed: the files
+    /// picked wait for what is said next.
+    fun chatCommand(text: String) = core.chatSend(text, emptyList())
+
     fun chatSetModel(model: String, effort: String?) = core.chatSetModel(model, effort)
     fun chatAnswer(ask: String, choice: String) = core.chatAnswer(ask, choice)
     fun chatInterrupt() = core.chatInterrupt()

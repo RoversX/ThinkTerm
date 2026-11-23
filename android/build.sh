@@ -79,7 +79,7 @@ for name in app-window archive bot check hand laptop-minimal monitor-smartphone 
   folder-open globe grid-2x2 key-round keyboard layers link-2 paperclip plus rotate-ccw search server \
   settings square-pen x cloud laptop hard-drive monitor cpu package square-terminal power \
   palette panels-top-left wifi info stethoscope git-branch scale arrow-up-right \
-  message-circle arrow-up lightbulb file-text terminal pencil wrench image; do
+  message-circle arrow-up lightbulb file-text terminal pencil wrench image square-slash sparkles arrow-down; do
   [ -f "third_party/lucide/icons/$name.svg" ] && cp "third_party/lucide/icons/$name.svg" android/app/src/main/assets/lucide/
 done
 # The desktop's own "new project", which is not one of Lucide's.

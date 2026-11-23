@@ -2,12 +2,24 @@ package com.roversx.thinkterm
 
 import android.graphics.BitmapFactory
 import android.util.Base64
+import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -46,16 +58,21 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -63,6 +80,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -70,22 +88,35 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
@@ -96,7 +127,9 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -104,6 +137,7 @@ import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
@@ -136,7 +170,38 @@ data class ChatView(
     val canAttach: Boolean,
     /// The model in use and the others; null when the agent does not say.
     val model: ChatModelMenu?,
+    /// What a `/` (or `$`) typed in the field offers.
+    val commands: List<ChatCommand>,
+    /// How full the model's context is: the ring in the bar and its sheet;
+    /// null when the agent does not say.
+    val context: ChatContext?,
 )
+
+/// How full the context is (`fill` 0 to 1, null while not known; `level`
+/// "ok", "high" or "full"), what fills it, and the session's totals.
+data class ChatContext(
+    val fill: Float?,
+    val level: String,
+    val percent: String,
+    val heading: String,
+    val amount: String,
+    val parts: List<ChatContextPart>,
+    val breakdown: String,
+    val compactsAt: String?,
+    val note: String?,
+    val totalsHeading: String,
+    val totals: List<Pair<String, String>>,
+    val compact: String?,
+)
+
+/// One part of the context: what it is ("system", "user", ... "free"),
+/// as said, how much, and its share of the window.
+data class ChatContextPart(val kind: String, val label: String, val amount: String, val share: Float, val percent: String)
+
+/// A command the field offers: as typed (`/compact`), what it does, what
+/// may follow it (a pick then puts it in the field rather than run it),
+/// and `here` for one the app does itself ("model": the model menu).
+data class ChatCommand(val name: String, val description: String, val args: String?, val here: String?)
 
 /// The model button: what it says, and what it opens on -- the models,
 /// each opening on how hard it can think.
@@ -212,6 +277,9 @@ sealed class MdBlock {
     data class Quote(val spans: List<MdSpan>) : MdBlock()
     data class Code(val lang: String, val text: String) : MdBlock()
     object Rule : MdBlock()
+    /// How each column lines up ("left", "center", "right", "none"), the
+    /// header's cells, then the rows'.
+    data class Table(val align: List<String>, val head: List<List<MdSpan>>, val rows: List<List<List<MdSpan>>>) : MdBlock()
 }
 
 data class MdSpan(val text: String, val bold: Boolean, val italic: Boolean, val code: Boolean, val strike: Boolean, val link: String?)
@@ -293,6 +361,27 @@ object ChatViews {
                     effortsHeading = m.optString("efforts_heading"),
                 )
             },
+            commands = o.optJSONArray("commands").objects().map {
+                ChatCommand(it.optString("name"), it.optString("description"), it.optStringOrNull("args"), it.optStringOrNull("here"))
+            },
+            context = o.optJSONObject("context")?.let { c ->
+                ChatContext(
+                    fill = if (c.has("fill") && !c.isNull("fill")) c.optDouble("fill").toFloat() else null,
+                    level = c.optString("level"),
+                    percent = c.optString("percent"),
+                    heading = c.optString("heading"),
+                    amount = c.optString("amount"),
+                    parts = c.optJSONArray("parts").objects().map {
+                        ChatContextPart(it.optString("kind"), it.optString("label"), it.optString("amount"), it.optDouble("share").toFloat(), it.optString("percent"))
+                    },
+                    breakdown = c.optString("breakdown"),
+                    compactsAt = c.optStringOrNull("compacts_at"),
+                    note = c.optStringOrNull("note"),
+                    totalsHeading = c.optString("totals_heading"),
+                    totals = c.optJSONArray("totals").objects().map { it.optString("label") to it.optString("value") },
+                    compact = c.optStringOrNull("compact"),
+                )
+            },
         )
     }.getOrNull()
 
@@ -354,9 +443,17 @@ object ChatViews {
             "quote" -> MdBlock.Quote(spans())
             "code" -> MdBlock.Code(b.optString("lang"), b.optString("text"))
             "rule" -> MdBlock.Rule
+            "table" -> MdBlock.Table(
+                align = b.optJSONArray("align").strings(),
+                head = cells(b.optJSONArray("head")),
+                rows = (0 until (b.optJSONArray("rows")?.length() ?: 0)).map { cells(b.optJSONArray("rows")?.optJSONArray(it)) },
+            )
             else -> null
         }
     }
+
+    private fun cells(array: JSONArray?): List<List<MdSpan>> =
+        if (array == null) emptyList() else (0 until array.length()).map { spans(array.optJSONArray(it)) }
 
     private fun spans(array: JSONArray?): List<MdSpan> = array.objects().map {
         MdSpan(
@@ -387,6 +484,10 @@ object ChatViews {
 
 // MARK: the page
 
+/// Further into the last row than any row is tall: a scroll to it ends at
+/// the end of the list.
+private const val TO_THE_END = 1 shl 20
+
 private val Working = Color(0xFF34C759)
 private val Waiting = Color(0xFFFF9F0A)
 private val Resting = Color(0xFF8E8E93)
@@ -410,8 +511,11 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
     var footPx by remember { mutableIntStateOf(0) }
     // The bar's row (back, and whom the chat is with), as tall as the
     // system's text size makes it.
-    var barRow by remember { mutableIntStateOf(with(density) { 42.dp.roundToPx() }) }
+    var barRow by remember { mutableIntStateOf(with(density) { 38.dp.roundToPx() }) }
     val list = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    // The context's sheet, risen from the bottom.
+    var showContext by remember(target.pane) { mutableStateOf(false) }
     BackHandler { onBack() }
 
     // Opened at the end, and kept there while the person reads the end:
@@ -446,7 +550,9 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
         opened = true
         if (atEnd && last != null) {
             follow = false
-            list.scrollToItem(before + rows.size - 1 + (if (chat?.busy != null) 1 else 0))
+            // To the end of the last row, however much taller than the
+            // screen it is: the list stops where its content does.
+            list.scrollToItem(before + rows.size - 1 + (if (chat?.busy != null) 1 else 0), TO_THE_END)
         }
     }
 
@@ -508,9 +614,37 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                     }
                 }
             }
-            items(rows, key = { it.id }) { row -> ChatRowView(row, model, dark) }
+            // Nothing said yet: whom the chat is with, where the words will be.
+            if (chat != null && rows.isEmpty() && chat.state != "connecting" && chat.problem == null && !chat.more) {
+                item(key = "tt:empty") {
+                    Column(
+                        Modifier.fillParentMaxWidth().fillParentMaxHeight(0.5f).animateItem(fadeInSpec = tween(300), fadeOutSpec = null),
+                        verticalArrangement = Arrangement.Bottom,
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Box(
+                            Modifier.size(52.dp).clip(CircleShape).background(chrome.ink.copy(alpha = 0.06f)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            DesktopIcon("message-circle", size = 24.dp, tint = secondary)
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Text(chat.agent.ifEmpty { target.agent }, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = chrome.ink)
+                        Text(target.place, fontSize = 13.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+            // Rows come in fading, and move aside smoothly; one that goes is
+            // gone at once (a fading one was left behind on screen).
+            items(rows, key = { it.id }) { row ->
+                Box(Modifier.animateItem(fadeInSpec = tween(260), placementSpec = spring(stiffness = Spring.StiffnessMediumLow), fadeOutSpec = null)) {
+                    ChatRowView(row, model, dark)
+                }
+            }
             chat?.busy?.let { busy ->
-                item(key = "tt:busy") { Busy(busy, chat.since, secondary) }
+                item(key = "tt:busy") {
+                    Box(Modifier.animateItem(fadeInSpec = tween(220), fadeOutSpec = null)) { Busy(busy, chat.since, secondary) }
+                }
             }
         }
 
@@ -521,22 +655,29 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
         Box(
             Modifier
                 .fillMaxWidth()
-                .progressiveBlur(backdrop, ground, top = true, solid = bars.calculateTopPadding() + 6.dp + with(density) { barRow.toDp() })
-                .padding(start = 10.dp, end = 10.dp, top = 6.dp + bars.calculateTopPadding(), bottom = 18.dp),
+                // Nearly all ground under its words: no line passing under
+                // them reads as a smudge beside them.
+                .progressiveBlur(backdrop, ground, top = true, solid = bars.calculateTopPadding() + 6.dp + with(density) { barRow.toDp() }, cover = 0.94f)
+                .padding(start = 12.dp, end = 12.dp, top = 6.dp + bars.calculateTopPadding(), bottom = 18.dp),
         ) {
             Row(
                 Modifier.onSizeChanged { barRow = it.height },
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                val back = tr("back")
                 Box(
-                    Modifier.size(42.dp).glass(backdrop, dark, CircleShape).clickable(onClick = onBack),
+                    Modifier
+                        .size(38.dp)
+                        .glass(backdrop, dark, CircleShape)
+                        .clickable(role = Role.Button, onClick = onBack)
+                        .semantics { contentDescription = back },
                     contentAlignment = Alignment.Center,
                 ) {
-                    DesktopIcon("chevron-left", size = 22.dp, tint = chrome.ink)
+                    DesktopIcon("chevron-left", size = 20.dp, tint = chrome.ink)
                 }
-                Column(Modifier.weight(1f)) {
-                    Text(target.place, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = chrome.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    Text(target.place, fontSize = 16.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold, color = chrome.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         val dot = when (chat?.state) {
                             "working" -> Working
@@ -546,22 +687,62 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                         Box(Modifier.size(7.dp).clip(CircleShape).background(dot))
                         val who = chat?.agent?.takeIf { it.isNotEmpty() } ?: target.agent
                         val said = listOfNotNull(who, chat?.stateLabel?.takeIf { it.isNotEmpty() }, chat?.title?.takeIf { it.isNotEmpty() })
-                        Text(said.joinToString(" · "), fontSize = 12.5.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(said.joinToString(" · "), fontSize = 12.5.sp, lineHeight = 16.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
-                chat?.model?.let { ModelButton(it, model, backdrop, dark) }
+                chat?.context?.let { context -> ContextRing(context, backdrop, dark) { showContext = true } }
+            }
+        }
+
+        // Scrolled up to read: a way back down to what comes now.
+        Box(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .imePadding()
+                .navigationBarsPadding()
+                .padding(bottom = with(density) { footPx.toDp() } + 10.dp),
+        ) {
+            val down = tr("chat.latest")
+            AnimatedVisibility(
+                visible = rows.isNotEmpty() && list.canScrollForward,
+                enter = fadeIn(tween(160)) + scaleIn(tween(160), initialScale = 0.8f),
+                exit = fadeOut(tween(120)) + scaleOut(tween(120), targetScale = 0.8f),
+            ) {
+                Box(
+                    Modifier
+                        .size(38.dp)
+                        .glass(backdrop, dark, CircleShape)
+                        .clickable(role = Role.Button) {
+                            scope.launch { list.animateScrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END) }
+                        }
+                        .semantics { contentDescription = down },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    DesktopIcon("arrow-down", size = 18.dp, tint = chrome.ink)
+                }
+            }
+        }
+
+        val context = chat?.context
+        if (showContext && context != null) {
+            ContextSheet(context, dark, onDismiss = { showContext = false }) {
+                showContext = false
+                model.chatCommand("/compact")
             }
         }
 
         // What it asks, or what is wrong, over the field to answer in.
+        // What scrolls under them blurs and fades into the ground toward
+        // the screen's edge, as under iOS's bars: never read through them.
         Column(
             Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
+                .progressiveBlur(backdrop, ground, top = false, cover = 0.94f)
                 .imePadding()
                 .navigationBarsPadding()
                 .onSizeChanged { footPx = it.height }
-                .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
+                .padding(start = 10.dp, end = 10.dp, top = 14.dp, bottom = 8.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             // A chat's notices are numbered from one again: the count of
@@ -589,8 +770,8 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean) {
                 SelectionContainer {
                     Text(
                         row.text,
-                        fontSize = 15.sp,
-                        lineHeight = 22.sp,
+                        fontSize = 16.sp,
+                        lineHeight = 23.sp,
                         color = ink,
                         modifier = Modifier
                             .widthIn(max = 320.dp)
@@ -601,7 +782,8 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean) {
                 }
             }
         }
-        is ChatRow.Text -> SelectionContainer { MdBlocks(row.blocks, ink, dark) }
+        // Grows smoothly as more of what it says comes.
+        is ChatRow.Text -> SelectionContainer(Modifier.animateContentSize(tween(180))) { MdBlocks(row.blocks, ink, dark) }
         is ChatRow.Fold -> FoldView(row, model, dark, secondary)
         is ChatRow.Group -> GroupView(row, model, dark, secondary)
         is ChatRow.Note -> Text(
@@ -768,43 +950,130 @@ private fun FoldBodyView(body: FoldBody, dark: Boolean, secondary: Color) {
 fun MdBlocks(blocks: List<MdBlock>, color: Color, dark: Boolean) {
     val mono = monoFamily()
     val codeGround = if (dark) Color(0xFF17181B) else Color(0xFFF2F2F5)
-    val inlineGround = if (dark) Color(0x24FFFFFF) else Color(0x14000000)
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        for (block in blocks) {
+    val inlineGround = if (dark) Color(0x1CFFFFFF) else Color(0x10000000)
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        for ((at, block) in blocks.withIndex()) {
             when (block) {
-                is MdBlock.Para -> Text(spans(block.spans, mono, inlineGround), fontSize = 15.sp, lineHeight = 23.sp, color = color)
+                is MdBlock.Para -> Text(spans(block.spans, mono, inlineGround), fontSize = 16.sp, lineHeight = 24.sp, color = color)
                 is MdBlock.Heading -> Text(
                     spans(block.spans, mono, inlineGround),
-                    fontSize = when (block.level) { 1 -> 20.sp; 2 -> 18.sp; else -> 16.sp },
-                    lineHeight = 26.sp,
+                    fontSize = when (block.level) { 1 -> 20.sp; 2 -> 18.sp; else -> 16.5.sp },
+                    lineHeight = when (block.level) { 1 -> 27.sp; 2 -> 25.sp; else -> 23.sp },
                     fontWeight = FontWeight.SemiBold,
                     color = color,
+                    modifier = Modifier.padding(top = if (at > 0 && block.level <= 2) 6.dp else 0.dp),
                 )
-                is MdBlock.Item -> Row(Modifier.padding(start = (block.depth * 16).dp)) {
-                    Text(block.mark, fontSize = 15.sp, lineHeight = 23.sp, color = color.copy(alpha = 0.7f), modifier = Modifier.width(22.dp))
-                    Text(spans(block.spans, mono, inlineGround), fontSize = 15.sp, lineHeight = 23.sp, color = color)
+                is MdBlock.Item -> Row(Modifier.padding(start = (block.depth * 18).dp)) {
+                    Text(block.mark, fontSize = 16.sp, lineHeight = 24.sp, color = color.copy(alpha = 0.55f), modifier = Modifier.width(22.dp))
+                    Text(spans(block.spans, mono, inlineGround), fontSize = 16.sp, lineHeight = 24.sp, color = color)
                 }
                 is MdBlock.Quote -> Row(Modifier.height(IntrinsicSize.Min)) {
-                    Box(Modifier.width(3.dp).fillMaxHeight().clip(CircleShape).background(color.copy(alpha = 0.3f)))
+                    Box(Modifier.width(3.dp).fillMaxHeight().clip(CircleShape).background(color.copy(alpha = 0.25f)))
                     Text(
                         spans(block.spans, mono, inlineGround),
-                        fontSize = 15.sp,
-                        lineHeight = 23.sp,
-                        color = color.copy(alpha = 0.75f),
-                        modifier = Modifier.padding(start = 10.dp),
+                        fontSize = 16.sp,
+                        lineHeight = 24.sp,
+                        color = color.copy(alpha = 0.72f),
+                        modifier = Modifier.padding(start = 12.dp),
                     )
                 }
-                is MdBlock.Code -> Box(
+                is MdBlock.Code -> Column(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
-                        .background(codeGround)
-                        .horizontalScroll(rememberScrollState())
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                        .background(codeGround),
                 ) {
-                    Text(block.text, fontFamily = mono, fontSize = 13.sp, lineHeight = 19.sp, color = color, softWrap = false)
+                    if (block.lang.isNotBlank()) {
+                        Text(
+                            block.lang,
+                            fontSize = 11.5.sp,
+                            color = color.copy(alpha = 0.5f),
+                            modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp),
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(start = 12.dp, end = 12.dp, top = if (block.lang.isNotBlank()) 4.dp else 10.dp, bottom = 10.dp),
+                    ) {
+                        Text(block.text, fontFamily = mono, fontSize = 13.sp, lineHeight = 19.sp, color = color, softWrap = false)
+                    }
                 }
                 MdBlock.Rule -> Box(Modifier.fillMaxWidth().height(1.dp).background(color.copy(alpha = 0.15f)))
+                is MdBlock.Table -> MdTable(block, color, mono, inlineGround)
+            }
+        }
+    }
+}
+
+/// A table as a phone shows one: the header bold, a thin line under each
+/// row, each column as wide as its widest cell (a longer one wraps), the
+/// whole sliding sideways when wider than the screen.
+@Composable
+private fun MdTable(table: MdBlock.Table, color: Color, mono: FontFamily, inlineGround: Color) {
+    val columns = maxOf(table.head.size, table.rows.maxOfOrNull { it.size } ?: 0)
+    if (columns == 0) return
+    val all = listOf(table.head) + table.rows
+    val widest = with(LocalDensity.current) { 240.dp.roundToPx() }
+    val thin = with(LocalDensity.current) { 0.5.dp.toPx() }
+    val thick = with(LocalDensity.current) { 1.dp.toPx() }
+    Box(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+        Layout(
+            content = {
+                for ((r, row) in all.withIndex()) {
+                    for (c in 0 until columns) {
+                        val lines = when (table.align.getOrNull(c)) {
+                            "center" -> TextAlign.Center
+                            "right" -> TextAlign.End
+                            else -> TextAlign.Start
+                        }
+                        val last = r == all.size - 1
+                        Text(
+                            spans(row.getOrNull(c).orEmpty(), mono, inlineGround),
+                            fontSize = 14.5.sp,
+                            lineHeight = 21.sp,
+                            fontWeight = if (r == 0) FontWeight.SemiBold else null,
+                            textAlign = lines,
+                            color = color,
+                            modifier = Modifier
+                                .drawBehind {
+                                    if (!last) {
+                                        val w = if (r == 0) thick else thin
+                                        drawRect(
+                                            color.copy(alpha = if (r == 0) 0.22f else 0.1f),
+                                            topLeft = Offset(0f, size.height - w),
+                                            size = Size(size.width, w),
+                                        )
+                                    }
+                                }
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+            },
+        ) { cells, _ ->
+            // Each column as wide as its widest cell, up to `widest`; each
+            // row as tall as its tallest cell at those widths.
+            val widths = IntArray(columns)
+            cells.forEachIndexed { i, cell ->
+                widths[i % columns] = maxOf(widths[i % columns], minOf(cell.maxIntrinsicWidth(Constraints.Infinity), widest))
+            }
+            val heights = IntArray(all.size)
+            cells.forEachIndexed { i, cell ->
+                heights[i / columns] = maxOf(heights[i / columns], cell.minIntrinsicHeight(widths[i % columns]))
+            }
+            val placed = cells.mapIndexed { i, cell -> cell.measure(Constraints.fixed(widths[i % columns], heights[i / columns])) }
+            layout(widths.sum(), heights.sum()) {
+                var y = 0
+                for (r in all.indices) {
+                    var x = 0
+                    for (c in 0 until columns) {
+                        placed[r * columns + c].place(x, y)
+                        x += widths[c]
+                    }
+                    y += heights[r]
+                }
             }
         }
     }
@@ -816,6 +1085,9 @@ private fun spans(spans: List<MdSpan>, mono: FontFamily, inlineGround: Color): A
             fontWeight = if (span.bold) FontWeight.SemiBold else null,
             fontStyle = if (span.italic) FontStyle.Italic else null,
             fontFamily = if (span.code) mono else null,
+            // Code a little smaller than the words around it, as it reads
+            // larger in a fixed width.
+            fontSize = if (span.code) 0.88.em else TextUnit.Unspecified,
             background = if (span.code) inlineGround else Color.Unspecified,
             textDecoration = when {
                 span.strike -> TextDecoration.LineThrough
@@ -858,7 +1130,23 @@ private fun Busy(text: String, since: Long?, secondary: Color) {
         }
         val secs = since?.let { (now - it).coerceAtLeast(0) }
         val said = if (secs != null) "$text · ${tr("chat.secs", secs)}" else text
-        Text(said, fontSize = 13.5.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        // A light passes over the words, as long as it works.
+        val sweep by pulse.animateFloat(-0.4f, 1.4f, infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Restart), label = "sweep")
+        var wide by remember { mutableIntStateOf(1) }
+        val lit = LocalChrome.current.ink
+        val at = sweep * wide
+        val brush = Brush.horizontalGradient(
+            listOf(secondary, lit.copy(alpha = 0.95f), secondary),
+            startX = at - wide * 0.25f,
+            endX = at + wide * 0.25f,
+        )
+        Text(
+            said,
+            style = TextStyle(brush = brush, fontSize = 13.5.sp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.onSizeChanged { wide = it.width.coerceAtLeast(1) },
+        )
     }
 }
 
@@ -1001,70 +1289,439 @@ private fun ProblemCard(problem: ChatProblem, model: TerminalModel, backdrop: Ba
     }
 }
 
-/// The field to say something in, and the button beside it: send, or
-/// stop while the agent works and nothing is typed.
+/// What each part of the context is drawn in.
+private fun partColor(kind: String, ink: Color): Color = when (kind) {
+    "system" -> Color(0xFFAF52DE)
+    "tools" -> Color(0xFF5E5CE6)
+    "instructions" -> Color(0xFF64D2FF)
+    "user" -> Color(0xFF0A84FF)
+    "assistant" -> Color(0xFF30D158)
+    "thinking" -> Color(0xFFFF9F0A)
+    "tool_use" -> Color(0xFFFF375F)
+    "summary" -> Color(0xFFFFD60A)
+    "free" -> ink.copy(alpha = 0.1f)
+    else -> Color(0xFF8E8E93)
+}
+
+/// The ring's colour: the ink while there is room, amber nearly full,
+/// red full.
+private fun levelColor(level: String, ink: Color): Color = when (level) {
+    "full" -> Removed
+    "high" -> Waiting
+    else -> ink.copy(alpha = 0.85f)
+}
+
+/// How full the context is, in the bar: a ring in a glass circle. A tap
+/// raises what it is made of.
+@Composable
+private fun ContextRing(context: ChatContext, backdrop: Backdrop, dark: Boolean, onClick: () -> Unit) {
+    val ink = LocalChrome.current.ink
+    val fill by animateFloatAsState(context.fill ?: 0f, tween(500), label = "ring")
+    val color = levelColor(context.level, ink)
+    val label = "${context.heading}: ${context.percent}"
+    Box(
+        Modifier
+            .size(38.dp)
+            .glass(backdrop, dark, CircleShape)
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(20.dp)) {
+            val stroke = 2.6.dp.toPx()
+            val inset = stroke / 2
+            val arc = Size(size.width - stroke, size.height - stroke)
+            drawArc(ink.copy(alpha = 0.16f), 0f, 360f, false, Offset(inset, inset), arc, style = Stroke(stroke))
+            if (fill > 0f) {
+                drawArc(color, -90f, 360f * fill.coerceAtLeast(0.02f), false, Offset(inset, inset), arc, style = Stroke(stroke, cap = StrokeCap.Round))
+            }
+        }
+    }
+}
+
+/// How full the context is, risen from the bottom: a ring of its parts with
+/// how full in its middle, when it compacts by itself, what the session has
+/// used, and a way to compact now. Each part with how much opens on a tap
+/// (of the ring, or the row that says so).
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ContextSheet(context: ChatContext, dark: Boolean, onDismiss: () -> Unit, onCompact: () -> Unit) {
+    val ink = LocalChrome.current.ink
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
+    val state = rememberModalBottomSheetState()
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = state,
+        containerColor = if (dark) Color(0xFF1C1C1E) else Color(0xFFF2F2F7),
+        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            // The parts as one ring, each its share, how full in its middle.
+            var grown by remember { mutableStateOf(false) }
+            var open by remember { mutableStateOf(false) }
+            LaunchedEffect(Unit) { grown = true }
+            val sweep by animateFloatAsState(if (grown) 1f else 0f, tween(700), label = "parts")
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+                Box(
+                    Modifier
+                        .size(112.dp)
+                        .clip(CircleShape)
+                        .clickable(enabled = context.parts.isNotEmpty(), role = Role.Button) { open = !open },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        val stroke = 14.dp.toPx()
+                        val inset = stroke / 2
+                        val arc = Size(size.width - stroke, size.height - stroke)
+                        drawArc(ink.copy(alpha = 0.08f), 0f, 360f, false, Offset(inset, inset), arc, style = Stroke(stroke))
+                        var at = -90f
+                        for (part in context.parts) {
+                            if (part.kind == "free") continue
+                            val angle = 360f * part.share * sweep
+                            if (angle <= 0f) continue
+                            // A hair's gap between parts.
+                            drawArc(partColor(part.kind, ink), at, (angle - 1.2f).coerceAtLeast(0.6f), false, Offset(inset, inset), arc, style = Stroke(stroke, cap = StrokeCap.Butt))
+                            at += angle
+                        }
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(context.percent, fontSize = 24.sp, lineHeight = 28.sp, fontWeight = FontWeight.SemiBold, color = levelColor(context.level, ink))
+                    }
+                }
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(context.heading, fontSize = 20.sp, lineHeight = 25.sp, fontWeight = FontWeight.SemiBold, color = ink)
+                    Text(context.amount, fontSize = 14.sp, lineHeight = 19.sp, color = secondary)
+                    context.compactsAt?.let { Text(it, fontSize = 13.sp, lineHeight = 18.sp, color = secondary) }
+                }
+            }
+            if (context.parts.isNotEmpty()) {
+                val turn by animateFloatAsState(if (open) 90f else 0f, tween(200), label = "chevron")
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(ink.copy(alpha = if (dark) 0.06f else 0.04f))
+                        .animateContentSize(tween(220)),
+                ) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clickable(role = Role.Button) { open = !open }
+                            .padding(horizontal = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(context.breakdown, fontSize = 15.sp, color = ink, modifier = Modifier.weight(1f))
+                        DesktopIcon("chevron-right", size = 15.dp, tint = secondary, modifier = Modifier.graphicsLayer { rotationZ = turn })
+                    }
+                    if (open) for ((at, part) in context.parts.withIndex()) {
+                        Box(Modifier.padding(start = if (at > 0) 40.dp else 16.dp).fillMaxWidth().height(0.5.dp).background(ink.copy(alpha = 0.08f)))
+                        Row(
+                            Modifier.fillMaxWidth().heightIn(min = 44.dp).padding(horizontal = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Box(Modifier.size(10.dp).clip(CircleShape).background(partColor(part.kind, ink)))
+                            Text(part.label, fontSize = 15.sp, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            Text(part.amount, fontSize = 14.sp, color = secondary)
+                            Text(part.percent, fontSize = 14.sp, color = ink.copy(alpha = 0.8f), textAlign = TextAlign.End, modifier = Modifier.width(44.dp))
+                        }
+                    }
+                }
+            }
+            if (open) context.note?.let { Text(it, fontSize = 12.5.sp, lineHeight = 17.sp, color = secondary) }
+            if (context.totals.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(context.totalsHeading, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = secondary)
+                    for (pair in context.totals.chunked(2)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for ((label, value) in pair) {
+                                Column(
+                                    Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(ink.copy(alpha = if (dark) 0.06f else 0.04f))
+                                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                                ) {
+                                    Text(label, fontSize = 12.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(value, fontSize = 18.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold, color = ink)
+                                }
+                            }
+                            if (pair.size == 1) Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+            context.compact?.let { label ->
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                        .clip(RoundedCornerShape(25.dp))
+                        .background(ink.copy(alpha = if (dark) 0.1f else 0.07f))
+                        .clickable(role = Role.Button, onClick = onCompact),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(label, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = ink)
+                }
+            }
+        }
+    }
+}
+
+/// The field to say something in, in one card with what goes with it:
+/// the + for files and pictures, the model, and send -- or stop, while
+/// the agent works and nothing is typed. Over it, as a `/` is typed, the
+/// commands the agent takes.
 @Composable
 private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: TerminalModel, backdrop: Backdrop, dark: Boolean, onSend: () -> Unit) {
     val ink = LocalChrome.current.ink
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
-    var text by rememberSaveable(target.pane) { mutableStateOf("") }
+    val view = LocalView.current
+    var field by rememberSaveable(target.pane, stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
+    val text = field.text
     val files = model.chatFiles
     // What is picked goes when all of it is there.
     val waiting = files.any { it.path == null && it.error == null }
     val ready = files.any { it.path != null }
     val canSend = chat?.canSend == true && !waiting && (text.isNotBlank() || ready)
     val stop = chat?.canStop == true && text.isBlank() && files.isEmpty()
+    val offer = remember(chat?.commands, text) { offerFor(chat?.commands.orEmpty(), text) }
+    // What was offered stays on show while it goes.
+    var lastOffer by remember { mutableStateOf<Offer?>(null) }
+    if (offer != null) lastOffer = offer
+    val emptied = {
+        field = TextFieldValue("")
+        onSend()
+    }
+    val pick = { command: ChatCommand, from: Int ->
+        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        if (command.args == null && from == 0) {
+            // One that runs as it is goes now, as typed.
+            model.chatCommand(command.name)
+            emptied()
+        } else {
+            val next = text.substring(0, from) + command.name + " "
+            field = TextFieldValue(next, TextRange(next.length))
+        }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (files.isNotEmpty()) PickedFiles(files, model, dark)
-        Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (chat?.canAttach == true) AttachMenu(model, backdrop, dark)
+        AnimatedVisibility(
+            visible = offer != null,
+            enter = fadeIn(tween(180)) +
+                scaleIn(tween(180), initialScale = 0.96f, transformOrigin = TransformOrigin(0.5f, 1f)) +
+                slideInVertically(tween(180)) { it / 16 },
+            exit = fadeOut(tween(140)) + scaleOut(tween(140), targetScale = 0.98f, transformOrigin = TransformOrigin(0.5f, 1f)),
+        ) {
+            lastOffer?.let { shown ->
+                CommandPalette(
+                    shown.commands,
+                    chat?.model,
+                    model,
+                    backdrop,
+                    dark,
+                    onPick = { pick(it, shown.from) },
+                    onModelPicked = { field = TextFieldValue("") },
+                )
+            }
+        }
+        val shape = RoundedCornerShape(24.dp)
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .glass(backdrop, dark, shape, tint = cardTint(dark))
+                .border(0.5.dp, ink.copy(alpha = if (dark) 0.12f else 0.08f), shape)
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+        ) {
+            if (files.isNotEmpty()) {
+                Box(Modifier.padding(start = 8.dp, end = 8.dp, top = 8.dp)) { PickedFiles(files, model, dark) }
+            }
             BasicTextField(
-                value = text,
-                onValueChange = { text = it },
+                value = field,
+                onValueChange = { field = it },
                 textStyle = TextStyle(color = ink, fontSize = 16.sp, lineHeight = 22.sp),
                 cursorBrush = SolidColor(LeadBlue),
                 maxLines = 6,
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = 46.dp)
-                    .glass(backdrop, dark, RoundedCornerShape(23.dp))
-                    .padding(horizontal = 18.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 2.dp),
                 decorationBox = { inner ->
                     Box {
                         if (text.isEmpty()) {
-                            Text(chat?.placeholder.orEmpty(), fontSize = 16.sp, color = secondary.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(chat?.placeholder.orEmpty(), fontSize = 16.sp, lineHeight = 22.sp, color = secondary.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         inner()
                     }
                 },
             )
-            Box(
-                Modifier
-                    .size(46.dp)
-                    .clip(CircleShape)
-                    .background(
-                        when {
-                            stop -> ink
-                            canSend -> LeadBlue
-                            else -> ink.copy(alpha = 0.14f)
-                        }
-                    )
-                    .clickable(enabled = stop || canSend) {
-                        if (stop) {
-                            model.chatInterrupt()
-                        } else {
-                            model.chatSend(text.trim())
-                            text = ""
-                            onSend()
-                        }
-                    },
-                contentAlignment = Alignment.Center,
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (stop) {
-                    Box(Modifier.size(14.dp).clip(RoundedCornerShape(3.5.dp)).background(listBackdrop(dark)))
-                } else {
-                    DesktopIcon("arrow-up", size = 20.dp, tint = if (canSend) Color.White else secondary, modifier = Modifier.alpha(if (canSend) 1f else 0.6f))
+                if (chat?.canAttach == true) AttachMenu(model, dark)
+                // The model takes the room there is, send keeps to the end.
+                Box(Modifier.weight(1f)) {
+                    chat?.model?.let { ModelChip(it, model, dark) }
                 }
+                SendButton(stop, canSend, dark) {
+                    if (stop) {
+                        model.chatInterrupt()
+                    } else {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        model.chatSend(text.trim())
+                        emptied()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The field's card: glass, but enough of the ground in it that what
+/// passes under it never reads through the words typed.
+private fun cardTint(dark: Boolean) = if (dark) Color(0xFF1C1C1E).copy(alpha = 0.93f) else Color.White.copy(alpha = 0.94f)
+
+/// Send, or stop: the one round button at the field's end, small, with
+/// all of a finger's room around it.
+@Composable
+private fun SendButton(stop: Boolean, canSend: Boolean, dark: Boolean, onClick: () -> Unit) {
+    val ink = LocalChrome.current.ink
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
+    val fill by animateColorAsState(
+        when {
+            stop -> ink
+            canSend -> LeadBlue
+            else -> ink.copy(alpha = 0.10f)
+        },
+        tween(160),
+        label = "send",
+    )
+    val label = tr(if (stop) "chat.stop" else "chat.send")
+    Box(
+        Modifier
+            .minimumInteractiveComponentSize()
+            .size(34.dp)
+            .clip(CircleShape)
+            .background(fill)
+            .clickable(enabled = stop || canSend, role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        Crossfade(stop, animationSpec = tween(160), label = "send-icon") { stopping ->
+            if (stopping) {
+                Box(Modifier.size(11.dp).clip(RoundedCornerShape(2.5.dp)).background(listBackdrop(dark)))
+            } else {
+                DesktopIcon("arrow-up", size = 18.dp, tint = if (canSend) Color.White else secondary, modifier = Modifier.alpha(if (canSend) 1f else 0.55f))
+            }
+        }
+    }
+}
+
+/// The word being typed, when it calls up commands: `/` at the start of
+/// the field, or a `$` word (a skill) anywhere; and those it may be.
+private class Offer(val from: Int, val commands: List<ChatCommand>)
+
+private fun offerFor(commands: List<ChatCommand>, text: String): Offer? {
+    if (commands.isEmpty()) return null
+    val from = if (text.startsWith("/")) 0 else text.indexOfLast { it.isWhitespace() } + 1
+    val word = text.substring(from)
+    if (word.isEmpty() || word.any { it.isWhitespace() }) return null
+    val sign = word[0]
+    if (sign != '/' && sign != '$') return null
+    val typed = word.lowercase()
+    val signed = commands.filter { it.name.startsWith(sign) }
+    // Those it begins first, then those whose names hold it.
+    val first = signed.filter { it.name.lowercase().startsWith(typed) }
+    val rest = typed.drop(1)
+    val then = if (rest.isEmpty()) emptyList() else signed.filter { it !in first && it.name.lowercase().contains(rest) }
+    val all = first + then
+    return if (all.isEmpty()) null else Offer(from, all)
+}
+
+/// The commands the word typed may be, over the field: a tap runs one
+/// that runs as it is, or puts one in the field to be followed.
+@Composable
+private fun CommandPalette(
+    commands: List<ChatCommand>,
+    menu: ChatModelMenu?,
+    model: TerminalModel,
+    backdrop: Backdrop,
+    dark: Boolean,
+    onPick: (ChatCommand) -> Unit,
+    onModelPicked: () -> Unit,
+) {
+    val ink = LocalChrome.current.ink
+    val shape = RoundedCornerShape(22.dp)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .glass(backdrop, dark, shape, tint = cardTint(dark))
+            .border(0.5.dp, ink.copy(alpha = if (dark) 0.12f else 0.08f), shape)
+            .heightIn(max = 292.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(vertical = 6.dp),
+    ) {
+        for (command in commands) {
+            key(command.name) {
+                if (command.here == "model" && menu != null) {
+                    var open by remember { mutableStateOf(false) }
+                    var into by remember { mutableStateOf<String?>(null) }
+                    Box {
+                        CommandRow(command) { open = true }
+                        DropdownMenu(expanded = open, onDismissRequest = { open = false; into = null }) {
+                            ModelMenuItems(menu, model, into, onInto = { into = it }) {
+                                open = false
+                                into = null
+                                onModelPicked()
+                            }
+                        }
+                    }
+                } else {
+                    CommandRow(command) { onPick(command) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CommandRow(command: ChatCommand, onClick: () -> Unit) {
+    val ink = LocalChrome.current.ink
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(
+            Modifier.size(30.dp).clip(RoundedCornerShape(9.dp)).background(ink.copy(alpha = 0.07f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            val icon = when {
+                command.here == "model" -> "cpu"
+                command.name.startsWith("$") || command.name.startsWith("/skill:") -> "sparkles"
+                else -> "square-slash"
+            }
+            DesktopIcon(icon, size = 16.dp, tint = secondary)
+        }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(command.name, fontSize = 14.5.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                command.args?.takeIf { it.isNotBlank() }?.let {
+                    Text(it, fontSize = 13.sp, lineHeight = 19.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            if (command.description.isNotBlank()) {
+                Text(command.description, fontSize = 12.5.sp, lineHeight = 16.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -1073,7 +1730,7 @@ private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: 
 /// The + beside the field: a photo, a file, or the clipboard's picture,
 /// put on the host to go with what is said next.
 @Composable
-private fun AttachMenu(model: TerminalModel, backdrop: Backdrop, dark: Boolean) {
+private fun AttachMenu(model: TerminalModel, dark: Boolean) {
     val context = LocalContext.current
     val ink = LocalChrome.current.ink
     var menu by remember { mutableStateOf(false) }
@@ -1098,13 +1755,15 @@ private fun AttachMenu(model: TerminalModel, backdrop: Backdrop, dark: Boolean) 
     Box {
         Box(
             Modifier
-                .size(46.dp)
-                .glass(backdrop, dark, CircleShape)
+                .minimumInteractiveComponentSize()
+                .size(34.dp)
+                .clip(CircleShape)
+                .background(ink.copy(alpha = if (dark) 0.10f else 0.07f))
                 .clickable(role = Role.Button) { menu = true }
                 .semantics { contentDescription = label },
             contentAlignment = Alignment.Center,
         ) {
-            DesktopIcon("plus", size = 21.dp, tint = ink)
+            DesktopIcon("plus", size = 19.dp, tint = ink)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             // A phone with nothing to pick with says so rather than closing.
@@ -1295,78 +1954,90 @@ internal fun pictureOf(file: File, side: Int): ImageBitmap? {
     return BitmapFactory.decodeFile(file.path, options)?.asImageBitmap()
 }
 
-/// The model in use, by the chat's name. A tap opens on the models; one
-/// that can think more or less opens, as iOS's menus nest, on how hard.
+/// The model in use, in the field beside send. A tap opens on the
+/// models; one that can think more or less opens, as iOS's menus nest, on
+/// how hard.
 @Composable
-private fun ModelButton(menu: ChatModelMenu, model: TerminalModel, backdrop: Backdrop, dark: Boolean) {
+private fun ModelChip(menu: ChatModelMenu, model: TerminalModel, dark: Boolean, modifier: Modifier = Modifier) {
     val ink = LocalChrome.current.ink
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     var open by remember { mutableStateOf(false) }
     // The model whose efforts are on show; none, the models.
     var into by remember { mutableStateOf<String?>(null) }
     val label = tr("chat.model")
-    val close = {
-        open = false
-        into = null
-    }
-    Box {
+    Box(modifier) {
         Row(
             Modifier
-                .heightIn(min = 36.dp)
-                .widthIn(max = 170.dp)
-                .glass(backdrop, dark, RoundedCornerShape(18.dp))
+                .minimumInteractiveComponentSize()
+                .height(34.dp)
+                .widthIn(max = 220.dp)
+                .clip(CircleShape)
                 .clickable(role = Role.Button) { open = true }
                 .semantics { contentDescription = "$label: ${menu.label}" }
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Text(menu.label, fontSize = 13.sp, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-            DesktopIcon("chevron-down", size = 12.dp, tint = secondary)
+            Text(menu.label, fontSize = 13.5.sp, color = ink.copy(alpha = 0.8f), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+            DesktopIcon("chevron-down", size = 13.dp, tint = secondary)
         }
-        DropdownMenu(expanded = open, onDismissRequest = close) {
-            val opened = menu.models.firstOrNull { it.id == into }
-            val tick: @Composable (Boolean) -> Unit = { on ->
-                Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) {
-                    if (on) DesktopIcon("check", size = 15.dp, tint = LeadBlue)
-                }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false; into = null }) {
+            ModelMenuItems(menu, model, into, onInto = { into = it }) {
+                open = false
+                into = null
             }
-            if (opened == null) {
-                MenuHeading(menu.modelsHeading, secondary)
-                for (choice in menu.models) {
-                    DropdownMenuItem(
-                        text = { Text(choice.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                        leadingIcon = { tick(choice.current) },
-                        trailingIcon = { if (choice.efforts.isNotEmpty()) DesktopIcon("chevron-right", size = 14.dp, tint = secondary) },
-                        onClick = {
-                            if (choice.efforts.isNotEmpty()) {
-                                into = choice.id
-                            } else {
-                                close()
-                                if (!choice.current) model.chatSetModel(choice.id, null)
-                            }
-                        },
-                    )
-                }
-            } else {
-                DropdownMenuItem(
-                    text = { Text(opened.label, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    leadingIcon = { DesktopIcon("chevron-left", size = 15.dp, tint = secondary) },
-                    onClick = { into = null },
-                )
-                HorizontalDivider()
-                MenuHeading(menu.effortsHeading, secondary)
-                for (effort in opened.efforts) {
-                    DropdownMenuItem(
-                        text = { Text(effort.label) },
-                        leadingIcon = { tick(effort.current) },
-                        onClick = {
-                            close()
-                            if (!effort.current) model.chatSetModel(opened.id, effort.id)
-                        },
-                    )
-                }
-            }
+        }
+    }
+}
+
+/// The models, or one's efforts: the menu the model chip and `/model`
+/// open. `onDone` once one is picked.
+@Composable
+private fun ModelMenuItems(menu: ChatModelMenu, model: TerminalModel, into: String?, onInto: (String?) -> Unit, onDone: () -> Unit) {
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
+    val view = LocalView.current
+    val opened = menu.models.firstOrNull { it.id == into }
+    val tick: @Composable (Boolean) -> Unit = { on ->
+        Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) {
+            if (on) DesktopIcon("check", size = 15.dp, tint = LeadBlue)
+        }
+    }
+    if (opened == null) {
+        MenuHeading(menu.modelsHeading, secondary)
+        for (choice in menu.models) {
+            DropdownMenuItem(
+                text = { Text(choice.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                leadingIcon = { tick(choice.current) },
+                trailingIcon = { if (choice.efforts.isNotEmpty()) DesktopIcon("chevron-right", size = 14.dp, tint = secondary) },
+                onClick = {
+                    if (choice.efforts.isNotEmpty()) {
+                        onInto(choice.id)
+                    } else {
+                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        onDone()
+                        if (!choice.current) model.chatSetModel(choice.id, null)
+                    }
+                },
+            )
+        }
+    } else {
+        DropdownMenuItem(
+            text = { Text(opened.label, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            leadingIcon = { DesktopIcon("chevron-left", size = 15.dp, tint = secondary) },
+            onClick = { onInto(null) },
+        )
+        HorizontalDivider()
+        MenuHeading(menu.effortsHeading, secondary)
+        for (effort in opened.efforts) {
+            DropdownMenuItem(
+                text = { Text(effort.label) },
+                leadingIcon = { tick(effort.current) },
+                onClick = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onDone()
+                    if (!effort.current) model.chatSetModel(opened.id, effort.id)
+                },
+            )
         }
     }
 }
