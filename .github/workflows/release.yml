@@ -564,6 +564,18 @@ jobs:
         run: |
           set -eu
           if command -v apt-get >/dev/null 2>&1 ; then
+            # Packages come from Microsoft's mirror of Ubuntu's archive, the
+            # one GitHub's own Ubuntu runners use, rather than Canonical's
+            # archive.ubuntu.com and security.ubuntu.com, which went
+            # unreachable from the runners (2026-11-23) and failed the
+            # release. The arm64 images' ports.ubuntu.com, which it does
+            # not mirror, is left as it is.
+            for list in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              if [ -f "$list" ]; then
+                sed -i -e 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g' \
+                  -e 's|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' "$list"
+              fi
+            done
             apt-get update
             apt-get install -y --no-install-recommends \
               ca-certificates curl git xz-utils
