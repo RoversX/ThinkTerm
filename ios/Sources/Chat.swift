@@ -29,10 +29,60 @@ struct ChatState: Decodable {
     var can_attach: Bool
     /// The model in use and the others; nil when the agent does not say.
     var model: ChatModelMenu?
+    /// What a `/` (or `$`) typed in the field offers.
+    var commands: [ChatCommand]?
+    /// How full the model's context is: the ring in the bar and its sheet;
+    /// nil when the agent does not say.
+    var context: ChatContext?
 }
 
 /// The model button: what it says, and what it opens on -- the models,
 /// each opening on how hard it can think.
+/// How full the context is (`fill` 0 to 1, nil while not known; `level`
+/// "ok", "high" or "full"), what fills it, and the session's totals.
+struct ChatContext: Decodable, Equatable {
+    var fill: Double?
+    var level: String
+    var percent: String
+    var heading: String
+    var amount: String
+    var parts: [ChatContextPart]
+    var breakdown: String
+    var compacts_at: String?
+    var note: String?
+    var totals_heading: String
+    var totals: [ChatStat]
+    var compact: String?
+}
+
+/// One part of the context: what it is ("system", "user", ... "free"), as
+/// said, how much, and its share of the window.
+struct ChatContextPart: Decodable, Equatable, Identifiable {
+    var kind: String
+    var label: String
+    var amount: String
+    var share: Double
+    var percent: String
+    var id: String { kind }
+}
+
+struct ChatStat: Decodable, Equatable, Identifiable {
+    var label: String
+    var value: String
+    var id: String { label }
+}
+
+/// A command the field offers: as typed (`/compact`), what it does, what
+/// may follow it (a pick then puts it in the field rather than run it),
+/// and `here` for one the app does itself ("model": the model menu).
+struct ChatCommand: Decodable, Hashable, Identifiable {
+    var name: String
+    var description: String
+    var args: String?
+    var here: String?
+    var id: String { name }
+}
+
 struct ChatModelMenu: Decodable, Equatable {
     var label: String
     var models_heading: String
@@ -167,8 +217,11 @@ enum MdBlock: Decodable, Hashable {
     case quote([MdSpan])
     case code(lang: String, text: String)
     case rule
+    /// How each column lines up ("left", "center", "right", "none"), the
+    /// header's cells, then the rows'.
+    case table(align: [String], head: [[MdSpan]], rows: [[[MdSpan]]])
 
-    private enum Key: String, CodingKey { case t, spans, level, depth, mark, lang, text }
+    private enum Key: String, CodingKey { case t, spans, level, depth, mark, lang, text, align, head, rows }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Key.self)
@@ -185,6 +238,12 @@ enum MdBlock: Decodable, Hashable {
         case "code":
             self = .code(lang: (try? c.decode(String.self, forKey: .lang)) ?? "", text: (try? c.decode(String.self, forKey: .text)) ?? "")
         case "rule": self = .rule
+        case "table":
+            self = .table(
+                align: (try? c.decode([String].self, forKey: .align)) ?? [],
+                head: (try? c.decode([[MdSpan]].self, forKey: .head)) ?? [],
+                rows: (try? c.decode([[[MdSpan]]].self, forKey: .rows)) ?? []
+            )
         default: self = .para(spans())
         }
     }
@@ -242,9 +301,14 @@ private let waiting = Color(red: 1.0, green: 0.62, blue: 0.04)
 /// The chat with the agent of a pane, over that pane's terminal: what it
 /// said and did, what it asks, and a field to say something. Going back --
 /// the button, or a swipe in from the left edge -- is going to its terminal.
+///
+/// It watches the chat's own state (`feed`), not the whole model, which
+/// changes with every refresh of the terminal under it: the page is drawn
+/// again when the chat changes, and the field only when what it shows does.
 struct ChatPage: View {
-    @ObservedObject var model: TerminalModel
-    @State private var text = ""
+    /// What is asked of the chat goes here; what is shown comes from `feed`.
+    let model: TerminalModel
+    @ObservedObject var feed: TerminalModel.ChatFeed
     @State private var notice: ChatNotice?
     @State private var noticeSeen: Int64 = 0
     /// The end of the list is in view: what comes next is shown as it
@@ -253,15 +317,17 @@ struct ChatPage: View {
     /// Just said something: what comes of it is shown, wherever the
     /// person was.
     @State private var follow = false
-    @State private var pickingPhotos = false
-    @State private var pickingFiles = false
-    @State private var photos: [PhotosPickerItem] = []
     /// A picture sent, shown big.
     @State private var shownPicture: ChatSent?
+    /// The rows on show already: one not among them comes in as it is
+    /// added, the first ones as they are.
+    @State private var known: Set<String> = []
+    /// The context's sheet, risen from the bottom.
+    @State private var showContext = false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let chat = model.chat
+        let chat = feed.chat
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
@@ -290,8 +356,31 @@ struct ChatPage: View {
                             .frame(maxWidth: .infinity)
                             .padding(.top, 80)
                     }
+                    // Nothing said yet: whom the chat is with, where the words
+                    // will be.
+                    if let chat, chat.rows.isEmpty, chat.state != "connecting", chat.problem == nil, !chat.more {
+                        VStack(spacing: 4) {
+                            Image(systemName: "bubble.left.and.bubble.right")
+                                .font(.system(size: 22))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 52, height: 52)
+                                .background(Circle().fill(Color.primary.opacity(0.06)))
+                                .padding(.bottom, 8)
+                            Text(chat.agent.isEmpty ? (feed.with?.agent ?? "") : chat.agent)
+                                .font(.system(size: 18, weight: .semibold))
+                            Text(feed.with?.place ?? "")
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 180)
+                        .transition(.opacity)
+                    }
                     ForEach(chat?.rows ?? []) { row in
-                        rowView(row).id(row.id)
+                        rowView(row)
+                            .modifier(Entrance(fresh: !known.isEmpty && !known.contains(row.id)))
+                            .id(row.id)
                     }
                     if let busy = chat?.busy {
                         BusyLine(text: busy, since: chat?.since).id("busy")
@@ -302,14 +391,42 @@ struct ChatPage: View {
                 .padding(.vertical, 8)
             }
             .scrollDismissesKeyboard(.interactively)
-            .scrollEdgeEffectStyle(.soft, for: .all)
+            // What scrolls under the bars blurs into them, firmly under the
+            // field: never read through what is typed.
+            .scrollEdgeEffectStyle(.soft, for: .top)
+            .scrollEdgeEffectStyle(.hard, for: .bottom)
             .defaultScrollAnchor(.bottom)
-            .safeAreaInset(edge: .top, spacing: 0) { header(chat) }
-            .safeAreaInset(edge: .bottom, spacing: 0) { foot(chat) }
+            .safeAreaBar(edge: .top, spacing: 0) { header(chat) }
+            .safeAreaBar(edge: .bottom, spacing: 0) {
+                foot(chat).overlay(alignment: .top) {
+                    // Scrolled up to read: a way back down to what comes now.
+                    if !atEnd && chat?.rows.isEmpty == false {
+                        Button {
+                            withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo("end", anchor: .bottom) }
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 36, height: 36)
+                                .glassEffect(.regular.interactive(), in: .circle)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(tr("chat.latest"))
+                        .offset(y: -50)
+                        .transition(.scale(scale: 0.8).combined(with: .opacity))
+                    }
+                }
+                .animation(.snappy(duration: 0.16), value: atEnd)
+            }
             .onScrollGeometryChange(for: Bool.self) { geometry in
                 geometry.visibleRect.maxY >= geometry.contentSize.height - 120
             } action: { _, near in
                 atEnd = near
+            }
+            .onChange(of: chat?.rows.map(\.id) ?? []) { _, ids in
+                known.formUnion(ids)
             }
             .onChange(of: chat?.rows.last?.id) {
                 guard atEnd || follow else { return }
@@ -322,24 +439,12 @@ struct ChatPage: View {
             }
         }
         .background(Color.chromeBackdrop.ignoresSafeArea())
-        .photosPicker(
-            isPresented: $pickingPhotos, selection: $photos, maxSelectionCount: 5,
-            matching: .images, preferredItemEncoding: .compatible
-        )
-        .onChange(of: photos) { _, picked in
-            guard !picked.isEmpty else { return }
-            photos = []
-            for item in picked { attachPhoto(item) }
-        }
-        .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
-            guard case .success(let urls) = result else { return }
-            for url in urls { model.chatAttach(copying: url) }
-        }
+        .onAppear { known.formUnion(chat?.rows.map(\.id) ?? []) }
         .fullScreenCover(item: $shownPicture) { picture in
             PictureView(
                 file: picture,
-                thumb: picture.picture.flatMap { model.chatThumbs[$0] },
-                local: picture.path.flatMap { model.chatPictures[$0] }
+                thumb: picture.picture.flatMap { feed.thumbs[$0] },
+                local: picture.path.flatMap { feed.pictures[$0] }
             ) { shownPicture = nil }
         }
         .onChange(of: chat?.notice) { _, new in
@@ -364,7 +469,7 @@ struct ChatPage: View {
     // MARK: the bar
 
     private func header(_ chat: ChatState?) -> some View {
-        let target = model.chatWith
+        let target = feed.with
         let dot: Color = switch chat?.state {
         case "working": working
         case "blocked": waiting
@@ -372,37 +477,73 @@ struct ChatPage: View {
         }
         let who = (chat?.agent).flatMap { $0.isEmpty ? nil : $0 } ?? target?.agent ?? ""
         let said = [who, chat?.state_label ?? "", chat?.title ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
-        return HStack(spacing: 10) {
+        return HStack(spacing: 8) {
+            // Drawn small; a finger's room around it all the same.
             Button {
                 model.closeChat()
             } label: {
                 Image(systemName: "chevron.left")
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 36, height: 36)
+                    .glassEffect(.regular.interactive(), in: .circle)
                     .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.circle)
+            .buttonStyle(.plain)
             .accessibilityLabel(tr("back"))
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(target?.place ?? "")
-                    .font(.headline)
+                    .font(.system(size: 16, weight: .semibold))
                     .lineLimit(1)
-                HStack(spacing: 6) {
-                    Circle().fill(dot).frame(width: 7, height: 7)
+                HStack(spacing: 5) {
+                    Circle().fill(dot).frame(width: 6, height: 6)
                     Text(said)
-                        .font(.caption)
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
             }
             Spacer(minLength: 0)
-            if let menu = chat?.model {
-                modelButton(menu)
+            if let context = chat?.context {
+                contextRing(context)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 4)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 8)
+        .padding(.bottom, 6)
+    }
+
+    /// How full the context is: a ring in a glass circle. A tap raises
+    /// what it is made of.
+    private func contextRing(_ context: ChatContext) -> some View {
+        let fill = context.fill ?? 0
+        return Button {
+            showContext = true
+        } label: {
+            ZStack {
+                Circle().stroke(Color.primary.opacity(0.16), lineWidth: 2.6)
+                Circle()
+                    .trim(from: 0, to: fill > 0 ? max(fill, 0.02) : 0)
+                    .stroke(contextLevelColor(context.level), style: StrokeStyle(lineWidth: 2.6, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+            }
+            .frame(width: 19, height: 19)
+            .animation(.smooth(duration: 0.5), value: fill)
+            .frame(width: 36, height: 36)
+            .glassEffect(.regular.interactive(), in: .circle)
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(context.heading): \(context.percent)")
+        .sheet(isPresented: $showContext) {
+            ContextSheet(feed: feed) {
+                showContext = false
+                model.chatCommand("/compact")
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
     }
 
     // MARK: what it said and did
@@ -413,13 +554,14 @@ struct ChatPage: View {
         case let .user(_, text, attachments):
             VStack(alignment: .trailing, spacing: 6) {
                 if !attachments.isEmpty {
-                    SentFiles(files: attachments, pictures: model.chatPictures, thumbs: model.chatThumbs) { shownPicture = $0 }
+                    SentFiles(files: attachments, pictures: feed.pictures, thumbs: feed.thumbs) { shownPicture = $0 }
                 }
                 if !text.isEmpty {
                     HStack {
                         Spacer(minLength: 48)
                         Text(text)
                             .font(.system(size: 16))
+                            .lineSpacing(3)
                             .textSelection(.enabled)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
@@ -432,8 +574,10 @@ struct ChatPage: View {
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case let .text(_, blocks):
+            // Grows smoothly as more of what it says comes.
             MarkdownBlocks(blocks: blocks)
                 .textSelection(.enabled)
+                .animation(.easeOut(duration: 0.18), value: blocks)
         case let .fold(fold):
             FoldView(fold: fold) { model.chatToggle(fold.id) }
         case let .group(group):
@@ -450,7 +594,9 @@ struct ChatPage: View {
     // MARK: what it asks, and the field
 
     private func foot(_ chat: ChatState?) -> some View {
-        GlassEffectContainer(spacing: 10) {
+        // Glass pieces sample together, each keeping its own shape: the
+        // commands over the field are two pieces, not one blob.
+        GlassEffectContainer(spacing: 2) {
             VStack(spacing: 10) {
                 if let notice {
                     Text(notice.text)
@@ -466,12 +612,25 @@ struct ChatPage: View {
                 } else if let ask = chat?.ask {
                     askCard(ask)
                 }
-                field(chat)
+                // Drawn again only when what it shows changes: not as rows
+                // come, nor as the list scrolls.
+                ChatComposer(
+                    model: model,
+                    placeholder: chat?.placeholder ?? "",
+                    canSend: chat?.can_send == true,
+                    canStop: chat?.can_stop == true,
+                    canAttach: chat?.can_attach == true,
+                    menu: chat?.model,
+                    commands: chat?.commands ?? [],
+                    files: feed.files,
+                    onSent: { follow = true }
+                )
+                .equatable()
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 10)
         .padding(.top, 8)
-        .padding(.bottom, 8)
+        .padding(.bottom, 6)
     }
 
     private func askCard(_ ask: ChatAsk) -> some View {
@@ -578,23 +737,319 @@ struct ChatPage: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
+}
 
-    /// The field to say something in, and the button beside it: send, or
-    /// stop while the agent works and nothing is typed.
-    private func field(_ chat: ChatState?) -> some View {
-        let files = model.chatFiles
+/// What each part of the context is drawn in.
+private func contextPartColor(_ kind: String) -> Color {
+    switch kind {
+    case "system": return Color(red: 0.69, green: 0.32, blue: 0.87)
+    case "tools": return Color(red: 0.37, green: 0.36, blue: 0.90)
+    case "instructions": return Color(red: 0.39, green: 0.82, blue: 1.0)
+    case "user": return Color(red: 0.04, green: 0.52, blue: 1.0)
+    case "assistant": return Color(red: 0.19, green: 0.82, blue: 0.35)
+    case "thinking": return Color(red: 1.0, green: 0.62, blue: 0.04)
+    case "tool_use": return Color(red: 1.0, green: 0.22, blue: 0.37)
+    case "summary": return Color(red: 1.0, green: 0.84, blue: 0.04)
+    case "free": return Color.primary.opacity(0.1)
+    default: return Color(red: 0.56, green: 0.56, blue: 0.58)
+    }
+}
+
+/// The ring's colour: the ink while there is room, amber nearly full,
+/// red full.
+private func contextLevelColor(_ level: String) -> Color {
+    switch level {
+    case "full": return ChatColors.removed
+    case "high": return ChatColors.waiting
+    default: return Color.primary.opacity(0.85)
+    }
+}
+
+/// How full the context is, risen from the bottom: a ring of its parts with
+/// how full in its middle, when it compacts by itself, what the session has
+/// used, and a way to compact now. Each part with how much opens on a tap
+/// (of the ring, or the row that says so). It follows the chat while open.
+private struct ContextSheet: View {
+    @ObservedObject var feed: TerminalModel.ChatFeed
+    let compact: () -> Void
+    @State private var grown = false
+    @State private var open = false
+
+    var body: some View {
+        if let context = feed.chat?.context {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(spacing: 18) {
+                        ZStack {
+                            Circle().stroke(Color.primary.opacity(0.08), lineWidth: 14)
+                            ForEach(Array(segments(context).enumerated()), id: \.offset) { _, segment in
+                                Circle()
+                                    .trim(from: segment.from * (grown ? 1 : 0), to: segment.to * (grown ? 1 : 0))
+                                    .stroke(contextPartColor(segment.kind), style: StrokeStyle(lineWidth: 14, lineCap: .butt))
+                                    .rotationEffect(.degrees(-90))
+                            }
+                            Text(context.percent)
+                                .font(.system(size: 24, weight: .semibold))
+                                .foregroundStyle(contextLevelColor(context.level))
+                        }
+                        .frame(width: 112, height: 112)
+                        .contentShape(Circle())
+                        .onTapGesture {
+                            guard !context.parts.isEmpty else { return }
+                            withAnimation(.snappy(duration: 0.22)) { open.toggle() }
+                        }
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(context.heading).font(.system(size: 20, weight: .semibold))
+                            Text(context.amount).font(.system(size: 14)).foregroundStyle(.secondary)
+                            if let at = context.compacts_at {
+                                Text(at).font(.system(size: 13)).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    if !context.parts.isEmpty {
+                        VStack(spacing: 0) {
+                            Button {
+                                withAnimation(.snappy(duration: 0.22)) { open.toggle() }
+                            } label: {
+                                HStack {
+                                    Text(context.breakdown).font(.system(size: 15))
+                                    Spacer(minLength: 8)
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                        .rotationEffect(.degrees(open ? 90 : 0))
+                                }
+                                .padding(.horizontal, 16)
+                                .frame(minHeight: 48)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            if open {
+                                ForEach(Array(context.parts.enumerated()), id: \.element.id) { at, part in
+                                Divider().padding(.leading, at > 0 ? 40 : 16)
+                                HStack(spacing: 12) {
+                                    Circle().fill(contextPartColor(part.kind)).frame(width: 10, height: 10)
+                                    Text(part.label).font(.system(size: 15)).lineLimit(1)
+                                    Spacer(minLength: 8)
+                                    Text(part.amount).font(.system(size: 14)).foregroundStyle(.secondary)
+                                    Text(part.percent)
+                                        .font(.system(size: 14).monospacedDigit())
+                                        .frame(width: 44, alignment: .trailing)
+                                }
+                                .padding(.horizontal, 16)
+                                .frame(minHeight: 44)
+                                .transition(.opacity)
+                                }
+                            }
+                        }
+                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+                    if open, let note = context.note {
+                        Text(note).font(.system(size: 12.5)).foregroundStyle(.secondary)
+                    }
+                    if !context.totals.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(context.totals_heading)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                                ForEach(context.totals) { stat in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(stat.label).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
+                                        Text(stat.value).font(.system(size: 18, weight: .semibold))
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                }
+                            }
+                        }
+                    }
+                    if let label = context.compact {
+                        Button(action: compact) {
+                            Text(label)
+                                .font(.system(size: 16, weight: .semibold))
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 44)
+                        }
+                        .buttonStyle(.glass)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 24)
+                .padding(.bottom, 28)
+            }
+            .onAppear {
+                withAnimation(.smooth(duration: 0.7)) { grown = true }
+            }
+        }
+    }
+
+    /// Where each part (not what is free) starts and ends round the ring.
+    private func segments(_ context: ChatContext) -> [(kind: String, from: Double, to: Double)] {
+        var at = 0.0
+        var out: [(kind: String, from: Double, to: Double)] = []
+        for part in context.parts where part.kind != "free" && part.share > 0 {
+            // A hair's gap between parts.
+            let end = min(1, at + part.share)
+            out.append((part.kind, at, max(at, end - 0.003)))
+            at = end
+        }
+        return out
+    }
+}
+
+/// The field to say something in, in one card with what goes with it:
+/// the + for files and pictures, the model, and send -- or stop, while the
+/// agent works and nothing is typed. Over it, as a `/` is typed, the
+/// commands the agent takes. Its draft is its own: typing redraws the
+/// field, not the chat.
+private struct ChatComposer: View, Equatable {
+    let model: TerminalModel
+    let placeholder: String
+    let canSend: Bool
+    let canStop: Bool
+    let canAttach: Bool
+    let menu: ChatModelMenu?
+    let commands: [ChatCommand]
+    let files: [TerminalModel.ChatFile]
+    /// Something was said: the chat follows what comes of it.
+    let onSent: () -> Void
+
+    @State private var text = ""
+    @State private var pickingPhotos = false
+    @State private var pickingFiles = false
+    @State private var photos: [PhotosPickerItem] = []
+    /// Bumped on each thing said, for the tap felt.
+    @State private var sent = 0
+    @FocusState private var typing: Bool
+
+    static func == (a: ChatComposer, b: ChatComposer) -> Bool {
+        a.model === b.model && a.placeholder == b.placeholder && a.canSend == b.canSend && a.canStop == b.canStop
+            && a.canAttach == b.canAttach && a.menu == b.menu && a.commands == b.commands && a.files == b.files
+    }
+
+    var body: some View {
+        field
+            .sensoryFeedback(.impact(weight: .light), trigger: sent)
+            .photosPicker(
+                isPresented: $pickingPhotos, selection: $photos, maxSelectionCount: 5,
+                matching: .images, preferredItemEncoding: .compatible
+            )
+            .onChange(of: photos) { _, picked in
+                guard !picked.isEmpty else { return }
+                photos = []
+                for item in picked { attachPhoto(item) }
+            }
+            .fileImporter(isPresented: $pickingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+                guard case .success(let urls) = result else { return }
+                for url in urls { model.chatAttach(copying: url) }
+            }
+    }
+
+    /// The field to say something in, in one card with what goes with it:
+    /// the + for files and pictures, the model, and send -- or stop, while
+    /// the agent works and nothing is typed. Over it, as a `/` is typed,
+    /// the commands the agent takes.
+    private var field: some View {
         let blank = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         // What is picked goes when all of it is there.
         let waiting = files.contains { $0.path == nil && $0.error == nil }
         let ready = files.contains { $0.path != nil }
-        let canSend = chat?.can_send == true && !waiting && (!blank || ready)
-        let stop = chat?.can_stop == true && blank && files.isEmpty
+        let sendable = canSend && !waiting && (!blank || ready)
+        let stop = canStop && blank && files.isEmpty
+        let offer = commandOffer(commands, text: text)
+        let card = RoundedRectangle(cornerRadius: 24, style: .continuous)
         return VStack(spacing: 8) {
-            if !files.isEmpty {
-                PickedFiles(files: files) { model.chatDetach($0) }
+            if let offer {
+                CommandPalette(commands: offer.commands, menu: menu, pick: { pick($0, from: offer.from) }) { id, effort in
+                    model.chatSetModel(id, effort: effort)
+                    text = ""
+                }
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity.combined(with: .scale(scale: 0.96, anchor: .bottom)).combined(with: .offset(y: 6)),
+                        removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
+                    )
+                )
             }
-            fieldRow(chat, canSend: canSend, stop: stop)
+            VStack(alignment: .leading, spacing: 0) {
+                if !files.isEmpty {
+                    PickedFiles(files: files) { model.chatDetach($0) }
+                        .padding(.horizontal, 10)
+                        .padding(.top, 10)
+                }
+                TextField(placeholder, text: $text, axis: .vertical)
+                    .lineLimit(1...6)
+                    .font(.system(size: 16))
+                    .focused($typing)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 13)
+                    .padding(.bottom, 3)
+                HStack(spacing: 0) {
+                    if canAttach {
+                        attachMenu
+                    }
+                    if let menu {
+                        modelChip(menu)
+                    }
+                    Spacer(minLength: 0)
+                    sendButton(canSend: sendable, stop: stop)
+                }
+                .padding(.horizontal, 4)
+                .padding(.bottom, 2)
+            }
+            // Glass with the ground in it: what passes under never reads
+            // through the words typed.
+            .glassEffect(.regular.tint(Color.chromeBackdrop.opacity(0.75)), in: card)
+            .overlay { card.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5) }
         }
+        .animation(.snappy(duration: 0.18), value: offer?.commands.map(\.name))
+    }
+
+    /// A command picked: one that runs as it is goes now, as typed; one
+    /// followed by more is put in the field for it.
+    private func pick(_ command: ChatCommand, from: String.Index) {
+        if command.args == nil && from == text.startIndex {
+            model.chatCommand(command.name)
+            text = ""
+            onSent()
+            sent += 1
+        } else {
+            text = String(text[..<from]) + command.name + " "
+            typing = true
+        }
+    }
+
+    private func sendButton(canSend: Bool, stop: Bool) -> some View {
+        Button {
+            if stop {
+                model.chatInterrupt()
+            } else {
+                model.chatSend(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                text = ""
+                onSent()
+                sent += 1
+            }
+        } label: {
+            Image(systemName: stop ? "stop.fill" : "arrow.up")
+                .font(.system(size: stop ? 12 : 15, weight: .bold))
+                .foregroundStyle(stop ? Color(uiColor: .systemBackground) : canSend ? .white : .secondary)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 34, height: 34)
+                .background(
+                    Circle().fill(stop ? Color.primary : canSend ? Color.accentColor : Color.primary.opacity(0.1))
+                )
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+                .animation(.easeOut(duration: 0.16), value: canSend)
+                .animation(.easeOut(duration: 0.16), value: stop)
+        }
+        .buttonStyle(.plain)
+        .disabled(!(stop || canSend))
+        .accessibilityLabel(tr(stop ? "chat.stop" : "chat.send"))
     }
 
     /// The + beside the field: a photo, a file, or the clipboard's picture,
@@ -612,11 +1067,15 @@ struct ChatPage: View {
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 18, weight: .semibold))
-                .frame(width: 46, height: 46)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(Color.primary.opacity(0.07)))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
         }
-        .buttonStyle(.glass)
-        .buttonBorderShape(.circle)
+        .menuStyle(.button)
+        .buttonStyle(.plain)
         .accessibilityLabel(tr("chat.attach"))
     }
 
@@ -632,81 +1091,194 @@ struct ChatPage: View {
         }
     }
 
-    /// The model in use. A tap opens on the models; one that can think more
-    /// or less opens on how hard, a menu of its own.
-    private func modelButton(_ menu: ChatModelMenu) -> some View {
+    /// The model in use, in the field beside send. A tap opens on the
+    /// models; one that can think more or less opens on how hard, a menu
+    /// of its own.
+    private func modelChip(_ menu: ChatModelMenu) -> some View {
         Menu {
-            Section(menu.models_heading) {
-                ForEach(menu.models) { choice in
-                    if choice.efforts.isEmpty {
-                        Button {
-                            if !choice.current { model.chatSetModel(choice.id, effort: nil) }
-                        } label: {
-                            if choice.current { Label(choice.label, systemImage: "checkmark") } else { Text(choice.label) }
-                        }
-                    } else {
-                        Menu {
-                            Section(menu.efforts_heading) {
-                                ForEach(choice.efforts) { effort in
-                                    Button {
-                                        if !effort.current { model.chatSetModel(choice.id, effort: effort.id) }
-                                    } label: {
-                                        if effort.current { Label(effort.label, systemImage: "checkmark") } else { Text(effort.label) }
-                                    }
-                                }
-                            }
-                        } label: {
-                            if choice.current { Label(choice.label, systemImage: "checkmark") } else { Text(choice.label) }
-                        }
-                    }
-                }
-            }
+            ModelMenu(menu: menu) { id, effort in model.chatSetModel(id, effort: effort) }
         } label: {
             HStack(spacing: 4) {
                 Text(menu.label)
-                    .font(.footnote)
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(.primary.opacity(0.8))
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 12)
-            .frame(maxWidth: 170, minHeight: 36)
+            .padding(.horizontal, 8)
+            .frame(maxWidth: 210, minHeight: 44)
+            .contentShape(Rectangle())
         }
-        .buttonStyle(.glass)
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .sensoryFeedback(.selection, trigger: menu.label)
         .accessibilityLabel("\(tr("chat.model")): \(menu.label)")
     }
+}
 
-    private func fieldRow(_ chat: ChatState?, canSend: Bool, stop: Bool) -> some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if chat?.can_attach == true {
-                attachMenu
-            }
-            TextField(chat?.placeholder ?? "", text: $text, axis: .vertical)
-                .lineLimit(1...6)
-                .font(.system(size: 16))
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 23, style: .continuous))
-            Button {
-                if stop {
-                    model.chatInterrupt()
+/// The models, each that thinks more or less opening on how hard: what
+/// the model chip and `/model` open on.
+private struct ModelMenu: View {
+    let menu: ChatModelMenu
+    let set: (String, String?) -> Void
+
+    var body: some View {
+        Section(menu.models_heading) {
+            ForEach(menu.models) { choice in
+                if choice.efforts.isEmpty {
+                    Button {
+                        if !choice.current { set(choice.id, nil) }
+                    } label: {
+                        if choice.current { Label(choice.label, systemImage: "checkmark") } else { Text(choice.label) }
+                    }
                 } else {
-                    model.chatSend(text.trimmingCharacters(in: .whitespacesAndNewlines))
-                    text = ""
-                    follow = true
+                    Menu {
+                        Section(menu.efforts_heading) {
+                            ForEach(choice.efforts) { effort in
+                                Button {
+                                    if !effort.current { set(choice.id, effort.id) }
+                                } label: {
+                                    if effort.current { Label(effort.label, systemImage: "checkmark") } else { Text(effort.label) }
+                                }
+                            }
+                        }
+                    } label: {
+                        if choice.current { Label(choice.label, systemImage: "checkmark") } else { Text(choice.label) }
+                    }
                 }
-            } label: {
-                Image(systemName: stop ? "stop.fill" : "arrow.up")
-                    .font(.system(size: 17, weight: .bold))
-                    .frame(width: 46, height: 46)
             }
-            .buttonStyle(.glassProminent)
-            .buttonBorderShape(.circle)
-            .tint(stop ? .primary : .accentColor)
-            .disabled(!(stop || canSend))
-            .accessibilityLabel(tr(stop ? "chat.stop" : "chat.send"))
         }
+    }
+}
+
+/// The word being typed, when it calls up commands: `/` at the start of
+/// the field, or a `$` word (a skill) anywhere; and those it may be.
+private struct CommandOffer {
+    let from: String.Index
+    let commands: [ChatCommand]
+}
+
+private func commandOffer(_ commands: [ChatCommand], text: String) -> CommandOffer? {
+    guard !commands.isEmpty else { return nil }
+    let from = text.hasPrefix("/") ? text.startIndex : (text.lastIndex(where: \.isWhitespace).map { text.index(after: $0) } ?? text.startIndex)
+    let word = text[from...]
+    guard let sign = word.first, sign == "/" || sign == "$", !word.contains(where: \.isWhitespace) else { return nil }
+    let typed = word.lowercased()
+    let signed = commands.filter { $0.name.first == sign }
+    // Those it begins first, then those whose names hold it.
+    let first = signed.filter { $0.name.lowercased().hasPrefix(typed) }
+    let rest = String(typed.dropFirst())
+    let then = rest.isEmpty ? [] : signed.filter { !first.contains($0) && $0.name.lowercased().contains(rest) }
+    let all = first + then
+    return all.isEmpty ? nil : CommandOffer(from: from, commands: all)
+}
+
+/// The commands the word typed may be, over the field: a tap runs one
+/// that runs as it is, or puts one in the field to be followed.
+private struct CommandPalette: View {
+    let commands: [ChatCommand]
+    let menu: ChatModelMenu?
+    let pick: (ChatCommand) -> Void
+    let setModel: (String, String?) -> Void
+
+    private let rowHeight: CGFloat = 50
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(commands) { command in
+                    if command.here == "model", let menu {
+                        Menu {
+                            ModelMenu(menu: menu, set: setModel)
+                        } label: {
+                            CommandRow(command: command).frame(height: rowHeight)
+                        }
+                        .menuStyle(.button)
+                        .buttonStyle(.plain)
+                    } else {
+                        Button {
+                            pick(command)
+                        } label: {
+                            CommandRow(command: command).frame(height: rowHeight)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(height: min(CGFloat(commands.count) * rowHeight + 12, 300))
+        .glassEffect(.regular.tint(Color.chromeBackdrop.opacity(0.75)), in: shape)
+        .overlay { shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5) }
+    }
+}
+
+private struct CommandRow: View {
+    let command: ChatCommand
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 30, height: 30)
+                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.07)))
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(command.name)
+                        .font(.system(size: 14.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let args = command.args, !args.isEmpty {
+                        Text(args)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                if !command.description.isEmpty {
+                    Text(command.description)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .contentShape(Rectangle())
+    }
+
+    private var symbol: String {
+        if command.here == "model" { return "cpu" }
+        if command.name.hasPrefix("$") || command.name.hasPrefix("/skill:") { return "sparkles" }
+        return "slash.circle"
+    }
+}
+
+/// A row added while the chat is on show comes in: up a little, from
+/// nothing. Rows there already, and all under Reduce Motion, are as
+/// they are.
+private struct Entrance: ViewModifier {
+    @State private var hidden: Bool
+    @Environment(\.accessibilityReduceMotion) private var still
+
+    init(fresh: Bool) {
+        _hidden = State(initialValue: fresh)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(hidden ? 0 : 1)
+            .offset(y: hidden && !still ? 8 : 0)
+            .onAppear {
+                guard hidden else { return }
+                withAnimation(.smooth(duration: 0.3)) { hidden = false }
+            }
     }
 }
 
@@ -859,6 +1431,8 @@ private struct PictureView: View {
 private struct BusyLine: View {
     let text: String
     let since: Int64?
+    @State private var sweep = false
+    @Environment(\.accessibilityReduceMotion) private var still
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -870,7 +1444,25 @@ private struct BusyLine: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .overlay {
+                        // A light passes over the words, as long as it works.
+                        GeometryReader { box in
+                            LinearGradient(colors: [.clear, .primary.opacity(0.75), .clear], startPoint: .leading, endPoint: .trailing)
+                                .frame(width: box.size.width * 0.5)
+                                .offset(x: (sweep ? 1.2 : -0.6) * box.size.width)
+                        }
+                        .mask {
+                            Text(said(at: context.date))
+                                .font(.subheadline)
+                                .lineLimit(1)
+                        }
+                        .allowsHitTesting(false)
+                    }
             }
+        }
+        .onAppear {
+            guard !still else { return }
+            withAnimation(.linear(duration: 1.8).repeatForever(autoreverses: false)) { sweep = true }
         }
     }
 
@@ -1065,46 +1657,163 @@ private struct FoldBodyView: View {
     }
 }
 
+/// A table as a phone shows one: the header bold, a thin line under each
+/// row, each column as wide as its widest cell (a longer one wraps), the
+/// whole sliding sideways when wider than the screen.
+private struct TableBlock: View {
+    let align: [String]
+    let head: [[MdSpan]]
+    let rows: [[[MdSpan]]]
+
+    var body: some View {
+        let columns = max(head.count, rows.map(\.count).max() ?? 0)
+        let all = [head] + rows
+        ScrollView(.horizontal, showsIndicators: false) {
+            TableLayout(columns: columns, widest: 240) {
+                ForEach(0..<(all.count * columns), id: \.self) { at in
+                    let (r, c) = (at / columns, at % columns)
+                    cell(c < all[r].count ? all[r][c] : [], column: c, row: r, last: r == all.count - 1)
+                }
+            }
+        }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+    }
+
+    private func cell(_ spans: [MdSpan], column: Int, row: Int, last: Bool) -> some View {
+        let lines = column < align.count ? align[column] : "none"
+        let (frame, text): (Alignment, TextAlignment) = switch lines {
+        case "center": (.top, .center)
+        case "right": (.topTrailing, .trailing)
+        default: (.topLeading, .leading)
+        }
+        return Text(MarkdownBlocks.attributed(spans, size: 14.5, weight: row == 0 ? .semibold : .regular))
+            .lineSpacing(2)
+            .multilineTextAlignment(text)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: frame)
+            .overlay(alignment: .bottom) {
+                if !last {
+                    Rectangle()
+                        .fill(Color.primary.opacity(row == 0 ? 0.22 : 0.1))
+                        .frame(height: row == 0 ? 1 : 0.5)
+                }
+            }
+    }
+}
+
+/// A table's cells, row by row: each column as wide as its widest cell up
+/// to `widest` (past which a cell wraps), each row as tall as its tallest.
+private struct TableLayout: Layout {
+    let columns: Int
+    let widest: CGFloat
+
+    struct Measure {
+        var widths: [CGFloat] = []
+        var heights: [CGFloat] = []
+    }
+
+    private func measure(_ subviews: Subviews) -> Measure {
+        guard columns > 0 else { return Measure() }
+        var widths = Array(repeating: CGFloat(0), count: columns)
+        for (i, view) in subviews.enumerated() {
+            widths[i % columns] = max(widths[i % columns], min(view.sizeThatFits(.unspecified).width, widest))
+        }
+        var heights = Array(repeating: CGFloat(0), count: (subviews.count + columns - 1) / columns)
+        for (i, view) in subviews.enumerated() {
+            let height = view.sizeThatFits(ProposedViewSize(width: widths[i % columns], height: nil)).height
+            heights[i / columns] = max(heights[i / columns], height)
+        }
+        return Measure(widths: widths, heights: heights)
+    }
+
+    func makeCache(subviews: Subviews) -> Measure { measure(subviews) }
+
+    func updateCache(_ cache: inout Measure, subviews: Subviews) { cache = measure(subviews) }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Measure) -> CGSize {
+        CGSize(width: cache.widths.reduce(0, +), height: cache.heights.reduce(0, +))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Measure) {
+        var y = bounds.minY
+        for r in cache.heights.indices {
+            var x = bounds.minX
+            for c in 0..<columns {
+                let i = r * columns + c
+                guard i < subviews.count else { break }
+                subviews[i].place(
+                    at: CGPoint(x: x, y: y), anchor: .topLeading,
+                    proposal: ProposedViewSize(width: cache.widths[c], height: cache.heights[r])
+                )
+                x += cache.widths[c]
+            }
+            y += cache.heights[r]
+        }
+    }
+}
+
 /// Markdown's blocks as text views.
 struct MarkdownBlocks: View {
     let blocks: [MdBlock]
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                blockView(block)
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { at, block in
+                blockView(block, first: at == 0)
             }
         }
     }
 
     @ViewBuilder
-    private func blockView(_ block: MdBlock) -> some View {
+    private func blockView(_ block: MdBlock, first: Bool) -> some View {
         switch block {
         case let .para(spans):
-            Text(Self.attributed(spans, size: 16)).fixedSize(horizontal: false, vertical: true)
-        case let .heading(level, spans):
-            Text(Self.attributed(spans, size: level == 1 ? 21 : level == 2 ? 19 : 17, weight: .semibold))
+            Text(Self.attributed(spans, size: 16))
+                .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
+        case let .heading(level, spans):
+            Text(Self.attributed(spans, size: level == 1 ? 20 : level == 2 ? 18 : 16.5, weight: .semibold))
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, !first && level <= 2 ? 6 : 0)
         case let .item(depth, mark, spans):
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(mark).font(.system(size: 16)).foregroundStyle(.secondary).frame(minWidth: 16, alignment: .leading)
-                Text(Self.attributed(spans, size: 16)).fixedSize(horizontal: false, vertical: true)
+                Text(mark).font(.system(size: 16)).foregroundStyle(.secondary.opacity(0.8)).frame(minWidth: 16, alignment: .leading)
+                Text(Self.attributed(spans, size: 16))
+                    .lineSpacing(4)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.leading, CGFloat(depth) * 16)
+            .padding(.leading, CGFloat(depth) * 18)
         case let .quote(spans):
-            HStack(spacing: 10) {
-                Capsule().fill(Color.secondary.opacity(0.4)).frame(width: 3)
-                Text(Self.attributed(spans, size: 16)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 12) {
+                Capsule().fill(Color.secondary.opacity(0.3)).frame(width: 3)
+                Text(Self.attributed(spans, size: 16))
+                    .lineSpacing(4)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .fixedSize(horizontal: false, vertical: true)
-        case let .code(_, text):
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(text)
-                    .font(.system(size: 13, design: .monospaced))
-                    .fixedSize()
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
+        case let .code(lang, text):
+            VStack(alignment: .leading, spacing: 4) {
+                if !lang.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Text(lang)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(text)
+                        .font(.system(size: 13, design: .monospaced))
+                        .lineSpacing(2)
+                        .fixedSize()
+                        .padding(.horizontal, 12)
+                        .padding(.top, lang.trimmingCharacters(in: .whitespaces).isEmpty ? 10 : 0)
+                        .padding(.bottom, 10)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
@@ -1113,6 +1822,8 @@ struct MarkdownBlocks: View {
             )
         case .rule:
             Divider()
+        case let .table(align, head, rows):
+            TableBlock(align: align, head: head, rows: rows)
         }
     }
 

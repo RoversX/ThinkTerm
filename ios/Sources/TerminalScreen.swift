@@ -158,7 +158,7 @@ struct TerminalScreen: View {
                     // The chat with an agent, over the whole screen and its
                     // pane's terminal, which going back shows.
                     // Its own state for each chat: a notice count, a draft.
-                    ChatPage(model: model)
+                    ChatPage(model: model, feed: model.chatFeed)
                         .id(model.chatWith?.pane)
                         .transition(.move(edge: .trailing))
                         .zIndex(10)

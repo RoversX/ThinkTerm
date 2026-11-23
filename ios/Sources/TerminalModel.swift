@@ -1101,8 +1101,23 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     /// The chat on show, over the terminal of its agent's pane; nil when
     /// none is (`chat` is nil too until its first view comes).
-    @Published private(set) var chatWith: ChatTarget?
-    @Published private(set) var chat: ChatState?
+    @Published private(set) var chatWith: ChatTarget? { didSet { chatFeed.with = chatWith } }
+    @Published private(set) var chat: ChatState? { didSet { chatFeed.chat = chat } }
+
+    /// The chat's own state, apart from the rest of the model: what the
+    /// chat page watches. The model changes with each refresh of the
+    /// terminals (their screens, the stats), many times a second while an
+    /// agent works; the chat page, over the agent's terminal, is redrawn
+    /// only when the chat changes.
+    final class ChatFeed: ObservableObject {
+        @Published fileprivate(set) var with: ChatTarget?
+        @Published fileprivate(set) var chat: ChatState?
+        @Published fileprivate(set) var files: [ChatFile] = []
+        @Published fileprivate(set) var pictures: [String: URL] = [:]
+        @Published fileprivate(set) var thumbs: [String: UIImage] = [:]
+    }
+
+    let chatFeed = ChatFeed()
 
     /// Show `row`'s agent as a chat. The terminal under it goes to the
     /// agent's pane first, as a tap on the row always did: going back from
@@ -1144,14 +1159,14 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
 
     /// What goes with what is said next.
-    @Published private(set) var chatFiles: [ChatFile] = []
+    @Published private(set) var chatFiles: [ChatFile] = [] { didSet { chatFeed.files = chatFiles } }
     /// The phone's own copies of the pictures sent, by where they are on
     /// the host: what a tap shows big, and what shows before the host's
     /// small picture comes.
-    @Published private(set) var chatPictures: [String: URL] = [:]
+    @Published private(set) var chatPictures: [String: URL] = [:] { didSet { chatFeed.pictures = chatPictures } }
     /// The host's small pictures of what was sent, by the key the chat's
     /// rows name them by: each comes once ("chat_picture").
-    @Published private(set) var chatThumbs: [String: UIImage] = [:]
+    @Published private(set) var chatThumbs: [String: UIImage] = [:] { didSet { chatFeed.thumbs = chatThumbs } }
     private var chatFilesTimer: Timer?
 
     /// Put what the phone has -- a photo, the clipboard's picture -- in the
@@ -1284,6 +1299,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.chatSend(text: text, attachments: ready.map { ChatAttachment(name: $0.name, image: $0.image, path: $0.path ?? "") })
     }
 
+    /// A command picked from the field's list, sent as typed: the files
+    /// picked wait for what is said next.
+    func chatCommand(_ text: String) { core.chatSend(text: text, attachments: []) }
     func chatSetModel(_ model: String, effort: String?) { core.chatSetModel(model: model, effort: effort) }
     func chatAnswer(ask: String, choice: String) { core.chatAnswer(ask: ask, choice: choice) }
     func chatInterrupt() { core.chatInterrupt() }
