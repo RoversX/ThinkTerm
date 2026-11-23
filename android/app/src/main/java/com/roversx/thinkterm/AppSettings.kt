@@ -74,6 +74,9 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     /// Threads lists only the threads the Status panel has something in
     /// (the eye in its bar), kept from one launch to the next.
     var agentsOnly by pref("home.agents", false)
+    /// The starry sky is felt as well as seen: at launch, and as a
+    /// connection's sky rushes off (`SkyHaptics`).
+    var skyHaptics by pref("sky.haptics", true)
     /// On a wide screen, whether the sidebar stays beside the terminal.
     var sidebarPinned by pref("sidebar.pinned", true)
     /// A tap on an agent in the Agents list, or on a thread one runs in on

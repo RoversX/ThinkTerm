@@ -133,6 +133,14 @@ fun LaunchSkyHost(
     // over the app.
     val fadeIn = if (replay) out(seg(t, 0f, .35f)) else 1f
     val view = LocalView.current
+    val context = LocalContext.current
+    // The welcome pages let the rush go, felt as it goes.
+    fun rushNow() {
+        if (rushAt == null) {
+            rushAt = t
+            SkyHaptics.rush(context)
+        }
+    }
     if (play || replay) {
         LaunchedEffect(again) {
             LaunchSky.played = true
@@ -145,6 +153,9 @@ fun LaunchSkyHost(
                 }
             }
             val start = withFrameNanos { it }
+            // Felt from the start: the stir as the stars draw near, then
+            // the rush with them.
+            if (!withPages) SkyHaptics.launch(context)
             while (true) {
                 withFrameNanos { now -> t = (now - start) / 1e9f }
                 val at = rushAt
@@ -176,12 +187,12 @@ fun LaunchSkyHost(
             if (withPages) {
                 // Back on the first page of a replay goes into the app, as
                 // the button does; on a later page the pages go back.
-                BackHandler(enabled = replay && rushAt == null) { rushAt = t }
+                BackHandler(enabled = replay && rushAt == null) { rushNow() }
                 val at = rushAt
                 Box(Modifier.fillMaxSize().graphicsLayer { alpha = if (at == null) fadeIn else 1 - seg(t, at, at + .2f) }) {
                     CompositionLocalProvider(LocalGlass provides sky) {
                         pages(
-                            { if (rushAt == null) rushAt = t },
+                            { rushNow() },
                             { page ->
                                 if (page.toFloat() != travelTo) {
                                     travelFrom = camera(t)
@@ -206,7 +217,13 @@ fun LaunchSkyHost(
 fun ConnectionSky(rushing: Boolean) {
     var t by remember { mutableFloatStateOf(0f) }
     var rushAt by remember { mutableStateOf<Float?>(null) }
-    LaunchedEffect(rushing) { if (rushing && rushAt == null) rushAt = t }
+    val context = LocalContext.current
+    LaunchedEffect(rushing) {
+        if (rushing && rushAt == null) {
+            rushAt = t
+            SkyHaptics.connected(context, shownForSeconds = t)
+        }
+    }
     LaunchedEffect(Unit) {
         val start = withFrameNanos { it }
         while (true) withFrameNanos { now -> t = (now - start) / 1e9f }

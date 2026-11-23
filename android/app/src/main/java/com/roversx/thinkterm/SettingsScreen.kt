@@ -378,6 +378,7 @@ private fun SettingsSection(
                     listOf(tr("i.spaces.list"), tr("i.spaces.menu")),
                     if (settings.spaces == "menu") 1 else 0,
                 ) { settings.spaces = if (it == 1) "menu" else "list" }
+                SwitchRow(tr("sky.haptics"), settings.skyHaptics) { settings.skyHaptics = it }
             }
             "agents" -> Group(footer = tr("chat.first.note")) {
                 SwitchRow(tr("chat.first"), settings.chatFirst) { settings.chatFirst = it }
