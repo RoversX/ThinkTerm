@@ -5,6 +5,8 @@
 //! stdout.
 
 mod codex;
+mod http;
+mod opencode;
 pub mod pi;
 mod rollout;
 mod thumb;
@@ -37,6 +39,11 @@ pub trait PaneControl: Send {
     fn screen(&self) -> Option<Vec<String>>;
     /// Types `line` into the pane and presses Enter.
     fn type_line(&self, line: &str) -> anyhow::Result<()>;
+    /// The pane's title, as the program in it last set it (OpenCode puts
+    /// its conversation's name there); none when it cannot be read.
+    fn title(&self) -> Option<String> {
+        None
+    }
 }
 
 /// How the agent the chat is with is doing in its pane, as the mux sees it.
@@ -89,20 +96,50 @@ pub(crate) fn fit_history(items: Vec<crate::Item>) -> (Vec<crate::Item>, bool) {
     (page, !held.is_empty())
 }
 
-/// A variable as the agent in the pane has it, where that can be read
-/// (Linux): the bridge runs with ssh's environment, not the pane's, and
-/// an agent's own folder (`CODEX_HOME`) may be set only in the pane's
-/// shell. `None` when no process of the pane's names it.
+/// A process of the pane's, as `/proc` tells it (Linux).
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct PaneProc {
+    pub pid: u32,
+    pub argv: Vec<String>,
+    environ: Vec<u8>,
+}
+
+impl PaneProc {
+    /// One of its environment variables.
+    pub fn var(&self, name: &str) -> Option<String> {
+        let want = format!("{name}=");
+        self.environ
+            .split(|&b| b == 0)
+            .find_map(|v| v.strip_prefix(want.as_bytes()))
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    }
+
+    /// Its parent's pid.
+    pub fn parent(&self) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
+        // After the name, which is in parentheses and may hold anything.
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(1)?.parse().ok()
+    }
+}
+
+/// The user's processes named one of `programs` that run in the target's
+/// pane (they say so in `WEZTERM_PANE`, and in `WEZTERM_UNIX_SOCKET`
+/// which mux the pane is of), where that can be read (Linux).
 #[cfg(target_os = "linux")]
-pub(crate) fn pane_env(target: &Target, programs: &[&str], name: &str) -> Option<String> {
+pub(crate) fn pane_procs(target: &Target, programs: &[&str]) -> Vec<PaneProc> {
     use std::os::unix::fs::MetadataExt;
     let pane = target.pane.to_string();
-    let want = format!("{name}=");
     let me = unsafe { libc::getuid() };
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        if !entry.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
-        }
+        };
         let dir = entry.path();
         // Only the user's own processes are looked at.
         if std::fs::metadata(&dir).map_or(true, |meta| meta.uid() != me) {
@@ -117,38 +154,133 @@ pub(crate) fn pane_env(target: &Target, programs: &[&str], name: &str) -> Option
         let Ok(environ) = std::fs::read(dir.join("environ")) else {
             continue;
         };
-        let vars: Vec<&[u8]> = environ.split(|&b| b == 0).collect();
-        let value = |prefix: &str| {
-            vars.iter()
-                .find_map(|v| v.strip_prefix(prefix.as_bytes()))
-                .map(|v| String::from_utf8_lossy(v).into_owned())
+        let proc = PaneProc {
+            pid,
+            argv: std::fs::read(dir.join("cmdline"))
+                .map(|cmdline| {
+                    cmdline
+                        .split(|&b| b == 0)
+                        .filter(|arg| !arg.is_empty())
+                        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            environ,
         };
-        if value("WEZTERM_PANE=").as_deref() != Some(pane.as_str()) {
+        if proc.var("WEZTERM_PANE").as_deref() != Some(pane.as_str()) {
             continue;
         }
         if let Some(mux) = target.mux_socket.as_deref() {
-            if !value("WEZTERM_UNIX_SOCKET=").is_some_and(|theirs| same_path(&theirs, mux)) {
+            if !proc.var("WEZTERM_UNIX_SOCKET").is_some_and(|theirs| same_path(&theirs, mux)) {
                 continue;
             }
         }
-        // Another program of the pane (a server run in it with node) may
-        // not have it set: the agent's own is looked for on.
-        if let Some(found) = value(&want) {
-            return Some(found);
+        found.push(proc);
+    }
+    found
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn pane_procs(_target: &Target, _programs: &[&str]) -> Vec<PaneProc> {
+    Vec::new()
+}
+
+/// A variable as the agent in the pane has it, where that can be read
+/// (Linux): the bridge runs with ssh's environment, not the pane's, and
+/// an agent's own folder (`CODEX_HOME`) may be set only in the pane's
+/// shell. `None` when no process of the pane's names it.
+pub(crate) fn pane_env(target: &Target, programs: &[&str], name: &str) -> Option<String> {
+    // Another program of the pane (a server run in it with node) may not
+    // have it set: the agent's own is looked for on.
+    pane_procs(target, programs).iter().find_map(|proc| proc.var(name))
+}
+
+/// The ports a process listens on for TCP, where that can be read
+/// (Linux).
+pub(crate) fn listening_ports(pid: u32) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for socket in tcp_sockets(pid).into_iter().filter(|s| s.listening) {
+        if !ports.contains(&socket.local) {
+            ports.push(socket.local);
         }
     }
-    None
+    ports
+}
+
+/// The ports a process is connected to over TCP (the other end's), where
+/// that can be read (Linux).
+pub(crate) fn connected_ports(pid: u32) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for socket in tcp_sockets(pid).into_iter().filter(|s| s.connected) {
+        if !ports.contains(&socket.remote) {
+            ports.push(socket.remote);
+        }
+    }
+    ports
+}
+
+/// A TCP socket of a process's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct TcpSocket {
+    listening: bool,
+    connected: bool,
+    local: u16,
+    remote: u16,
+}
+
+/// A process's TCP sockets: its own, found among all the kernel lists.
+#[cfg(target_os = "linux")]
+fn tcp_sockets(pid: u32) -> Vec<TcpSocket> {
+    let mut inodes = std::collections::HashSet::new();
+    if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        for fd in fds.flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let link = link.to_string_lossy();
+            if let Some(inode) = link.strip_prefix("socket:[").and_then(|l| l.strip_suffix(']')) {
+                inodes.insert(inode.to_string());
+            }
+        }
+    }
+    let port = |address: &str| address.rsplit(':').next().and_then(|p| u16::from_str_radix(p, 16).ok());
+    let mut sockets = Vec::new();
+    for table in ["tcp", "tcp6"] {
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/net/{table}")) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // local address, remote, state (0A listening, 01 connected), …, inode.
+            let (Some(local), Some(remote), Some(state), Some(inode)) = (fields.get(1), fields.get(2), fields.get(3), fields.get(9))
+            else {
+                continue;
+            };
+            if !inodes.contains(*inode) {
+                continue;
+            }
+            if let (Some(local), Some(remote)) = (port(local), port(remote)) {
+                sockets.push(TcpSocket {
+                    listening: *state == "0A",
+                    connected: *state == "01",
+                    local,
+                    remote,
+                });
+            }
+        }
+    }
+    sockets
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tcp_sockets(_pid: u32) -> Vec<TcpSocket> {
+    Vec::new()
 }
 
 /// The same file, however its path is written.
 pub(crate) fn same_path(a: &str, b: &str) -> bool {
     let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
     a == b || canonical(a) == canonical(b)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn pane_env(_target: &Target, _programs: &[&str], _name: &str) -> Option<String> {
-    None
 }
 
 /// Where the bridge's lines go, one JSON object a line, each flushed.
@@ -268,6 +400,7 @@ pub fn run(
         "codex" => codex::run(&target, input, out),
         // OMP (Oh My Pi) is a fork of Pi: the same extension speaks for it.
         "pi" | "omp" => pi::run(&target, input, out, pane),
+        "opencode" => opencode::run(&target, input, out, pane),
         other => Ok(out.error(Some(Need::Unsupported), format!("no chat for the agent `{other}`"))?),
     }
 }

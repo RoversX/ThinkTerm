@@ -5,7 +5,8 @@
 //! protocol, and the two exchange one JSON object per line: [`Op`]s from
 //! the client, [`Ev`]s from the bridge. The bridge speaks each agent's own
 //! interface -- Codex's app-server daemon, the extension ThinkTerm puts
-//! into Pi -- and tells what happens in the shapes below, the same for
+//! into Pi, OpenCode's background service -- and tells what happens in
+//! the shapes below, the same for
 //! every agent. Nothing here is worded for a person: the client words it,
 //! in the language it shows.
 
@@ -33,7 +34,7 @@ pub fn reload_command(agent_id: &str) -> &'static str {
 /// Whether a chat can be had with an agent, by the id its detection gives
 /// it (`thinkterm_proto::AgentStatus::agent_id`).
 pub fn chat_agent(agent_id: &str) -> bool {
-    matches!(agent_id, "codex" | "pi" | "omp")
+    matches!(agent_id, "codex" | "pi" | "omp" | "opencode")
 }
 
 /// Bumped when a line changes meaning. Either side ignores the fields it
@@ -88,7 +89,7 @@ pub enum Ev {
     /// The first line once the pane's conversation is found.
     Hello {
         protocol: u32,
-        /// `codex`, `pi`, `omp`.
+        /// `codex`, `pi`, `omp`, `opencode`.
         agent: String,
         /// The conversation's own name, when it has one.
         #[serde(default)]
@@ -474,6 +475,13 @@ pub enum Need {
     CodexDaemon,
     /// The daemon has no conversation that is this pane's.
     CodexThread,
+    /// No OpenCode service answers: none runs, or the TUI runs a private
+    /// one where it cannot be read.
+    OpenCodeService,
+    /// The service has no session that is this pane's.
+    OpenCodeSession,
+    /// The pane runs OpenCode 1, which has no service to talk to.
+    OpenCodeUpgrade,
     /// The pane is not on the machine the bridge runs on.
     NotHere,
     /// The pane runs no agent the chat knows.
