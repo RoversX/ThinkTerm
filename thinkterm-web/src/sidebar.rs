@@ -19,6 +19,10 @@ pub enum Editing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideClick {
     Thread(String),
+    /// The thread was opened some other way -- its agent's chat, from the
+    /// phone's thread list: it is read and recent, as an opened one is,
+    /// with the panes left where they are.
+    TouchThread(String),
     Window(WindowId),
     ToggleProject(String),
     ToggleArchived,

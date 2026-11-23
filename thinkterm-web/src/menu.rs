@@ -468,6 +468,8 @@ mod tests {
             deleting: false,
             failed: false,
             icons: Vec::new(),
+            agent: false,
+            chat: None,
         };
         assert_eq!(labels(&for_thread(&row)), ["Unpin Thread", "Rename Thread…", "Delete Thread", "Mark as Unread"]);
         assert_eq!(for_thread(&row)[0].id, "unpin:t1");

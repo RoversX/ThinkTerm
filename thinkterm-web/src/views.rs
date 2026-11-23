@@ -335,8 +335,10 @@ mod tests {
                 deleting: false,
                 failed: false,
                 icons: Vec::new(),
+                agent: false,
+                chat: None,
             }),
-            Row::Window { window_id: 3, title: "Terminal".into(), selected: false },
+            Row::Window { window_id: 3, title: "Terminal".into(), selected: false, agent: false },
         ];
         let v = to_value(SidebarView {
             rows,

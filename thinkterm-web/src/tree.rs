@@ -75,6 +75,11 @@ pub enum Row {
         window_id: WindowId,
         title: String,
         selected: bool,
+        /// The Status panel lists something in its panes, as a thread's
+        /// `agent`: no thread claims it, but the phone's "agents only"
+        /// keeps it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        agent: bool,
     },
 }
 
@@ -100,6 +105,23 @@ pub struct ThreadRow {
     /// a thread with no pane has the terminal's).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub icons: Vec<String>,
+    /// The Status panel lists something in its panes -- an agent, or a
+    /// program saying how it is doing: the phone's "agents only" view
+    /// keeps it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent: bool,
+    /// The agent in it the phone can chat with, for a tap to open: the
+    /// one waiting on you, else the first in its tabs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ThreadChat>,
+}
+
+/// An agent a thread's row can open the chat of: its pane, and the agent
+/// as detection names it ("codex", "pi").
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ThreadChat {
+    pub pane: PaneId,
+    pub agent: String,
 }
 
 /// The tree whole: `TreeModel::tree`.
@@ -150,6 +172,8 @@ pub struct TreeModel {
     pub space: Option<String>,
     /// Every window on the server, with its workspace and a title.
     windows: Vec<(WindowId, String, String)>,
+    /// The panes in each of those windows, every tab's.
+    window_panes: HashMap<WindowId, Vec<PaneId>>,
 }
 
 impl TreeModel {
@@ -268,8 +292,12 @@ impl TreeModel {
     pub fn apply_panes(&mut self, list: &ListPanesResponse) {
         let mut seen = HashSet::new();
         self.windows.clear();
+        self.window_panes.clear();
         for node in &list.tabs {
             let leaves = crate::layout::leaves(node);
+            for leaf in &leaves {
+                self.window_panes.entry(leaf.window_id).or_default().push(leaf.pane_id);
+            }
             let Some(first) = leaves.first() else {
                 continue;
             };
@@ -358,6 +386,7 @@ impl TreeModel {
         } else {
             Dot::Quiet
         };
+        let (agent, chat) = self.thread_agents(t);
         ThreadRow {
             id: t.id.clone(),
             project_id: project_id.to_string(),
@@ -371,7 +400,36 @@ impl TreeModel {
             deleting: deleting == Some(t.id.as_str()),
             failed: self.has_failed(t),
             icons: Vec::new(),
+            agent,
+            chat,
         }
+    }
+
+    /// The agent in a pane as the Status panel lists it, its id and state;
+    /// none once it reported its own end, as lists leave those out.
+    fn listed_agent(&self, pane: PaneId) -> Option<(&str, AgentState)> {
+        if self.agents_ended.contains(&pane) {
+            return None;
+        }
+        let state = *self.agents.get(&pane)?;
+        Some((self.agent_details.get(&pane).map_or("", |(id, _)| id.as_str()), state))
+    }
+
+    /// Whether the Status panel lists anything in the thread's panes, and
+    /// the agent in them a chat can be had with -- the one waiting on you,
+    /// else the first met.
+    fn thread_agents(&self, t: &ThinkTermSessionThread) -> (bool, Option<ThreadChat>) {
+        let mut listed = false;
+        let mut chat: Option<(PaneId, &str, AgentState)> = None;
+        for pane in t.tabs.iter().flat_map(|tab| tab.pane_ids.iter().copied()) {
+            let Some((id, state)) = self.listed_agent(pane) else { continue };
+            listed = true;
+            let better = chat.map_or(true, |(_, _, held)| held != AgentState::Blocked && state == AgentState::Blocked);
+            if better && thinkterm_agent_chat::chat_agent(id) {
+                chat = Some((pane, id, state));
+            }
+        }
+        (listed, chat.map(|(pane, agent, _)| ThreadChat { pane, agent: agent.to_string() }))
     }
 
     /// The whole tree, every Space with its projects and their threads,
@@ -596,7 +654,15 @@ impl TreeModel {
             .windows
             .iter()
             .filter(|(_, ws, _)| !claimed.contains(ws.as_str()))
-            .map(|(id, _, title)| Row::Window { window_id: *id, title: title.clone(), selected: *id == current_window })
+            .map(|(id, _, title)| Row::Window {
+                window_id: *id,
+                title: title.clone(),
+                selected: *id == current_window,
+                agent: self
+                    .window_panes
+                    .get(id)
+                    .is_some_and(|panes| panes.iter().any(|pane| self.listed_agent(*pane).is_some())),
+            })
             .collect();
         if !others.is_empty() {
             rows.push(Row::Others);
@@ -1056,6 +1122,53 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_says_what_the_status_panel_lists_in_it_and_whose_chat_a_tap_opens() {
+        let mut m = TreeModel::default();
+        let threads = vec![
+            thread("plain", Some("ws-1"), vec![(1, vec![10])]),
+            thread("claude", Some("ws-2"), vec![(2, vec![20])]),
+            thread("two", Some("ws-3"), vec![(3, vec![30, 31]), (4, vec![40])]),
+        ];
+        assert!(m.apply_session(session(threads)));
+        let mut agent = |pane: PaneId, id: &str, state: AgentState| {
+            m.agents.insert(pane, state);
+            m.agent_details.insert(pane, (id.into(), String::new()));
+        };
+        // An agent the phone has no chat for is listed all the same, and
+        // so is one with nothing to do.
+        agent(20, "claude", AgentState::Idle);
+        agent(30, "codex", AgentState::Working);
+        agent(31, "claude", AgentState::Blocked);
+        agent(40, "pi", AgentState::Blocked);
+        let tree = m.tree(0, "", None);
+        let threads = &tree.spaces[0].projects[0].threads;
+        let row = |id: &str| threads.iter().find(|t| t.id == id).unwrap();
+        assert_eq!((row("plain").agent, &row("plain").chat), (false, &None));
+        assert_eq!((row("claude").agent, &row("claude").chat), (true, &None));
+        // The chat that waits on you comes before the first one met.
+        assert!(row("two").agent);
+        assert_eq!(row("two").chat, Some(ThreadChat { pane: 40, agent: "pi".into() }));
+        m.agents.insert(40, AgentState::Working);
+        let tree = m.tree(0, "", None);
+        let two = tree.spaces[0].projects[0].threads.iter().find(|t| t.id == "two").unwrap();
+        assert_eq!(two.chat, Some(ThreadChat { pane: 30, agent: "codex".into() }));
+        // Neither is said when it is not so.
+        let json = serde_json::to_value(row("plain")).unwrap();
+        assert!(json.get("agent").is_none() && json.get("chat").is_none());
+        // An agent that reported its own end is not listed, nor chatted with.
+        m.agents_ended.insert(30);
+        m.agents_ended.insert(31);
+        let tree = m.tree(0, "", None);
+        let two = tree.spaces[0].projects[0].threads.iter().find(|t| t.id == "two").unwrap();
+        assert!(two.agent, "pi in pane 40 is still there");
+        assert_eq!(two.chat, Some(ThreadChat { pane: 40, agent: "pi".into() }));
+        m.agents_ended.insert(40);
+        let tree = m.tree(0, "", None);
+        let two = tree.spaces[0].projects[0].threads.iter().find(|t| t.id == "two").unwrap();
+        assert_eq!((two.agent, &two.chat), (false, &None));
+    }
+
+    #[test]
     fn a_thread_a_program_failed_in_is_marked_apart_from_a_wait() {
         let mut m = TreeModel::default();
         let t = thread("a", Some("ws"), vec![(1, vec![10, 11])]);
@@ -1103,7 +1216,16 @@ mod tests {
         };
         m.apply_panes(&list);
         let rows = m.rows(30, "default", 3);
-        assert!(matches!(rows.last(), Some(Row::Window { window_id: 3, selected: true, title }) if title == "Terminal"));
+        assert!(matches!(rows.last(), Some(Row::Window { window_id: 3, selected: true, title, agent: false }) if title == "Terminal"));
         assert!(rows.iter().any(|r| matches!(r, Row::Others)));
+        // An agent in a window no thread claims is the window's to say, for
+        // a list of agents only to keep it -- until it reports its end.
+        m.agents.insert(300, AgentState::Working);
+        m.agent_details.insert(300, ("codex".into(), String::new()));
+        let rows = m.rows(30, "default", 3);
+        assert!(matches!(rows.last(), Some(Row::Window { agent: true, .. })));
+        m.agents_ended.insert(300);
+        let rows = m.rows(30, "default", 3);
+        assert!(matches!(rows.last(), Some(Row::Window { agent: false, .. })));
     }
 }

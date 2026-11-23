@@ -9,6 +9,7 @@ use thinkterm_proto::{PaneId, SplitDirection, TabId};
 pub fn side_click(kind: &str, id: Option<String>, flag: Option<bool>) -> Option<SideClick> {
     Some(match (kind, id) {
         ("thread", Some(id)) => SideClick::Thread(id),
+        ("touch-thread", Some(id)) => SideClick::TouchThread(id),
         ("window", Some(id)) => SideClick::Window(id.parse().ok()?),
         ("toggle-project", Some(id)) => SideClick::ToggleProject(id),
         ("toggle-archived", _) => SideClick::ToggleArchived,

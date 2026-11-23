@@ -3969,6 +3969,10 @@ impl<P: Platform, L: Link> App<P, L> {
         }
         match click {
             SideClick::Thread(id) => self.activate_thread(id),
+            SideClick::TouchThread(id) => {
+                let app = Rc::clone(self);
+                self.spawn(async move { app.touch_thread(id).await });
+            }
             SideClick::Window(window_id) => {
                 let pane = {
                     let inner = self.inner.borrow();
@@ -4330,23 +4334,30 @@ impl<P: Platform, L: Link> App<P, L> {
             if let Some(pane) = pane {
                 app.show(list, pane).await;
             }
-            let now = app.now_secs();
-            let _ = thinkterm_session::host::request(
-                &link,
-                Pdu::MutateThinkTermTree(codec::MutateThinkTermTree {
-                    ops: vec![
-                        codec::TreeOp::TouchThread { thread_id: id.clone(), at: now },
-                        codec::TreeOp::SetThreadUnread { thread_id: id.clone(), unread: false },
-                    ],
-                }),
-                |p| match p {
-                    Pdu::ThinkTermTreeState(s) => Ok(s.tree),
-                    other => Err(other),
-                },
-            )
-            .await;
-            app.fetch_session().await;
+            app.touch_thread(id).await;
         });
+    }
+
+    /// An opened thread is the most recent and read, on the server: the
+    /// desktop's sidebar and every other client show it so.
+    async fn touch_thread(self: &Rc<Self>, id: String) {
+        let link = self.inner.borrow().link.clone();
+        let now = self.now_secs();
+        let _ = thinkterm_session::host::request(
+            &link,
+            Pdu::MutateThinkTermTree(codec::MutateThinkTermTree {
+                ops: vec![
+                    codec::TreeOp::TouchThread { thread_id: id.clone(), at: now },
+                    codec::TreeOp::SetThreadUnread { thread_id: id, unread: false },
+                ],
+            }),
+            |p| match p {
+                Pdu::ThinkTermTreeState(s) => Ok(s.tree),
+                other => Err(other),
+            },
+        )
+        .await;
+        self.fetch_session().await;
     }
 
     /// Something the chrome shows changed: the probe's attribute is
