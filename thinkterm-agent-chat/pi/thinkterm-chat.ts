@@ -19,7 +19,7 @@ import * as path from "node:path";
 
 /// Raised with every change: ThinkTerm puts a newer one in place of an
 /// older one when a chat opens.
-const EXTENSION_VERSION = 6;
+const EXTENSION_VERSION = 7;
 /// 2: what is said may carry files and pictures; the model can be changed.
 const PROTOCOL = 2;
 const MAX_LINE = 8 << 20;
@@ -68,6 +68,8 @@ export default function (pi: ExtensionAPI) {
   const toolArgs = new Map<string, any>();
   // The approvals OMP waits on, by tool call.
   const asking = new Map<string, any>();
+  // The look, just after a run's end, whether the agent rests.
+  let settling: ReturnType<typeof setTimeout> | undefined;
   // The model in use, as last chosen (here or in the terminal).
   let model: any;
   // Where each picture of the sessions read is, as a file, by the message
@@ -148,6 +150,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   function stop() {
+    // Nothing of this session's runs after it: its context is no longer
+    // Pi's to use (Pi throws for one used after the session is replaced).
+    clearTimeout(settling);
+    settling = undefined;
     // What this session asked goes with it.
     withdraw();
     for (const client of clients) client.destroy();
@@ -236,7 +242,14 @@ export default function (pi: ExtensionAPI) {
       while ((at = buffered.indexOf("\n")) >= 0) {
         const line = buffered.slice(0, at);
         buffered = buffered.slice(at + 1);
-        if (line.trim()) handle(line, client);
+        if (!line.trim()) continue;
+        // Whatever goes wrong with one line is said to its client, never
+        // thrown into Pi.
+        try {
+          handle(line, client);
+        } catch (err) {
+          send({ ev: "refused", message: String(err) }, client);
+        }
       }
     });
     const gone = () => {
@@ -245,7 +258,12 @@ export default function (pi: ExtensionAPI) {
     };
     client.on("close", gone);
     client.on("error", gone);
-    greet(client);
+    try {
+      greet(client);
+    } catch (err) {
+      send({ ev: "error", message: String(err) }, client);
+      client.destroy();
+    }
   }
 
   function handle(line: string, client: net.Socket) {
@@ -770,8 +788,15 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (_event: any, context: any) => {
     ctx = context;
     withdraw();
-    setTimeout(() => {
-      if (ctx?.isIdle?.()) setState("idle");
+    // Only where a phone may be told (a Pi in its terminal): a print or
+    // json run is over, its context gone, by the time a look would come.
+    if (!server) return;
+    clearTimeout(settling);
+    settling = setTimeout(() => {
+      settling = undefined;
+      try {
+        if (ctx?.isIdle?.()) setState("idle");
+      } catch {}
     }, 300);
   });
   // OMP asks before some tools run (not by default): the chat shows what,
