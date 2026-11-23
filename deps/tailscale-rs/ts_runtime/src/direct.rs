@@ -193,6 +193,14 @@ fn udp_rx(sock: impl Borrow<UdpSocket>) -> impl Stream<Item = UdpRx> {
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         break;
                     }
+                    // ThinkTerm (refused sends): added. Windows reports an ICMP port unreachable
+                    // for something sent from this socket -- a STUN server, a peer's address
+                    // that is gone -- as WSAECONNRESET from the next receive; the socket is
+                    // fine. As an error it ended this stream, and DirectActor panicked.
+                    Err(e) if e.kind() == ErrorKind::ConnectionReset => {
+                        tracing::debug!(error = %e, "a send from this socket was refused");
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 };
 

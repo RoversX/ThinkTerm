@@ -152,6 +152,15 @@ map update (ts_runtime)
     network, just as the connection to control goes down.
     Drop when: upstream's control runner takes a failed map update in its stride.
 
+refused sends (ts_runtime)
+    DirectActor's UDP receive goes on past ConnectionReset. Windows reports an ICMP port
+    unreachable for something the socket sent -- a STUN server, a peer's address that is
+    gone -- as WSAECONNRESET from the next receive; the socket is fine. As an error it ended
+    the receive stream, and DirectActor panicked and was made anew on new ports. Since 0.7.0
+    the socket also sends STUN to every DERP region's server. Other systems do not report
+    these on a socket that is not connected.
+    Drop when: upstream turns SIO_UDP_CONNRESET off or skips the error.
+
 derp dial (ts_derp, ts_runtime)
     A DERP region whose servers cannot be reached, or whose TLS handshake fails, is an error
     for its client; 0.6.1 unwraps the outcome of the dial and panics. A connection gets 15 s
@@ -269,7 +278,8 @@ taking the place of the stop. Signing in to a real tailnet after an upgrade chec
 first; signing in while the control server cannot be reached checks the second. Nor are the
 parts of derp dial and derp frames that need a working DERP server (the waits starting over
 after a connection that held, frames the server sends). Map update needs a control server:
-changing networks under a signed-in node checks it.
+changing networks under a signed-in node checks it. Refused sends happen on Windows only: a
+node there with a DERP region's STUN server unreachable checks them.
 
 Upgrading
 ---------
