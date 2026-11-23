@@ -74,7 +74,10 @@ struct LaunchSky: ViewModifier {
                 Self.played = true
                 start = Date()
                 if !onboard {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.rush) { rushIn() }
+                    // Felt from the start: the stir as the stars draw near,
+                    // then the rush with them.
+                    SkyHaptics.launch()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.rush) { rushIn(felt: false) }
                 }
             }
             .onChange(of: again.asks) { replay() }
@@ -98,9 +101,11 @@ struct LaunchSky: ViewModifier {
     }
 
     /// The stars streak past, and the app comes out of the zoom and the
-    /// blur as the sky goes.
-    private func rushIn() {
+    /// blur as the sky goes; felt, unless the launch's haptics already
+    /// hold the rush.
+    private func rushIn(felt: Bool = true) {
         guard rushAt == nil else { return }
+        if felt { SkyHaptics.rush() }
         if onboard { AppSettings.shared.onboarded = true }
         rushAt = Date().timeIntervalSince(start)
         withAnimation(.timingCurve(0.33, 0, 0.67, 1, duration: 0.47).delay(0.1)) { revealed = true }

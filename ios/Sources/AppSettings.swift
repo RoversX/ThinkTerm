@@ -99,6 +99,12 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(agentsOnly, forKey: "home.agents") }
     }
 
+    /// The starry sky is felt as well as seen: at launch, and as a
+    /// connection's sky rushes off (`SkyHaptics`).
+    @Published var skyHaptics: Bool {
+        didSet { defaults.set(skyHaptics, forKey: "sky.haptics") }
+    }
+
     // MARK: keyboard
 
     /// A tap on a key taps back. The key bar and the key panel read it.
@@ -175,6 +181,7 @@ final class AppSettings: ObservableObject {
         chatText = d.string(forKey: "chat.text") ?? "m"
         spaces = d.string(forKey: "ui.spaces") ?? "list"
         agentsOnly = d.object(forKey: "home.agents") as? Bool ?? false
+        skyHaptics = d.object(forKey: "sky.haptics") as? Bool ?? true
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
         autoKeyPanel = d.object(forKey: "key.autopanel") as? Bool ?? false
         pinchZoom = d.object(forKey: "gesture.pinch") as? Bool ?? true

@@ -792,6 +792,7 @@ struct TerminalScreen: View {
         }
         let at = Date().timeIntervalSince(start)
         skyRushAt = at
+        SkyHaptics.connected(shownFor: at)
         DispatchQueue.main.asyncAfter(deadline: .now() + LaunchSky.afterRush) {
             // Unless another page has come up meanwhile, with its own sky.
             guard skyStart == start, skyRushAt == at else { return }

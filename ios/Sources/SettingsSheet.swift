@@ -229,6 +229,7 @@ struct SettingsPageView: View {
                     PickerOption("list", tr("i.spaces.list")),
                     PickerOption("menu", tr("i.spaces.menu")),
                 ])
+                Toggle(tr("sky.haptics"), isOn: $settings.skyHaptics)
             }
         case .agents:
             Section {
