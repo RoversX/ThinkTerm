@@ -253,6 +253,8 @@ pub enum ChatCmd {
     Interrupt,
     Older,
     Install,
+    /// Have the agent take its extension in (`Op::Reload`).
+    Load,
     /// Open its channel again, after it ended.
     Retry,
     /// Open or fold a row.
@@ -708,6 +710,7 @@ impl State {
                     }
                 }
             }
+            ChatCmd::Load => self.chat_op_or_end(ChatOp::Reload),
             ChatCmd::Install => {
                 self.chat_op(ChatOp::Install);
             }

@@ -908,10 +908,11 @@ impl Core {
         let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Older));
     }
 
-    /// The chat's problem's action: "install" or "retry".
+    /// The chat's problem's action: "install", "load" or "retry".
     pub fn chat_action(&self, action: String) {
         let cmd = match action.as_str() {
             "install" => core::ChatCmd::Install,
+            "load" => core::ChatCmd::Load,
             _ => core::ChatCmd::Retry,
         };
         let _ = self.tx.send(core::Cmd::Chat(cmd));
