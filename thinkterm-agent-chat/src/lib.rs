@@ -159,6 +159,11 @@ pub enum Ev {
     /// its folder: the chat goes on, without what is newer, until the
     /// agent takes it in ([`Op::Reload`]).
     Outdated,
+    /// How long a turn worked, said after the last thing that came of it
+    /// (the item `after`), where the client shows it. A line of its own,
+    /// not an item: a client that does not know it lets it go, where an
+    /// item it did not know would cost it the whole history it came in.
+    Worked { id: String, after: String, seconds: u64 },
 }
 
 fn is_false(b: &bool) -> bool {
@@ -394,6 +399,12 @@ pub enum NoteKind {
     Interrupted,
     /// The turn failed; `text` says how.
     Failed,
+    /// How long the turn worked: `text` is its seconds. Made by the view
+    /// from [`Ev::Worked`]; never sent as an item.
+    Worked,
+    /// A kind this side does not know yet: shown as nothing.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

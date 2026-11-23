@@ -256,8 +256,14 @@ pub enum Row {
         label: String,
         /// `running`, `stopped`, `done`.
         state: &'static str,
-        /// How many of them failed, when some did ("1 failed").
+        /// How many of them failed, when some did ("1 failed"); for one
+        /// thing done, its own ("declined", "exit 1").
         badge: Option<String>,
+        /// For one change done, the lines it added and took out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        added: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        removed: Option<u32>,
         open: bool,
         /// Its folds, while open.
         rows: Vec<Row>,
@@ -440,6 +446,20 @@ impl Chat {
                 self.can_load = can_load;
             }
             Ev::Outdated => self.outdated = true,
+            // Put after what it follows; with that not held, let go.
+            Ev::Worked { id, after, seconds } => {
+                self.items.retain(|item| item.id() != id);
+                if let Some(at) = self.items.iter().rposition(|item| item.id() == after) {
+                    self.items.insert(
+                        at + 1,
+                        Item::Note {
+                            id,
+                            note: NoteKind::Worked,
+                            text: seconds.to_string(),
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -529,22 +549,23 @@ impl Chat {
         while start > 0 && is_work(&self.items[start - 1]) {
             start -= 1;
         }
-        let mut done = 0;
+        // As `work_rows` makes them: a fold each, a run of looks one; two
+        // or more are a group.
+        let mut folds = 0;
         let mut looking = false;
         for item in self.items[start..].iter().take_while(|item| is_work(item)) {
             match item {
-                Item::Thinking { .. } => looking = false,
                 Item::Command { looks, .. } if !looks.is_empty() => {
-                    done += usize::from(!looking);
+                    folds += usize::from(!looking);
                     looking = true;
                 }
                 _ => {
-                    done += 1;
+                    folds += 1;
                     looking = false;
                 }
             }
         }
-        (done >= 2).then(|| format!("group:{}", self.items[start].id()))
+        (folds >= 2).then(|| format!("group:{}", self.items[start].id()))
     }
 
     /// The ids of the work done in a row from item `first` on.
@@ -867,7 +888,10 @@ impl Chat {
             }
             i += 1;
         }
-        if done < 2 {
+        // A run of work is one row however it grows: a fold alone, or one
+        // line for all it holds. (Folds that turned into a group as more
+        // came made the chat shrink and grow while the agent worked.)
+        if folds.len() < 2 {
             rows.extend(folds);
             return;
         }
@@ -880,15 +904,43 @@ impl Chat {
             Item::Command { status, .. } | Item::Edit { status, .. } | Item::Tool { status, .. } => *status == Status::Running,
             _ => false,
         });
-        rows.push(Row::Group {
-            icon: tally.icon(),
-            label: tally.label(),
-            state: if running { state_word(Status::Running, resting) } else { "done" },
-            badge: (tally.failed > 0).then(|| {
+        // One thing done, with its thinking: that thing's own line.
+        let single = (done <= 1)
+            .then(|| {
+                folds
+                    .iter()
+                    .rev()
+                    .find(|row| matches!(row, Row::Fold { icon, .. } if *icon != "think" || done == 0))
+            })
+            .flatten();
+        let group_badge = || {
+            (tally.failed > 0).then(|| {
                 let mut args = FluentArgs::new();
                 args.set("count", tally.failed as i64);
                 tr_args("chat-group-failed", &args)
-            }),
+            })
+        };
+        let group_state = if running { state_word(Status::Running, resting) } else { "done" };
+        // That thing's own: its look, how it ended, what it changed.
+        let (icon, label, state, badge, added, removed) = match single {
+            Some(Row::Fold {
+                icon,
+                label,
+                state,
+                badge,
+                added,
+                removed,
+                ..
+            }) => (*icon, label.clone(), *state, badge.clone(), *added, *removed),
+            _ => (tally.icon(), tally.label(), group_state, group_badge(), None, None),
+        };
+        rows.push(Row::Group {
+            icon,
+            label,
+            state,
+            badge,
+            added,
+            removed,
             open,
             rows: if open { folds } else { Vec::new() },
             id,
@@ -1059,6 +1111,14 @@ impl Chat {
                         args.set("why", text.clone());
                         tr_args("chat-note-failed", &args)
                     }
+                    NoteKind::Worked => {
+                        // A turn quicker than this is not worth a line.
+                        let seconds = text.trim().parse::<u64>().ok().filter(|&s| s >= WORKED_SAID)?;
+                        let mut args = FluentArgs::new();
+                        args.set("time", duration_words(seconds));
+                        tr_args("chat-note-worked", &args)
+                    }
+                    NoteKind::Other => return None,
                 },
             },
         })
@@ -1461,6 +1521,30 @@ fn diff_files(files: &[FileEdit]) -> Vec<DiffFile> {
         .collect()
 }
 
+/// The shortest turn whose time is said ("Worked for 2 s").
+const WORKED_SAID: u64 = 2;
+
+/// A time, as said: "12 s", "1 min 5 s", "2 h 3 min".
+fn duration_words(seconds: u64) -> String {
+    let mut args = FluentArgs::new();
+    match seconds {
+        0..=59 => {
+            args.set("s", seconds as i64);
+            tr_args("chat-time-s", &args)
+        }
+        60..=3599 => {
+            args.set("m", (seconds / 60) as i64);
+            args.set("s", (seconds % 60) as i64);
+            tr_args("chat-time-ms", &args)
+        }
+        _ => {
+            args.set("h", (seconds / 3600) as i64);
+            args.set("m", (seconds % 3600 / 60) as i64);
+            tr_args("chat-time-hm", &args)
+        }
+    }
+}
+
 /// Tokens, short: 950, 1.2k, 74k, 1.3M.
 fn token_count(n: u64) -> String {
     let short = |value: f64, unit: &str| {
@@ -1853,7 +1937,9 @@ mod tests {
         chat.toggle("c2");
         assert_eq!(open_rows(&chat), (true, 4));
 
-        // One thing done, with its thought: no group.
+        // One thing done, with its thought: one line still -- the thing's
+        // own -- so the chat does not grow by a line and shrink by two as
+        // the agent goes on.
         let mut chat = Chat::new(1, "codex");
         chat.apply(Ev::History {
             items: vec![
@@ -1866,8 +1952,84 @@ mod tests {
             more: false,
             reset: true,
         });
-        assert!(chat.view().rows.iter().all(|row| matches!(row, Row::Fold { .. })));
-        assert_eq!(chat.view().rows.len(), 2);
+        let rows = chat.view().rows;
+        assert_eq!(rows.len(), 1);
+        let Row::Group { label, icon, .. } = &rows[0] else { panic!("{rows:?}") };
+        assert_eq!(*icon, "run");
+        assert!(label.contains("make"), "{label}");
+        // That one thing declined is said to be, as its own fold says.
+        let mut chat = Chat::new(1, "codex");
+        chat.apply(Ev::History {
+            items: vec![
+                Item::Thinking {
+                    id: "t".into(),
+                    text: "x".into(),
+                },
+                command("c1", "rm -rf build", Status::Declined, vec![]),
+            ],
+            more: false,
+            reset: true,
+        });
+        let rows = chat.view().rows;
+        let Row::Group { state, badge, .. } = &rows[0] else { panic!("{rows:?}") };
+        assert_eq!(*state, "declined");
+        assert!(badge.is_some());
+        // Its thought opened and closed again: the group stays as it was.
+        chat.toggle("group:t");
+        chat.toggle("t");
+        chat.toggle("t");
+        assert!(matches!(&chat.view().rows[0], Row::Group { open: true, .. }));
+
+        // Thinking alone is its own fold.
+        let mut chat = Chat::new(1, "codex");
+        chat.apply(Ev::Item {
+            item: Item::Thinking {
+                id: "t".into(),
+                text: "x".into(),
+            },
+        });
+        assert!(matches!(chat.view().rows[..], [Row::Fold { .. }]));
+    }
+
+    #[test]
+    fn a_turn_says_how_long_it_worked_when_that_was_a_while() {
+        let said = |id: &str| Item::Text {
+            id: id.into(),
+            text: "done".into(),
+        };
+        let mut chat = Chat::new(1, "pi");
+        chat.apply(Ev::History {
+            items: vec![said("a"), said("b"), said("c"), said("d")],
+            more: false,
+            reset: true,
+        });
+        for (after, seconds) in [("a", 1), ("b", 12), ("c", 65), ("d", 3725), ("gone", 30)] {
+            chat.apply(Ev::Worked {
+                id: format!("w-{after}"),
+                after: after.into(),
+                seconds,
+            });
+        }
+        // Said again, it stays one.
+        chat.apply(Ev::Worked {
+            id: "w-b".into(),
+            after: "b".into(),
+            seconds: 12,
+        });
+        let rows = chat.view().rows;
+        // Each note right after what it follows.
+        assert!(matches!(&rows[2], Row::Note { .. }) && matches!(&rows[1], Row::Text { .. }), "{rows:?}");
+        let said: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Note { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said.len(), 3, "a turn of a second is not worth a line, nor one after what is not held: {said:?}");
+        assert!(said[0].contains("12"), "{said:?}");
+        assert!(said[1].contains('1') && said[1].contains('5'), "{said:?}");
+        assert!(said[2].contains('1') && said[2].contains('2'), "{said:?}");
     }
 
     #[test]
