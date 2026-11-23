@@ -10,6 +10,7 @@ struct ThreadsHome: View {
     @EnvironmentObject var store: HostStore
     @EnvironmentObject var sessions: Sessions
     @ObservedObject private var lang = AppLanguage.shared
+    @ObservedObject private var settings = AppSettings.shared
     @State private var path = NavigationPath()
     @State private var searching = false
     @State private var query = ""
@@ -157,6 +158,23 @@ struct ThreadsHome: View {
                 .font(.largeTitle.weight(.bold))
                 .lineLimit(1)
             Spacer(minLength: 0)
+            if !searching {
+                // Only the threads the Status panel has something in, or
+                // every one; kept from one launch to the next. A search
+                // looks through them all.
+                Button {
+                    withAnimation(.snappy(duration: 0.3)) { settings.agentsOnly.toggle() }
+                } label: {
+                    DesktopIcon(name: "eye")
+                        .foregroundColor(settings.agentsOnly ? .white : .primary)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .glassCircle(tint: settings.agentsOnly ? Color.accentColor : nil)
+                .accessibilityLabel(tr(settings.agentsOnly ? "home.agents.all" : "home.agents.only"))
+                .transition(.opacity.combined(with: .scale(scale: 0.8)))
+            }
             Button {
                 withAnimation(.easeOut(duration: 0.2)) {
                     searching.toggle()
@@ -466,37 +484,61 @@ private struct Connected: View {
         }
     }
 
+    /// Only the threads the Status panel has something in -- an agent, a
+    /// program saying how it is doing -- as the eye in the bar asks; a
+    /// search looks through every one all the same (`found`).
+    private var agentsOnly: Bool { settings.agentsOnly }
+
+    /// A project's threads as the list shows them.
+    private func shown(_ project: TreeProject) -> [ThreadRow] {
+        agentsOnly ? project.threads.filter { $0.agent == true } : project.threads
+    }
+
+    /// A project has its row unless agents only are shown and it has none.
+    private func listed(_ project: TreeProject) -> Bool {
+        !agentsOnly || !shown(project).isEmpty
+    }
+
     /// The host's Spaces, projects and threads; a lone Space has no row
     /// of its own, as in the sidebar. Windows no thread claims come last.
     @ViewBuilder
     private var tree: some View {
         if spaces.count == 1, let space = spaces.first {
-            ForEach(space.projects) { project in projectRows(space, project, depth: 0) }
+            ForEach(space.projects.filter { listed($0) }) { project in projectRows(space, project, depth: 0) }
         } else {
-            ForEach(spaces) { space in
+            ForEach(spaces.filter { space in !agentsOnly || space.projects.contains { listed($0) } }) { space in
                 SidebarRow(icon: "layers", title: space.name, bold: space.current, dim: true) {}
-                ForEach(space.projects) { project in projectRows(space, project, depth: 1) }
+                ForEach(space.projects.filter { listed($0) }) { project in projectRows(space, project, depth: 1) }
             }
         }
-        ForEach(windows, id: \.id) { window in
+        // A window no thread claims stays too when an agent runs in it.
+        ForEach(windows.filter { !agentsOnly || $0.agent }, id: \.id) { window in
             SidebarRow(icon: "app-window", title: window.title.isEmpty ? tr("window.n", window.id) : window.title) {
                 model.sideClick("window", id: String(window.id))
                 open()
             }
         }
-        if spaces.allSatisfy({ $0.projects.isEmpty }) && windows.isEmpty {
-            Text(tr("overview.none"))
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
+        if agentsOnly && !spaces.contains(where: { $0.projects.contains { listed($0) } }) && !windows.contains(where: \.agent) {
+            // Said, not left blank: a host with nothing under it reads as
+            // one whose connection broke.
+            emptyLine(tr("home.agents.none"))
+        } else if !agentsOnly && spaces.allSatisfy({ $0.projects.isEmpty }) && windows.isEmpty {
+            emptyLine(tr("overview.none"))
         }
     }
 
+    private func emptyLine(_ text: String) -> some View {
+        Text(text)
+            .font(.subheadline)
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+    }
+
     /// The windows the sidebar lists after its tree.
-    private var windows: [(id: Int, title: String)] {
+    private var windows: [(id: Int, title: String, agent: Bool)] {
         (model.sidebar?.rows ?? []).compactMap { row in
-            if case .window(let id, let title, _) = row { return (id, title) }
+            if case .window(let id, let title, _, let agent) = row { return (id, title, agent) }
             return nil
         }
     }
@@ -531,15 +573,15 @@ private struct Connected: View {
         }
         .contextMenu { AppMenuItems(model: model, kind: "project", id: project.id) }
         if !isFolded {
-            ForEach(project.threads) { thread in
+            ForEach(shown(project)) { thread in
                 // Under the project's name, not stepped in: the desktop's
                 // rows all start at one edge.
-                threadRow(thread, space: space, depth: depth)
+                threadRow(thread, space: space, project: project, depth: depth)
             }
         }
     }
 
-    private func threadRow(_ thread: ThreadRow, space: TreeSpace, depth: Int, subtitle: String? = nil) -> some View {
+    private func threadRow(_ thread: ThreadRow, space: TreeSpace, project: TreeProject, depth: Int, subtitle: String? = nil) -> some View {
         SidebarRow(
             lead: AnyView(ThreadCards(core: model.core, icons: thread.icons ?? [], revision: model.iconsRevision)),
             mark: AnyView(ThreadMark(status: thread.markStatus, dot: thread.dot, live: thread.live, size: 9)),
@@ -548,7 +590,16 @@ private struct Connected: View {
             depth: depth,
             dim: !thread.live
         ) {
-            model.openThread(thread.id, space: space.id)
+            if settings.chatFirst, let chat = thread.chat {
+                // Its agent's chat, over the terminal of the agent's pane;
+                // back from it is back here. The thread is read and recent
+                // all the same, as an opened one is.
+                if !space.current { model.setSpace(space.id) }
+                model.sideClick("touch-thread", id: thread.id)
+                model.openChat(pane: chat.pane, agent: chat.agent, place: project.name + " · " + thread.name, fromThreads: true)
+            } else {
+                model.openThread(thread.id, space: space.id)
+            }
             open()
         }
         .contextMenu { AppMenuItems(model: model, kind: "thread", id: thread.id) }
@@ -569,7 +620,7 @@ private struct Connected: View {
         if !hits.isEmpty {
             HostTitle(name: name, color: dot)
             ForEach(hits, id: \.thread.id) { hit in
-                threadRow(hit.thread, space: hit.space, depth: 0, subtitle: hit.project.name)
+                threadRow(hit.thread, space: hit.space, project: hit.project, depth: 0, subtitle: hit.project.name)
             }
         }
     }

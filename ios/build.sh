@@ -96,7 +96,7 @@ mkdir -p "$icons"
 printf '{"info":{"author":"xcode","version":1}}\n' > "$icons/Contents.json"
 for name in app-window archive chevron-left chevron-right chevrons-up-down circle-plus folder \
   folder-open globe grid-2x2 key-round layers link-2 rotate-ccw search server \
-  settings square-pen x hand monitor-smartphone triangle-alert; do
+  settings square-pen x hand monitor-smartphone triangle-alert eye; do
   set="$icons/lucide-$name.imageset"
   mkdir -p "$set"
   sed 's/stroke="currentColor"/stroke="#000000"/' "third_party/lucide/icons/$name.svg" > "$set/$name.svg"

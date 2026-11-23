@@ -74,8 +74,9 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(paneBars, forKey: "ui.panebars") }
     }
 
-    /// A tap on an agent in the Agents list opens its chat (Codex, Pi)
-    /// rather than its terminal; off, its chat button still does.
+    /// A tap on an agent in the Agents list, or on a thread one runs in on
+    /// Threads, opens its chat (Codex, Pi, OpenCode) rather than its
+    /// terminal; off, its chat button still does.
     @Published var chatFirst: Bool {
         didSet { defaults.set(chatFirst, forKey: "chat.first") }
     }
@@ -90,6 +91,12 @@ final class AppSettings: ObservableObject {
     /// as the desktop's sidebar has them.
     @Published var spaces: String {
         didSet { defaults.set(spaces, forKey: "ui.spaces") }
+    }
+
+    /// Threads lists only the threads the Status panel has something in
+    /// (the eye in its bar), kept from one launch to the next.
+    @Published var agentsOnly: Bool {
+        didSet { defaults.set(agentsOnly, forKey: "home.agents") }
     }
 
     // MARK: keyboard
@@ -167,6 +174,7 @@ final class AppSettings: ObservableObject {
         chatFirst = d.object(forKey: "chat.first") as? Bool ?? false
         chatText = d.string(forKey: "chat.text") ?? "m"
         spaces = d.string(forKey: "ui.spaces") ?? "list"
+        agentsOnly = d.object(forKey: "home.agents") as? Bool ?? false
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
         autoKeyPanel = d.object(forKey: "key.autopanel") as? Bool ?? false
         pinchZoom = d.object(forKey: "gesture.pinch") as? Bool ?? true

@@ -17,6 +17,7 @@ struct SettingsView: View {
                 row(.appearance)
                 row(.terminal)
                 row(.interface)
+                row(.agents)
             }
             Section {
                 row(.keyboard)
@@ -49,7 +50,7 @@ struct SettingsView: View {
 
 /// What Settings has a page for.
 enum SettingsPage {
-    case general, appearance, terminal, interface, keyboard, gestures, connection, diagnostics, about
+    case general, appearance, terminal, interface, agents, keyboard, gestures, connection, diagnostics, about
 
     var title: String {
         switch self {
@@ -57,6 +58,7 @@ enum SettingsPage {
         case .appearance: return tr("sec.appearance")
         case .terminal: return tr("sec.terminal")
         case .interface: return tr("sec.interface")
+        case .agents: return tr("sec.agents")
         case .keyboard: return tr("sec.keyboard")
         case .gestures: return tr("sec.gestures")
         case .connection: return tr("sec.connection")
@@ -72,6 +74,7 @@ enum SettingsPage {
         case .appearance: return "paintbrush.pointed.fill"
         case .terminal: return "apple.terminal.fill"
         case .interface: return "rectangle.split.2x1.fill"
+        case .agents: return "sparkles"
         case .keyboard: return "keyboard.fill"
         case .gestures: return "hand.tap.fill"
         case .connection: return "antenna.radiowaves.left.and.right"
@@ -87,6 +90,7 @@ enum SettingsPage {
         case .appearance: return GlassTile.blue
         case .terminal: return GlassTile.indigo
         case .interface: return GlassTile.teal
+        case .agents: return GlassTile.purple
         case .gestures: return GlassTile.orange
         case .connection: return GlassTile.green
         case .diagnostics: return GlassTile.red
@@ -127,6 +131,7 @@ struct GlassTile: View {
     static let orange = Color(red: 0xFF / 255, green: 0x95 / 255, blue: 0x00 / 255)
     static let green = Color(red: 0x34 / 255, green: 0xC7 / 255, blue: 0x59 / 255)
     static let red = Color(red: 0xFF / 255, green: 0x3B / 255, blue: 0x30 / 255)
+    static let purple = Color(red: 0xAF / 255, green: 0x52 / 255, blue: 0xDE / 255)
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
@@ -225,6 +230,7 @@ struct SettingsPageView: View {
                     PickerOption("menu", tr("i.spaces.menu")),
                 ])
             }
+        case .agents:
             Section {
                 Toggle(tr("chat.first"), isOn: $settings.chatFirst)
                 push(tr("chat.text"), selection: $settings.chatText, options: [

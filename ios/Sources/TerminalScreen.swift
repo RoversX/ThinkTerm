@@ -19,6 +19,9 @@ struct TerminalScreen: View {
     @State private var wide = false
     @AppStorage("sidebar.pinned") private var sidebarPinned = true
     @State private var showLog = false
+    /// Going back to Threads from a chat opened there: the chat closes
+    /// once the screen is gone.
+    @State private var leavingToThreads = false
     /// The connection page's sky (`skyFollows`): when it came up, and when
     /// it rushes off, in seconds after that.
     @State private var skyStart: Date?
@@ -613,6 +616,12 @@ struct TerminalScreen: View {
             }
         }
         .onChange(of: showLog) { _, on in model.logShown = on }
+        // Back from a chat opened on Threads: to Threads, the chat going
+        // with the screen once it is gone.
+        .onChange(of: model.backToThreads) { _, _ in
+            leavingToThreads = true
+            leave()
+        }
         .onChange(of: model.sidebar?.editing) { _, editing in
             // A new project has no id yet: the same field, asking for the
             // name of what is about to exist.
@@ -739,6 +748,13 @@ struct TerminalScreen: View {
             moves.onScreen = false
             overviewClosed()
             model.leaveScreen()
+            // A chat opened on Threads ends with the screen it was over --
+            // only when going back there: a picture opened full screen
+            // from the chat takes the screen out of sight too.
+            if leavingToThreads {
+                leavingToThreads = false
+                model.closeChat(toTerminal: true)
+            }
         }
     }
 

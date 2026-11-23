@@ -425,7 +425,7 @@ struct SidebarPanel: View {
                     .contextMenu { AppMenuItems(model: model, kind: "archived-project", id: id) }
             case .others:
                 sectionTitle(tr("otherwindows"))
-            case .window(let id, let title, let selected):
+            case .window(let id, let title, let selected, _):
                 SidebarRow(icon: "app-window", title: title.isEmpty ? tr("window.n", id) : title, selected: selected) {
                     model.sideClick("window", id: String(id))
                     done()
@@ -708,11 +708,17 @@ extension View {
     }
 
     /// The system's Liquid Glass round a button, from iOS 26; a material
-    /// before it.
+    /// before it. Tinted, a button that is on.
     @ViewBuilder
-    func glassCircle() -> some View {
+    func glassCircle(tint: Color? = nil) -> some View {
         if #available(iOS 26.0, *) {
-            glassEffect(.regular.interactive(), in: .circle)
+            if let tint {
+                glassEffect(.regular.tint(tint).interactive(), in: .circle)
+            } else {
+                glassEffect(.regular.interactive(), in: .circle)
+            }
+        } else if let tint {
+            background(tint, in: Circle())
         } else {
             background(.ultraThinMaterial, in: Circle())
         }

@@ -248,7 +248,8 @@ enum SideRow: Decodable, Hashable, Identifiable {
     case thread(ThreadRow)
     case archived(count: Int, open: Bool, label: String)
     case others
-    case window(id: Int, title: String, selected: Bool)
+    /// `agent`: the Status panel lists something in it (`ThreadRow.agent`).
+    case window(id: Int, title: String, selected: Bool, agent: Bool)
 
     var id: String {
         switch self {
@@ -260,12 +261,12 @@ enum SideRow: Decodable, Hashable, Identifiable {
         case .thread(let t): return "thread:" + t.id
         case .archived: return "archived"
         case .others: return "others"
-        case .window(let id, _, _): return "window:\(id)"
+        case .window(let id, _, _, _): return "window:\(id)"
         }
     }
 
     private enum Keys: String, CodingKey {
-        case kind, id, name, path, collapsed, archived, count, open, label, title, selected
+        case kind, id, name, path, collapsed, archived, count, open, label, title, selected, agent
     }
 
     init(from decoder: Decoder) throws {
@@ -296,7 +297,8 @@ enum SideRow: Decodable, Hashable, Identifiable {
             self = .window(
                 id: try c.decode(Int.self, forKey: .id),
                 title: try c.decode(String.self, forKey: .title),
-                selected: try c.decode(Bool.self, forKey: .selected)
+                selected: try c.decode(Bool.self, forKey: .selected),
+                agent: try c.decodeIfPresent(Bool.self, forKey: .agent) ?? false
             )
         case let other:
             throw DecodingError.dataCorruptedError(forKey: .kind, in: c, debugDescription: "unknown row kind \(other)")
@@ -319,9 +321,20 @@ struct ThreadRow: Decodable, Hashable, Identifiable {
     var icons: [String]?
     /// A program in it stopped on an error: it has a mark of its own.
     var failed: Bool?
+    /// The Status panel lists something in it: an agents-only list keeps it.
+    var agent: Bool?
+    /// The agent in it a chat can be had with, for a tap to open.
+    var chat: ThreadChat?
 
     /// The status word its mark is drawn for (`threadMark`).
     var markStatus: String { failed == true ? "Failed" : status }
+}
+
+/// An agent a thread's row opens the chat of: its pane, and the agent as
+/// its detection names it ("codex", "pi").
+struct ThreadChat: Decodable, Hashable {
+    var pane: Int
+    var agent: String
 }
 
 struct Editing: Decodable, Hashable {

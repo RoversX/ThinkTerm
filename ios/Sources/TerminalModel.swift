@@ -1119,19 +1119,42 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     let chatFeed = ChatFeed()
 
+    /// The chat on show was opened from Threads: going back from it goes
+    /// back there, past the terminal under it.
+    private(set) var chatFromThreads = false
+    /// Bumped to send the terminal's screen back to Threads, a chat opened
+    /// there still over it: `TerminalScreen` goes, and closes the chat once
+    /// it is gone.
+    @Published private(set) var backToThreads = 0
+
     /// Show `row`'s agent as a chat. The terminal under it goes to the
     /// agent's pane first, as a tap on the row always did: going back from
     /// the chat is going to that terminal.
     func openChat(_ row: AgentRow) {
-        chromeClick("pane", pane: row.pane)
-        chat = nil
-        chatThumbs = [:]
-        chatWith = ChatTarget(pane: row.pane, agent: row.agent_id, place: row.place.isEmpty ? row.name : row.place)
-        core.chatOpen(pane: UInt32(row.pane), agent: row.agent_id)
+        openChat(pane: row.pane, agent: row.agent_id, place: row.place.isEmpty ? row.name : row.place)
     }
 
-    func closeChat() {
+    /// Show the agent in `pane` as a chat; `fromThreads`, going back from
+    /// it goes back to Threads rather than to the terminal under it.
+    func openChat(pane: Int, agent: String, place: String, fromThreads: Bool = false) {
+        chromeClick("pane", pane: pane)
+        chat = nil
+        chatThumbs = [:]
+        chatFromThreads = fromThreads
+        chatWith = ChatTarget(pane: pane, agent: agent, place: place)
+        core.chatOpen(pane: UInt32(pane), agent: agent)
+    }
+
+    /// Back from the chat: to the terminal under it -- or, for one opened
+    /// from Threads, to Threads, unless `toTerminal` (an ask answered only
+    /// in the terminal).
+    func closeChat(toTerminal: Bool = false) {
         guard chatWith != nil else { return }
+        if chatFromThreads && !toTerminal {
+            backToThreads += 1
+            return
+        }
+        chatFromThreads = false
         chatWith = nil
         chat = nil
         core.chatClose()

@@ -730,7 +730,7 @@ struct ChatPage: View {
             // Answered only in the agent's terminal, which is under the chat.
             if let terminal = ask.terminal {
                 Button {
-                    model.closeChat()
+                    model.closeChat(toTerminal: true)
                 } label: {
                     Text(terminal)
                         .font(.body.weight(.semibold))
