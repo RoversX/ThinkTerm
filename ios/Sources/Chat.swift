@@ -34,10 +34,23 @@ struct ChatState: Decodable {
     /// How full the model's context is: the ring in the bar and its sheet;
     /// nil when the agent does not say.
     var context: ChatContext?
+    /// The agent runs an older ThinkTerm extension than the one in its
+    /// folder: said over the field, with the button that loads the new one.
+    var outdated: ChatOutdated?
 }
 
-/// The model button: what it says, and what it opens on -- the models,
-/// each opening on how hard it can think.
+/// The agent runs an older ThinkTerm extension than the one in its
+/// folder: what is said, and the button that loads the new one.
+struct ChatOutdated: Decodable, Equatable {
+    var text: String
+    var action: ChatOutdatedAction
+}
+
+struct ChatOutdatedAction: Decodable, Equatable {
+    var id: String
+    var label: String
+}
+
 /// How full the context is (`fill` 0 to 1, nil while not known; `level`
 /// "ok", "high" or "full"), what fills it, and the session's totals.
 struct ChatContext: Decodable, Equatable {
@@ -83,6 +96,8 @@ struct ChatCommand: Decodable, Hashable, Identifiable {
     var id: String { name }
 }
 
+/// The model button: what it says, and what it opens on -- the models,
+/// each opening on how hard it can think.
 struct ChatModelMenu: Decodable, Equatable {
     var label: String
     var models_heading: String
@@ -391,10 +406,10 @@ struct ChatPage: View {
                 .padding(.vertical, 8)
             }
             .scrollDismissesKeyboard(.interactively)
-            // What scrolls under the bars blurs into them, firmly under the
-            // field: never read through what is typed.
-            .scrollEdgeEffectStyle(.soft, for: .top)
-            .scrollEdgeEffectStyle(.hard, for: .bottom)
+            // What scrolls under the bars blurs and fades into them, softly:
+            // a hard edge drew a line across and a band of frost over the
+            // field.
+            .scrollEdgeEffectStyle(.soft, for: .all)
             .defaultScrollAnchor(.bottom)
             .safeAreaBar(edge: .top, spacing: 0) { header(chat) }
             .safeAreaBar(edge: .bottom, spacing: 0) {
@@ -607,6 +622,9 @@ struct ChatPage: View {
                         .glassEffect(.regular, in: .capsule)
                         .transition(.opacity)
                 }
+                if let outdated = chat?.outdated {
+                    outdatedCard(outdated)
+                }
                 if let problem = chat?.problem {
                     problemCard(problem)
                 } else if let ask = chat?.ask {
@@ -708,6 +726,25 @@ struct ChatPage: View {
             RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .strokeBorder(waiting.opacity(0.4), lineWidth: 1)
         }
+    }
+
+    /// The agent runs an older extension than the one in its folder: a
+    /// line over the field, and the button that has it take the new one in.
+    private func outdatedCard(_ outdated: ChatOutdated) -> some View {
+        HStack(spacing: 10) {
+            Text(outdated.text)
+                .font(.system(size: 13))
+                .foregroundStyle(.primary.opacity(0.85))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button(outdated.action.label) { model.chatAction(outdated.action.id) }
+                .font(.system(size: 13.5, weight: .semibold))
+                .buttonStyle(.glassProminent)
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 6)
+        .padding(.vertical, 6)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
     private func problemCard(_ problem: ChatProblem) -> some View {
@@ -1001,9 +1038,9 @@ private struct ChatComposer: View, Equatable {
                 .padding(.horizontal, 4)
                 .padding(.bottom, 2)
             }
-            // Glass with the ground in it: what passes under never reads
-            // through the words typed.
-            .glassEffect(.regular.tint(Color.chromeBackdrop.opacity(0.75)), in: card)
+            // Glass, floating over the chat: what passes under it is blurred
+            // and faded by the scroll edge.
+            .glassEffect(.regular, in: card)
             .overlay { card.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5) }
         }
         .animation(.snappy(duration: 0.18), value: offer?.commands.map(\.name))
@@ -1212,7 +1249,7 @@ private struct CommandPalette: View {
         }
         .scrollBounceBehavior(.basedOnSize)
         .frame(height: min(CGFloat(commands.count) * rowHeight + 12, 300))
-        .glassEffect(.regular.tint(Color.chromeBackdrop.opacity(0.75)), in: shape)
+        .glassEffect(.regular, in: shape)
         .overlay { shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5) }
     }
 }
