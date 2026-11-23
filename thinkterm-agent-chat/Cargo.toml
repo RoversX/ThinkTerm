@@ -1,0 +1,39 @@
+[package]
+name = "thinkterm-agent-chat"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A coding agent's conversation as a chat.
+#
+# - Always: the lines a client and the host's bridge exchange
+#   (`thinkterm cli agent chat`), one JSON object per line.
+# - "view": what a client draws of them (a phone): rows, folds, the
+#   question being asked, Markdown cut into blocks.
+# - "host": the bridge itself, beside the agents: Codex's app-server
+#   daemon, and the extension ThinkTerm puts into Pi.
+
+[features]
+default = []
+view = ["dep:pulldown-cmark", "dep:thinkterm-i18n"]
+host = ["dep:libc", "dep:image", "dep:base64"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+pulldown-cmark = { workspace = true, optional = true }
+thinkterm-i18n = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+base64 = { workspace = true, features = ["std"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[example]]
+name = "bridge"
+required-features = ["host"]

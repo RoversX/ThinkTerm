@@ -6,6 +6,7 @@ members = [
   "strip-ansi-escapes",
   "sync-color-schemes",
   "thinkterm-syntax",
+  "thinkterm-agent-chat",
   "thinkterm-core",
   "thinkterm-reverse-access",
   "thinkterm-connect-auth",
@@ -198,6 +199,7 @@ thinkterm-file-index = { path = "thinkterm-file-index" }
 thinkterm-font-core = { path = "thinkterm-font-core" }
 thinkterm-font-web = { path = "thinkterm-font-web" }
 thinkterm-i18n = { path = "thinkterm-i18n" }
+thinkterm-agent-chat = { path = "thinkterm-agent-chat" }
 thinkterm-import = { path = "thinkterm-import" }
 thinkterm-import-herdr = { path = "thinkterm-import-herdr" }
 thinkterm-plugin-channel = { path = "thinkterm-plugin-channel", default-features = false }

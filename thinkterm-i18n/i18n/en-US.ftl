@@ -1959,3 +1959,94 @@ settings-reverse-all-local = All local terminals
 settings-reverse-all-description = Includes current and future local terminals you own. Terminal creation and closure are handled automatically.
 settings-reverse-all-active = All local terminals · { $permission } · { $time } remaining
 settings-reverse-connect-first = Connect to a server first. Each connection has its own permission, duration and revoke control.
+
+## Agent chat: an agent's conversation shown as a chat (the phone app).
+chat-connecting = Connecting…
+chat-writing = Writing
+chat-thought = Thinking
+chat-looked = { $files ->
+    [one] Looked at 1 file
+   *[other] Looked at { $files } files
+}
+chat-searched = { $searches ->
+    [one] Searched once
+   *[other] Searched { $searches } times
+}
+chat-looked-searched = Looked at { $files ->
+    [one] 1 file
+   *[other] { $files } files
+}, searched { $searches ->
+    [one] once
+   *[other] { $searches } times
+}
+chat-ran = Ran { $command }
+chat-running = Running { $command }
+chat-edited = Edited { $file }
+chat-edited-files = Edited { $count } files
+chat-editing = Editing { $file }
+chat-editing-files = Editing { $count } files
+chat-searched-web = Searched the web: { $query }
+chat-viewed-image = Looked at an image
+chat-sub-agent = Started a sub-agent
+chat-used = Used { $tool }
+chat-group-read = { $count ->
+    [one] looked at 1 file
+   *[other] looked at { $count } files
+}
+chat-group-searched = { $count ->
+    [one] searched once
+   *[other] searched { $count } times
+}
+chat-group-ran = { $count ->
+    [one] ran a command
+   *[other] ran { $count } commands
+}
+chat-group-edited = { $count ->
+    [one] edited a file
+   *[other] edited { $count } files
+}
+chat-group-used = { $count ->
+    [one] used a tool
+   *[other] used { $count } tools
+}
+chat-group-failed = { $count } failed
+chat-list-sep = ,{ " " }
+chat-model = Model
+chat-effort = Thinking
+chat-effort-none = None
+chat-effort-off = Off
+chat-effort-minimal = Minimal
+chat-effort-low = Low
+chat-effort-medium = Medium
+chat-effort-high = High
+chat-effort-xhigh = Extra high
+chat-effort-max = Max
+chat-effort-ultra = Ultra
+chat-exit = exit { $code }
+chat-declined = declined
+chat-note-compacted = Earlier messages were summarized
+chat-note-interrupted = Stopped
+chat-note-failed = Failed: { $why }
+chat-ask-command = Run this command?
+chat-ask-edit = Change these files?
+chat-ask-tool = Use this tool?
+chat-ask-terminal = Answer in the terminal
+chat-ask-in = In { $dir }
+chat-choice-accept = Allow
+chat-choice-session = Allow for this session
+chat-choice-decline = Decline
+chat-guessed = Several { $agent } conversations are open in this folder; this is the latest.
+chat-more = Earlier messages
+chat-placeholder = Message { $agent }
+chat-refused = Couldn't do that: { $why }
+chat-installed = Installed. Type { $command } in { $agent }, or restart it.
+chat-install = Install the extension
+chat-retry = Try again
+chat-ended = The chat was cut off.
+chat-need-pi-extension = To chat with { $agent } here, ThinkTerm needs to add a small extension to { $agent }.
+chat-need-pi-restart = The extension is in place. Type { $command } in { $agent }, or restart it.
+chat-need-codex-daemon = Can't reach Codex's background service. Codex may be too old, or not running.
+chat-need-codex-thread = Can't find this pane's Codex conversation. It may not have started yet, or Codex was started with -c options.
+chat-need-not-here = This pane isn't on this machine.
+chat-need-unsupported = This agent can't be shown as a chat yet.
+chat-need-bridge = The ThinkTerm on that machine is too old for chat. Update it there.

@@ -1953,3 +1953,97 @@ settings-reverse-all-local = Tous les terminaux locaux
 settings-reverse-all-description = Inclut vos terminaux locaux actuels et futurs. Leur ouverture et leur fermeture sont prises en compte automatiquement.
 settings-reverse-all-active = Tous les terminaux locaux · { $permission } · { $time } restantes
 settings-reverse-connect-first = Connectez d’abord un serveur. Chaque connexion possède ses propres droits, durée et commande de révocation.
+
+## Agent chat: an agent's conversation shown as a chat (the phone app).
+chat-connecting = Connexion…
+chat-writing = Écrit
+chat-thought = Réflexion
+chat-looked = { $files ->
+    [one] 1 fichier consulté
+   *[other] { $files } fichiers consultés
+}
+chat-searched = { $searches ->
+    [one] 1 recherche
+   *[other] { $searches } recherches
+}
+chat-looked-searched = { $files ->
+    [one] 1 fichier consulté
+   *[other] { $files } fichiers consultés
+}, { $searches ->
+    [one] 1 recherche
+   *[other] { $searches } recherches
+}
+chat-ran = Exécuté : { $command }
+chat-running = Exécute : { $command }
+chat-edited = Modifié : { $file }
+chat-edited-files = { $count } fichiers modifiés
+chat-editing = Modification : { $file }
+chat-editing-files = Modification de { $count } fichiers
+chat-searched-web = Recherche web : { $query }
+chat-viewed-image = Image consultée
+chat-sub-agent = Sous-agent lancé
+chat-used = Utilisé : { $tool }
+chat-group-read = { $count ->
+    [one] 1 fichier consulté
+   *[other] { $count } fichiers consultés
+}
+chat-group-searched = { $count ->
+    [one] 1 recherche
+   *[other] { $count } recherches
+}
+chat-group-ran = { $count ->
+    [one] 1 commande exécutée
+   *[other] { $count } commandes exécutées
+}
+chat-group-edited = { $count ->
+    [one] 1 fichier modifié
+   *[other] { $count } fichiers modifiés
+}
+chat-group-used = { $count ->
+    [one] 1 outil utilisé
+   *[other] { $count } outils utilisés
+}
+chat-group-failed = { $count ->
+    [one] 1 échec
+   *[other] { $count } échecs
+}
+chat-list-sep = ,{ " " }
+chat-model = Modèle
+chat-effort = Réflexion
+chat-effort-none = Aucune
+chat-effort-off = Désactivée
+chat-effort-minimal = Minimale
+chat-effort-low = Faible
+chat-effort-medium = Moyenne
+chat-effort-high = Élevée
+chat-effort-xhigh = Très élevée
+chat-effort-max = Maximale
+chat-effort-ultra = Ultra
+chat-exit = code { $code }
+chat-declined = refusé
+chat-note-compacted = Les messages précédents ont été résumés
+chat-note-interrupted = Arrêté
+chat-note-failed = Échec : { $why }
+chat-ask-command = Exécuter cette commande ?
+chat-ask-edit = Modifier ces fichiers ?
+chat-ask-tool = Utiliser cet outil ?
+chat-ask-terminal = Répondre dans le terminal
+chat-ask-in = Dans { $dir }
+chat-choice-accept = Autoriser
+chat-choice-session = Autoriser pour cette session
+chat-choice-decline = Refuser
+chat-guessed = Plusieurs conversations { $agent } sont ouvertes dans ce dossier ; voici la plus récente.
+chat-more = Messages précédents
+chat-placeholder = Message à { $agent }
+chat-refused = Impossible : { $why }
+chat-installed = Installée. Tapez { $command } dans { $agent }, ou redémarrez-le.
+chat-install = Installer l’extension
+chat-retry = Réessayer
+chat-ended = Le chat a été interrompu.
+chat-need-pi-extension = Pour discuter avec { $agent } ici, ThinkTerm doit ajouter une petite extension à { $agent }.
+chat-need-pi-restart = L’extension est installée. Tapez { $command } dans { $agent }, ou redémarrez-le.
+chat-need-codex-daemon = Impossible de joindre le service d’arrière-plan de Codex. Codex est peut-être trop ancien, ou ne tourne pas.
+chat-need-codex-thread = Impossible de trouver la conversation Codex de ce volet. Elle n’a peut-être pas commencé, ou Codex a été lancé avec des options -c.
+chat-need-not-here = Ce volet n’est pas sur cette machine.
+chat-need-unsupported = Cet agent ne peut pas encore être affiché en chat.
+chat-need-bridge = Le ThinkTerm de cette machine est trop ancien pour le chat. Mettez-le à jour là-bas.
