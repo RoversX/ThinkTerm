@@ -445,18 +445,33 @@ impl ControlRunner {
             return;
         };
 
-        self.with_map_request(false, async |req| {
+        let update = self.with_map_request(false, async |req| {
             send_map_request(
                 req,
                 &self.params.config.server_url.join("machine/map").unwrap(),
                 conn,
             )
             .await
-        })
-        .await
-        .unwrap();
+        });
+
+        // ThinkTerm (map update): was `.await.unwrap()`, with no time limit. A failure panicked
+        // the control runner, and with it every question ThinkTerm asks the node, which then
+        // made the node anew and dropped every connection; one that hung kept the runner from
+        // answering anything else. Since 0.7.0 the address STUN finds is one of the endpoints,
+        // and changes with the network, as the connection to control goes down. The endpoints
+        // and latencies go with the next map request instead.
+        match tokio::time::timeout(MAP_UPDATE_TIMEOUT, update).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "updating the map request"),
+            Err(_) => tracing::warn!("updating the map request timed out"),
+        }
     }
 }
+
+// ThinkTerm (map update): added.
+/// How long an update of the map request -- this node's endpoints, its DERP latencies -- may
+/// take before it is given up.
+const MAP_UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Message<AuthRequired> for ControlRunner {
     type Reply = ();

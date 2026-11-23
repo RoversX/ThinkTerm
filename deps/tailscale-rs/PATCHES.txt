@@ -142,6 +142,16 @@ stun probes (ts_runtime)
     without end.
     Drop when: upstream ends a STUN probe it gave up on.
 
+map update (ts_runtime)
+    An update of the map request -- this node's endpoints or DERP latencies changed -- that
+    fails is logged, and one that takes over 15 s given up; the next map request carries
+    them. 0.7.1 unwraps it, so a failure panicked the control runner, and with it every
+    question ThinkTerm asks the node, which then made the node anew, dropping every
+    connection; and it waits without a limit, the runner answering nothing else meanwhile.
+    Since 0.7.0 the address STUN finds is one of the endpoints, and it changes with the
+    network, just as the connection to control goes down.
+    Drop when: upstream's control runner takes a failed map update in its stride.
+
 derp dial (ts_derp, ts_runtime)
     A DERP region whose servers cannot be reached, or whose TLS handshake fails, is an error
     for its client; 0.6.1 unwraps the outcome of the dial and panics. A connection gets 15 s
@@ -258,7 +268,8 @@ Not covered by a test: the peer tracker's answer for an empty tailnet, and the F
 taking the place of the stop. Signing in to a real tailnet after an upgrade checks the
 first; signing in while the control server cannot be reached checks the second. Nor are the
 parts of derp dial and derp frames that need a working DERP server (the waits starting over
-after a connection that held, frames the server sends).
+after a connection that held, frames the server sends). Map update needs a control server:
+changing networks under a signed-in node checks it.
 
 Upgrading
 ---------
