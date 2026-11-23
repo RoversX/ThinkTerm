@@ -1554,7 +1554,16 @@ impl crate::TermWindow {
                 None => crate::i18n::tr("sidebar-connecting"),
             }
         } else {
-            crate::i18n::tr("sidebar-reconnect")
+            // An edit just refused for this server being away says why here,
+            // for a moment, where the person is looking.
+            let refused_until = crate::local_sessions::connection_domain_for_space(
+                self.workspace_sidebar_space_id(),
+            )
+            .and_then(|name| crate::workspace_threads::refused_remote_edit_until(&name));
+            match refused_until {
+                Some(_) => crate::i18n::tr("sidebar-reconnect-to-edit"),
+                None => crate::i18n::tr("sidebar-reconnect"),
+            }
         };
         let row_icon_size = (ui_cell_height + self.ui_px(12))
             .clamp(self.ui_px(30), self.ui_px(36))

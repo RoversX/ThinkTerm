@@ -146,18 +146,26 @@ pub(crate) fn space_destructive_menu_items(
     // device's copy: the Space is untouched for everyone else and returns on
     // the next connect. Deleting it for real is a separate, more-consequential
     // entry offered alongside.
-    let mut children = vec![
-        ContextMenuItem::item_with_icon(
-            crate::i18n::tr("menu-space-disconnect-short"),
+    // A desktop's own default Space cannot be deleted on that desktop, so it
+    // is not deleted from here either: disconnecting is all there is, and a
+    // submenu of one item is just an extra click.
+    if crate::workspace_threads::is_a_desktops_default_space(&space.id) {
+        return vec![ContextMenuItem::item_with_icon(
+            tr_with_name("menu-disconnect-space", &space.name),
             ContextMenuIcon::Disconnect,
             KeyAssignment::DeleteSpace(space.id.clone()),
-        ),
-        ContextMenuItem::item_with_icon(
-            crate::i18n::tr("menu-space-delete-everywhere-short"),
-            ContextMenuIcon::Delete,
-            KeyAssignment::DeleteSpaceEverywhere(space.id.clone()),
-        ),
-    ];
+        )];
+    }
+    let mut children = vec![ContextMenuItem::item_with_icon(
+        crate::i18n::tr("menu-space-disconnect-short"),
+        ContextMenuIcon::Disconnect,
+        KeyAssignment::DeleteSpace(space.id.clone()),
+    )];
+    children.push(ContextMenuItem::item_with_icon(
+        crate::i18n::tr("menu-space-delete-everywhere-short"),
+        ContextMenuIcon::Delete,
+        KeyAssignment::DeleteSpaceEverywhere(space.id.clone()),
+    ));
     if offer_remote_kill {
         children.push(ContextMenuItem::item_with_icon(
             crate::i18n::tr("menu-space-delete-and-sessions-short"),
@@ -6416,7 +6424,71 @@ impl super::TermWindow {
         thread_id: &str,
         context: Option<&dyn WindowOps>,
     ) {
-        match crate::workspace_threads::end_workspace_thread_record(thread_id) {
+        // The last thread of a workspace of this device's: whether its folder
+        // is still there decides what ending it does. That is asked off the
+        // window thread, as a stalled mount must not freeze the window.
+        if let (Some(folder), Some(window)) = (
+            crate::workspace_threads::last_local_thread_folder(thread_id),
+            self.window.clone(),
+        ) {
+            let thread_id = thread_id.to_string();
+            let domain = Mux::get()
+                .resolve_spawn_tab_domain(None, &SpawnTabDomain::DefaultDomain)
+                .ok();
+            promise::spawn::spawn(async move {
+                let missing = promise::spawn::spawn_into_new_thread(move || {
+                    // Asked as `materialize_thread` asks it: only a terminal
+                    // started on this machine's own filesystem reads the
+                    // folder as written here. WSL, exec and serial domains
+                    // read it inside a distribution or container, where a
+                    // folder this machine cannot see may well be.
+                    let here = domain.is_some_and(|domain| {
+                        domain
+                            .downcast_ref::<mux::domain::LocalDomain>()
+                            .is_some_and(mux::domain::LocalDomain::is_plain_local)
+                            || domain
+                                .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                                .is_some_and(|client| client.is_local_session_host())
+                    });
+                    Ok(here && crate::workspace_threads::folder_is_missing(&folder))
+                })
+                .await
+                .unwrap_or(false);
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let window = term_window.window.clone();
+                    term_window.finish_ending_workspace_thread(
+                        &thread_id,
+                        missing,
+                        window.as_ref().map(|w| w as &dyn WindowOps),
+                    );
+                })));
+            })
+            .detach();
+            return;
+        }
+        self.finish_ending_workspace_thread(thread_id, false, context);
+    }
+
+    /// Remove Project, from the sidebar's menu or the page of a workspace
+    /// that cannot be opened. The removed workspace's windows go once the
+    /// window has moved on (`finish_removed_project`): the one it moves to
+    /// may still have to open, and the last mirror of a server's terminals
+    /// taken down first can detach that server.
+    pub(crate) fn remove_workspace_project(&mut self, project_id: &str) {
+        let Some(removed) = crate::workspace_threads::remove_project(project_id) else {
+            return;
+        };
+        let window = self.window.clone();
+        self.finish_removed_project(removed, window.as_ref().map(|w| w as &dyn WindowOps));
+    }
+
+    fn finish_ending_workspace_thread(
+        &mut self,
+        thread_id: &str,
+        folder_missing: bool,
+        context: Option<&dyn WindowOps>,
+    ) {
+        match crate::workspace_threads::end_workspace_thread_record(thread_id, folder_missing) {
             crate::workspace_threads::EndWorkspaceThreadResult::DeletedThread(deleted) => {
                 self.finish_deleted_workspace_thread(deleted, context);
             }
@@ -6545,6 +6617,16 @@ impl super::TermWindow {
         if crate::workspace_threads::local_project_path(&project_id).is_none() {
             grant_item = grant_item.disabled();
         }
+        // Greyed out rather than silent: a Space's last workspace cannot go
+        // when it is already the one the Space would get in its place.
+        let mut remove_item = ContextMenuItem::item_with_icon(
+            crate::i18n::tr("menu-remove-project"),
+            ContextMenuIcon::FolderRemove,
+            KeyAssignment::RemoveProject(project_id.clone()),
+        );
+        if !crate::workspace_threads::can_remove_project(&project_id) {
+            remove_item = remove_item.disabled();
+        }
 
         let mut items = vec![
             ContextMenuItem::item_with_icon(
@@ -6608,11 +6690,7 @@ impl super::TermWindow {
                     )
                 }
             },
-            ContextMenuItem::item_with_icon(
-                crate::i18n::tr("menu-remove-project"),
-                ContextMenuIcon::FolderRemove,
-                KeyAssignment::RemoveProject(project_id),
-            ),
+            remove_item,
         ];
         if cfg!(target_os = "macos") {
             items.insert(2, grant_item);

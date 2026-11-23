@@ -38,6 +38,8 @@ enum ProjectRootAction {
     /// The session server, not the GUI, was refused: a picker cannot grant
     /// for it, so send the user to the switch macOS keeps for it.
     OpenSystemSettings,
+    /// Take the workspace off the sidebar, as its Remove Project does.
+    RemoveWorkspace,
 }
 
 /// Deliberately only two states: everything beyond these existed to drive an
@@ -135,41 +137,68 @@ impl ProjectRootView {
         }
     }
 
-    /// (label, icon, action, primary). macOS only: there a picker selection
-    /// grants access (TCC never re-prompts on its own); on other platforms a
-    /// picker grants nothing, so the hint text points at the real remedy.
+    /// (label, icon, action, primary). Granting access is macOS only: there a
+    /// picker selection grants it (TCC never re-prompts on its own); on other
+    /// platforms a picker grants nothing, so the hint text points at the real
+    /// remedy. Removing the workspace is offered everywhere: without it, a
+    /// folder that is gone left a page with nothing to press.
     fn buttons(&self) -> Vec<(String, SvgIcon, ProjectRootAction, bool)> {
-        if self.reauth_in_flight || !cfg!(target_os = "macos") {
+        if self.reauth_in_flight {
             return Vec::new();
         }
         match &self.phase {
-            ViewPhase::Blocked(failure) if failure.problem.can_reauthorize() => {
-                let mut buttons = vec![(
-                    crate::i18n::tr("project-root-reauthorize"),
-                    SvgIcon::FolderOpen,
-                    ProjectRootAction::Reauthorize,
-                    true,
-                )];
-                if failure.via_session_server {
+            ViewPhase::Blocked(failure) => {
+                let mut buttons = Vec::new();
+                if cfg!(target_os = "macos") && failure.problem.can_reauthorize() {
                     buttons.push((
-                        crate::i18n::tr("project-root-open-settings"),
-                        SvgIcon::Settings,
-                        ProjectRootAction::OpenSystemSettings,
+                        crate::i18n::tr("project-root-reauthorize"),
+                        SvgIcon::FolderOpen,
+                        ProjectRootAction::Reauthorize,
+                        true,
+                    ));
+                    if failure.via_session_server {
+                        buttons.push((
+                            crate::i18n::tr("project-root-open-settings"),
+                            SvgIcon::Settings,
+                            ProjectRootAction::OpenSystemSettings,
+                            false,
+                        ));
+                    }
+                }
+                if self.removable_project().is_some() {
+                    buttons.push((
+                        crate::i18n::tr("menu-remove-project"),
+                        SvgIcon::FolderMinus,
+                        ProjectRootAction::RemoveWorkspace,
                         false,
                     ));
                 }
                 buttons
             }
-            ViewPhase::Blocked(_) => Vec::new(),
             // Delegates to the exact activation a sidebar click triggers;
             // its predecessor's bugs all came from re-implementing that.
-            ViewPhase::Granted => vec![(
+            ViewPhase::Granted if cfg!(target_os = "macos") => vec![(
                 crate::i18n::tr("project-root-open-terminal"),
                 SvgIcon::SquareTerminal,
                 ProjectRootAction::OpenThread,
                 true,
             )],
+            ViewPhase::Granted => Vec::new(),
         }
+    }
+
+    /// The workspace this page's thread is in, when Remove Project can take
+    /// it away (`can_remove_project`). Not for a thread opened through a
+    /// reference from another Space: as in the sidebar, a reference does not
+    /// remove what it points at.
+    fn removable_project(&self) -> Option<String> {
+        if crate::workspace_threads::thread_space_id(&self.thread_id).as_deref()
+            != Some(self.space_id.as_str())
+        {
+            return None;
+        }
+        crate::workspace_threads::project_id_for_thread(&self.thread_id)
+            .filter(|project_id| crate::workspace_threads::can_remove_project(project_id))
     }
 
     fn wrap(
@@ -587,6 +616,10 @@ impl ProjectRootView {
                 open_files_and_folders_settings();
                 ContentViewResponse::Redraw
             }
+            ProjectRootAction::RemoveWorkspace => match self.removable_project() {
+                Some(project_id) => remove_workspace_response(project_id),
+                None => ContentViewResponse::Redraw,
+            },
         }
     }
 }
@@ -1004,6 +1037,17 @@ fn open_thread_response(thread_id: String) -> ContentViewResponse {
             return;
         };
         tw.activate_workspace_thread(thread_id, &window);
+    }))
+}
+
+/// Remove the workspace the page is about. The page goes with it: its thread
+/// is gone, and the window moves on as Remove Project in the sidebar moves it.
+fn remove_workspace_response(project_id: String) -> ContentViewResponse {
+    ContentViewResponse::Run(Box::new(move |tw: &mut TermWindow| {
+        if let Some(view_id) = tw.content_view_response_tab_id {
+            tw.close_content_view_by_id(view_id);
+        }
+        tw.remove_workspace_project(&project_id);
     }))
 }
 

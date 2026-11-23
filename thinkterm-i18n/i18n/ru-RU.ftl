@@ -384,6 +384,7 @@ sidebar-default-space = По умолчанию
 sidebar-connecting = Подключение…
 sidebar-connecting-attempt = Подключение… ({ $current }/{ $total })
 sidebar-reconnect = Подключиться снова
+sidebar-reconnect-to-edit = Подключитесь, чтобы изменить
 sidebar-new-thread = Новая ветка
 sidebar-pinned = Закреплённые
 sidebar-thread-refs = Ссылки

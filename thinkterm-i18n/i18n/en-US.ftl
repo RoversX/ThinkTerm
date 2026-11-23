@@ -387,6 +387,7 @@ sidebar-default-space = Default
 sidebar-connecting = Connecting…
 sidebar-connecting-attempt = Connecting… ({ $current }/{ $total })
 sidebar-reconnect = Reconnect
+sidebar-reconnect-to-edit = Reconnect to make changes
 sidebar-new-thread = New Thread
 sidebar-pinned = Pinned
 sidebar-thread-refs = References

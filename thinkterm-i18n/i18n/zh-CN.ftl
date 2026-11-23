@@ -384,6 +384,7 @@ sidebar-default-space = 默认
 sidebar-connecting = 正在连接…
 sidebar-connecting-attempt = 正在连接…（{ $current }/{ $total }）
 sidebar-reconnect = 重新连接
+sidebar-reconnect-to-edit = 重新连接后才能修改
 sidebar-new-thread = 新建会话
 sidebar-pinned = 已置顶
 sidebar-thread-refs = 引用

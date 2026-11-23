@@ -384,6 +384,7 @@ sidebar-default-space = デフォルト
 sidebar-connecting = 接続中…
 sidebar-connecting-attempt = 接続中…（{ $current }/{ $total }）
 sidebar-reconnect = 再接続
+sidebar-reconnect-to-edit = 変更するには再接続
 sidebar-new-thread = 新しいセッション
 sidebar-pinned = ピン留め
 sidebar-thread-refs = 参照

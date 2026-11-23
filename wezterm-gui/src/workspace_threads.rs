@@ -73,6 +73,24 @@ pub struct WorkspaceThreadStore {
     /// is turned down -- leaves no folder behind.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub invented_server_domains: std::collections::BTreeSet<String>,
+    /// A server's Space kept here under an id other than its own, local id →
+    /// the id on its server: one whose id is that of a Space of this
+    /// device's. Every desktop's default Space is `space-default`, and a
+    /// desktop publishes its Spaces through its session server, so taken as
+    /// it came that server's default Space would be this device's own. See
+    /// `tree_from_server`. Per-device, like the fields above.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub server_space_ids: std::collections::BTreeMap<SpaceId, SpaceId>,
+    /// The same for a workspace of such a Space whose id is that of a
+    /// workspace of this device's: local id → the id on its server.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub server_project_ids: std::collections::BTreeMap<ProjectId, ProjectId>,
+    /// The thread this device first landed on in a server's Space that has
+    /// no workspace of the connection's own (`land_in_server_workspace`),
+    /// Space id → thread id. By Space, so it goes with the Space from one
+    /// connection name to another. Per-device, like the fields above.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub landing_threads: std::collections::BTreeMap<SpaceId, WorkspaceThreadId>,
     /// Threads this device has open in a window of their own: they go back
     /// to one when it starts. Per-device, like the fields above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2252,10 +2270,21 @@ pub async fn delete_space_for_window(
             return Err(DeleteSpaceError::Occupied);
         }
         let store = THREAD_STORE.lock();
+        // A desktop's default Space cannot be deleted on that desktop, so it
+        // is not deleted from here either (`is_a_desktops_default_space`).
+        if store.server_space_ids.get(space_id).map(String::as_str) == Some(DEFAULT_SPACE_ID) {
+            return Err(DeleteSpaceError::DefaultSpace);
+        }
         let mut staged = store.clone();
         let deleted = staged.delete_space(space_id)?;
         (window_was_active, occupied_by_other, deleted)
     };
+    let server_space_id = THREAD_STORE
+        .lock()
+        .server_space_ids
+        .get(space_id)
+        .cloned()
+        .unwrap_or_else(|| space_id.to_string());
 
     let domain_name = domain_name.unwrap();
     if !remote_tree_domain_is_attached(&domain_name) {
@@ -2308,7 +2337,7 @@ pub async fn delete_space_for_window(
 
     let tree = match client
         .mutate_thinkterm_tree(vec![codec::TreeOp::DeleteSpace {
-            space_id: space_id.to_string(),
+            space_id: server_space_id.clone(),
         }])
         .await
     {
@@ -2319,7 +2348,7 @@ pub async fn delete_space_for_window(
             return Err(DeleteSpaceError::RemoteUnavailable);
         }
     };
-    if tree.space(space_id).is_some() {
+    if tree.space(&server_space_id).is_some() {
         log::error!("{domain_name} rejected deletion of ThinkTerm Space {space_id}");
         return Err(DeleteSpaceError::ServerRejected);
     }
@@ -2567,6 +2596,15 @@ pub fn thread_id_for_workspace(space_id: &str, workspace: &str) -> Option<Worksp
 /// process launch cwd (`std::env::current_dir()`), which is arbitrary — `/`
 /// when launched from Finder, or whatever directory the binary was started
 /// from — and made a new Space appear to "inherit" the previous window's path.
+/// Home, the workspace a Space of this device's falls back to: by its id, or
+/// by its folder for one made under another id. Not a connection's own
+/// workspace, which only opens there.
+fn is_home_project(project: &Project) -> bool {
+    project.id == default_project_for_space(&project.space_id).id
+        || project.path == *config::HOME_DIR
+        || project.path == Path::new("~")
+}
+
 pub fn default_project_for_space(space_id: &str) -> Project {
     let path = config::HOME_DIR.clone();
     let id = project_id_for_path(space_id, &path);
@@ -4682,17 +4720,31 @@ pub fn remove_project(project_id: &str) -> Option<RemovedProject> {
     if !remote_tree_mutation_allowed(domain.as_deref()) {
         return None;
     }
+    // The Space's last workspace goes with another in its place, which the
+    // server has to hear of as well: then the subtree is restated.
+    let replaced = store
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .is_some_and(|project| {
+            !project.is_archived() && store.live_project_count(&project.space_id) <= 1
+        });
     let removed = store.remove_project(project_id);
     if removed.is_some() {
-        if let Some(domain) = domain {
-            submit_tree_op(
-                domain,
-                codec::TreeOp::RemoveProject {
-                    project_id: project_id.to_string(),
-                },
-            );
-        }
         persist_locked(&store);
+        drop(store);
+        if let Some(domain) = domain {
+            if replaced {
+                reconcile_remote_subtree(&domain);
+            } else {
+                submit_tree_op(
+                    domain,
+                    codec::TreeOp::RemoveProject {
+                        project_id: project_id.to_string(),
+                    },
+                );
+            }
+        }
     }
     removed
 }
@@ -5038,13 +5090,48 @@ pub fn delete_thread(thread_id: &str) -> Option<DeletedWorkspaceThread> {
     deleted
 }
 
-pub fn end_workspace_thread_record(thread_id: &str) -> EndWorkspaceThreadResult {
+/// The folder whose state decides what ending `thread_id` does: set when the
+/// thread is the last of a workspace of this device's (see
+/// `end_workspace_thread_record`). The caller asks `folder_is_missing` of it
+/// off the window thread.
+pub fn last_local_thread_folder(thread_id: &str) -> Option<PathBuf> {
+    let store = THREAD_STORE.lock();
+    let project = store
+        .projects
+        .iter()
+        .find(|project| project.threads.iter().any(|thread| thread.id == thread_id))?;
+    (project.threads.len() == 1 && !is_remote_project(project, &store.spaces))
+        .then(|| local_project_root(&project.path))
+}
+
+/// Whether `space_id` is a server's Space that its desktop has as its own
+/// default Space (`tree_from_server`).
+pub fn is_a_desktops_default_space(space_id: &str) -> bool {
+    THREAD_STORE
+        .lock()
+        .server_space_ids
+        .get(space_id)
+        .map(String::as_str)
+        == Some(DEFAULT_SPACE_ID)
+}
+
+/// Whether Remove Project can take `project_id` away; only a Space's last
+/// workspace, when it is already the one the Space would get in its place,
+/// cannot go.
+pub fn can_remove_project(project_id: &str) -> bool {
+    THREAD_STORE.lock().can_remove_project(project_id)
+}
+
+pub fn end_workspace_thread_record(
+    thread_id: &str,
+    folder_missing: bool,
+) -> EndWorkspaceThreadResult {
     let mut store = THREAD_STORE.lock();
     let domain = tree_domain_for_thread(&store, thread_id);
     if !remote_tree_mutation_allowed(domain.as_deref()) {
         return EndWorkspaceThreadResult::Noop;
     }
-    let result = store.end_workspace_thread_record(thread_id);
+    let result = store.end_workspace_thread_record(thread_id, folder_missing);
     if !matches!(result, EndWorkspaceThreadResult::Noop) {
         persist_locked(&store);
     }
@@ -5145,7 +5232,10 @@ fn send_tree_ops(domain_name: String, ops: Vec<codec::TreeOp>) {
             restore_last_authoritative_tree(&domain_name);
             return;
         }
-        match client.mutate_thinkterm_tree(ops.clone()).await {
+        // In flight they stay in this device's Space ids, as the trees they
+        // are folded into are; the server reads its own.
+        let wire_ops = THREAD_STORE.lock().ops_for_server(ops.clone());
+        match client.mutate_thinkterm_tree(wire_ops).await {
             Ok(tree) => {
                 // The domain delivers the reply to the tree sink before this
                 // future resumes.  At that point this batch is deliberately
@@ -5584,12 +5674,51 @@ fn remote_tree_connection_can_mutate(
         && !reconnect_suspended
 }
 
+lazy_static::lazy_static! {
+    /// When each connection's server last refused an edit for being
+    /// disconnected: see `refused_remote_edit_until`.
+    static ref REFUSED_REMOTE_EDIT: Mutex<HashMap<String, std::time::Instant>> =
+        Mutex::new(HashMap::new());
+}
+
+/// How long the sidebar's Reconnect row says an edit waits on reconnecting.
+const REFUSED_REMOTE_EDIT_NOTICE: Duration = Duration::from_secs(5);
+
+/// Until when the sidebar's Reconnect row for `domain_name` says that an edit
+/// was refused until the server is reconnected. That row is where the person
+/// is looking; the system notification alone was easy to miss, and some
+/// desktops show none.
+pub fn refused_remote_edit_until(domain_name: &str) -> Option<std::time::Instant> {
+    let until = *REFUSED_REMOTE_EDIT.lock().get(domain_name)? + REFUSED_REMOTE_EDIT_NOTICE;
+    (until > std::time::Instant::now()).then_some(until)
+}
+
 /// Report an unavailable server for an explicit user edit. Background state
 /// synchronization must stay silent and only restore the authoritative tree.
 fn notify_remote_tree_mutation_unavailable(domain_name: &str) {
     log::warn!(
         "ThinkTerm tree mutation for {domain_name} was rejected: reconnect to the server first"
     );
+    {
+        let now = std::time::Instant::now();
+        let mut refused = REFUSED_REMOTE_EDIT.lock();
+        refused.retain(|_, at| now.saturating_duration_since(*at) < REFUSED_REMOTE_EDIT_NOTICE);
+        refused.insert(domain_name.to_string(), now);
+    }
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        front_end.invalidate_all_windows();
+        // And once more when the notice is over, so the row says Reconnect
+        // again without waiting for something else to repaint it.
+        if promise::spawn::is_scheduler_configured() {
+            promise::spawn::spawn_into_main_thread(async {
+                smol::Timer::after(REFUSED_REMOTE_EDIT_NOTICE).await;
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+            })
+            .detach();
+        }
+    }
     if crate::frontend::try_front_end().is_some() {
         let mut args = FluentArgs::new();
         args.set("name", crate::ssh_hosts::connect_domain_label(domain_name));
@@ -5623,9 +5752,6 @@ fn remote_tree_mutation_allowed(domain_name: Option<&str>) -> bool {
 /// carried across by id.
 pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
     let mut tree = tree;
-    if let Some(hidden) = LOCALLY_HIDDEN_SPACES.lock().get(domain_name) {
-        strip_hidden_spaces(&mut tree, hidden);
-    }
 
     // Before anything else, and before the emptiness below is given any
     // meaning: a tree older than the one we hold is stale news, whichever
@@ -5644,6 +5770,24 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
             tree.revision
         );
         return;
+    }
+
+    // From here on the tree speaks this device's Space ids, as everything it
+    // is compared with does: the store, the ops in flight, the last tree
+    // kept. The host's are this desktop's own.
+    if !crate::local_sessions::is_host_domain_name(domain_name) {
+        let hidden = LOCALLY_HIDDEN_SPACES
+            .lock()
+            .get(domain_name)
+            .cloned()
+            .unwrap_or_default();
+        let mut store = THREAD_STORE.lock();
+        if store.tree_from_server(domain_name, &mut tree, &remote_server_runtime_id, &hidden) {
+            persist_locked(&store);
+        }
+    }
+    if let Some(hidden) = LOCALLY_HIDDEN_SPACES.lock().get(domain_name) {
+        strip_hidden_spaces(&mut tree, hidden);
     }
     // The server answered: from now on its Space here is more than a first
     // connect's guess.
@@ -5736,6 +5880,12 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
     }
     // Asked before the store is locked: the mux takes locks of its own.
     let attached = !host && remote_domain_is_attached(domain_name);
+    let hidden_anywhere: std::collections::HashSet<SpaceId> = LOCALLY_HIDDEN_SPACES
+        .lock()
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
     let mut store = THREAD_STORE.lock();
     // Which Spaces belonged to this server *before* it spoke. Only a window
     // parked on one of these can have been orphaned by this push, and the set
@@ -5760,7 +5910,7 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         // Agents panel led there, and new threads tried the way that was down.
         // Not once it has lost its server and is only trying to get back
         // (`still_holds_on`).
-        store.ingest_remote_tree_with(domain_name, &tree_for_store, &|other| {
+        let changed = store.ingest_remote_tree_with(domain_name, &tree_for_store, &|other| {
             another_name_keeps_its_spaces(
                 attached,
                 still_holds_on(
@@ -5768,7 +5918,8 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
                     remote_domain_has_lost_its_server(other),
                 ),
             )
-        })
+        });
+        store.prune_server_space_ids(&hidden_anywhere) || changed
     };
     // A name never used for this server, opened while another name for it
     // is up, lands where that one is (`follow_same_server_holder`).
@@ -5899,6 +6050,16 @@ fn dead_server_only_spaces(
         .filter(|space| !store.has_space(&space.id) && is_hosts_own_landing(tree, space))
         .map(|space| space.id.clone())
         .collect()
+}
+
+/// An id derived from other ids rather than minted fresh: a workspace's from
+/// its Space and folder (`project_id_for_path`), a startup thread's from its
+/// workspace (`initial_thread_id_for_workspace`) -- kind, then one hash. Two
+/// desktops can derive the same one.
+fn derived_id(id: &str, kind: &str) -> bool {
+    id.strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// An id the server minted (`new_id`: kind, then a dashed uuid). The
@@ -6660,6 +6821,7 @@ impl WorkspaceThreadStore {
         changed |= self.retire_collection_spaces();
         changed |= self.groom_thread_refs();
         changed |= self.groom_server_folder_spaces();
+        changed |= self.prune_server_space_ids(&Default::default());
         changed
     }
 
@@ -7883,7 +8045,7 @@ impl WorkspaceThreadStore {
         if is_remote_project(project, &self.spaces) {
             return None;
         }
-        Some(project.path.clone())
+        Some(local_project_root(&project.path))
     }
 
     fn sync_active_workspace(
@@ -8097,6 +8259,7 @@ impl WorkspaceThreadStore {
     }
 
     fn create_thread(&mut self, project_id: &str, name: Option<String>) -> WorkspaceThreadId {
+        let on_server = self.server_project_ids.get(project_id).cloned();
         let project = self
             .projects
             .iter_mut()
@@ -8105,7 +8268,14 @@ impl WorkspaceThreadStore {
         let name = name
             .map(|name| unique_thread_name(project, None, name.trim()))
             .unwrap_or_else(|| next_thread_name(project));
-        let session = WorkspaceThread::new(project.id.clone(), name, None);
+        let mut session = WorkspaceThread::new(project.id.clone(), name, None);
+        if let Some(server_project) = on_server {
+            // A workspace kept here under an id of its own (`tree_from_server`):
+            // its threads' workspace is the one its server derives, from its
+            // own id, or the two ends name one terminal two ways.
+            session.planned_workspace_name =
+                Some(workspace_name_for_thread(&server_project, &session.id));
+        }
         let id = session.id.clone();
         project.threads.push(session);
         id
@@ -8393,11 +8563,16 @@ impl WorkspaceThreadStore {
             .or_else(|| session.planned_workspace_name.clone())
             .unwrap_or_else(|| workspace_name_for_thread(&project.id, &session.id));
         let needs_materialize = !live_workspaces.iter().any(|live| live == &workspace_name);
+        let project_path = if is_remote_project(project, &self.spaces) {
+            project.path.clone()
+        } else {
+            local_project_root(&project.path)
+        };
         Some(ActivationPlan {
             project_id: project.id.clone(),
             thread_id: session.id.clone(),
             workspace_name,
-            project_path: project.path.clone(),
+            project_path,
             needs_materialize,
         })
     }
@@ -8932,6 +9107,305 @@ impl WorkspaceThreadStore {
     #[cfg(test)]
     fn ingest_remote_tree(&mut self, domain_name: &str, tree: &codec::ThinkTermTree) -> bool {
         self.ingest_remote_tree_with(domain_name, tree, &remote_domain_is_live)
+    }
+
+    /// Rewrite `tree`, as `domain_name`'s server sent it, into this device's
+    /// ids; true when that took a new id.
+    ///
+    /// A desktop publishes its own Spaces through its session server, under
+    /// their own ids, and every desktop's default Space is `space-default`.
+    /// Taken as it came, the server's default Space was this device's: its
+    /// rows were dropped (`ingest_remote_tree_with` takes no Space whose id is
+    /// one of ours from elsewhere), and the first connect, finding no Space
+    /// there, invented one on the server, named after the host -- which the
+    /// server's desktop then showed as well. Such a Space is kept here under
+    /// an id of its own (`server_space_ids`); `ops_for_server` turns it back
+    /// on the way out.
+    ///
+    /// What is in it is that desktop's own too, and may clash the same way:
+    /// - A workspace id is derived from the Space's id and its folder, so the
+    ///   desktop's Home is this device's Home when both have one home path.
+    ///   Such a workspace is kept under an id of its own as well
+    ///   (`server_project_ids`). Its threads that name no workspace yet are
+    ///   given the one the server would derive, so both ends agree on it.
+    /// - A thread whose id is a thread of another workspace here is left
+    ///   out, and so is a thread on a workspace the desktop opened by itself
+    ///   (its startup terminal, `default`): this device has a workspace of
+    ///   that name of its own, and tearing one down would close the other.
+    ///
+    /// The ids go with the Space from one connection name to another, as
+    /// everything else of it does (`taken_over` in `ingest_remote_tree_with`):
+    /// see `kept_id_for_server_space`. `hidden` are the Spaces this device
+    /// disconnected from on this connection: they keep their id until it is
+    /// made again, so the filter that hides them still knows them.
+    fn tree_from_server(
+        &mut self,
+        domain_name: &str,
+        tree: &mut codec::ThinkTermTree,
+        runtime_id: &dyn Fn(&str) -> Option<String>,
+        hidden: &std::collections::HashSet<SpaceId>,
+    ) -> bool {
+        let mut minted = false;
+        let mut local_ids: HashMap<SpaceId, SpaceId> = HashMap::new();
+        for space in &tree.spaces {
+            if let Some(local) =
+                self.kept_id_for_server_space(domain_name, &space.id, tree, runtime_id, hidden)
+            {
+                local_ids.insert(space.id.clone(), local);
+                continue;
+            }
+            let ours = space.id == DEFAULT_SPACE_ID
+                || self
+                    .spaces
+                    .iter()
+                    .any(|local| local.id == space.id && local.client_domain.is_none());
+            if ours {
+                let local = new_id("space");
+                log::info!(
+                    "keeping {domain_name}'s Space {:?} as {local}: its id is one of this device's",
+                    space.id
+                );
+                self.server_space_ids
+                    .insert(local.clone(), space.id.clone());
+                local_ids.insert(space.id.clone(), local);
+                minted = true;
+            }
+        }
+        if local_ids.is_empty() {
+            return false;
+        }
+        for space in &mut tree.spaces {
+            if let Some(local) = local_ids.get(&space.id) {
+                space.id = local.clone();
+            }
+        }
+        let mut projects = std::mem::take(&mut tree.projects);
+        for project in &mut projects {
+            let Some(local_space) = local_ids.get(&project.space_id) else {
+                continue;
+            };
+            project.space_id = local_space.clone();
+            let server_project_id = project.id.clone();
+            let local_project = self.kept_project_id(local_space, &server_project_id, &mut minted);
+            project.threads.retain(|thread| {
+                let own_terminal = thread
+                    .materialized_workspace_name
+                    .as_deref()
+                    .or(thread.planned_workspace_name.as_deref())
+                    .is_some_and(|workspace| !workspace.starts_with("thinkterm:"));
+                let clashes = self.projects.iter().any(|other| {
+                    other.id != local_project && other.threads.iter().any(|t| t.id == thread.id)
+                });
+                if own_terminal || clashes {
+                    log::debug!(
+                        "leaving {domain_name}'s thread {:?} out: {}",
+                        thread.id,
+                        if own_terminal {
+                            "the desktop opened its workspace by itself"
+                        } else {
+                            "its id is a thread of another workspace here"
+                        }
+                    );
+                }
+                !own_terminal && !clashes
+            });
+            for thread in &mut project.threads {
+                thread.project_id = local_project.clone();
+                if local_project != server_project_id
+                    && thread.materialized_workspace_name.is_none()
+                    && thread.planned_workspace_name.is_none()
+                {
+                    thread.planned_workspace_name =
+                        Some(workspace_name_for_thread(&server_project_id, &thread.id));
+                }
+            }
+            project.id = local_project;
+        }
+        tree.projects = projects;
+        minted
+    }
+
+    /// The id a workspace of a desktop's own Space, kept here under
+    /// `local_space`, goes by here (`tree_from_server`): the one it was kept
+    /// under before, else its own unless that is another Space's workspace
+    /// here, else a new one.
+    fn kept_project_id(
+        &mut self,
+        local_space: &str,
+        server_project_id: &str,
+        minted: &mut bool,
+    ) -> ProjectId {
+        let kept = self
+            .server_project_ids
+            .iter()
+            .filter(|(_, on_server)| on_server.as_str() == server_project_id)
+            .map(|(local, _)| local)
+            .find(|local| {
+                self.projects
+                    .iter()
+                    .any(|project| &project.id == *local && project.space_id == local_space)
+            });
+        if let Some(local) = kept {
+            return local.clone();
+        }
+        let clashes = self
+            .projects
+            .iter()
+            .any(|project| project.id == server_project_id && project.space_id != local_space);
+        if !clashes {
+            return server_project_id.to_string();
+        }
+        let local = new_id("project");
+        log::info!(
+            "keeping workspace {server_project_id:?} as {local}: its id is one of this device's"
+        );
+        self.server_project_ids
+            .insert(local.clone(), server_project_id.to_string());
+        *minted = true;
+        local
+    }
+
+    /// The id this device already keeps `server_id` of `domain_name`'s server
+    /// under, if it keeps it under another (`tree_from_server`): the Space
+    /// this name holds; one it disconnected from (`hidden`); or one another
+    /// name holds that reaches the same server. Two live handshakes naming
+    /// their servers settle that either way; otherwise the other name holds
+    /// another of this tree's Spaces, or the tree carries one of its threads
+    /// made with a fresh id -- unlike an id derived from a Space and a folder,
+    /// which any desktop can share.
+    fn kept_id_for_server_space(
+        &self,
+        domain_name: &str,
+        server_id: &str,
+        tree: &codec::ThinkTermTree,
+        runtime_id: &dyn Fn(&str) -> Option<String>,
+        hidden: &std::collections::HashSet<SpaceId>,
+    ) -> Option<SpaceId> {
+        let kept: Vec<&SpaceId> = self
+            .server_space_ids
+            .iter()
+            .filter(|(_, on_server)| on_server.as_str() == server_id)
+            .map(|(local, _)| local)
+            .collect();
+        if let Some(local) = kept.iter().find(|local| hidden.contains(local.as_str())) {
+            return Some((*local).clone());
+        }
+        let kept: Vec<&Space> = kept
+            .iter()
+            .filter_map(|local| self.spaces.iter().find(|space| &space.id == *local))
+            .collect();
+        let held_here = kept
+            .iter()
+            .find(|space| space.client_domain.as_deref() == Some(domain_name));
+        if let Some(space) = held_here {
+            return Some(space.id.clone());
+        }
+        let this_server = runtime_id(domain_name);
+        kept.iter()
+            .find(|space| {
+                let Some(holder) = space.client_domain.as_deref() else {
+                    return false;
+                };
+                if let (Some(this), Some(that)) = (this_server.as_ref(), runtime_id(holder)) {
+                    return *this == that;
+                }
+                let holds_another = tree.spaces.iter().any(|other| {
+                    other.id != server_id
+                        && self.spaces.iter().any(|local| {
+                            local.id == other.id && local.client_domain.as_deref() == Some(holder)
+                        })
+                });
+                let shares_a_thread = tree
+                    .projects
+                    .iter()
+                    .flat_map(|project| project.threads.iter())
+                    .filter(|thread| !derived_id(&thread.id, "thread"))
+                    .any(|thread| {
+                        self.projects.iter().any(|project| {
+                            project.space_id == space.id
+                                && project.threads.iter().any(|t| t.id == thread.id)
+                        })
+                    });
+                holds_another || shares_a_thread
+            })
+            .map(|space| space.id.clone())
+    }
+
+    /// `ops`, as the server they go to names its rows (`tree_from_server`).
+    fn ops_for_server(&self, ops: Vec<codec::TreeOp>) -> Vec<codec::TreeOp> {
+        if self.server_space_ids.is_empty() && self.server_project_ids.is_empty() {
+            return ops;
+        }
+        let space = |space_id: &mut String| {
+            if let Some(server_id) = self.server_space_ids.get(space_id.as_str()) {
+                *space_id = server_id.clone();
+            }
+        };
+        let project = |project_id: &mut String| {
+            if let Some(server_id) = self.server_project_ids.get(project_id.as_str()) {
+                *project_id = server_id.clone();
+            }
+        };
+        ops.into_iter()
+            .map(|mut op| {
+                match &mut op {
+                    codec::TreeOp::CreateSpace { space_id, .. }
+                    | codec::TreeOp::RenameSpace { space_id, .. }
+                    | codec::TreeOp::DeleteSpace { space_id } => space(space_id),
+                    codec::TreeOp::CreateProject {
+                        project_id,
+                        space_id,
+                        ..
+                    } => {
+                        space(space_id);
+                        project(project_id);
+                    }
+                    codec::TreeOp::MoveProjectBefore {
+                        space_id,
+                        project_id,
+                        before,
+                    } => {
+                        space(space_id);
+                        project(project_id);
+                        if let Some(before) = before {
+                            project(before);
+                        }
+                    }
+                    codec::TreeOp::RenameProject { project_id, .. }
+                    | codec::TreeOp::RemoveProject { project_id }
+                    | codec::TreeOp::SetProjectArchived { project_id, .. }
+                    | codec::TreeOp::CreateThread { project_id, .. }
+                    | codec::TreeOp::MoveThreadBefore { project_id, .. } => project(project_id),
+                    _ => {}
+                }
+                op
+            })
+            .collect()
+    }
+
+    /// Forget the ids kept for Spaces and workspaces this device no longer
+    /// has -- except the Spaces in `hidden`, disconnected from on a
+    /// connection that is still up (`tree_from_server`) -- and the threads
+    /// connections landed on in them.
+    fn prune_server_space_ids(&mut self, hidden: &std::collections::HashSet<SpaceId>) -> bool {
+        let count = |store: &Self| {
+            (
+                store.server_space_ids.len(),
+                store.server_project_ids.len(),
+                store.landing_threads.len(),
+            )
+        };
+        let before = count(self);
+        let spaces = &self.spaces;
+        let projects = &self.projects;
+        self.server_space_ids.retain(|local, _| {
+            hidden.contains(local) || spaces.iter().any(|space| &space.id == local)
+        });
+        self.server_project_ids
+            .retain(|local, _| projects.iter().any(|project| &project.id == local));
+        self.landing_threads
+            .retain(|space_id, _| spaces.iter().any(|space| &space.id == space_id));
+        before != count(self)
     }
 
     /// Rebuild this domain's Spaces/Projects/Threads from the server's tree.
@@ -9707,7 +10181,19 @@ impl WorkspaceThreadStore {
         None
     }
 
-    fn end_workspace_thread_record(&mut self, thread_id: &str) -> EndWorkspaceThreadResult {
+    /// End `thread_id`. A workspace's last thread is not simply deleted, as a
+    /// workspace never stands empty: a server's workspace goes with it, and
+    /// so does one of this device's whose folder is gone (`folder_missing`,
+    /// asked off the window thread by the caller) -- nothing could open there
+    /// again. One whose folder is still there stays, and so does the last
+    /// workspace of a server's Space (`can_remove_project`), with a fresh
+    /// thread in place of the ended one: deleting a thread never takes a
+    /// folder off the sidebar.
+    fn end_workspace_thread_record(
+        &mut self,
+        thread_id: &str,
+        folder_missing: bool,
+    ) -> EndWorkspaceThreadResult {
         if let Some(deleted) = self.delete_thread(thread_id) {
             return EndWorkspaceThreadResult::DeletedThread(deleted);
         }
@@ -9720,26 +10206,29 @@ impl WorkspaceThreadStore {
         }) else {
             return EndWorkspaceThreadResult::Noop;
         };
-
-        if !is_remote_project(&self.projects[project_index], &self.spaces) {
-            return EndWorkspaceThreadResult::Noop;
-        }
-
         let project_id = self.projects[project_index].id.clone();
         let space_id = self.projects[project_index].space_id.clone();
-        let project_count = self
-            .projects
-            .iter()
-            .filter(|project| project.space_id == space_id && !project.is_archived())
-            .count();
+        let stays = if is_remote_project(&self.projects[project_index], &self.spaces) {
+            !self.can_remove_project(&project_id)
+        } else {
+            !folder_missing
+        };
 
-        if project_count <= 1 {
-            let mut project = default_project_for_space(&space_id);
-            let session = WorkspaceThread::new(project.id.clone(), "main".to_string(), None);
-            project.active_thread_id = Some(session.id.clone());
-            project.threads.push(session);
-            self.projects.push(project);
-            self.set_active_project_for_space(&space_id, project_id.clone());
+        if stays {
+            // With two threads the ended one can go, and `delete_thread`
+            // moves the workspace's selection onto the fresh one. The window
+            // follows only when it was showing that workspace: a workspace in
+            // the background keeps its last thread as its active one too.
+            self.create_thread(&project_id, None);
+            let showing =
+                self.active_project_id_for_space(&space_id).as_deref() == Some(project_id.as_str());
+            return self
+                .delete_thread(thread_id)
+                .map(|mut deleted| {
+                    deleted.was_active &= showing;
+                    EndWorkspaceThreadResult::DeletedThread(deleted)
+                })
+                .unwrap_or(EndWorkspaceThreadResult::Noop);
         }
 
         self.remove_project(&project_id)
@@ -9832,23 +10321,83 @@ impl WorkspaceThreadStore {
         )
     }
 
+    /// Whether `remove_project` would take `project_id` away. A Space keeps
+    /// one workspace to land in: its last one goes only from a Space of this
+    /// device's, and not when it is Home already (`home_for_space`).
+    fn can_remove_project(&self, project_id: &str) -> bool {
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+        else {
+            return false;
+        };
+        project.is_archived()
+            || self.live_project_count(&project.space_id) > 1
+            || (self.is_local_space(&project.space_id) && !is_home_project(project))
+    }
+
+    /// Live projects only: archived rows must not prop up a Space that has no
+    /// usable project left.
+    fn live_project_count(&self, space_id: &str) -> usize {
+        self.projects
+            .iter()
+            .filter(|project| project.space_id == space_id && !project.is_archived())
+            .count()
+    }
+
+    /// A Space of this device's, not a server's.
+    fn is_local_space(&self, space_id: &str) -> bool {
+        self.spaces
+            .iter()
+            .any(|space| space.id == space_id && space.client_domain.is_none())
+    }
+
+    /// Make Home the live workspace of `space_id`, a Space of this device's
+    /// whose last one is going, with a thread to open: an archived Home --
+    /// by its folder, as `create_project_from_path` finds a project, so one
+    /// made under another id counts -- is brought back rather than doubled.
+    /// A server's Space gets none: what it holds is the server's, and any
+    /// stand-in made here would show up on that server's desktop too.
+    fn home_for_space(&mut self, space_id: &str, leaving: &str) -> bool {
+        if !self.is_local_space(space_id) {
+            return false;
+        }
+        let existing = self.projects.iter_mut().find(|project| {
+            project.space_id == space_id && project.id != leaving && is_home_project(project)
+        });
+        let home = match existing {
+            Some(home) => {
+                home.archived_at = None;
+                home
+            }
+            None => {
+                self.projects.push(default_project_for_space(space_id));
+                self.projects.last_mut().expect("just pushed")
+            }
+        };
+        if home.threads.is_empty() {
+            let session = WorkspaceThread::new(home.id.clone(), "main".to_string(), None);
+            home.active_thread_id = Some(session.id.clone());
+            home.threads.push(session);
+        }
+        true
+    }
+
     fn remove_project(&mut self, project_id: &str) -> Option<RemovedProject> {
         let index = self
             .projects
             .iter()
             .position(|project| project.id == project_id)?;
         let space_id = self.projects[index].space_id.clone();
-        // Count live projects only: archived rows must not prop up a Space
-        // that has no usable project left.
-        if !self.projects[index].is_archived()
-            && self
-                .projects
-                .iter()
-                .filter(|project| project.space_id == space_id && !project.is_archived())
-                .count()
-                <= 1
-        {
-            return None;
+        if !self.projects[index].is_archived() && self.live_project_count(&space_id) <= 1 {
+            // The Space's last workspace: Home comes first, and the window
+            // moves onto it.
+            if is_home_project(&self.projects[index]) || !self.home_for_space(&space_id, project_id)
+            {
+                return None;
+            }
+            self.set_active_project_for_space(&space_id, project_id.to_string());
         }
         let removed = self.projects.remove(index);
         let was_active = self.active_project_id_for_space(&space_id).as_deref() == Some(project_id);
@@ -11698,6 +12247,31 @@ fn strip_windows_verbatim_prefix_text(path: &str) -> Option<String> {
         .map(|unc_path| format!(r"\\{unc_path}"))
 }
 
+/// The folder a workspace of this device's opens in. A row that came in
+/// through the session server can carry a path naming no folder here: the
+/// `wezterm-mux://` of a connection's own workspace, which a device connected
+/// to this one put in one of its Spaces, and the server's `~`. Both mean this
+/// machine's home; taken as written, the thread could only ever show
+/// "Folder not found".
+fn local_project_root(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text.starts_with("wezterm-mux://") || text == "~" {
+        return config::HOME_DIR.clone();
+    }
+    match text.strip_prefix("~/") {
+        Some(rest) => config::HOME_DIR.join(rest),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Whether the folder at `path` is gone, as `FolderProblem::MissingRoot`
+/// means it: renamed, deleted, or on a volume that is not mounted. Touches
+/// the filesystem, so never on the window thread: a stalled mount would
+/// freeze the GUI for its timeout.
+pub fn folder_is_missing(path: &Path) -> bool {
+    matches!(std::fs::metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn workspace_name_for_thread(project_id: &str, thread_id: &str) -> String {
     format!("thinkterm:{project_id}:{thread_id}")
 }
@@ -11755,6 +12329,23 @@ fn workspace_name_for_remote_default(project_id: &str, thread_id: &str, workspac
 
 pub fn remote_project_id_for_space(space_id: &str, host_id: &str) -> ProjectId {
     format!("{host_id}{REMOTE_PROJECT_SPACE_SEPARATOR}{space_id}")
+}
+
+/// A connection's own workspace in a server's Space: named for the
+/// connection, opening in the server's home (its `wezterm-mux://` path names
+/// no folder), without threads yet.
+fn mux_domain_own_project(space_id: &str, domain_name: &str) -> Project {
+    Project {
+        id: remote_project_id_for_space(space_id, &mux_domain_host_id(domain_name)),
+        space_id: space_id.to_string(),
+        name: crate::ssh_hosts::connect_domain_label(domain_name),
+        path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
+        threads: vec![],
+        active_thread_id: None,
+        threads_collapsed: false,
+        active_note_path: None,
+        archived_at: None,
+    }
 }
 
 /// The Space a remote project id was minted for, if it carries one. Lets a
@@ -12219,6 +12810,76 @@ impl WorkspaceThreadStore {
         self.ensure_mux_domain_space_with(domain_name, &remote_domain_is_live)
     }
 
+    /// Where `domain_name` lands in a Space of its server's that has
+    /// workspaces but none of the connection's own. The first time, on a new
+    /// thread of its own, in the workspace this device was last in there or
+    /// the Space's first: not on one of the server desktop's threads, which
+    /// would be one terminal typed into from two machines, and not on what
+    /// the Space's active thread happens to be then -- the re-home of a window
+    /// whose invented Space vanished may have pointed it at the server's
+    /// first thread. After that, where this device was last in the Space,
+    /// else on that thread again (`landing_threads`).
+    ///
+    /// `None` unless the Space is held by `domain_name` itself and has a live
+    /// workspace. A Space held through the server's other name keeps the
+    /// connection's own workspace: it is what tells that this name was there
+    /// (`space_on_same_server`).
+    fn land_in_server_workspace(
+        &mut self,
+        space_id: &str,
+        domain_name: &str,
+    ) -> Option<MuxDomainSpacePlan> {
+        let space = self.spaces.iter().find(|space| space.id == space_id)?;
+        if space.client_domain.as_deref() != Some(domain_name) {
+            return None;
+        }
+        let live = |project: &Project| project.space_id == space_id && !project.is_archived();
+        let thread_in = |project: &Project, thread_id: Option<&str>| {
+            thread_id
+                .filter(|id| project.threads.iter().any(|thread| thread.id == *id))
+                .map(|id| (project.id.clone(), id.to_string()))
+        };
+        let active_project = space
+            .active_project_id
+            .as_deref()
+            .and_then(|active| self.projects.iter().find(|p| p.id == active && live(p)));
+        let landed = match self.landing_threads.get(space_id) {
+            Some(landing) => active_project
+                .and_then(|project| thread_in(project, project.active_thread_id.as_deref()))
+                .or_else(|| {
+                    self.projects
+                        .iter()
+                        .filter(|p| live(p))
+                        .find_map(|project| thread_in(project, Some(landing)))
+                }),
+            None => None,
+        };
+        let (project_id, thread_id) = match landed {
+            Some(landed) => landed,
+            None => {
+                let project_id = active_project
+                    .or_else(|| self.projects.iter().find(|p| live(p)))?
+                    .id
+                    .clone();
+                let thread_id = self.create_thread(&project_id, None);
+                self.landing_threads
+                    .insert(space_id.to_string(), thread_id.clone());
+                (project_id, thread_id)
+            }
+        };
+        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
+            project.active_thread_id = Some(thread_id.clone());
+        }
+        if let Some(space) = self.spaces.iter_mut().find(|space| space.id == space_id) {
+            space.active_project_id = Some(project_id.clone());
+        }
+        Some(MuxDomainSpacePlan {
+            space_id: space_id.to_string(),
+            project_id,
+            thread_id,
+        })
+    }
+
     /// `ensure_mux_domain_space`, with `is_live` saying which other
     /// connections are up.
     fn ensure_mux_domain_space_with(
@@ -12243,17 +12904,16 @@ impl WorkspaceThreadStore {
 
         let project_id = store.mux_domain_project_id(&space_id, domain_name);
         if !store.projects.iter().any(|p| p.id == project_id) {
-            store.projects.push(Project {
-                id: project_id.clone(),
-                space_id: space_id.clone(),
-                name: label.clone(),
-                path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
-                threads: vec![],
-                active_thread_id: None,
-                threads_collapsed: false,
-                active_note_path: None,
-                archived_at: None,
-            });
+            // A server's Space that already has workspaces gets no workspace
+            // of the connection's own: this device lands in one of the
+            // server's. Made there, a workspace named after the connection
+            // showed up in the server desktop's sidebar too.
+            if let Some(plan) = store.land_in_server_workspace(&space_id, domain_name) {
+                return plan;
+            }
+            store
+                .projects
+                .push(mux_domain_own_project(&space_id, domain_name));
         }
 
         let project = store
@@ -15994,7 +16654,15 @@ mod tests {
             store.active_project_id_for_space(&space_id).as_deref(),
             Some("project-1")
         );
-        assert!(store.remove_project("project-1").is_none());
+        // The last one goes too, with Home in its place.
+        store
+            .remove_project("project-1")
+            .expect("the last workspace goes");
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(
+            store.projects[0].id,
+            default_project_for_space(&space_id).id
+        );
     }
 
     #[test]
@@ -16015,7 +16683,7 @@ mod tests {
         store.projects.push(project);
         store.set_active_project_for_space(&space_id, "project-1".to_string());
 
-        let result = store.end_workspace_thread_record(&second_id);
+        let result = store.end_workspace_thread_record(&second_id, false);
         let EndWorkspaceThreadResult::DeletedThread(deleted) = result else {
             panic!("expected deleted thread result");
         };
@@ -16055,7 +16723,7 @@ mod tests {
         store.projects.push(remote_project);
         store.set_active_project_for_space(&space_id, "ssh-host".to_string());
 
-        let result = store.end_workspace_thread_record(&remote_id);
+        let result = store.end_workspace_thread_record(&remote_id, false);
         let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
             panic!("expected removed project result");
         };
@@ -16085,7 +16753,7 @@ mod tests {
         store.projects.push(remote_project);
         store.set_active_project_for_space(&space_id, "ssh-host".to_string());
 
-        let result = store.end_workspace_thread_record(&remote_id);
+        let result = store.end_workspace_thread_record(&remote_id, false);
         let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
             panic!("expected removed project result");
         };
@@ -16106,12 +16774,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn end_workspace_thread_removes_mux_domain_path_project() {
+    /// A server's Space holding `project-path` (`/remote/project`, one
+    /// thread, shown) and, with `other`, a second workspace; that thread's id.
+    fn server_space_store(other: bool) -> (WorkspaceThreadStore, String) {
         let space_id = default_space_id();
         let mut store = test_store();
         store.spaces[0].client_domain = Some("remote-mux".to_string());
-
         let thread =
             WorkspaceThread::new("project-path".to_string(), "Session 1".to_string(), None);
         let thread_id = thread.id.clone();
@@ -16123,9 +16791,25 @@ mod tests {
         );
         project.active_thread_id = Some(thread_id.clone());
         store.projects.push(project);
+        if other {
+            let thread =
+                WorkspaceThread::new("project-other".to_string(), "main".to_string(), None);
+            store.projects.push(test_project(
+                "project-other",
+                "Other",
+                PathBuf::from("/remote/other"),
+                vec![thread],
+            ));
+        }
         store.set_active_project_for_space(&space_id, "project-path".to_string());
+        (store, thread_id)
+    }
 
-        let result = store.end_workspace_thread_record(&thread_id);
+    #[test]
+    fn end_workspace_thread_removes_mux_domain_path_project() {
+        let (mut store, thread_id) = server_space_store(true);
+
+        let result = store.end_workspace_thread_record(&thread_id, false);
         let EndWorkspaceThreadResult::RemovedProject(removed) = result else {
             panic!("expected mux-domain project removal");
         };
@@ -16136,32 +16820,252 @@ mod tests {
             .all(|project| project.id != "project-path"));
     }
 
+    /// The last workspace of a server's Space stays: nothing stands in for
+    /// it there, as a stand-in made here -- Home with this device's folder,
+    /// or one named after the connection -- would show up on the server's
+    /// desktop as well. Its last thread can still be ended: a fresh one
+    /// takes its place.
     #[test]
-    fn end_workspace_thread_noops_for_last_local_thread() {
+    fn a_server_spaces_last_workspace_stays() {
+        let (mut store, thread_id) = server_space_store(false);
+        assert!(!store.can_remove_project("project-path"));
+        assert!(store.remove_project("project-path").is_none());
+
+        let EndWorkspaceThreadResult::DeletedThread(deleted) =
+            store.end_workspace_thread_record(&thread_id, false)
+        else {
+            panic!("expected the thread to make way for a fresh one");
+        };
+        assert!(deleted.was_active);
+        assert_eq!(store.projects.len(), 1);
+        let project = &store.projects[0];
+        assert_eq!(project.id, "project-path");
+        assert_eq!(project.threads.len(), 1);
+        assert_ne!(project.threads[0].id, thread_id);
+    }
+
+    /// Ending the last thread of a workspace the window is not showing
+    /// leaves the window where it is; the workspace's own selection moves
+    /// to the fresh thread.
+    #[test]
+    fn ending_a_background_workspaces_last_thread_keeps_the_window_where_it_is() {
+        let space_id = default_space_id();
+        let (mut store, thread_id) = store_with_one_local_thread();
+        let mut shown = test_project(
+            "project-shown",
+            "shown",
+            PathBuf::from("/tmp/shown"),
+            vec![WorkspaceThread::new(
+                "project-shown".to_string(),
+                "main".to_string(),
+                None,
+            )],
+        );
+        shown.active_thread_id = Some(shown.threads[0].id.clone());
+        store.projects.push(shown);
+        store.set_active_project_for_space(&space_id, "project-shown".to_string());
+
+        let EndWorkspaceThreadResult::DeletedThread(deleted) =
+            store.end_workspace_thread_record(&thread_id, false)
+        else {
+            panic!("expected the thread to be deleted");
+        };
+        assert!(!deleted.was_active);
+        let alpha = store
+            .projects
+            .iter()
+            .find(|project| project.id == "project-alpha")
+            .unwrap();
+        assert_eq!(alpha.active_thread_id.as_ref(), Some(&alpha.threads[0].id));
+    }
+
+    /// A store whose default Space holds one workspace of this device's, at
+    /// `/tmp/alpha`, with one thread; the workspace's id and the thread's.
+    fn store_with_one_local_thread() -> (WorkspaceThreadStore, String) {
         let space_id = default_space_id();
         let mut store = test_store();
-        let thread = WorkspaceThread::new("project-local".to_string(), "main".to_string(), None);
+        let thread = WorkspaceThread::new("project-alpha".to_string(), "main".to_string(), None);
         let thread_id = thread.id.clone();
         let mut project = test_project(
-            "project-local",
-            "Home",
-            PathBuf::from("/tmp/home"),
+            "project-alpha",
+            "alpha",
+            PathBuf::from("/tmp/alpha"),
             vec![thread],
         );
         project.active_thread_id = Some(thread_id.clone());
         store.projects.push(project);
-        store.set_active_project_for_space(&space_id, "project-local".to_string());
+        store.set_active_project_for_space(&space_id, "project-alpha".to_string());
+        (store, thread_id)
+    }
 
-        assert_eq!(
-            store.end_workspace_thread_record(&thread_id),
-            EndWorkspaceThreadResult::Noop
-        );
+    /// Ending a workspace's last thread used to do nothing at all, without a
+    /// word. With its folder still there the workspace stays, on a fresh
+    /// thread: deleting a thread never takes a folder off the sidebar.
+    #[test]
+    fn ending_the_last_thread_of_a_workspace_leaves_a_fresh_one() {
+        let (mut store, thread_id) = store_with_one_local_thread();
+
+        let EndWorkspaceThreadResult::DeletedThread(deleted) =
+            store.end_workspace_thread_record(&thread_id, false)
+        else {
+            panic!("expected the thread to be deleted");
+        };
+        assert!(deleted.was_active);
+        let project = &store.projects[0];
+        assert_eq!(project.id, "project-alpha");
+        assert_eq!(project.threads.len(), 1);
+        let fresh = &project.threads[0];
+        assert_ne!(fresh.id, thread_id);
+        assert_eq!(deleted.next_thread_id.as_deref(), Some(fresh.id.as_str()));
+        assert_eq!(project.active_thread_id.as_deref(), Some(fresh.id.as_str()));
+    }
+
+    /// A workspace whose folder is gone goes with its last thread, and the
+    /// Space, left without one, gets Home to land in.
+    #[test]
+    fn ending_the_last_thread_of_a_workspace_whose_folder_is_gone_removes_it() {
+        let space_id = default_space_id();
+        let (mut store, thread_id) = store_with_one_local_thread();
+
+        let EndWorkspaceThreadResult::RemovedProject(removed) =
+            store.end_workspace_thread_record(&thread_id, true)
+        else {
+            panic!("expected the workspace to be removed");
+        };
+        assert!(removed.was_active);
         assert_eq!(store.projects.len(), 1);
-        assert_eq!(store.projects[0].threads.len(), 1);
+        let home = &store.projects[0];
+        assert_eq!(home.id, default_project_for_space(&space_id).id);
+        assert_eq!(home.name, "Home");
+        assert_eq!(removed.next_thread_id, home.active_thread_id);
+        assert!(removed.next_thread_id.is_some());
         assert_eq!(
             store.active_project_id_for_space(&space_id).as_deref(),
-            Some("project-local")
+            Some(home.id.as_str())
         );
+    }
+
+    /// Remove Project on a Space's only workspace was refused without a word.
+    /// It goes now, with Home in its place; only a Space whose last workspace
+    /// is Home itself keeps it, and the menu says so by greying the item out.
+    #[test]
+    fn the_last_workspace_of_a_space_can_be_removed_unless_it_is_home() {
+        let space_id = default_space_id();
+        let (mut store, _) = store_with_one_local_thread();
+        assert!(store.can_remove_project("project-alpha"));
+
+        let removed = store
+            .remove_project("project-alpha")
+            .expect("the last workspace goes, with Home in its place");
+        let home_id = default_project_for_space(&space_id).id;
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].id, home_id);
+        assert_eq!(removed.next_thread_id, store.projects[0].active_thread_id);
+
+        assert!(!store.can_remove_project(&home_id));
+        assert!(store.remove_project(&home_id).is_none());
+        assert_eq!(store.projects.len(), 1);
+    }
+
+    /// A Home made under another id -- migrated, or carried in through the
+    /// session server -- is found by its folder: brought back, not doubled.
+    #[test]
+    fn removing_the_last_workspace_brings_back_a_home_made_under_another_id() {
+        let space_id = default_space_id();
+        let (mut store, _) = store_with_one_local_thread();
+        let mut home = test_project("project-old-home", "Home", config::HOME_DIR.clone(), vec![]);
+        home.archived_at = Some(1);
+        store.projects.push(home);
+
+        store
+            .remove_project("project-alpha")
+            .expect("the last live workspace goes");
+        assert_eq!(store.projects.len(), 1);
+        let home = &store.projects[0];
+        assert_eq!(home.id, "project-old-home");
+        assert!(!home.is_archived());
+        assert_eq!(home.threads.len(), 1);
+        assert_eq!(
+            store.active_project_id_for_space(&space_id).as_deref(),
+            Some("project-old-home")
+        );
+        // And that Home, the Space's last workspace, stays.
+        assert!(!store.can_remove_project("project-old-home"));
+    }
+
+    /// An archived Home is brought back for the Space to land in, not
+    /// doubled beside itself.
+    #[test]
+    fn removing_the_last_workspace_brings_back_an_archived_home() {
+        let space_id = default_space_id();
+        let (mut store, _) = store_with_one_local_thread();
+        let mut home = default_project_for_space(&space_id);
+        home.archived_at = Some(1);
+        let home_id = home.id.clone();
+        store.projects.push(home);
+
+        store
+            .remove_project("project-alpha")
+            .expect("the last live workspace goes");
+        let homes: Vec<&Project> = store.projects.iter().filter(|p| p.id == home_id).collect();
+        assert_eq!(homes.len(), 1);
+        assert!(!homes[0].is_archived());
+        assert_eq!(homes[0].threads.len(), 1);
+        assert_eq!(store.projects.len(), 1);
+    }
+
+    /// A row the session server carries into one of this desktop's Spaces can
+    /// name no folder here: a connection's own workspace, which another
+    /// device made, and the server's `~`. They open in this machine's home.
+    #[test]
+    fn a_connections_workspace_in_a_local_space_opens_at_home() {
+        let mut store = test_store();
+        let thread = WorkspaceThread::new(
+            "muxdomain-lan::space::x".to_string(),
+            "main".to_string(),
+            None,
+        );
+        let thread_id = thread.id.clone();
+        store.projects.push(test_project(
+            "muxdomain-lan::space::x",
+            "192.168.1.50",
+            PathBuf::from("wezterm-mux://192.168.1.50"),
+            vec![thread],
+        ));
+        let plan = store
+            .activation_plan_for_thread(&thread_id, &[])
+            .expect("a plan");
+        assert_eq!(plan.project_path, *config::HOME_DIR);
+
+        assert_eq!(local_project_root(Path::new("~")), *config::HOME_DIR);
+        assert_eq!(
+            local_project_root(Path::new("~/src")),
+            config::HOME_DIR.join("src")
+        );
+        assert_eq!(
+            local_project_root(Path::new("/tmp/alpha")),
+            PathBuf::from("/tmp/alpha")
+        );
+    }
+
+    /// In a server's Space the sentinel stays as it is: the remote branch of
+    /// activation knows it means the server's own starting folder.
+    #[test]
+    fn a_server_spaces_paths_are_not_rewritten() {
+        let mut store = test_store();
+        store.spaces[0].client_domain = Some("remote-mux".to_string());
+        let thread = WorkspaceThread::new("project-r".to_string(), "main".to_string(), None);
+        let thread_id = thread.id.clone();
+        store.projects.push(test_project(
+            "project-r",
+            "r",
+            PathBuf::from("~/src"),
+            vec![thread],
+        ));
+        let plan = store
+            .activation_plan_for_thread(&thread_id, &[])
+            .expect("a plan");
+        assert_eq!(plan.project_path, PathBuf::from("~/src"));
     }
 
     #[test]
@@ -16625,6 +17529,518 @@ mod tests {
             }],
             revision: 1,
         }
+    }
+
+    /// What a desktop's session server holds once the desktop has published
+    /// its Spaces: its default Space, under the id every desktop gives its
+    /// own, with Home in it; and `extra`, when given, as a Space of its own.
+    fn desktop_server_tree(home: &str, extra: Option<&str>) -> codec::ThinkTermTree {
+        let mut tree = codec::ThinkTermTree {
+            spaces: vec![codec::TtSpace {
+                id: DEFAULT_SPACE_ID.to_string(),
+                name: "Default".to_string(),
+            }],
+            projects: vec![codec::TtProject {
+                id: format!("project-{home}"),
+                space_id: DEFAULT_SPACE_ID.to_string(),
+                name: "Home".to_string(),
+                path: format!("/home/{home}"),
+                threads: vec![tree_thread(
+                    &format!("thread-{home}"),
+                    &format!("project-{home}"),
+                    "main",
+                )],
+                archived_at: None,
+            }],
+            revision: 3,
+        };
+        if let Some(extra) = extra {
+            tree.spaces.push(codec::TtSpace {
+                id: extra.to_string(),
+                name: extra.to_string(),
+            });
+        }
+        tree
+    }
+
+    fn no_runtime_ids(_: &str) -> Option<String> {
+        None
+    }
+
+    /// The server's default Space shares its id with this device's own. It
+    /// was dropped, its workspaces with it, and the first connect invented a
+    /// Space on the server, named after the host. It is kept under an id of
+    /// its own now, and goes back to the server under its own.
+    #[test]
+    fn a_servers_default_space_is_kept_under_an_id_of_its_own() {
+        let server = "192.168.1.50";
+        let mut store = test_store();
+        let mut tree = desktop_server_tree("bob", None);
+        assert!(store.tree_from_server(server, &mut tree, &no_runtime_ids, &Default::default()));
+        let kept = tree.spaces[0].id.clone();
+        assert_ne!(kept, DEFAULT_SPACE_ID);
+        assert_eq!(tree.projects[0].space_id, kept);
+        assert_eq!(
+            store.server_space_ids.get(&kept).map(String::as_str),
+            Some(DEFAULT_SPACE_ID)
+        );
+
+        assert!(store.ingest_remote_tree(server, &tree));
+        let space = store.spaces.iter().find(|space| space.id == kept).unwrap();
+        assert_eq!(space.name, "Default");
+        assert_eq!(space.client_domain.as_deref(), Some(server));
+        assert!(!space.is_default);
+        assert!(store
+            .projects
+            .iter()
+            .any(|project| project.id == "project-bob" && project.space_id == kept));
+        // This device's own default Space is untouched.
+        let own = store
+            .spaces
+            .iter()
+            .find(|s| s.id == DEFAULT_SPACE_ID)
+            .unwrap();
+        assert!(own.is_default && own.client_domain.is_none());
+
+        // The next tree from the server finds the same id.
+        let mut again = desktop_server_tree("bob", None);
+        assert!(!store.tree_from_server(server, &mut again, &no_runtime_ids, &Default::default()));
+        assert_eq!(again.spaces[0].id, kept);
+
+        // A tree already in this device's ids passes through as it is.
+        let mut kept_tree = again.clone();
+        assert!(!store.tree_from_server(
+            server,
+            &mut kept_tree,
+            &no_runtime_ids,
+            &Default::default()
+        ));
+        assert_eq!(kept_tree, again);
+
+        let ops = store.ops_for_server(vec![
+            codec::TreeOp::CreateProject {
+                project_id: "p".to_string(),
+                space_id: kept.clone(),
+                name: "p".to_string(),
+                path: "/srv/p".to_string(),
+            },
+            codec::TreeOp::RenameSpace {
+                space_id: kept.clone(),
+                name: "Shared".to_string(),
+            },
+            codec::TreeOp::MoveProjectBefore {
+                space_id: kept.clone(),
+                project_id: "p".to_string(),
+                before: None,
+            },
+            codec::TreeOp::CreateSpace {
+                space_id: "space-new".to_string(),
+                name: "New".to_string(),
+            },
+        ]);
+        let space_ids: Vec<&str> = ops
+            .iter()
+            .map(|op| match op {
+                codec::TreeOp::CreateProject { space_id, .. }
+                | codec::TreeOp::RenameSpace { space_id, .. }
+                | codec::TreeOp::MoveProjectBefore { space_id, .. }
+                | codec::TreeOp::CreateSpace { space_id, .. } => space_id.as_str(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            space_ids,
+            vec![
+                DEFAULT_SPACE_ID,
+                DEFAULT_SPACE_ID,
+                DEFAULT_SPACE_ID,
+                "space-new"
+            ]
+        );
+
+        // Gone from the server, it is gone here, and so is the id kept for it.
+        let mut emptied = desktop_server_tree("bob", None);
+        emptied.spaces.clear();
+        emptied.projects.clear();
+        emptied.revision = 4;
+        assert!(store.ingest_remote_tree(server, &emptied));
+        assert!(store.prune_server_space_ids(&Default::default()));
+        assert!(store.server_space_ids.is_empty());
+    }
+
+    /// Two desktops with one home path derive one id for their Home. The
+    /// server desktop's is kept here under an id of its own; its threads that
+    /// name no workspace are told the one the server would derive; and edits
+    /// go back under the server's id. Taken as it came, the landing thread
+    /// went into this device's own Home.
+    #[test]
+    fn a_workspace_sharing_an_id_with_one_of_ours_is_kept_under_its_own() {
+        let server = "192.168.1.50";
+        let mut store = test_store();
+        let ours = default_project_for_space(DEFAULT_SPACE_ID);
+        let ours_id = ours.id.clone();
+        store.projects.push(ours);
+        let server_tree = || {
+            let mut tree = desktop_server_tree("bob", None);
+            tree.projects[0].id = ours_id.clone();
+            for thread in &mut tree.projects[0].threads {
+                thread.project_id = ours_id.clone();
+                thread.materialized_workspace_name = None;
+            }
+            tree
+        };
+
+        let mut tree = server_tree();
+        assert!(store.tree_from_server(server, &mut tree, &no_runtime_ids, &Default::default()));
+        let kept = tree.projects[0].id.clone();
+        assert_ne!(kept, ours_id);
+        assert_eq!(store.server_project_ids.get(&kept), Some(&ours_id));
+        let thread = &tree.projects[0].threads[0];
+        assert_eq!(thread.project_id, kept);
+        assert_eq!(
+            thread.planned_workspace_name.as_deref(),
+            Some(workspace_name_for_thread(&ours_id, "thread-bob").as_str())
+        );
+        assert!(store.ingest_remote_tree(server, &tree));
+        let with_our_id: Vec<&Project> =
+            store.projects.iter().filter(|p| p.id == ours_id).collect();
+        assert_eq!(with_our_id.len(), 1);
+        assert_eq!(with_our_id[0].space_id, DEFAULT_SPACE_ID);
+
+        let mut again = server_tree();
+        assert!(!store.tree_from_server(server, &mut again, &no_runtime_ids, &Default::default()));
+        assert_eq!(again.projects[0].id, kept);
+
+        // A thread made here in it is told the workspace the server derives.
+        let made = store.create_thread(&kept, None);
+        let made_thread = store
+            .projects
+            .iter()
+            .flat_map(|project| project.threads.iter())
+            .find(|thread| thread.id == made)
+            .unwrap();
+        assert_eq!(
+            made_thread.planned_workspace_name.as_deref(),
+            Some(workspace_name_for_thread(&ours_id, &made).as_str())
+        );
+
+        let space = tree.spaces[0].id.clone();
+        let ops = store.ops_for_server(vec![
+            codec::TreeOp::CreateThread {
+                thread_id: "thread-new".to_string(),
+                project_id: kept.clone(),
+                name: "Thread 2".to_string(),
+                workspace: None,
+                created_at: 0,
+            },
+            codec::TreeOp::MoveProjectBefore {
+                space_id: space,
+                project_id: kept.clone(),
+                before: Some(kept.clone()),
+            },
+            codec::TreeOp::RemoveProject {
+                project_id: kept.clone(),
+            },
+        ]);
+        match &ops[0] {
+            codec::TreeOp::CreateThread { project_id, .. } => assert_eq!(project_id, &ours_id),
+            other => panic!("unexpected {other:?}"),
+        }
+        match &ops[1] {
+            codec::TreeOp::MoveProjectBefore {
+                space_id,
+                project_id,
+                before,
+            } => {
+                assert_eq!(space_id, DEFAULT_SPACE_ID);
+                assert_eq!(project_id, &ours_id);
+                assert_eq!(before.as_ref(), Some(&ours_id));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &ops[2] {
+            codec::TreeOp::RemoveProject { project_id } => assert_eq!(project_id, &ours_id),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A desktop's startup terminal sits on a workspace it opened by itself
+    /// (`default`), a name this device has a workspace of too: tearing one
+    /// down would close the other. It is left out here, and so is a thread
+    /// whose id is a thread of another workspace here.
+    #[test]
+    fn a_desktops_own_startup_terminal_is_left_out() {
+        let mut store = test_store();
+        let mut ours = default_project_for_space(DEFAULT_SPACE_ID);
+        ours.threads
+            .push(WorkspaceThread::new(ours.id.clone(), "x".to_string(), None));
+        let ours_thread = ours.threads[0].id.clone();
+        store.projects.push(ours);
+        let mut tree = desktop_server_tree("bob", None);
+        let mut startup = tree_thread("thread-startup", "project-bob", "main");
+        startup.materialized_workspace_name = Some("default".to_string());
+        tree.projects[0].threads.push(startup);
+        tree.projects[0]
+            .threads
+            .push(tree_thread(&ours_thread, "project-bob", "copy"));
+
+        store.tree_from_server(
+            "192.168.1.50",
+            &mut tree,
+            &no_runtime_ids,
+            &Default::default(),
+        );
+        let ids: Vec<&str> = tree.projects[0]
+            .threads
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["thread-bob"]);
+    }
+
+    /// Disconnecting from a server's default Space drops it here and hides
+    /// it for the rest of the connection. Its id stays kept meanwhile:
+    /// minted afresh, the hidden filter would not know it, and the Space
+    /// came straight back with the server's next push.
+    #[test]
+    fn a_disconnected_default_space_keeps_its_id_for_the_rest_of_the_connection() {
+        let server = "192.168.1.50";
+        let mut store = test_store();
+        let mut tree = desktop_server_tree("bob", Some("space-work"));
+        store.tree_from_server(server, &mut tree, &no_runtime_ids, &Default::default());
+        assert!(store.ingest_remote_tree(server, &tree));
+        let kept = tree.spaces[0].id.clone();
+
+        store.delete_space(&kept).expect("disconnected here");
+        let hidden: std::collections::HashSet<SpaceId> = std::iter::once(kept.clone()).collect();
+        store.prune_server_space_ids(&hidden);
+        assert!(store.server_space_ids.contains_key(&kept));
+
+        let mut next = desktop_server_tree("bob", Some("space-work"));
+        assert!(!store.tree_from_server(server, &mut next, &no_runtime_ids, &hidden));
+        assert_eq!(next.spaces[0].id, kept);
+    }
+
+    /// Two live handshakes naming two servers settle it, whatever else the
+    /// trees have in common: a copied tree is not the same server.
+    #[test]
+    fn known_runtime_ids_settle_whether_two_names_reach_one_server() {
+        let mut store = test_store();
+        let mut first = desktop_server_tree("bob", Some("space-shared"));
+        store.tree_from_server(
+            "Lab Server",
+            &mut first,
+            &no_runtime_ids,
+            &Default::default(),
+        );
+        assert!(store.ingest_remote_tree("Lab Server", &first));
+        let kept = first.spaces[0].id.clone();
+
+        let two_servers = |name: &str| Some(format!("server-of-{name}"));
+        let mut second = desktop_server_tree("bob", Some("space-shared"));
+        store.tree_from_server("Copy", &mut second, &two_servers, &Default::default());
+        assert_ne!(second.spaces[0].id, kept);
+    }
+
+    /// With nothing but its default Space, the same machine under its other
+    /// name is found by a thread made with a fresh id, such as the one this
+    /// device landed on there. An id derived from a workspace, as a startup
+    /// thread's is, says nothing: any desktop can derive it.
+    #[test]
+    fn a_fresh_thread_in_common_tells_the_same_server() {
+        let fresh = "thread-1795364772819-033e5cab";
+        let with_threads = |threads: &[&str]| {
+            let mut tree = desktop_server_tree("bob", None);
+            tree.projects[0].threads = threads
+                .iter()
+                .map(|id| tree_thread(id, "project-bob", id))
+                .collect();
+            tree
+        };
+        let mut store = test_store();
+        let mut first = with_threads(&[fresh, "thread-9f3a"]);
+        store.tree_from_server(
+            "Lab Server",
+            &mut first,
+            &no_runtime_ids,
+            &Default::default(),
+        );
+        assert!(store.ingest_remote_tree("Lab Server", &first));
+        let kept = first.spaces[0].id.clone();
+
+        let mut derived_only = with_threads(&["thread-9f3a"]);
+        store.tree_from_server(
+            "Other",
+            &mut derived_only,
+            &no_runtime_ids,
+            &Default::default(),
+        );
+        assert_ne!(derived_only.spaces[0].id, kept);
+
+        let mut same = with_threads(&[fresh]);
+        store.tree_from_server(
+            "tailnet:lab",
+            &mut same,
+            &no_runtime_ids,
+            &Default::default(),
+        );
+        assert_eq!(same.spaces[0].id, kept);
+        assert!(derived_id("thread-9f3a", "thread"));
+        assert!(!derived_id(fresh, "thread"));
+    }
+
+    /// Two servers, each with its default Space: two Spaces here.
+    #[test]
+    fn two_servers_default_spaces_are_kept_apart() {
+        let mut store = test_store();
+        let mut alpha = desktop_server_tree("alpha", None);
+        let mut beta = desktop_server_tree("beta", None);
+        assert!(store.tree_from_server(
+            "alpha-host",
+            &mut alpha,
+            &no_runtime_ids,
+            &Default::default()
+        ));
+        assert!(store.ingest_remote_tree("alpha-host", &alpha));
+        assert!(store.tree_from_server(
+            "beta-host",
+            &mut beta,
+            &no_runtime_ids,
+            &Default::default()
+        ));
+        assert!(store.ingest_remote_tree("beta-host", &beta));
+        assert_ne!(alpha.spaces[0].id, beta.spaces[0].id);
+        for (tree, host) in [(&alpha, "alpha-host"), (&beta, "beta-host")] {
+            let space = store
+                .spaces
+                .iter()
+                .find(|space| space.id == tree.spaces[0].id)
+                .unwrap();
+            assert_eq!(space.client_domain.as_deref(), Some(host));
+        }
+    }
+
+    /// The same machine saved under two names keeps one default Space here,
+    /// as it keeps one of every other: the second name finds the id the
+    /// first keeps it under, by a Space the first holds, or by both
+    /// connections reporting one server.
+    #[test]
+    fn a_servers_default_space_keeps_its_id_under_the_machines_other_name() {
+        let lan = "Lab Server";
+        let tailnet = "tailnet:lab.example.ts.net";
+        let mut store = test_store();
+        let mut first = desktop_server_tree("bob", Some("space-shared"));
+        assert!(store.tree_from_server(lan, &mut first, &no_runtime_ids, &Default::default()));
+        assert!(store.ingest_remote_tree(lan, &first));
+        let kept = first.spaces[0].id.clone();
+
+        let mut second = desktop_server_tree("bob", Some("space-shared"));
+        assert!(!store.tree_from_server(
+            tailnet,
+            &mut second,
+            &no_runtime_ids,
+            &Default::default()
+        ));
+        assert_eq!(second.spaces[0].id, kept);
+
+        // Only the default Space, but both connections report one server.
+        let mut only_default = desktop_server_tree("bob", None);
+        let one_server = |_: &str| Some("server-1".to_string());
+        assert!(!store.tree_from_server(
+            tailnet,
+            &mut only_default,
+            &one_server,
+            &Default::default()
+        ));
+        assert_eq!(only_default.spaces[0].id, kept);
+
+        // Another machine with nothing of the first's gets its own.
+        let mut other = desktop_server_tree("eve", None);
+        assert!(store.tree_from_server(
+            "Other Server",
+            &mut other,
+            &no_runtime_ids,
+            &Default::default()
+        ));
+        assert_ne!(other.spaces[0].id, kept);
+    }
+
+    /// The bug as it was met: an SSH host saved without a name, its server a
+    /// desktop with only its default Space. The first connect now lands in
+    /// that Space, on a thread of its own in its Home, and invents nothing --
+    /// no Space named after the IP on the server for its desktop to show.
+    #[test]
+    fn a_first_connect_lands_in_the_desktops_default_space() {
+        let server = "192.168.1.50";
+        let mut store = test_store();
+        let mut tree = desktop_server_tree("bob", None);
+        store.tree_from_server(server, &mut tree, &no_runtime_ids, &Default::default());
+        assert!(store.ingest_remote_tree(server, &tree));
+        let spaces_before = store.spaces.len();
+        // The window's re-home during the attach has already pointed the
+        // Space at the server's first thread: that is not where to land.
+        let kept = tree.spaces[0].id.clone();
+        store.set_active_project_for_space(&kept, "project-bob".to_string());
+        store
+            .projects
+            .iter_mut()
+            .find(|project| project.id == "project-bob")
+            .unwrap()
+            .active_thread_id = Some("thread-bob".to_string());
+
+        let plan = store.ensure_mux_domain_space_with(server, &|_| false);
+        assert_eq!(plan.space_id, tree.spaces[0].id);
+        assert_eq!(plan.project_id, "project-bob");
+        assert_ne!(plan.thread_id, "thread-bob");
+        assert_eq!(store.spaces.len(), spaces_before);
+        assert!(!store.invented_server_domains.contains(server));
+        assert!(store
+            .projects
+            .iter()
+            .all(|project| !project.path.to_string_lossy().starts_with("wezterm-mux://")));
+    }
+
+    /// A connect to a machine whose Space already has workspaces lands in
+    /// one of them, on a thread of its own. It used to add a workspace named
+    /// for the connection -- for a host saved without a name, its IP -- and
+    /// the server's desktop showed that in its sidebar too.
+    #[test]
+    fn a_connect_lands_in_the_servers_workspace_on_a_thread_of_its_own() {
+        let domain = "192.168.1.50";
+        let mut store = remote_test_store(domain);
+        assert!(store.ingest_remote_tree(domain, &sample_tree()));
+
+        let plan = store.ensure_mux_domain_space_with(domain, &|_| false);
+        assert_eq!(plan.space_id, "space-remote");
+        assert_eq!(plan.project_id, "rp1");
+        assert!(
+            plan.thread_id != "rt1" && plan.thread_id != "rt2",
+            "not a thread the server's desktop may have open"
+        );
+        let own = remote_project_id_for_space("space-remote", &mux_domain_host_id(domain));
+        assert!(store.projects.iter().all(|project| project.id != own));
+
+        // The next connect comes back to the same thread.
+        let again = store.ensure_mux_domain_space_with(domain, &|_| false);
+        assert_eq!(again.thread_id, plan.thread_id);
+        let rp1 = store.projects.iter().find(|p| p.id == "rp1").unwrap();
+        assert_eq!(rp1.threads.len(), 3);
+    }
+
+    /// A server's Space with no workspace still gets the connection's own.
+    #[test]
+    fn a_connect_to_a_server_space_without_workspaces_makes_its_own() {
+        let domain = "192.168.1.50";
+        let mut store = remote_test_store(domain);
+        let mut tree = sample_tree();
+        tree.projects.clear();
+        store.ingest_remote_tree(domain, &tree);
+
+        let plan = store.ensure_mux_domain_space_with(domain, &|_| false);
+        assert_eq!(
+            plan.project_id,
+            remote_project_id_for_space("space-remote", &mux_domain_host_id(domain))
+        );
     }
 
     /// `sample_tree`, with the project the server keeps in its Space for

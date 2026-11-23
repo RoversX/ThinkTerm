@@ -844,6 +844,7 @@ pub(crate) async fn connect_domain_into_space(
         // miss here means the intent armed inside it can never be released.
         log::warn!("remote open: no GUI window for mux window {window_id}; intent unreleased");
     }
+    let landing_window = window.clone();
     let remote_open = RemoteOpenRequest {
         window,
         domain_id: domain.domain_id(),
@@ -960,6 +961,20 @@ pub(crate) async fn connect_domain_into_space(
         }
         adopt_materialized_workspace_window(window_id, &response.workspace, domain.domain_id())
             .await?;
+        // The Space invented for this window may have given way to the
+        // server's while it attached: the window waited for this rather than
+        // open that Space's first thread (`rehome_if_space_vanished`).
+        if let Some(window) = landing_window {
+            let opened_on = plan.space_id.clone();
+            let space_id = settled.space_id.clone();
+            let thread_id = settled.thread_id.clone();
+            let workspace = response.workspace.clone();
+            window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                move |term_window| {
+                    term_window.land_connect(&opened_on, space_id, thread_id, &workspace);
+                },
+            )));
+        }
     } else {
         let thread_workspace_filter = Some(thread_workspace.clone());
         if !have_panes_in_domain_and_ws(&domain, &thread_workspace_filter) {

@@ -8356,12 +8356,46 @@ impl TermWindow {
         if self.active_space_id == target {
             return;
         }
+        if self.opened_to_connect {
+            // A connect is landing this window (`land_connect`). Moved here,
+            // it would open the Space's first thread meanwhile, which can be
+            // one the server's desktop has open: typed into from here.
+            log::info!(
+                "Space {} is gone from its server; the connect lands this window",
+                self.active_space_id
+            );
+            return;
+        }
         log::info!(
             "Space {} is gone from its server; moving this window to {target}",
             self.active_space_id
         );
         if let Some(window) = self.window.clone() {
             self.switch_space(target, &window);
+        }
+    }
+
+    /// Where a connect that opened this window settled: its Space and the
+    /// thread on screen (`connect_domain_into_space`). Only while the window
+    /// is still on the Space it was opened on, or already on that one: a
+    /// window the person moved meanwhile stays where they put it.
+    pub(crate) fn land_connect(
+        &mut self,
+        opened_on: &str,
+        space_id: String,
+        thread_id: String,
+        workspace: &str,
+    ) {
+        if self.active_space_id != opened_on && self.active_space_id != space_id {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if self.active_space_id != space_id {
+            self.switch_space_to_thread(space_id, Some(thread_id), &window);
+        } else if self.current_mux_workspace().as_deref() != Some(workspace) {
+            self.activate_workspace_thread(thread_id, &window);
         }
     }
 
@@ -12619,24 +12653,7 @@ impl TermWindow {
                 }
             }
             RemoveProject(project_id) => {
-                if let Some(removed) = crate::workspace_threads::remove_project(project_id) {
-                    if removed.was_active {
-                        if let (Some(next_thread_id), Some(window)) =
-                            (removed.next_thread_id, window.as_ref())
-                        {
-                            self.activate_workspace_thread(next_thread_id, window);
-                        }
-                    }
-                    let mux = Mux::get();
-                    for workspace in removed.materialized_workspace_names {
-                        for window_id in mux.iter_windows_in_workspace(&workspace) {
-                            mux.kill_window(window_id);
-                        }
-                    }
-                    if let Some(window) = window.as_ref() {
-                        window.invalidate();
-                    }
-                }
+                self.remove_workspace_project(project_id);
             }
             ArchiveProject(project_id) => {
                 self.start_archive_project(project_id);
