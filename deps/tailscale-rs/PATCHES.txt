@@ -132,6 +132,16 @@ direct fallback (ts_runtime)
     direct.
     Drop when: upstream withdraws a direct path that stops answering.
 
+stun probes (ts_runtime)
+    A STUN probe ends with the future that waits for it (stunner's EndProbe): it is stopped,
+    and its subscription to the bus's IncomingStunMsg taken off. In 0.7.1 a probe only
+    stopped when its own answer came; dropping its ActorRef when try_stun gave up on it was
+    meant to end it, but the bus holds a strong Recipient of it too. So a probe nothing
+    answered lived as long as the node -- one more about every 3 s while UDP is blocked, each
+    handed every STUN answer after -- and one whose DirectActor was gone waited for it
+    without end.
+    Drop when: upstream ends a STUN probe it gave up on.
+
 derp dial (ts_derp, ts_runtime)
     A DERP region whose servers cannot be reached, or whose TLS handshake fails, is an error
     for its client; 0.6.1 unwraps the outcome of the dial and panics. A connection gets 15 s
@@ -233,6 +243,7 @@ build. The changes in behaviour have tests:
     no panic        env::tests
     direct fallback path_discoverer::tests (a direct path that stops answering, one that
                     misses a round, rounds that cannot probe)
+    stun probes     stunner::tests (probes nothing answers)
     derp dial       multiderp::uniderp::tests (an unreachable region, becoming home, a
                     connection that does not come up, the next server)
     derp reads      client::tests in ts_derp (a connection gone quiet, keep-alives)

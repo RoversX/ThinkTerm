@@ -327,3 +327,23 @@ mod test {
     }
 }
 
+// ThinkTerm (stun probes): added, for tests.
+/// How many actors are subscribed to `M`.
+#[cfg(test)]
+pub(crate) struct CountSubscribers<M>(pub(crate) PhantomData<M>);
+
+#[cfg(test)]
+impl<M> Message<CountSubscribers<M>> for RetainedBus
+where
+    M: Send + 'static,
+{
+    type Reply = usize;
+
+    async fn handle(
+        &mut self,
+        _: CountSubscribers<M>,
+        _: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.get::<M>().map_or(0, |state| state.recipients.len())
+    }
+}
