@@ -71,10 +71,14 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     /// folds, or "menu", the Space on show with the others in its menu, as
     /// the desktop's sidebar has them.
     var spaces by pref("ui.spaces", "list")
+    /// Threads lists only the threads the Status panel has something in
+    /// (the eye in its bar), kept from one launch to the next.
+    var agentsOnly by pref("home.agents", false)
     /// On a wide screen, whether the sidebar stays beside the terminal.
     var sidebarPinned by pref("sidebar.pinned", true)
-    /// A tap on an agent in the Agents list opens its chat (Codex, Pi)
-    /// rather than its terminal; off, its chat button still does.
+    /// A tap on an agent in the Agents list, or on a thread one runs in on
+    /// Threads, opens its chat (Codex, Pi, OpenCode) rather than its
+    /// terminal; off, its chat button still does.
     var chatFirst by pref("chat.first", false)
     /// How large the chat's text is: "s", "m", "l" or "xl".
     var chatText by pref("chat.text", "m")

@@ -135,6 +135,7 @@ internal object TileColors {
     val orange = Color(0xFFFF9500)
     val green = Color(0xFF34C759)
     val red = Color(0xFFFF3B30)
+    val purple = Color(0xFFAF52DE)
 }
 
 private val SETTINGS_PAGES = listOf(
@@ -142,6 +143,7 @@ private val SETTINGS_PAGES = listOf(
     SettingsPage("appearance", { tr("sec.appearance") }, "palette", TileColors.blue),
     SettingsPage("terminal", { tr("sec.terminal") }, "square-terminal", TileColors.indigo),
     SettingsPage("interface", { tr("sec.interface") }, "panels-top-left", TileColors.teal),
+    SettingsPage("agents", { tr("sec.agents") }, "sparkles", TileColors.purple),
     SettingsPage("keyboard", { tr("sec.keyboard") }, "keyboard", TileColors.gray),
     SettingsPage("gestures", { tr("sec.gestures") }, "hand", TileColors.orange),
     SettingsPage("connection", { tr("sec.connection") }, "wifi", TileColors.green),
@@ -158,7 +160,7 @@ private fun settingsPage(key: String) = SETTINGS_PAGES.first { it.key == key }
 private fun SettingsHome(diagnostics: Boolean, onDone: (() -> Unit)?, push: (String) -> Unit) {
     GroupedPage(tr("settings"), onBack = null, onDone = onDone) {
         Group {
-            for (key in listOf("general", "appearance", "terminal", "interface")) SettingsHomeRow(settingsPage(key), push)
+            for (key in listOf("general", "appearance", "terminal", "interface", "agents")) SettingsHomeRow(settingsPage(key), push)
         }
         Spacer(Modifier.height(18.dp))
         Group {
@@ -369,24 +371,22 @@ private fun SettingsSection(
                 SwitchRow(tr("bell"), settings.bell) { settings.bell = it }
                 PushRow(tr("resize.mode"), label(resizes(), settings.resizeMode)) { onPush("resize.mode") }
             }
-            "interface" -> {
-                Group {
-                    SwitchRow(tr("i.panebars"), settings.paneBars) { settings.paneBars = it }
-                    SegmentRow(
-                        tr("i.spaces"),
-                        listOf(tr("i.spaces.list"), tr("i.spaces.menu")),
-                        if (settings.spaces == "menu") 1 else 0,
-                    ) { settings.spaces = if (it == 1) "menu" else "list" }
-                }
-                Group(footer = tr("chat.first.note")) {
-                    SwitchRow(tr("chat.first"), settings.chatFirst) { settings.chatFirst = it }
-                    val sizes = listOf("s", "m", "l", "xl")
-                    SegmentRow(
-                        tr("chat.text"),
-                        sizes.map { tr("chat.text.$it") },
-                        sizes.indexOf(settings.chatText).coerceAtLeast(0),
-                    ) { settings.chatText = sizes[it] }
-                }
+            "interface" -> Group {
+                SwitchRow(tr("i.panebars"), settings.paneBars) { settings.paneBars = it }
+                SegmentRow(
+                    tr("i.spaces"),
+                    listOf(tr("i.spaces.list"), tr("i.spaces.menu")),
+                    if (settings.spaces == "menu") 1 else 0,
+                ) { settings.spaces = if (it == 1) "menu" else "list" }
+            }
+            "agents" -> Group(footer = tr("chat.first.note")) {
+                SwitchRow(tr("chat.first"), settings.chatFirst) { settings.chatFirst = it }
+                val sizes = listOf("s", "m", "l", "xl")
+                SegmentRow(
+                    tr("chat.text"),
+                    sizes.map { tr("chat.text.$it") },
+                    sizes.indexOf(settings.chatText).coerceAtLeast(0),
+                ) { settings.chatText = sizes[it] }
             }
             "keyboard" -> Group {
                 PushRow(tr("k.keybar"), keyCaps.size.toString()) { onPush("k.keybar") }

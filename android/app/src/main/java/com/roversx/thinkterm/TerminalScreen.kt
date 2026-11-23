@@ -213,7 +213,16 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     }
     // Leaving takes the picture, not the connection: the frame loop
     // rests, the surface goes with the view, the socket stays.
-    DisposableEffect(model) { onDispose { model.leaveScreen() } }
+    DisposableEffect(model) {
+        onDispose {
+            model.leaveScreen()
+            // A chat opened on Threads ends with the screen it was over.
+            if (model.chatFromThreads) model.closeChat(toTerminal = true)
+        }
+    }
+    // Back from a chat opened on Threads: to Threads, the chat going with
+    // the screen. A change while it is up, not the count it came up with.
+    LaunchedEffect(model) { snapshotFlow { model.backToThreads }.drop(1).collect { onBack() } }
 
     // The open terminal follows the preferences as they change.
     LaunchedEffect(model) {

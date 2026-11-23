@@ -174,7 +174,8 @@ sealed class SideRow {
         override val key get() = "others"
     }
 
-    data class Window(val id: Int, val title: String, val selected: Boolean) : SideRow() {
+    /// `agent`: the Status panel lists something in it (`ThreadRow.agent`).
+    data class Window(val id: Int, val title: String, val selected: Boolean, val agent: Boolean = false) : SideRow() {
         override val key get() = "window:$id"
     }
 }
@@ -194,10 +195,18 @@ data class ThreadRow(
     val icons: List<String> = emptyList(),
     /// A program in it stopped on an error: it has a mark of its own.
     val failed: Boolean = false,
+    /// The Status panel lists something in it: an agents-only list keeps it.
+    val agent: Boolean = false,
+    /// The agent in it a chat can be had with, for a tap to open.
+    val chat: ThreadChat? = null,
 ) {
     /// The status word its mark is drawn for (`threadMark`).
     val markStatus: String get() = if (failed) "Failed" else status
 }
+
+/// An agent a thread's row opens the chat of: its pane, and the agent as
+/// its detection names it ("codex", "pi").
+data class ThreadChat(val pane: Int, val agent: String)
 
 data class Editing(val kind: String, val id: String?)
 
@@ -352,6 +361,8 @@ object Views {
         deleting = r.optBoolean("deleting"),
         icons = strings(r.optJSONArray("icons")),
         failed = r.optBoolean("failed"),
+        agent = r.optBoolean("agent"),
+        chat = r.optJSONObject("chat")?.let { ThreadChat(it.optInt("pane"), it.optString("agent")) },
     )
 
     fun panes(json: String): PanesView? {
@@ -460,7 +471,7 @@ object Views {
                 )
                 "archived" -> SideRow.Archived(r.optInt("count"), r.optBoolean("open"), r.optString("label"))
                 "others" -> SideRow.Others
-                "window" -> SideRow.Window(r.optInt("id"), r.optString("title"), r.optBoolean("selected"))
+                "window" -> SideRow.Window(r.optInt("id"), r.optString("title"), r.optBoolean("selected"), r.optBoolean("agent"))
                 else -> null
             }
         }

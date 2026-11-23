@@ -17,6 +17,7 @@ import android.os.VibratorManager
 import android.util.Log
 import android.view.Choreographer
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -881,15 +882,28 @@ class TerminalModel(
     var chat by mutableStateOf<ChatView?>(null)
         private set
 
+    /// The chat on show was opened from Threads: going back from it goes
+    /// back there, past the terminal under it.
+    var chatFromThreads = false
+        private set
+    /// Bumped to send the terminal's screen back to Threads, a chat opened
+    /// there still over it: `TerminalScreen` goes, and closes the chat once
+    /// it is gone.
+    var backToThreads by mutableIntStateOf(0)
+        private set
+
     /// Show `row`'s agent as a chat. The terminal under it goes to the
     /// agent's pane first, as a tap on the row always did: going back from
     /// the chat is going to that terminal.
     fun openChat(row: AgentRow) = openChat(row.pane, row.agentId, row.place.ifEmpty { row.name })
 
-    fun openChat(pane: Int, agent: String, place: String) {
+    /// `fromThreads`: going back from the chat goes back to Threads rather
+    /// than to the terminal under it.
+    fun openChat(pane: Int, agent: String, place: String, fromThreads: Boolean = false) {
         chromeClick("pane", pane = pane)
         chat = null
         chatThumbs.clear()
+        chatFromThreads = fromThreads
         chatWith = ChatTarget(pane, agent, place.ifEmpty { agent })
         core.chatOpen(pane.toUInt(), agent)
     }
@@ -900,13 +914,21 @@ class TerminalModel(
         if (link.chat) {
             openChat(link.pane, link.agent, link.place)
         } else {
-            closeChat()
+            closeChat(toTerminal = true)
             chromeClick("pane", pane = link.pane)
         }
     }
 
-    fun closeChat() {
+    /// Back from the chat: to the terminal under it -- or, for one opened
+    /// from Threads, to Threads, unless `toTerminal` (an ask answered only
+    /// in the terminal).
+    fun closeChat(toTerminal: Boolean = false) {
         if (chatWith == null) return
+        if (chatFromThreads && !toTerminal) {
+            backToThreads++
+            return
+        }
+        chatFromThreads = false
         chatWith = null
         chat = null
         core.chatClose()

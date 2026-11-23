@@ -813,7 +813,7 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             // said while they go.
             Appearing(target.pane, chat?.problem) { ProblemCard(it, model, backdrop, dark) }
             Appearing(target.pane, chat?.outdated) { OutdatedCard(it, model, backdrop, dark) }
-            Appearing(target.pane, chat?.ask) { AskCard(it, model, backdrop, dark, onTerminal = onBack) }
+            Appearing(target.pane, chat?.ask) { AskCard(it, model, backdrop, dark, onTerminal = { model.closeChat(toTerminal = true) }) }
             ChatField(chat, target, model, backdrop, dark, onSend = { follow = true })
         }
     }

@@ -2,8 +2,12 @@ package com.roversx.thinkterm
 
 import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -43,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -178,6 +183,25 @@ fun ThreadsHome(
                     maxLines = 1,
                     modifier = Modifier.weight(1f),
                 )
+                // Only the threads the Status panel has something in, or
+                // every one; kept from one launch to the next. A search
+                // looks through them all, and the eye narrows away as it
+                // fades, the search button sliding over rather than jumping.
+                AnimatedVisibility(
+                    !searching,
+                    enter = fadeIn() + expandHorizontally(),
+                    exit = fadeOut() + shrinkHorizontally(),
+                ) {
+                    val settings = AppSettings.get(context)
+                    Row {
+                        GlassCircle(
+                            backdrop, dark, 44, "eye",
+                            tr(if (settings.agentsOnly) "home.agents.all" else "home.agents.only"),
+                            tint = if (settings.agentsOnly) LeadBlue else null,
+                        ) { settings.agentsOnly = !settings.agentsOnly }
+                        Spacer(Modifier.width(10.dp))
+                    }
+                }
                 GlassCircle(backdrop, dark, 44, if (searching) "x" else "search", tr(if (searching) "cancel" else "search")) {
                     searching = !searching
                     if (!searching) query = ""
@@ -228,17 +252,19 @@ private fun GlassCircle(
     size: Int,
     icon: String,
     label: String,
+    /// Lit: a button that is on, its icon white on the colour.
+    tint: Color? = null,
     onClick: () -> Unit,
 ) {
     Box(
         Modifier
             .size(size.dp)
-            .glass(backdrop, dark, CircleShape)
+            .glass(backdrop, dark, CircleShape, tint = tint)
             .clickable(role = Role.Button, onClick = onClick)
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
-        DesktopIcon(icon, size = if (size >= 50) 22.dp else 20.dp, tint = MaterialTheme.colorScheme.onSurface)
+        DesktopIcon(icon, size = if (size >= 50) 22.dp else 20.dp, tint = if (tint != null) Color.White else MaterialTheme.colorScheme.onSurface)
     }
 }
 
@@ -441,6 +467,25 @@ private fun ConnectedHost(
     }
 }
 
+/// Rows that come and go with the eye in the bar: folding up and fading,
+/// what is under them closing up.
+@Composable
+private fun Shown(visible: Boolean, content: @Composable () -> Unit) {
+    AnimatedVisibility(
+        visible,
+        enter = expandVertically() + fadeIn(),
+        exit = shrinkVertically() + fadeOut(),
+    ) { Column { content() } }
+}
+
+/// The threads the list shows: with the eye on, only the ones the Status
+/// panel has something in -- an agent, a program saying how it is doing.
+private fun shownThread(thread: ThreadRow, agentsOnly: Boolean) = !agentsOnly || thread.agent
+
+/// A project has its row unless agents only are shown and it has none.
+private fun listedProject(project: TreeProject, agentsOnly: Boolean) =
+    !agentsOnly || project.threads.any { it.agent }
+
 /// The host's Spaces, projects and threads; a lone Space has no row of its
 /// own, as in the sidebar. Windows no thread claims come last.
 @Composable
@@ -448,23 +493,41 @@ private fun HostTree(model: TerminalModel, dark: Boolean, open: () -> Unit) {
     val spaces = model.tree?.spaces ?: emptyList()
     val folded = remember { mutableStateListOf<String>() }
     val windows = (model.sidebar?.rows ?: emptyList()).filterIsInstance<SideRow.Window>()
+    val agentsOnly = AppSettings.shared.agentsOnly
+    // Each row's showing is its own, kept by its id: a row added or gone
+    // elsewhere in the list does not play another's fold.
     if (spaces.size == 1) {
-        for (project in spaces[0].projects) ProjectRows(model, spaces[0], project, 0, folded, dark, open)
+        for (project in spaces[0].projects) key(project.id) {
+            Shown(listedProject(project, agentsOnly)) { ProjectRows(model, spaces[0], project, 0, folded, dark, agentsOnly, open) }
+        }
     } else {
-        for (space in spaces) {
-            HomeRow(icon = "layers", title = space.name, bold = space.current, dim = true, onClick = {})
-            for (project in space.projects) ProjectRows(model, space, project, 1, folded, dark, open)
+        for (space in spaces) key(space.id) {
+            Shown(!agentsOnly || space.projects.any { listedProject(it, agentsOnly) }) {
+                HomeRow(icon = "layers", title = space.name, bold = space.current, dim = true, onClick = {})
+                for (project in space.projects) key(project.id) {
+                    Shown(listedProject(project, agentsOnly)) { ProjectRows(model, space, project, 1, folded, dark, agentsOnly, open) }
+                }
+            }
         }
     }
-    for (window in windows) {
-        HomeRow(icon = "app-window", title = window.title.ifEmpty { tr("window.n", window.id) }) {
-            model.sideClick("window", window.id.toString())
-            open()
+    // A window no thread claims stays too when an agent runs in it.
+    for (window in windows) key(window.id) {
+        Shown(!agentsOnly || window.agent) {
+            HomeRow(icon = "app-window", title = window.title.ifEmpty { tr("window.n", window.id) }) {
+                model.sideClick("window", window.id.toString())
+                open()
+            }
         }
     }
-    if (spaces.all { it.projects.isEmpty() } && windows.isEmpty()) {
+    val none = when {
+        // Said, not left blank: a host with nothing under it reads as one
+        // whose connection broke.
+        agentsOnly -> spaces.none { space -> space.projects.any { listedProject(it, true) } } && windows.none { it.agent }
+        else -> spaces.all { it.projects.isEmpty() } && windows.isEmpty()
+    }
+    if (none) {
         Text(
-            tr("overview.none"),
+            tr(if (agentsOnly) "home.agents.none" else "overview.none"),
             fontSize = 14.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -480,6 +543,7 @@ private fun ProjectRows(
     depth: Int,
     folded: MutableList<String>,
     dark: Boolean,
+    agentsOnly: Boolean,
     open: () -> Unit,
 ) {
     val key = "project:" + project.id
@@ -512,7 +576,9 @@ private fun ProjectRows(
     if (!isFolded) {
         // Under the project's name, not stepped in: the desktop's rows all
         // start at one edge.
-        for (thread in project.threads) ThreadRowItem(model, thread, space, depth, dark, null, open)
+        for (thread in project.threads) key(thread.id) {
+            Shown(shownThread(thread, agentsOnly)) { ThreadRowItem(model, thread, space, project, depth, dark, null, open) }
+        }
     }
 }
 
@@ -521,6 +587,7 @@ private fun ThreadRowItem(
     model: TerminalModel,
     thread: ThreadRow,
     space: TreeSpace,
+    project: TreeProject,
     depth: Int,
     dark: Boolean,
     subtitle: String?,
@@ -537,7 +604,17 @@ private fun ThreadRowItem(
             dim = !thread.live,
             onLongClick = { menu = true },
         ) {
-            model.openThread(thread.id, space.id)
+            val chat = thread.chat
+            if (AppSettings.shared.chatFirst && chat != null) {
+                // Its agent's chat, over the terminal of the agent's pane;
+                // back from it is back here. The thread is read and recent
+                // all the same, as an opened one is.
+                if (!space.current) model.setSpace(space.id)
+                model.sideClick("touch-thread", thread.id)
+                model.openChat(chat.pane, chat.agent, project.name + " · " + thread.name, fromThreads = true)
+            } else {
+                model.openThread(thread.id, space.id)
+            }
             open()
         }
         AppContextMenu(model, "thread", thread.id, expanded = menu, onDismiss = { menu = false })
@@ -556,7 +633,7 @@ private fun Found(name: String, model: TerminalModel, query: String, dot: Color,
     }
     if (hits.isEmpty()) return
     HostTitle(name, dot)
-    for ((space, project, thread) in hits) ThreadRowItem(model, thread, space, 0, dark, project.name, open)
+    for ((space, project, thread) in hits) ThreadRowItem(model, thread, space, project, 0, dark, project.name, open)
 }
 
 /// A row as the desktop's sidebar draws it: an icon (or a thread's cards),
