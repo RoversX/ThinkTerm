@@ -27,6 +27,30 @@ pub struct Target {
     pub mux_socket: Option<String>,
 }
 
+/// What the bridge may do to the agent's pane, through the mux that owns
+/// it: given by the CLI, which holds the connection to the mux.
+pub trait PaneControl: Send {
+    /// How the agent the chat is with is doing in the pane.
+    fn agent(&self) -> AgentHere;
+    /// The rows on the pane's screen, as text; none when they cannot be
+    /// read.
+    fn screen(&self) -> Option<Vec<String>>;
+    /// Types `line` into the pane and presses Enter.
+    fn type_line(&self, line: &str) -> anyhow::Result<()>;
+}
+
+/// How the agent the chat is with is doing in its pane, as the mux sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHere {
+    Resting,
+    Working,
+    /// There, doing it does not say what.
+    Unknown,
+    /// Not in the pane any more (it quit; the pane holds a shell, or
+    /// another program).
+    Gone,
+}
+
 /// Most of a history sent in one line: well under what either side takes
 /// in ([`MAX_LINE`]), however long the conversation.
 pub(crate) const HISTORY_BUDGET: usize = 4 << 20;
@@ -157,6 +181,7 @@ impl Out {
         self.send(&Ev::Error {
             need,
             message: message.into(),
+            can_load: false,
         })
     }
 
@@ -231,11 +256,18 @@ pub(crate) fn read_line(reader: &mut impl BufRead) -> io::Result<Option<String>>
 }
 
 /// Runs the chat for `target` until the client goes or the agent does.
-pub fn run(target: Target, input: impl BufRead + Send + 'static, out: Out) -> anyhow::Result<()> {
+/// `pane`, where the CLI can give it, lets the bridge type into the
+/// agent's pane (to have it take its extension in).
+pub fn run(
+    target: Target,
+    input: impl BufRead + Send + 'static,
+    out: Out,
+    pane: Option<Box<dyn PaneControl>>,
+) -> anyhow::Result<()> {
     match target.agent.as_str() {
         "codex" => codex::run(&target, input, out),
         // OMP (Oh My Pi) is a fork of Pi: the same extension speaks for it.
-        "pi" | "omp" => pi::run(&target, input, out),
+        "pi" | "omp" => pi::run(&target, input, out, pane),
         other => Ok(out.error(Some(Need::Unsupported), format!("no chat for the agent `{other}`"))?),
     }
 }

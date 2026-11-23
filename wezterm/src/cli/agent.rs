@@ -118,16 +118,25 @@ impl AgentChatCommand {
         let cwd = working_dir.as_ref().and_then(local_path);
         // The mux the pane belongs to, which its programs know it by.
         let mux_socket = client.unix_socket_path().map(|path| path.to_string_lossy().into_owned());
-        // The mux is not needed again: the agent is talked with directly.
-        drop(client);
         let target = Target {
             pane: self.pane as u64,
             agent,
             cwd,
             mux_socket,
         };
+        // The agent is talked with directly; the mux is kept for its pane,
+        // which the bridge may type into (to have the agent take in its
+        // extension).
+        // Kept for events only: the mux pushes it no pane's contents, which
+        // it would otherwise for every pane while the chat is open.
+        client.subscribe_events(codec::SubscribeEvents {}).await?;
+        let pane: Box<dyn thinkterm_agent_chat::host::PaneControl> = Box::new(MuxPane {
+            client,
+            pane: self.pane,
+            agent: target.agent.clone(),
+        });
         smol::unblock(move || {
-            thinkterm_agent_chat::host::run(target, std::io::BufReader::new(std::io::stdin()), out)
+            thinkterm_agent_chat::host::run(target, std::io::BufReader::new(std::io::stdin()), out, Some(pane))
         })
         .await
     }
@@ -141,6 +150,95 @@ impl AgentChatCommand {
 /// Programs whose pane is a window onto another machine.
 #[cfg(unix)]
 const REMOTE_SHELLS: [&str; 6] = ["ssh", "mosh", "mosh-client", "et", "autossh", "tsh"];
+
+/// The agent's pane, through the mux that owns it: whether its agent
+/// rests, its screen, and typing into it. Asked from the bridge's own
+/// thread, which waits for each answer.
+#[cfg(unix)]
+struct MuxPane {
+    client: Client,
+    pane: mux::pane::PaneId,
+    /// The agent the chat is with (`AgentStatus::agent_id`).
+    agent: String,
+}
+
+#[cfg(unix)]
+impl thinkterm_agent_chat::host::PaneControl for MuxPane {
+    fn agent(&self) -> thinkterm_agent_chat::host::AgentHere {
+        use thinkterm_agent_chat::host::AgentHere;
+        let Ok(statuses) = smol::block_on(self.client.get_agent_statuses()) else {
+            return AgentHere::Unknown;
+        };
+        // No agent in the pane, or another one: what it holds now is not
+        // the agent the chat is with.
+        let Some(entry) = statuses
+            .statuses
+            .iter()
+            .find(|entry| entry.pane_id == self.pane && entry.status.agent_id == self.agent)
+        else {
+            return AgentHere::Gone;
+        };
+        match entry.status.state {
+            AgentState::Idle | AgentState::Error => AgentHere::Resting,
+            AgentState::Working | AgentState::Blocked => AgentHere::Working,
+            AgentState::Unknown => AgentHere::Unknown,
+        }
+    }
+
+    fn screen(&self) -> Option<Vec<String>> {
+        smol::block_on(async {
+            let info = self
+                .client
+                .get_dimensions(codec::GetPaneRenderableDimensions { pane_id: self.pane })
+                .await
+                .ok()?;
+            let top = info.dimensions.physical_top;
+            let rows = info.dimensions.viewport_rows as wezterm_term::StableRowIndex;
+            let lines = self
+                .client
+                .get_lines(codec::GetLines {
+                    pane_id: self.pane,
+                    lines: vec![top..top + rows],
+                })
+                .await
+                .ok()?;
+            Some(
+                lines
+                    .lines
+                    .extract_data()
+                    .0
+                    .into_iter()
+                    .map(|(_, line)| line.as_str().into_owned())
+                    .collect(),
+            )
+        })
+    }
+
+    fn type_line(&self, line: &str) -> anyhow::Result<()> {
+        use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+        smol::block_on(async {
+            self.client
+                .write_to_pane(codec::WriteToPane {
+                    pane_id: self.pane,
+                    data: line.as_bytes().to_vec(),
+                })
+                .await?;
+            // As send-text --enter: what was typed is taken in first.
+            smol::Timer::after(thinkterm_reverse_access::protocol::enter_delay(line.len())).await;
+            self.client
+                .key_down(codec::SendKeyDown {
+                    pane_id: self.pane,
+                    event: KeyEvent {
+                        key: KeyCode::Enter,
+                        modifiers: Modifiers::NONE,
+                    },
+                    input_serial: codec::InputSerial::now(),
+                })
+                .await?;
+            Ok(())
+        })
+    }
+}
 
 /// Whether a host OSC 7 names is this machine: empty, localhost, this
 /// machine's name (with or without its domain), or one of its addresses

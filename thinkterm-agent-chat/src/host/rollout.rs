@@ -322,7 +322,7 @@ mod tests {
         rollout.read_on();
         let info = rollout.info();
         assert_eq!((info.used, info.window), (Some(3000), Some(200000)));
-        assert_eq!(info.parts.iter().map(|p| p.tokens).sum::<u64>().abs_diff(3000) <= 2, true);
+        assert!(info.parts.iter().map(|p| p.tokens).sum::<u64>().abs_diff(3000) <= 2, "the parts add up to the total");
         assert_eq!(info.totals.cache_read, Some(4000));
         assert_eq!(info.totals.cache_write, None);
 

@@ -18,6 +18,8 @@ fn main() -> anyhow::Result<()> {
             target,
             std::io::BufReader::new(std::io::stdin()),
             thinkterm_agent_chat::host::Out::stdout(),
+            // No mux here: nothing is typed into the pane.
+            None,
         )?;
     }
     Ok(())

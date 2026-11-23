@@ -55,6 +55,10 @@ pub struct Chat {
     commands: Vec<CommandInfo>,
     /// How full the context is, as the agent last said.
     context: Option<ContextInfo>,
+    /// The bridge can have the agent take its extension in (`Op::Reload`).
+    can_load: bool,
+    /// The agent runs an older extension than the one in its folder.
+    outdated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +100,16 @@ pub struct ChatView {
     /// How full the model's context is: the ring in the bar, and the sheet
     /// it opens. None when the agent does not say.
     pub context: Option<ContextView>,
+    /// The agent runs an older ThinkTerm extension than the one in its
+    /// folder: said over the field, with the button that loads the new
+    /// one (`load`).
+    pub outdated: Option<OutdatedView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutdatedView {
+    pub text: String,
+    pub action: ActionView,
 }
 
 /// How full the context is, and what fills it.
@@ -308,7 +322,7 @@ pub struct ProblemView {
 
 #[derive(Debug, Serialize)]
 pub struct ActionView {
-    /// `install`, `retry`.
+    /// `install`, `load`, `retry`.
     pub id: &'static str,
     pub label: String,
 }
@@ -351,6 +365,9 @@ impl Chat {
             } => {
                 self.agent = agent;
                 self.protocol = protocol;
+                // An extension's greeting is taken as current; the bridge
+                // says after it when it is not (`Ev::Outdated`).
+                self.outdated = false;
                 // None is a conversation with no name (a new one, or one
                 // whose name was taken off).
                 self.title = title;
@@ -407,7 +424,7 @@ impl Chat {
             Ev::Done { what: Done::Installed } => {
                 let mut args = FluentArgs::new();
                 args.set("agent", display_name(&self.agent));
-                args.set("command", takes_extensions(&self.agent));
+                args.set("command", crate::reload_command(&self.agent));
                 self.notify(tr_args("chat-installed", &args));
                 self.problem = Some((Some(Need::PiRestart), String::new()));
             }
@@ -418,7 +435,11 @@ impl Chat {
                 args.set("why", message);
                 self.notify(tr_args("chat-refused", &args));
             }
-            Ev::Error { need, message } => self.problem = Some((need, message)),
+            Ev::Error { need, message, can_load } => {
+                self.problem = Some((need, message));
+                self.can_load = can_load;
+            }
+            Ev::Outdated => self.outdated = true,
         }
     }
 
@@ -444,6 +465,8 @@ impl Chat {
         // The channel to come says them again, if its agent still does.
         self.commands.clear();
         self.context = None;
+        self.can_load = false;
+        self.outdated = false;
     }
 
     /// The small pictures in `item`, kept by key and taken out of it.
@@ -612,7 +635,7 @@ impl Chat {
             problem: self
                 .problem
                 .as_ref()
-                .map(|(need, detail)| problem_view(*need, detail, &self.agent)),
+                .map(|(need, detail)| problem_view(*need, detail, &self.agent, self.can_load)),
             notice: self.notice.as_ref().map(|(seq, text)| NoticeView {
                 seq: *seq,
                 text: text.clone(),
@@ -624,6 +647,17 @@ impl Chat {
             can_attach: self.problem.is_none() && self.protocol >= 2,
             commands: self.command_views(),
             context: self.context_view(),
+            outdated: (self.outdated && self.problem.is_none()).then(|| {
+                let mut args = FluentArgs::new();
+                args.set("agent", display_name(&self.agent));
+                OutdatedView {
+                    text: tr_args("chat-outdated", &args),
+                    action: ActionView {
+                        id: "load",
+                        label: tr_args("chat-load", &args),
+                    },
+                }
+            }),
             model: self.model_view(),
             agent,
         }
@@ -1300,7 +1334,7 @@ fn ask_view(ask: &Ask) -> AskView {
     }
 }
 
-fn problem_view(need: Option<Need>, detail: &str, agent_id: &str) -> ProblemView {
+fn problem_view(need: Option<Need>, detail: &str, agent_id: &str, can_load: bool) -> ProblemView {
     let retry = || {
         Some(ActionView {
             id: "retry",
@@ -1315,6 +1349,18 @@ fn problem_view(need: Option<Need>, detail: &str, agent_id: &str) -> ProblemView
                 label: tr("chat-install"),
             }),
         ),
+        // The bridge can have the agent take the extension in: one tap.
+        Some(Need::PiRestart) if can_load => (
+            "chat-need-pi-load",
+            Some(ActionView {
+                id: "load",
+                label: {
+                    let mut args = FluentArgs::new();
+                    args.set("agent", display_name(agent_id));
+                    tr_args("chat-load", &args)
+                },
+            }),
+        ),
         Some(Need::PiRestart) => ("chat-need-pi-restart", retry()),
         Some(Need::CodexDaemon) => ("chat-need-codex-daemon", retry()),
         Some(Need::CodexThread) => ("chat-need-codex-thread", retry()),
@@ -1327,21 +1373,11 @@ fn problem_view(need: Option<Need>, detail: &str, agent_id: &str) -> ProblemView
         text: {
             let mut args = FluentArgs::new();
             args.set("agent", display_name(agent_id));
-            args.set("command", takes_extensions(agent_id));
+            args.set("command", crate::reload_command(agent_id));
             tr_args(key, &args)
         },
         detail: detail.to_string(),
         action,
-    }
-}
-
-/// What the agent is told to take a new extension in with: Pi's `/reload`;
-/// OMP's reloads only its plugins, and its `/restart` the extensions too.
-fn takes_extensions(agent_id: &str) -> &'static str {
-    if agent_id == "omp" {
-        "/restart"
-    } else {
-        "/reload"
     }
 }
 
@@ -1956,6 +1992,27 @@ mod tests {
                 ("/name".to_string(), None, true)
             ]
         );
+    }
+
+    #[test]
+    fn an_agent_started_before_the_extension_is_offered_to_load_it() {
+        let mut chat = Chat::new(1, "pi");
+        chat.line(r#"{"ev":"error","need":"pi_restart","message":"not running","can_load":true}"#);
+        let problem = chat.view().problem.unwrap();
+        assert_eq!(problem.action.map(|a| a.id), Some("load"));
+        // An older bridge cannot: the person is told what to type.
+        chat.reconnecting();
+        chat.line(r#"{"ev":"error","need":"pi_restart","message":"not running"}"#);
+        assert_eq!(chat.view().problem.unwrap().action.map(|a| a.id), Some("retry"));
+
+        // Running an older extension: said over the field until a greeting
+        // of one that is current.
+        chat.reconnecting();
+        chat.line(r#"{"ev":"hello","protocol":2,"agent":"pi"}"#);
+        chat.line(r#"{"ev":"outdated"}"#);
+        assert_eq!(chat.view().outdated.map(|o| o.action.id), Some("load"));
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi"}"#);
+        assert!(chat.view().outdated.is_none());
     }
 
     #[test]

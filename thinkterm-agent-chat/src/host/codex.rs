@@ -739,6 +739,7 @@ fn handle_op(daemon: &mut Daemon, chat: &mut Chat, out: &Out, op: Op) -> Result<
             })?,
         },
         Op::Install => out.refused("Codex needs nothing installed")?,
+        Op::Reload => out.refused("Codex has no extension to load")?,
     }
     Ok(())
 }

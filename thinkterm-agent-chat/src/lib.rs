@@ -19,6 +19,17 @@ pub mod markdown;
 #[cfg(feature = "view")]
 pub mod view;
 
+/// The command that has a running agent take ThinkTerm's extension in
+/// anew: Pi's `/reload`; OMP's reloads only its plugins, and its
+/// `/restart` the extensions too.
+pub fn reload_command(agent_id: &str) -> &'static str {
+    if agent_id == "omp" {
+        "/restart"
+    } else {
+        "/reload"
+    }
+}
+
 /// Whether a chat can be had with an agent, by the id its detection gives
 /// it (`thinkterm_proto::AgentStatus::agent_id`).
 pub fn chat_agent(agent_id: &str) -> bool {
@@ -56,6 +67,10 @@ pub enum Op {
     /// Put ThinkTerm's extension into the agent, after an
     /// [`Ev::Error`] said one is needed ([`Need::PiExtension`]).
     Install,
+    /// Have the agent running in the pane take in its extensions anew
+    /// (Pi's `/reload`), as the bridge offered: an [`Ev::Error`] that
+    /// `can_load`, or [`Ev::Outdated`].
+    Reload,
     /// Talk to another model ([`ModelChoice::id`]), or think harder or
     /// less (one of its [`ModelChoice::efforts`]): from the next request
     /// on (Pi), or the next turn (Codex).
@@ -135,7 +150,19 @@ pub enum Ev {
         #[serde(default)]
         need: Option<Need>,
         message: String,
+        /// The extension is in place but not running in this agent, and
+        /// the bridge can have the agent take it in ([`Op::Reload`]).
+        #[serde(default, skip_serializing_if = "is_false")]
+        can_load: bool,
     },
+    /// The agent runs an older ThinkTerm extension than the one now in
+    /// its folder: the chat goes on, without what is newer, until the
+    /// agent takes it in ([`Op::Reload`]).
+    Outdated,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One thing in the conversation.
