@@ -868,8 +868,11 @@ impl crate::TermWindow {
         self.update_next_frame_time(Some(now + Duration::from_millis(125)));
         let area = self.content_view_area();
         let palette = self.chrome();
-        self.filled_rectangle(layers, 0, area, palette.window_bg)
-            .context("frontend handoff opaque background")?;
+        // The panes are not painted under it, so the ground a page in the
+        // terminal's place has hides nothing and keeps a see-through window
+        // as see-through as the terminal and the pages.
+        self.filled_rectangle(layers, 0, area, self.content_view_ground())
+            .context("frontend handoff background")?;
 
         let font_size =
             crate::native_settings::home_font_size(&crate::native_settings::load_shared());
