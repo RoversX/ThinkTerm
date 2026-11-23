@@ -76,6 +76,8 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     /// A tap on an agent in the Agents list opens its chat (Codex, Pi)
     /// rather than its terminal; off, its chat button still does.
     var chatFirst by pref("chat.first", false)
+    /// How large the chat's text is: "s", "m", "l" or "xl".
+    var chatText by pref("chat.text", "m")
 
     // MARK: keyboard
 

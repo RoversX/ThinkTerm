@@ -661,7 +661,10 @@ class TerminalModel(
         inFront = false
         updateShown()
         updateRunning()
-        if (!settings.keepSessionInBackground && !picking && connection.startsWith("pane ")) {
+        // Attached, or on its way (a failed dial waiting to be made again
+        // reads "connecting" too): dropped now, and dialled again on return.
+        val wanted = connection.startsWith("pane ") || connection.startsWith("connecting")
+        if (!settings.keepSessionInBackground && !picking && wanted) {
             disconnect()
             pausedForBackground = true
         }

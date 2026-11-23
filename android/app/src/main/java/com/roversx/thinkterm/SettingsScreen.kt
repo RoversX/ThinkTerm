@@ -380,6 +380,12 @@ private fun SettingsSection(
                 }
                 Group(footer = tr("chat.first.note")) {
                     SwitchRow(tr("chat.first"), settings.chatFirst) { settings.chatFirst = it }
+                    val sizes = listOf("s", "m", "l", "xl")
+                    SegmentRow(
+                        tr("chat.text"),
+                        sizes.map { tr("chat.text.$it") },
+                        sizes.indexOf(settings.chatText).coerceAtLeast(0),
+                    ) { settings.chatText = sizes[it] }
                 }
             }
             "keyboard" -> Group {

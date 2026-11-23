@@ -15,10 +15,10 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -74,6 +74,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -81,6 +82,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -94,6 +96,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
@@ -127,7 +133,6 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
@@ -255,9 +260,13 @@ sealed class ChatRow {
         override val id: String,
         val icon: String,
         val label: String,
-        /// "running", "stopped", "done".
+        /// "running", "stopped", "done"; for one thing done, its own
+        /// ("failed", "declined").
         val state: String,
         val badge: String?,
+        /// For one change done, the lines it added and took out.
+        val added: Int?,
+        val removed: Int?,
         val open: Boolean,
         val rows: List<Fold>,
     ) : ChatRow()
@@ -423,6 +432,8 @@ object ChatViews {
                 label = r.optString("label"),
                 state = r.optString("state"),
                 badge = r.optStringOrNull("badge"),
+                added = r.optIntOrNull("added"),
+                removed = r.optIntOrNull("removed"),
                 open = r.optBoolean("open"),
                 rows = r.optJSONArray("rows").objects().mapNotNull { row(it) as? ChatRow.Fold },
             )
@@ -492,6 +503,32 @@ object ChatViews {
 
 // MARK: the page
 
+/// `base`, its text `scale` times as large: sp converted here still goes
+/// through `base`'s own conversion, which grows a large system font size
+/// less than in proportion, as the rest of the app does. At the standard
+/// size `base` is used as it is.
+private class ScaledText(private val base: Density, private val scale: Float) : Density by base {
+    // Text laid out from the scale itself (as Compose's paragraphs are)
+    // grows by it too.
+    override val fontScale: Float get() = base.fontScale * scale
+
+    override fun TextUnit.toDp(): Dp = if (isSp) with(base) { (value * scale).sp.toDp() } else with(base) { this@toDp.toDp() }
+
+    override fun TextUnit.toPx(): Float = if (isSp) with(base) { (value * scale).sp.toPx() } else with(base) { this@toPx.toPx() }
+
+    override fun Dp.toSp(): TextUnit = with(base) { (this@toSp.toSp().value / scale).sp }
+
+    override fun Float.toSp(): TextUnit = with(base) { (this@toSp.toSp().value / scale).sp }
+}
+
+/// How large the chat's text is drawn, as its setting says.
+internal fun chatTextScale(setting: String): Float = when (setting) {
+    "s" -> 0.9f
+    "l" -> 1.12f
+    "xl" -> 1.25f
+    else -> 1f
+}
+
 /// Further into the last row than any row is tall: a scroll to it ends at
 /// the end of the list.
 private const val TO_THE_END = 1 shl 20
@@ -535,6 +572,15 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
     var follow by remember(target.pane) { mutableStateOf(false) }
     // The row on top when older ones were asked for: it stays in its place.
     var keep by remember(target.pane) { mutableStateOf<String?>(null) }
+    // Whether the person reads the end: as their last scroll (or the last
+    // one made here) left the list. What comes in below does not change
+    // it: rows that came in a burst once read as a scroll away from it.
+    var reading by remember(target.pane) { mutableStateOf(true) }
+    LaunchedEffect(list, target.pane) {
+        snapshotFlow { list.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) reading = !list.canScrollForward
+        }
+    }
     // Also when what is under the list grows (a question, the keyboard):
     // the end stays above it.
     LaunchedEffect(rows.size, last, chat?.busy, chat?.loadingOlder, footPx) {
@@ -551,10 +597,9 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             }
             if (chat?.loadingOlder != true) keep = null
         }
-        // The layout is still the one before these rows came.
-        val laid = list.layoutInfo
-        val shown = laid.visibleItemsInfo.lastOrNull()?.index ?: -1
-        val atEnd = !opened || follow || shown < 0 || shown >= laid.totalItemsCount - 3
+        // A scroll on its way (a fling up from the end) is the person's: what
+        // comes in meanwhile does not pull the list back.
+        val atEnd = !opened || follow || (reading && !list.isScrollInProgress)
         opened = true
         if (atEnd && last != null) {
             follow = false
@@ -574,6 +619,11 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                 }
             }
         )
+        // The chat's text as large as its setting makes it: what was said,
+        // and what was done; the bars keep theirs.
+        val textScale = chatTextScale(model.settings.chatText)
+        val scaled = remember(density, textScale) { if (textScale == 1f) density else ScaledText(density, textScale) }
+        CompositionLocalProvider(LocalDensity provides scaled) {
         LazyColumn(
             state = list,
             modifier = Modifier.fillMaxSize().layerBackdrop(backdrop).background(ground),
@@ -642,18 +692,21 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                     }
                 }
             }
-            // Rows come in fading, and move aside smoothly; one that goes is
-            // gone at once (a fading one was left behind on screen).
+            // Rows come in fading. None slides as the one above it grows (a
+            // reply being written): the list stays still under the words.
+            // One that goes is gone at once (a fading one was left behind
+            // on screen).
             items(rows, key = { it.id }) { row ->
-                Box(Modifier.animateItem(fadeInSpec = tween(260), placementSpec = spring(stiffness = Spring.StiffnessMediumLow), fadeOutSpec = null)) {
+                Box(Modifier.animateItem(fadeInSpec = tween(260), placementSpec = null, fadeOutSpec = null)) {
                     ChatRowView(row, model, dark)
                 }
             }
             chat?.busy?.let { busy ->
                 item(key = "tt:busy") {
-                    Box(Modifier.animateItem(fadeInSpec = tween(220), fadeOutSpec = null)) { Busy(busy, chat.since, secondary) }
+                    Box(Modifier.animateItem(fadeInSpec = tween(220), placementSpec = null, fadeOutSpec = null)) { Busy(busy, chat.since, secondary) }
                 }
             }
+        }
         }
 
         // The bar: back, and whom the chat is with. Its two lines reach
@@ -676,7 +729,7 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                 val back = tr("back")
                 Box(
                     Modifier
-                        .size(38.dp)
+                        .size(40.dp)
                         .glass(backdrop, dark, CircleShape)
                         .clickable(role = Role.Button, onClick = onBack)
                         .semantics { contentDescription = back },
@@ -718,7 +771,7 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             ) {
                 Box(
                     Modifier
-                        .size(38.dp)
+                        .size(40.dp)
                         .glass(backdrop, dark, CircleShape)
                         .clickable(role = Role.Button) {
                             scope.launch { list.animateScrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END) }
@@ -756,9 +809,11 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             // A chat's notices are numbered from one again: the count of
             // the ones shown is the chat's own.
             key(target.pane) { Notice(chat?.notice, backdrop, dark) }
-            chat?.problem?.let { ProblemCard(it, model, backdrop, dark) }
-            chat?.outdated?.let { OutdatedCard(it, model, backdrop, dark) }
-            chat?.ask?.let { AskCard(it, model, backdrop, dark, onTerminal = onBack) }
+            // Cards over the field rise in and drop away, keeping what they
+            // said while they go.
+            Appearing(target.pane, chat?.problem) { ProblemCard(it, model, backdrop, dark) }
+            Appearing(target.pane, chat?.outdated) { OutdatedCard(it, model, backdrop, dark) }
+            Appearing(target.pane, chat?.ask) { AskCard(it, model, backdrop, dark, onTerminal = onBack) }
             ChatField(chat, target, model, backdrop, dark, onSend = { follow = true })
         }
     }
@@ -791,8 +846,9 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean) {
                 }
             }
         }
-        // Grows smoothly as more of what it says comes.
-        is ChatRow.Text -> SelectionContainer(Modifier.animateContentSize(tween(180))) { MdBlocks(row.blocks, ink, dark) }
+        // Grows as more of what it says comes, at once: an animated growth
+        // a few times a second kept the list moving under the words.
+        is ChatRow.Text -> SelectionContainer { MdBlocks(row.blocks, ink, dark) }
         is ChatRow.Fold -> FoldView(row, model, dark, secondary)
         is ChatRow.Group -> GroupView(row, model, dark, secondary)
         is ChatRow.Note -> Text(
@@ -807,13 +863,18 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean) {
 
 @Composable
 private fun FoldView(row: ChatRow.Fold, model: TerminalModel, dark: Boolean, secondary: Color) {
+    // Turned at the tap, before the core's view comes back with what opens.
+    val open = rememberOpen(row.id, row.open)
     Column(Modifier.fillMaxWidth()) {
         Row(
             Modifier
                 .fillMaxWidth()
                 .heightIn(min = 28.dp)
                 .clip(RoundedCornerShape(8.dp))
-                .clickable(enabled = row.canOpen) { model.chatToggle(row.id) }
+                .clickable(enabled = row.canOpen) {
+                    open.value = !open.value
+                    model.chatToggle(row.id)
+                }
                 .padding(vertical = 3.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(7.dp),
@@ -821,7 +882,7 @@ private fun FoldView(row: ChatRow.Fold, model: TerminalModel, dark: Boolean, sec
             if (row.state == "running") {
                 CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = secondary)
             } else {
-                DesktopIcon(if (row.open) "chevron-down" else "chevron-right", size = 13.dp, tint = secondary)
+                Chevron(open.value, secondary)
             }
             DesktopIcon(foldIcon(row.icon), size = 15.dp, tint = secondary)
             Text(
@@ -840,22 +901,76 @@ private fun FoldView(row: ChatRow.Fold, model: TerminalModel, dark: Boolean, sec
                 "done" -> if (row.icon == "run") DesktopIcon("check", size = 13.dp, tint = Added)
             }
         }
-        if (row.open && row.body != null) {
-            Box(Modifier.padding(start = 20.dp, top = 4.dp)) { FoldBodyView(row.body, dark, secondary) }
+        // What opens slides open and fades in, and closes the same way: the
+        // last body shown stays on show while it goes.
+        var shown by remember(row.id) { mutableStateOf(row.body) }
+        if (row.body != null) shown = row.body
+        AnimatedVisibility(
+            visible = open.value && row.open && row.body != null,
+            enter = expandVertically(tween(220)) + fadeIn(tween(220)),
+            exit = shrinkVertically(tween(180)) + fadeOut(tween(140)),
+        ) {
+            shown?.let { body -> Box(Modifier.padding(start = 20.dp, top = 4.dp)) { FoldBodyView(body, dark, secondary) } }
         }
     }
+}
+
+/// `value`'s card, rising in as it comes and dropping away as it goes, with
+/// what it last said -- the chat's own (`chat`), and not to be tapped once
+/// it is going.
+@Composable
+private fun <T : Any> Appearing(chat: Int, value: T?, content: @Composable (T) -> Unit) {
+    var last by remember(chat) { mutableStateOf(value) }
+    if (value != null) last = value
+    AnimatedVisibility(
+        visible = value != null,
+        enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { it / 4 } + expandVertically(tween(220), expandFrom = Alignment.Bottom),
+        exit = fadeOut(tween(150)) + shrinkVertically(tween(200), shrinkTowards = Alignment.Bottom),
+    ) {
+        val going = value == null
+        Box(
+            if (!going) Modifier else Modifier.pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
+                }
+            },
+        ) {
+            last?.let { content(it) }
+        }
+    }
+}
+
+/// Whether a row is open, as last tapped: turned at once, and following
+/// the core's view when that says otherwise (another of the person's
+/// devices, a fold opened by the core itself).
+@Composable
+private fun rememberOpen(id: String, open: Boolean): androidx.compose.runtime.MutableState<Boolean> {
+    val state = remember(id) { mutableStateOf(open) }
+    LaunchedEffect(open) { state.value = open }
+    return state
+}
+
+/// The fold's chevron: right when shut, turning down as it opens.
+@Composable
+private fun Chevron(open: Boolean, tint: Color) {
+    val turn by animateFloatAsState(if (open) 90f else 0f, tween(200), label = "chevron")
+    DesktopIcon("chevron-right", size = 13.dp, tint = tint, modifier = Modifier.graphicsLayer { rotationZ = turn })
 }
 
 /// Work done between two things said, as one line; open, its folds.
 @Composable
 private fun GroupView(row: ChatRow.Group, model: TerminalModel, dark: Boolean, secondary: Color) {
+    val open = rememberOpen(row.id, row.open)
     Column(Modifier.fillMaxWidth()) {
         Row(
             Modifier
                 .fillMaxWidth()
                 .heightIn(min = 28.dp)
                 .clip(RoundedCornerShape(8.dp))
-                .clickable { model.chatToggle(row.id) }
+                .clickable {
+                    open.value = !open.value
+                    model.chatToggle(row.id)
+                }
                 .padding(vertical = 3.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(7.dp),
@@ -863,7 +978,7 @@ private fun GroupView(row: ChatRow.Group, model: TerminalModel, dark: Boolean, s
             if (row.state == "running") {
                 CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = secondary)
             } else {
-                DesktopIcon(if (row.open) "chevron-down" else "chevron-right", size = 13.dp, tint = secondary)
+                Chevron(open.value, secondary)
             }
             DesktopIcon(foldIcon(row.icon), size = 15.dp, tint = secondary)
             Text(
@@ -874,14 +989,22 @@ private fun GroupView(row: ChatRow.Group, model: TerminalModel, dark: Boolean, s
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f, fill = false),
             )
-            row.badge?.let { Text(it, fontSize = 12.5.sp, color = Removed) }
+            row.added?.takeIf { it > 0 }?.let { Text("+$it", fontSize = 13.sp, color = Added) }
+            row.removed?.takeIf { it > 0 }?.let { Text("−$it", fontSize = 13.sp, color = Removed) }
+            row.badge?.let { Text(it, fontSize = 12.5.sp, color = if (row.state == "declined") Waiting else Removed) }
         }
-        if (row.open) {
+        var shown by remember(row.id) { mutableStateOf(row.rows) }
+        if (row.rows.isNotEmpty()) shown = row.rows
+        AnimatedVisibility(
+            visible = open.value && row.open && row.rows.isNotEmpty(),
+            enter = expandVertically(tween(220)) + fadeIn(tween(220)),
+            exit = shrinkVertically(tween(180)) + fadeOut(tween(140)),
+        ) {
             Column(
                 Modifier.padding(start = 20.dp, top = 2.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                for (fold in row.rows) key(fold.id) { FoldView(fold, model, dark, secondary) }
+                for (fold in shown) key(fold.id) { FoldView(fold, model, dark, secondary) }
             }
         }
     }
@@ -1360,13 +1483,13 @@ private fun ContextRing(context: ChatContext, backdrop: Backdrop, dark: Boolean,
     val label = "${context.heading}: ${context.percent}"
     Box(
         Modifier
-            .size(38.dp)
+            .size(40.dp)
             .glass(backdrop, dark, CircleShape)
             .clickable(role = Role.Button, onClick = onClick)
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
-        Canvas(Modifier.size(20.dp)) {
+        Canvas(Modifier.size(21.dp)) {
             val stroke = 2.6.dp.toPx()
             val inset = stroke / 2
             val arc = Size(size.width - stroke, size.height - stroke)
@@ -1579,8 +1702,8 @@ private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: 
                 .border(0.5.dp, ink.copy(alpha = if (dark) 0.12f else 0.08f), shape)
                 .padding(horizontal = 4.dp, vertical = 2.dp),
         ) {
-            if (files.isNotEmpty()) {
-                Box(Modifier.padding(start = 8.dp, end = 8.dp, top = 8.dp)) { PickedFiles(files, model, dark) }
+            Appearing(target.pane, files.takeIf { it.isNotEmpty() }) { picked ->
+                Box(Modifier.padding(start = 8.dp, end = 8.dp, top = 8.dp)) { PickedFiles(picked, model, dark) }
             }
             BasicTextField(
                 value = field,
@@ -1640,7 +1763,7 @@ private fun SendButton(stop: Boolean, canSend: Boolean, dark: Boolean, onClick: 
     Box(
         Modifier
             .minimumInteractiveComponentSize()
-            .size(34.dp)
+            .size(40.dp)
             .clip(CircleShape)
             .background(fill)
             .clickable(enabled = stop || canSend, role = Role.Button, onClick = onClick)
@@ -1791,7 +1914,7 @@ private fun AttachMenu(model: TerminalModel, dark: Boolean) {
         Box(
             Modifier
                 .minimumInteractiveComponentSize()
-                .size(34.dp)
+                .size(40.dp)
                 .clip(CircleShape)
                 .background(ink.copy(alpha = if (dark) 0.10f else 0.07f))
                 .clickable(role = Role.Button) { menu = true }
