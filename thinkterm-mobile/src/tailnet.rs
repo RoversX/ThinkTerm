@@ -244,8 +244,10 @@ mod held {
                     hostname: blank(config.hostname),
                     auth_key: blank(config.auth_key),
                     node_keys: config.keys,
-                    // A phone takes nothing in: there is no sshd on it.
-                    forward_ssh: false,
+                    // A phone takes nothing in: there is no sshd on it,
+                    // nor a port anyone opened.
+                    forward_ports: Vec::new(),
+                    ports_opened_to: None,
                 };
                 // Found out before the node running is stopped for them.
                 wanted.check().context("these settings")?;

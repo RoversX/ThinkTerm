@@ -43,8 +43,16 @@ pub struct NodeConfig {
     pub hostname: Option<String>,
     pub auth_key: Option<String>,
     pub node_keys: String,
-    /// Take SSH connections from the tailnet to this machine's own sshd.
-    pub forward_ssh: bool,
+    /// The TCP ports it takes connections on from the tailnet, each handed
+    /// to the same port on this machine: 22 to its own sshd, and whatever
+    /// else its settings open. Sorted, each once: the same ports in another
+    /// order are no change.
+    pub forward_ports: Vec<u16>,
+    /// The node, as its tailnet knows it (see [`Node::membership`]), the
+    /// ports but SSH's were opened on: a node the tailnet knows otherwise --
+    /// let into another tailnet on the same keys, say -- takes in none of
+    /// them. SSH's is the settings' alone, as it always was.
+    pub ports_opened_to: Option<String>,
 }
 
 impl NodeConfig {
@@ -53,12 +61,16 @@ impl NodeConfig {
     /// auth key alone restarts only a node it could get in: one not yet in,
     /// or one asked to log in again. It only matters for getting in, and
     /// the node that is in -- or only reconnecting -- carries connections a
-    /// restart would end.
+    /// restart would end. Other ports taken in restart it too: the
+    /// connections a port let in end with it, where a listener closed under
+    /// them would leave them running, and the library closes one it drops
+    /// only when its queue has room.
     pub fn needs_restart_for(&self, new: &NodeConfig, status: &Status, was_in: bool) -> bool {
         let same_node = self.control_url == new.control_url
             && self.hostname == new.hostname
             && self.node_keys == new.node_keys
-            && self.forward_ssh == new.forward_ssh;
+            && self.forward_ports == new.forward_ports
+            && self.ports_opened_to == new.ports_opened_to;
         let key_matters = !was_in || matches!(status, Status::NeedsLogin { .. });
         !same_node || (self.auth_key != new.auth_key && key_matters)
     }
@@ -101,6 +113,12 @@ pub struct Shared {
     device: Mutex<Option<Arc<Device>>>,
     /// The tailnet's own domain, as this machine's full name has it.
     domain: Mutex<Option<String>>,
+    /// This node as its tailnet knows it (see `Node::membership`), once the
+    /// node has its netmap.
+    membership: Mutex<Option<String>>,
+    /// Where the node listens for the tailnet, SSH's port included: each
+    /// listener once it has bound, until it ends (see `Listening`).
+    listening: Mutex<std::collections::BTreeSet<SocketAddr>>,
     /// Set once the node is stopped: what waits on it gives up.
     stopped: AtomicBool,
     /// Set once the node is given up, to be started anew (see
@@ -384,6 +402,8 @@ impl Node {
             state: Mutex::new((Status::Starting, vec![])),
             device: Mutex::new(None),
             domain: Mutex::new(None),
+            membership: Mutex::new(None),
+            listening: Mutex::new(std::collections::BTreeSet::new()),
             stopped: AtomicBool::new(false),
             broken: AtomicBool::new(false),
             was_in: AtomicBool::new(false),
@@ -397,7 +417,8 @@ impl Node {
                 Arc::clone(&shared),
                 library_config,
                 config.auth_key.clone(),
-                config.forward_ssh,
+                config.forward_ports.clone(),
+                config.ports_opened_to.clone(),
             ),
         );
         watched(
@@ -456,6 +477,29 @@ impl Node {
         self.shared.peers()
     }
 
+    /// This node as its tailnet knows it -- the tailnet's name and the id
+    /// its control server gave the node -- once it has its netmap: what the
+    /// ports but SSH's are opened to (see [`NodeConfig::ports_opened_to`]).
+    pub fn membership(&self) -> Option<String> {
+        self.shared.membership.lock().unwrap().clone()
+    }
+
+    /// The ports the node listens on for the tailnet, SSH's included: on
+    /// one of its addresses at least, and only once the listener has bound.
+    pub fn forwarding(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .shared
+            .listening
+            .lock()
+            .unwrap()
+            .iter()
+            .map(SocketAddr::port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
     /// Leaves the tailnet: every connection through the node ends with it,
     /// and one still waiting on it gives up. Waits a moment for the node to
     /// wind down, so that one started next on the same keys does not meet
@@ -499,7 +543,8 @@ async fn run(
     shared: Arc<Shared>,
     config: tailscale::Config,
     auth_key: Option<String>,
-    forward_ssh: bool,
+    forward_ports: Vec<u16>,
+    ports_opened_to: Option<String>,
 ) {
     let mut wait = Duration::from_secs(5);
     let device = loop {
@@ -515,7 +560,8 @@ async fn run(
     };
     *shared.device.lock().unwrap() = Some(Arc::clone(&device));
 
-    let mut listeners: Vec<(IpAddr, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut listeners: Vec<(SocketAddr, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut told_elsewhere = false;
     let mut asking_authorization = None;
     let mut asking_netmap = None;
     loop {
@@ -587,21 +633,34 @@ async fn run(
                 .into_iter()
                 .filter(|ip| !ip.is_unspecified())
                 .collect();
-                if forward_ssh {
-                    // At most one listener per current node address. A
-                    // fresh authorization may give the node new addresses.
-                    listeners.retain(|(on, task)| {
-                        let keep = addresses.contains(on) && !task.is_finished();
-                        if !keep {
-                            task.abort();
-                        }
-                        keep
-                    });
-                    for &on in &addresses {
-                        if !listeners.iter().any(|(address, _)| *address == on) {
+                let membership = membership_of(&this);
+                let ports = taken_in(&forward_ports, ports_opened_to.as_deref(), &membership);
+                if ports.len() < forward_ports.len() && !told_elsewhere {
+                    told_elsewhere = true;
+                    log::warn!(
+                        "tailnet: ports were opened to this machine as another tailnet knew it; \
+                         `thinkterm tailnet serve add` opens them to this one"
+                    );
+                }
+                // At most one listener per port taken in and current node
+                // address. A fresh authorization may give the node new
+                // addresses, or make it another node.
+                listeners.retain(|(on, task)| {
+                    let keep = addresses.contains(&on.ip())
+                        && ports.contains(&on.port())
+                        && !task.is_finished();
+                    if !keep {
+                        task.abort();
+                    }
+                    keep
+                });
+                for &address in &addresses {
+                    for &port in &ports {
+                        let on = SocketAddr::new(address, port);
+                        if !listeners.iter().any(|(listening, _)| *listening == on) {
                             listeners.push((
                                 on,
-                                tokio::spawn(forward_ssh_to_this_machine(
+                                tokio::spawn(forward_to_this_machine(
                                     Arc::clone(&device),
                                     Arc::clone(&shared),
                                     on,
@@ -611,6 +670,7 @@ async fn run(
                     }
                 }
                 *shared.domain.lock().unwrap() = this.tailnet.clone();
+                *shared.membership.lock().unwrap() = Some(membership);
                 let mut peers: Vec<Peer> = nodes.iter().map(peer).collect();
                 peers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.fqdn.cmp(&b.fqdn)));
                 shared.set_peers(peers);
@@ -783,32 +843,50 @@ fn peer(node: &tailscale::NodeInfo) -> Peer {
     }
 }
 
-/// Port 22 on this machine's tailnet address, handed to its own sshd. That
-/// is all the node lets in. sshd sees a loopback client, so its local-address
-/// rules apply; this forwarding is enabled separately with --serve-ssh.
-async fn forward_ssh_to_this_machine(device: Arc<Device>, shared: Arc<Shared>, on: IpAddr) {
-    let listener = match device.tcp_listen(SocketAddr::new(on, 22)).await {
+/// SSH's port, handed to this machine's own sshd.
+const SSH_PORT: u16 = 22;
+
+/// This node as its tailnet knows it: the tailnet's name and the id its
+/// control server gave the node. Let into another tailnet, even on the same
+/// keys and control server, it is another.
+fn membership_of(this: &tailscale::NodeInfo) -> String {
+    format!(
+        "{}/{}",
+        this.tailnet.as_deref().unwrap_or_default(),
+        this.stable_id.0
+    )
+}
+
+/// Of the ports a node is to take in, the ones it does as the tailnet knows
+/// it now (`membership`): SSH's, which its settings alone open, and the
+/// others only if they were opened to it as it is.
+fn taken_in(forward_ports: &[u16], opened_to: Option<&str>, membership: &str) -> Vec<u16> {
+    forward_ports
+        .iter()
+        .copied()
+        .filter(|&port| port == SSH_PORT || opened_to == Some(membership))
+        .collect()
+}
+
+/// A port on this machine's tailnet address, `on`, handed to the same port
+/// on the machine itself: 22 to its own sshd, another to whatever listens
+/// there. That is all the node lets in, and only the ports its settings
+/// open (`thinkterm tailnet up --serve-ssh`, `thinkterm tailnet serve add`).
+/// What listens sees a loopback client, so its rules for local connections
+/// apply.
+async fn forward_to_this_machine(device: Arc<Device>, shared: Arc<Shared>, on: SocketAddr) {
+    let listener = match device.tcp_listen(on).await {
         Ok(listener) => listener,
         Err(err) => {
-            log::error!("tailnet: listening for SSH on {on}: {err}");
+            log::error!("tailnet: listening on {on}: {err}");
             return;
         }
     };
-    let sshd = [
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 22)),
-        SocketAddr::from((Ipv6Addr::LOCALHOST, 22)),
-    ];
+    let _listening = Listening::new(Arc::clone(&shared), on);
     loop {
         match listener.accept().await {
             Ok(stream) => {
-                tokio::spawn(async move {
-                    match tokio::net::TcpStream::connect(&sshd[..]).await {
-                        Ok(local) => bridge(stream, local).await,
-                        Err(err) => {
-                            log::warn!("tailnet: an SSH connection came in, but no sshd answers on this machine: {err}")
-                        }
-                    }
-                });
+                tokio::spawn(hand_to_this_machine(stream, on.port()));
             }
             // The netstack gone, nothing comes in again: the node is given
             // up rather than asked every second.
@@ -821,10 +899,118 @@ async fn forward_ssh_to_this_machine(device: Arc<Device>, shared: Arc<Shared>, o
                 return;
             }
             Err(err) => {
-                log::warn!("tailnet: accepting an SSH connection: {err}");
+                log::warn!("tailnet: accepting a connection on {on}: {err}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
+    }
+}
+
+/// A listener that has bound, in `Shared::listening` for as long as it runs:
+/// what the node reports it takes in. Its going, aborted among others, is
+/// told as its coming is.
+struct Listening {
+    shared: Arc<Shared>,
+    on: SocketAddr,
+}
+
+impl Listening {
+    fn new(shared: Arc<Shared>, on: SocketAddr) -> Self {
+        shared.listening.lock().unwrap().insert(on);
+        (shared.changed)();
+        Self { shared, on }
+    }
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.shared.listening.lock().unwrap().remove(&self.on);
+        (self.shared.changed)();
+    }
+}
+
+/// How long the local side of a connection whose tailnet side has ended
+/// may go without sending before it is ended too: a service that answers
+/// does so sooner, one that keeps the connection after the end of the
+/// request would keep it for as long as the node runs.
+const ANSWER_IDLE: Duration = Duration::from_secs(60);
+
+/// Carries a connection that came in from the tailnet on `port` to the same
+/// port here, over loopback: IPv4's first, then IPv6's, so that a server
+/// listening on either one alone takes it. SSH's goes as it always went
+/// (see `bridge`), the others as `bridge_to_local` carries them.
+async fn hand_to_this_machine(stream: impl AsyncRead + AsyncWrite, port: u16) {
+    let here = [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+    ];
+    match tokio::net::TcpStream::connect(&here[..]).await {
+        Ok(local) if port == SSH_PORT => bridge(stream, local).await,
+        Ok(local) => bridge_to_local(stream, local, ANSWER_IDLE).await,
+        Err(err) if port == SSH_PORT => {
+            log::warn!("tailnet: an SSH connection came in, but no sshd answers on this machine: {err}")
+        }
+        Err(err) => log::warn!(
+            "tailnet: a connection came in on port {port}, but nothing on this machine answers on it: {err}"
+        ),
+    }
+}
+
+/// Copies a connection from the tailnet to one on this machine both ways.
+/// Once the tailnet's side has sent all it will, the local side is told so
+/// -- a TCP connection here can half-close -- and its answer still goes
+/// back: what a client that sends its request and then its end waits for.
+/// The local side ending, either failing, or the local side sending nothing
+/// for `idle` after the tailnet's has ended, ends both: the tailnet's
+/// streams cannot half-close (see `bridge`).
+async fn bridge_to_local(
+    remote: impl AsyncRead + AsyncWrite,
+    local: tokio::net::TcpStream,
+    idle: Duration,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut remote_read, mut remote_write) = tokio::io::split(remote);
+    let (mut local_read, mut local_write) = local.into_split();
+    let (ended, ends) = (AtomicBool::new(false), tokio::sync::Notify::new());
+    let (ended, ends) = (&ended, &ends);
+    let to_local = async {
+        if tokio::io::copy(&mut remote_read, &mut local_write).await.is_ok()
+            && local_write.shutdown().await.is_ok()
+        {
+            ended.store(true, Ordering::SeqCst);
+            ends.notify_one();
+            // The answer is the other direction's to carry.
+            std::future::pending::<()>().await;
+        }
+    };
+    // Once the tailnet's side has ended: `idle` from the last the local
+    // side sent.
+    let quiet_after_the_end = move || async move {
+        if !ended.load(Ordering::SeqCst) {
+            ends.notified().await;
+        }
+        tokio::time::sleep(idle).await;
+    };
+    let to_remote = async {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let read = tokio::select! {
+                read = local_read.read(&mut buf) => read,
+                _ = quiet_after_the_end() => return,
+            };
+            match read {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if remote_write.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    tokio::select! {
+        _ = to_remote => {}
+        _ = to_local => {}
     }
 }
 
@@ -850,7 +1036,8 @@ mod tests {
             hostname: Some("server-a".into()),
             auth_key: Some("tskey-old".into()),
             node_keys: new_node_keys().unwrap(),
-            forward_ssh: true,
+            forward_ports: vec![22],
+            ports_opened_to: None,
         }
     }
 
@@ -881,6 +1068,46 @@ mod tests {
             ..running.clone()
         };
         assert!(running.needs_restart_for(&renamed, &connected, true));
+    }
+
+    #[test]
+    fn a_port_opened_or_closed_restarts_the_node() {
+        let running = config();
+        let connected = Status::Connected {
+            name: "server-a".into(),
+            address: None,
+        };
+        let with_vnc = NodeConfig {
+            forward_ports: vec![22, 5900],
+            ..running.clone()
+        };
+        assert!(running.needs_restart_for(&with_vnc, &connected, true));
+        assert!(with_vnc.needs_restart_for(&running, &connected, true));
+        assert!(!with_vnc.needs_restart_for(&with_vnc.clone(), &connected, true));
+        let without_ssh = NodeConfig {
+            forward_ports: vec![5900],
+            ..with_vnc.clone()
+        };
+        assert!(with_vnc.needs_restart_for(&without_ssh, &connected, true));
+        let opened_elsewhere = NodeConfig {
+            ports_opened_to: Some("example.ts.net/n2".into()),
+            ..with_vnc.clone()
+        };
+        assert!(with_vnc.needs_restart_for(&opened_elsewhere, &connected, true));
+    }
+
+    #[test]
+    fn ports_are_taken_in_only_by_the_node_they_were_opened_to() {
+        let ports = [22, 5900, 5902];
+        let here = "example.ts.net/n1";
+        assert_eq!(taken_in(&ports, Some(here), here), [22, 5900, 5902]);
+        // Let into another tailnet, or made another node in this one: SSH's
+        // alone, as its settings say.
+        assert_eq!(taken_in(&ports, Some(here), "other.ts.net/n1"), [22]);
+        assert_eq!(taken_in(&ports, Some(here), "example.ts.net/n2"), [22]);
+        // Opened before the node was known: none of them.
+        assert_eq!(taken_in(&ports, None, here), [22]);
+        assert!(taken_in(&[5900], Some("a/b"), "a/c").is_empty());
     }
 
     #[test]
@@ -1291,6 +1518,160 @@ mod tests {
         assert!(rest.is_empty());
     }
 
+    /// What a connection handed to `port` here carries both ways, as the
+    /// server on `local` sees it, and that it ends with the server's side.
+    async fn handed_over(local: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let port = local.local_addr().unwrap().port();
+        let (mut tailnet, came_in) = tokio::io::duplex(64);
+        let handed = tokio::spawn(hand_to_this_machine(came_in, port));
+        // Failing, not waiting forever, should it have gone elsewhere.
+        let (mut server, _) = tokio::time::timeout(Duration::from_secs(5), local.accept())
+            .await
+            .expect("the connection reached the server")
+            .unwrap();
+
+        tailnet.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.write_all(b"pong").await.unwrap();
+        tailnet.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(5), handed)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut rest = vec![];
+        tailnet.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connection_from_the_tailnet_is_handed_to_the_same_port_here() {
+        handed_over(
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_client_that_sends_its_end_still_gets_the_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = local.local_addr().unwrap().port();
+        let (mut tailnet, came_in) = tokio::io::duplex(64);
+        let handed = tokio::spawn(hand_to_this_machine(came_in, port));
+        // A server that answers only once the request has ended.
+        let server = tokio::spawn(async move {
+            let (mut server, _) = local.accept().await.unwrap();
+            let mut request = vec![];
+            server.read_to_end(&mut request).await.unwrap();
+            server.write_all(b"answer to ").await.unwrap();
+            server.write_all(&request).await.unwrap();
+        });
+        tailnet.write_all(b"question").await.unwrap();
+        tailnet.shutdown().await.unwrap();
+        let mut answer = vec![];
+        tokio::time::timeout(Duration::from_secs(5), tailnet.read_to_end(&mut answer))
+            .await
+            .expect("the answer came back")
+            .unwrap();
+        assert_eq!(answer, b"answer to question");
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_server_silent_after_the_end_is_let_go() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = local.local_addr().unwrap().port();
+        let connect = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port));
+        let (connected, accepted) = tokio::join!(connect, local.accept());
+        let (mut server, _) = accepted.unwrap();
+        let (mut tailnet, came_in) = tokio::io::duplex(64);
+        let bridged = tokio::spawn(bridge_to_local(
+            came_in,
+            connected.unwrap(),
+            Duration::from_millis(200),
+        ));
+        tailnet.write_all(b"bye").await.unwrap();
+        tailnet.shutdown().await.unwrap();
+        // The server reads the end and then keeps the connection, silent.
+        let mut request = vec![];
+        server.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"bye");
+        tokio::time::timeout(Duration::from_secs(5), bridged)
+            .await
+            .expect("let go after being quiet that long")
+            .unwrap();
+        let mut rest = vec![];
+        tailnet.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn a_server_on_ipv6_loopback_alone_takes_it_too() {
+        // A machine without IPv6 loopback has nothing to tell here.
+        let Ok(local) = tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
+            return;
+        };
+        // Nothing may answer on IPv4's at that port, or it would take it:
+        // held, not listened on, it refuses connections meanwhile and
+        // nothing else can take it.
+        let port = local.local_addr().unwrap().port();
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        if held.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_err() {
+            return;
+        }
+        handed_over(local).await;
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_connection_nothing_here_answers_ends_at_once() {
+        use tokio::io::AsyncReadExt;
+        // A port held on both loopbacks and listened on by neither: both
+        // refuse it meanwhile, and nothing else can take it.
+        let v4 = tokio::net::TcpSocket::new_v4().unwrap();
+        v4.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let v6 = match tokio::net::TcpSocket::new_v6() {
+            Ok(v6) => match v6.bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))) {
+                Ok(()) => Some(v6),
+                // Someone else's: it might answer.
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => return,
+                // No IPv6 loopback here: nothing answers on it either.
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        let (mut tailnet, came_in) = tokio::io::duplex(64);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hand_to_this_machine(came_in, port),
+        )
+        .await
+        .unwrap();
+        let mut rest = vec![];
+        tailnet.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        drop((v4, v6));
+    }
+
     /// Shared state with nothing running, and how often it said it changed.
     fn shared_counting() -> (Arc<Shared>, Arc<std::sync::atomic::AtomicUsize>) {
         let said = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1298,6 +1679,8 @@ mod tests {
             state: Mutex::new((Status::Starting, vec![])),
             device: Mutex::new(None),
             domain: Mutex::new(None),
+            membership: Mutex::new(None),
+            listening: Mutex::new(std::collections::BTreeSet::new()),
             stopped: AtomicBool::new(false),
             broken: AtomicBool::new(false),
             was_in: AtomicBool::new(false),

@@ -160,6 +160,20 @@ fn peers() -> Vec<Peer> {
     vec![]
 }
 
+/// The ports this process's node listens on for the tailnet, and the node
+/// as its tailnet knows it: none and nobody without one.
+fn forwarding() -> (Vec<u16>, Option<String>) {
+    NODE.lock()
+        .unwrap()
+        .as_ref()
+        .map(|node| (node.forwarding(), node.membership()))
+        .unwrap_or_default()
+}
+
+/// What a report says: the node's status, its machines, the ports it takes
+/// in and the node as its tailnet knows it.
+type Told = (Status, Vec<Peer>, (Vec<u16>, Option<String>));
+
 /// What the settings thread does after acting on the settings.
 enum Next {
     /// Nothing until the settings change.
@@ -204,7 +218,7 @@ fn follow_loop(changed: Changed, woken: mpsc::Receiver<Wake>) {
         // the node goes on as it was: the page shows the file, and
         // `thinkterm tailnet up` waits for a report written after its
         // change.
-        let now = (status(), peers());
+        let now: Told = (status(), peers(), forwarding());
         if matches!(now.0, Status::Connected { .. } | Status::NeedsLogin { .. }) {
             GIVEN_UP.store(0, Ordering::SeqCst);
         }
@@ -320,7 +334,8 @@ fn reconcile() -> Next {
         hostname: settings.hostname.clone(),
         auth_key: settings.auth_key.clone(),
         node_keys,
-        forward_ssh: settings.serve_ssh,
+        forward_ports: settings.forwarded_ports(),
+        ports_opened_to: settings.serve_ports_to.clone(),
     };
     if let Err(err) = config.check() {
         return unusable(err);
@@ -416,7 +431,7 @@ fn settings_with_node_keys() -> Result<Option<Settings>> {
 /// Writes what the node is doing for the app and `thinkterm tailnet` to
 /// read: this process's node, or why it has none -- held elsewhere, failed
 /// before it got the node -- unless another live process reports here.
-fn report((status, peers): &(Status, Vec<Peer>)) {
+fn report((status, peers, (forwarding, membership)): &Told) {
     let holding = HOLD.lock().unwrap().is_some();
     if !holding && read_live_report().is_some_and(|report| report.pid != std::process::id()) {
         return;
@@ -430,6 +445,8 @@ fn report((status, peers): &(Status, Vec<Peer>)) {
         status: status.clone(),
         peers: peers.clone(),
         revision: ACTED.load(Ordering::SeqCst),
+        forwarding: Some(forwarding.clone()),
+        membership: membership.clone(),
     });
 }
 
@@ -444,6 +461,8 @@ fn report_if_ours(status: Status) {
         status,
         peers: vec![],
         revision: ACTED.load(Ordering::SeqCst),
+        forwarding: Some(vec![]),
+        membership: None,
     });
 }
 

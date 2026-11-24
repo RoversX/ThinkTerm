@@ -28,6 +28,18 @@ pub struct Report {
     /// had acted on when it wrote this.
     #[serde(default)]
     pub revision: u64,
+    /// The TCP ports the node it holds takes in from the tailnet, SSH's
+    /// included (see `node::NodeConfig::forward_ports`); none without a
+    /// node. Missing from the reports of a process from before other ports
+    /// could be opened, which opens none of them, whatever the settings say.
+    /// None of them is in it before the node has its netmap, nor ones
+    /// opened to the node as another tailnet knew it.
+    #[serde(default)]
+    pub forwarding: Option<Vec<u16>>,
+    /// The node as its tailnet knows it (see `node::Node::membership`), once
+    /// it has its netmap: what `thinkterm tailnet serve add` opens ports to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<String>,
 }
 
 /// Scoped to the build profile like the mux server's socket, so a debug
@@ -162,10 +174,19 @@ mod tests {
             },
             peers: vec![peer()],
             revision: 7,
+            forwarding: Some(vec![22, 5900]),
+            membership: Some("example.ts.net/n1".into()),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"state\":\"connected\""));
         assert_eq!(serde_json::from_str::<Report>(&json).unwrap(), report);
+    }
+
+    #[test]
+    fn a_report_from_before_ports_could_be_opened_says_so() {
+        let old = r#"{"pid":42,"status":{"state":"off"},"peers":[],"revision":3}"#;
+        let report: Report = serde_json::from_str(old).unwrap();
+        assert_eq!(report.forwarding, None);
     }
 
     #[test]

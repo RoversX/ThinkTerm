@@ -14,7 +14,8 @@
 //! for them on a socket, and need nothing of the library. The node also
 //! takes SSH connections from the tailnet to this machine's own sshd when
 //! `thinkterm tailnet up --serve-ssh` said to ([`Settings::serve_ssh`]), and
-//! nothing else.
+//! connections to the other ports `thinkterm tailnet serve add` opened, each
+//! handed to the same port here ([`Settings::serve_ports`]); nothing else.
 
 mod settings;
 mod status;
@@ -45,7 +46,9 @@ mod proxy;
 pub use holder::{follow, is_following, is_off};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use keeper::{keep_node, will_hold};
-pub use settings::{load, load_summary, Settings, Summary};
+pub use settings::{
+    load, load_summary, served_ports, Settings, Summary, MAX_SERVED_PORTS, SSH_PORT,
+};
 pub(crate) use status::Family;
 pub use status::{read_live_report, Peer, Report, Status};
 
@@ -121,6 +124,18 @@ const KEY_VERSION: &str = "130";
 /// to start on are not stored unless one could; leaving never needs usable
 /// ones.
 pub fn update(change: impl FnOnce(&mut Settings)) -> Result<Settings> {
+    update_if(|settings| {
+        change(settings);
+        true
+    })?
+    .ok_or_else(|| anyhow::anyhow!("the tailnet settings were not saved"))
+}
+
+/// Changes the settings file as [`update`] does, if `change` -- which sees
+/// the file as it is under the lock -- says to: one it turns down, by
+/// returning false, leaves the file as it was, its revision included, and
+/// gives None.
+pub fn update_if(change: impl FnOnce(&mut Settings) -> bool) -> Result<Option<Settings>> {
     // Serializes this process's read-modify-write of the file; the file
     // lock does the same between processes.
     static SETTINGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -129,8 +144,11 @@ pub fn update(change: impl FnOnce(&mut Settings)) -> Result<Settings> {
         let _guard = SETTINGS.lock().unwrap();
         let _locked = settings::lock_for_update()?;
         let mut settings = settings::load()?;
+        let before = settings.clone();
         let saved_url = settings.control_url.clone();
-        change(&mut settings);
+        if !change(&mut settings) {
+            return Ok(None);
+        }
         settings.normalize();
         // Only an address that is new, or that a node is to start on, has
         // to be one: an address broken by hand does not keep the node on.
@@ -140,6 +158,7 @@ pub fn update(change: impl FnOnce(&mut Settings)) -> Result<Settings> {
                 None => None,
             };
         }
+        settings.close_ports_unless_same_tailnet(&before);
         settings.revision = settings.revision.wrapping_add(1);
         settings::save(&settings)?;
         settings
@@ -149,7 +168,23 @@ pub fn update(change: impl FnOnce(&mut Settings)) -> Result<Settings> {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     holder::settings_changed();
-    Ok(settings)
+    Ok(Some(settings))
+}
+
+/// Whether two control server addresses, as the settings or `--control-url`
+/// give them, name the same server: written another way, or Tailscale's own
+/// named or left out. An address that is none names no server, not even
+/// the same one twice.
+pub fn same_control_server(a: &Option<String>, b: &Option<String>) -> bool {
+    let named = |url: &Option<String>| match url.as_deref() {
+        Some(text) => match control_url_as_kept(text) {
+            Ok(Some(url)) => Some(url),
+            Ok(None) => control_url_as_kept(DEFAULT_CONTROL_SERVER).ok().flatten(),
+            Err(_) => None,
+        },
+        None => control_url_as_kept(DEFAULT_CONTROL_SERVER).ok().flatten(),
+    };
+    matches!((named(a), named(b)), (Some(a), Some(b)) if a == b)
 }
 
 /// A control server's address as the settings keep it: None for
@@ -352,6 +387,25 @@ fn through_holder_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_control_server_is_the_same_however_it_is_written() {
+        let url = |text: &str| Some(text.to_string());
+        assert!(same_control_server(
+            &url("https://headscale.example.com"),
+            &url("headscale.example.com/")
+        ));
+        assert!(same_control_server(&None, &url("https://controlplane.tailscale.com")));
+        assert!(same_control_server(&None, &url("  ")));
+        assert!(same_control_server(&None, &None));
+        assert!(!same_control_server(&None, &url("https://headscale.example.com")));
+        assert!(!same_control_server(
+            &url("https://a.example.com"),
+            &url("https://b.example.com")
+        ));
+        // No server at all is not the same as itself.
+        assert!(!same_control_server(&url("http://a.example.com"), &url("http://a.example.com")));
+    }
 
     #[test]
     fn control_urls_get_a_scheme_when_typed_without() {

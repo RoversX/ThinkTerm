@@ -1,8 +1,8 @@
 //! `tailnet.json`: whether this machine joins, whether the tailnet may SSH
-//! into it, and the secrets that make it the same node every time. It sits
-//! beside the SSH host catalog and its encryption key, and the auth key and
-//! the node's keys are encrypted with that key the same way host passwords
-//! are.
+//! into it or reach other ports of it, and the secrets that make it the same
+//! node every time. It sits beside the SSH host catalog and its encryption
+//! key, and the auth key and the node's keys are encrypted with that key the
+//! same way host passwords are.
 //!
 //! On Windows that is in the local half of the profile
 //! (`%LOCALAPPDATA%\ThinkTerm\ssh`), which a roaming profile does not copy
@@ -31,6 +31,16 @@ pub struct Settings {
     /// machine's own sshd: what `thinkterm tailnet up` turns on, for a
     /// machine nobody sits at. The app's switch never does.
     pub serve_ssh: bool,
+    /// Other TCP ports the node takes connections on from the tailnet, each
+    /// handed to the same port on this machine -- a VNC server's, say: what
+    /// `thinkterm tailnet serve add` opens, and the app never does. They
+    /// stay open only while the tailnet stays on, on the same control
+    /// server (see [`Settings::close_ports_unless_same_tailnet`]).
+    pub serve_ports: Vec<u16>,
+    /// The node, as its tailnet knew it, `serve_ports` were opened to (see
+    /// `node::NodeConfig::ports_opened_to`): the same keys let into another
+    /// tailnet take in none of them. None without ports.
+    pub serve_ports_to: Option<String>,
     /// The control server; None is Tailscale's own.
     pub control_url: Option<String>,
     /// The name to ask the tailnet for; None is one made from the machine's
@@ -61,12 +71,47 @@ impl Settings {
                 .map(|text| text.trim().to_string())
                 .filter(|text| !text.is_empty());
         }
+        self.serve_ports = served_ports(&self.serve_ports);
+        if self.serve_ports.is_empty() {
+            self.serve_ports_to = None;
+        }
+    }
+
+    /// The ports the node takes in: SSH's while `serve_ssh` says so, and
+    /// the ones `serve_ports` opens. Sorted, each once.
+    pub fn forwarded_ports(&self) -> Vec<u16> {
+        let mut ports = served_ports(&self.serve_ports);
+        if self.serve_ssh {
+            ports.push(SSH_PORT);
+            ports.sort_unstable();
+        }
+        ports
+    }
+
+    /// Closes the ports `serve_ports` opened unless the tailnet they were
+    /// opened to goes on as it was `before` this change: on before it and
+    /// after it, on the same control server, as the same node. Turning it
+    /// off -- `down`, Log out, the app's switch -- closes them, and turning
+    /// it on again, pointing it at another server or joining as a new node
+    /// -- whose keys no longer decrypted, say -- opens none: each is opened
+    /// to the tailnet it was opened to, and no other.
+    pub(crate) fn close_ports_unless_same_tailnet(&mut self, before: &Settings) {
+        let same = before.enabled
+            && self.enabled
+            && crate::same_control_server(&before.control_url, &self.control_url)
+            && before.node_keys == self.node_keys;
+        if !same {
+            self.serve_ports.clear();
+            self.serve_ports_to = None;
+        }
     }
 
     pub fn summary(&self) -> Summary {
         Summary {
             enabled: self.enabled,
             serve_ssh: self.serve_ssh,
+            serve_ports: self.serve_ports.clone(),
+            serve_ports_to: self.serve_ports_to.clone(),
             control_url: self.control_url.clone(),
             hostname: self.hostname.clone(),
             has_auth_key: self.auth_key.is_some(),
@@ -82,12 +127,37 @@ impl std::fmt::Debug for Settings {
     }
 }
 
+/// SSH's port, which `serve_ssh` alone opens.
+pub const SSH_PORT: u16 = 22;
+
+/// The most ports `serve_ports` opens: each costs the node a listener on
+/// each of its addresses, with buffers of their own, before anything
+/// connects.
+pub const MAX_SERVED_PORTS: usize = 16;
+
+/// `ports` as `serve_ports` keeps them: sorted, each once, no more than
+/// MAX_SERVED_PORTS, and without 0 -- no port -- or SSH's, which
+/// `serve_ssh` opens. A file edited by hand opens no more than that either.
+pub fn served_ports(ports: &[u16]) -> Vec<u16> {
+    let mut ports: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|&port| port != 0 && port != SSH_PORT)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports.truncate(MAX_SERVED_PORTS);
+    ports
+}
+
 /// The settings without their secrets, read without decrypting them: what
 /// a page shows, and all a process needs to know whether it holds the node.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     pub enabled: bool,
     pub serve_ssh: bool,
+    pub serve_ports: Vec<u16>,
+    pub serve_ports_to: Option<String>,
     pub control_url: Option<String>,
     pub hostname: Option<String>,
     pub has_auth_key: bool,
@@ -102,6 +172,14 @@ struct Stored {
     enabled: bool,
     #[serde(default)]
     serve_ssh: bool,
+    #[serde(
+        default,
+        deserialize_with = "ports_or_none",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    serve_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    serve_ports_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     control_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +190,14 @@ struct Stored {
     node_keys: Option<String>,
     #[serde(default)]
     revision: u64,
+}
+
+/// The ports the file names, or none where it names them wrong -- null, a
+/// word, a number no port has: the rest of the file is read all the same,
+/// for one that cannot be read cannot be turned off either.
+fn ports_or_none<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u16>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 pub(crate) fn path() -> Result<PathBuf> {
@@ -289,6 +375,8 @@ pub(crate) fn load_from(path: &Path, decrypt: impl Fn(&str) -> Option<String>) -
     Ok(Settings {
         enabled: stored.enabled,
         serve_ssh: stored.serve_ssh,
+        serve_ports: served_ports(&stored.serve_ports),
+        serve_ports_to: stored.serve_ports_to,
         control_url: stored.control_url,
         hostname: stored.hostname,
         auth_key: stored.auth_key.as_deref().and_then(&decrypt),
@@ -305,6 +393,8 @@ pub(crate) fn save_to(
     let stored = Stored {
         enabled: settings.enabled,
         serve_ssh: settings.serve_ssh,
+        serve_ports: settings.serve_ports.clone(),
+        serve_ports_to: settings.serve_ports_to.clone(),
         control_url: settings.control_url.clone(),
         hostname: settings.hostname.clone(),
         auth_key: settings.auth_key.as_deref().map(&encrypt).transpose()?,
@@ -390,12 +480,148 @@ mod tests {
     }
 
     #[test]
+    fn a_file_from_before_ports_opens_none_and_one_edited_by_hand_no_more_than_it_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tailnet.json");
+        std::fs::write(&path, r#"{"enabled":true,"serve_ssh":true}"#).unwrap();
+        let settings = load_from(&path, unseal).unwrap();
+        assert!(settings.serve_ports.is_empty());
+        assert_eq!(settings.forwarded_ports(), [22]);
+
+        let many: Vec<String> = (6000..6040).map(|port| port.to_string()).collect();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"enabled":true,"serve_ports":[5902,0,22,5900,5902,{}]}}"#,
+                many.join(",")
+            ),
+        )
+        .unwrap();
+        let settings = load_from(&path, unseal).unwrap();
+        assert_eq!(settings.serve_ports.len(), MAX_SERVED_PORTS);
+        assert_eq!(settings.serve_ports[..3], [5900, 5902, 6000]);
+        // SSH's port stays closed without serve_ssh, whatever the file says.
+        assert!(!settings.forwarded_ports().contains(&SSH_PORT));
+    }
+
+    #[test]
+    fn ssh_and_the_ports_opened_are_taken_in_sorted_and_once() {
+        let settings = Settings {
+            enabled: true,
+            serve_ssh: true,
+            serve_ports: vec![5902, 5900, 5902],
+            ..Settings::default()
+        };
+        assert_eq!(settings.forwarded_ports(), [22, 5900, 5902]);
+        let settings = Settings {
+            serve_ssh: false,
+            ..settings
+        };
+        assert_eq!(settings.forwarded_ports(), [5900, 5902]);
+        assert!(Settings::default().forwarded_ports().is_empty());
+    }
+
+    #[test]
+    fn ports_stay_open_only_to_the_tailnet_they_were_opened_to() {
+        let before = Settings {
+            enabled: true,
+            serve_ports: vec![5900],
+            control_url: Some("https://headscale.example.com/".into()),
+            node_keys: Some("keys-a".into()),
+            ..Settings::default()
+        };
+        let left = |after: Settings| {
+            let mut after = after;
+            after.close_ports_unless_same_tailnet(&before);
+            after.serve_ports
+        };
+        // On before and after, on the same server as the same node: a new
+        // name, say, or the server written another way.
+        assert_eq!(
+            left(Settings {
+                hostname: Some("server-b".into()),
+                ..before.clone()
+            }),
+            [5900]
+        );
+        assert_eq!(
+            left(Settings {
+                control_url: Some("https://headscale.example.com".into()),
+                ..before.clone()
+            }),
+            [5900]
+        );
+        // Turned off: down, Log out, the app's switch.
+        assert!(left(Settings {
+            enabled: false,
+            ..before.clone()
+        })
+        .is_empty());
+        let mut off = Settings {
+            enabled: false,
+            serve_ports_to: Some("example.ts.net/n1".into()),
+            ..before.clone()
+        };
+        off.close_ports_unless_same_tailnet(&before);
+        assert_eq!(off.serve_ports_to, None);
+        // Pointed at another control server, Tailscale's own included.
+        assert!(left(Settings {
+            control_url: None,
+            ..before.clone()
+        })
+        .is_empty());
+        // Tailscale's own, left out or named, is the one server.
+        let on_tailscale = Settings {
+            control_url: None,
+            ..before.clone()
+        };
+        let mut named = Settings {
+            control_url: Some("https://controlplane.tailscale.com".into()),
+            ..on_tailscale.clone()
+        };
+        named.close_ports_unless_same_tailnet(&on_tailscale);
+        assert_eq!(named.serve_ports, [5900]);
+        // Joining as another node: keys made anew.
+        assert!(left(Settings {
+            node_keys: Some("keys-b".into()),
+            ..before.clone()
+        })
+        .is_empty());
+        // Turned on again, from a file that still named ports.
+        let mut on_again = before.clone();
+        on_again.close_ports_unless_same_tailnet(&Settings {
+            enabled: false,
+            ..before.clone()
+        });
+        assert!(on_again.serve_ports.is_empty());
+    }
+
+    #[test]
+    fn ports_written_wrong_open_none_and_leave_the_file_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tailnet.json");
+        for ports in ["null", "\"5900\"", "[5900,\"vnc\"]", "[70000]", "{}"] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"enabled":false,"serve_ssh":true,"serve_ports":{ports}}}"#),
+            )
+            .unwrap();
+            let settings = load_from(&path, unseal).unwrap();
+            assert!(settings.serve_ports.is_empty(), "{ports}");
+            // The rest is read as it was written: the switch among it.
+            assert!(!settings.enabled && settings.serve_ssh, "{ports}");
+        }
+    }
+
+    #[test]
     fn secrets_are_written_sealed_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tailnet.json");
         let settings = Settings {
             enabled: true,
             serve_ssh: true,
+            serve_ports: vec![5900, 5902],
+            serve_ports_to: Some("example.ts.net/n1".into()),
             control_url: Some("https://headscale.example.com".into()),
             hostname: Some("server-a".into()),
             auth_key: Some("tskey-example".into()),
