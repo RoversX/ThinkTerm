@@ -9,6 +9,7 @@ use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
 use config::{ConfigSubscription, NotificationHandling};
 use mux::client::ClientId;
 use mux::domain::DomainId;
+use mux::pane::PaneId;
 use mux::tab::TabId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
@@ -364,6 +365,20 @@ impl GuiFrontEnd {
 
                     if let Some((_domain, window_id, tab_id)) = mux.resolve_pane_id(pane_id) {
                         let config = config::configuration();
+                        // Programs told never to show are not news on the bell
+                        // either.
+                        if !matches!(
+                            config.notification_handling,
+                            NotificationHandling::NeverShow
+                        ) {
+                            let said = match &title {
+                                Some(title) if !title.trim().is_empty() => {
+                                    format!("{title}: {body}")
+                                }
+                                _ => body.clone(),
+                            };
+                            mark_thread_alerted(pane_id, Some(said));
+                        }
                         // Nothing focused yet, as in a window not clicked
                         // since it opened, suppresses nothing.
                         let focused = mux.resolve_focused_pane(&client_id);
@@ -397,8 +412,18 @@ impl GuiFrontEnd {
                     }
                 }
                 MuxNotification::Alert {
+                    pane_id,
+                    alert: Alert::Bell,
+                } => {
+                    // The beep and the visual bell are the window's, via
+                    // TermWindowNotif. A pane nobody is looking at also marks
+                    // its thread on the notification bell, whichever window
+                    // (if any) shows it.
+                    mark_thread_alerted(pane_id, None);
+                }
+                MuxNotification::Alert {
                     pane_id: _,
-                    alert: Alert::Bell | Alert::Progress(_),
+                    alert: Alert::Progress(_),
                 } => {
                     // Handled via TermWindowNotif; NOP it here.
                 }
@@ -1379,6 +1404,20 @@ impl GuiFrontEnd {
 
 thread_local! {
     static FRONT_END: RefCell<Option<Rc<GuiFrontEnd>>> = RefCell::new(None);
+}
+
+/// Mark `pane_id`'s thread on the notification bell for a bell or a
+/// program's notification, on the main thread: alerts arrive on whichever
+/// thread read them, and the windows repaint from there.
+fn mark_thread_alerted(pane_id: PaneId, message: Option<String>) {
+    promise::spawn::spawn_into_main_thread(async move {
+        if crate::workspace_threads::note_pane_alert(pane_id, message.as_deref()) {
+            if let Some(front_end) = try_front_end() {
+                front_end.invalidate_all_windows();
+            }
+        }
+    })
+    .detach();
 }
 
 pub fn try_front_end() -> Option<Rc<GuiFrontEnd>> {

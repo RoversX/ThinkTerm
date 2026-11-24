@@ -7074,8 +7074,16 @@ impl super::TermWindow {
                     };
                     // What the thread's program said beats where the thread
                     // lives: the reason is what decides which to open first.
-                    let label = match crate::agent_status::thread_reason(&notification.thread_id)
-                    {
+                    // An agent's reason first while its work is the news,
+                    // then a notification's text. A wait already
+                    // acknowledged is not why the thread is back.
+                    let reason = if notification.work_news {
+                        crate::agent_status::thread_reason(&notification.thread_id)
+                            .or(notification.alert)
+                    } else {
+                        notification.alert
+                    };
+                    let label = match reason {
                         Some(reason) => format!("{} — {reason}", notification.thread_name),
                         None => format!(
                             "{} — {} · {}",

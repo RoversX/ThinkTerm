@@ -276,6 +276,12 @@ pub struct WorkspaceThread {
     /// a keypress acknowledges it. Replaced on each scan, cleared on exit.
     #[serde(skip)]
     pub work_waiting_panes: HashMap<PaneId, WorkMoment>,
+    /// A program in the thread rang the bell or posted a notification
+    /// (BEL, OSC 9, OSC 777) while the thread was not in front of anyone:
+    /// what it said, empty for a bare bell. On the notification bell until
+    /// the thread is acknowledged.
+    #[serde(skip)]
+    pub work_alert: Option<String>,
     #[serde(default)]
     pub work_finished_unseen: bool,
 }
@@ -622,21 +628,31 @@ pub struct ThreadWorkNotification {
     pub thread_id: WorkspaceThreadId,
     pub thread_name: String,
     pub status: WorkspaceThreadWorkStatus,
+    /// What a program in the thread said when it rang or notified, if it
+    /// said anything.
+    pub alert: Option<String>,
+    /// Whether the thread's own work is news here -- a wait not yet
+    /// acknowledged, or work finished unseen -- and not only an alert. Only
+    /// then does an agent's reason speak for the entry: after a wait is
+    /// acknowledged, its question is old news beside a new notification.
+    pub work_news: bool,
 }
 
 /// What puts a thread on the notification bell, each part on its own: the
-/// Dock counts them by kind.
+/// Dock counts them by kind, and the bell's list says which spoke.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PendingNotice {
     /// A wait the user has not acknowledged.
     waiting: bool,
+    /// A bell or a program's notification.
+    alert: bool,
     /// Work that finished unseen.
     finished: bool,
 }
 
 impl PendingNotice {
     fn any(self) -> bool {
-        self.waiting || self.finished
+        self.waiting || self.alert || self.finished
     }
 }
 
@@ -3627,13 +3643,15 @@ fn notify_system(
 
 /// The moments an unseen thread's status stands for, if it is unseen work.
 /// The moments a thread's notice stands for. `attention` is what its waiting
-/// panes wait with.
+/// panes wait with; a bell or a program's notification asks for the user as
+/// a question does, so it counts as needing input.
 fn unseen_work_moments(notice: PendingNotice, attention: WorkMoments) -> WorkMoments {
     let mut moments = if notice.waiting {
         attention
     } else {
         no_work_moments()
     };
+    moments.needs_input |= notice.alert;
     moments.finished |= notice.finished;
     moments
 }
@@ -3803,6 +3821,54 @@ fn panes_are_in_front(panes: &[PaneId]) -> bool {
         .map(|positioned| positioned.pane.pane_id())
         .collect();
     panes.iter().all(|pane| shown.contains(pane))
+}
+
+/// The most of a program's notification the bell's list keeps.
+const ALERT_MESSAGE_MAX_CHARS: usize = 160;
+
+/// A program in `pane_id` rang the bell (BEL) or posted a notification
+/// (OSC 9, OSC 777): unless its thread is in front of someone, mark the
+/// thread so the notification bell lights. `message` is what it said, if
+/// anything. Whether the bell changed.
+pub fn note_pane_alert(pane_id: PaneId, message: Option<&str>) -> bool {
+    let mux = Mux::get();
+    let Some((_domain, window_id, _tab)) = mux.resolve_pane_id(pane_id) else {
+        return false;
+    };
+    // A known agent's own state already puts its thread on the bell when it
+    // waits or finishes. Its bells and notifications say the same (Claude
+    // Code's reminder after a minute idle, say), and must not bring back a
+    // wait or a result the user already acknowledged.
+    let speaks_through_status = mux.get_pane(pane_id).is_some_and(|pane| {
+        crate::agent_status::enabled()
+            && crate::agent_status::agent_work_status(pane.as_ref()).is_some()
+    });
+    if speaks_through_status {
+        return false;
+    }
+    let Some(workspace) = mux
+        .get_window(window_id)
+        .map(|window| window.get_workspace().to_string())
+    else {
+        return false;
+    };
+    if panes_are_in_front(&[pane_id]) {
+        return false;
+    }
+    let message: String = message
+        .and_then(|message| message.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(ALERT_MESSAGE_MAX_CHARS)
+        .collect();
+    let changed = THREAD_STORE
+        .lock()
+        .note_thread_alert_for_workspace(&workspace, &message);
+    if changed {
+        publish_thinkterm_session_changed();
+    }
+    changed
 }
 
 pub fn refresh_all_thread_work() -> bool {
@@ -9626,6 +9692,7 @@ impl WorkspaceThreadStore {
             work_needs_attention: bool,
             work_attention_acknowledged: bool,
             work_waiting_panes: HashMap<PaneId, WorkMoment>,
+            work_alert: Option<String>,
             work_finished_unseen: bool,
         }
 
@@ -9652,6 +9719,7 @@ impl WorkspaceThreadStore {
                         work_needs_attention: thread.work_needs_attention,
                         work_attention_acknowledged: thread.work_attention_acknowledged,
                         work_waiting_panes: thread.work_waiting_panes.clone(),
+                        work_alert: thread.work_alert.clone(),
                         work_finished_unseen: thread.work_finished_unseen,
                     },
                 );
@@ -9713,6 +9781,7 @@ impl WorkspaceThreadStore {
                             work_waiting_panes: state
                                 .map(|state| state.work_waiting_panes.clone())
                                 .unwrap_or_default(),
+                            work_alert: state.and_then(|state| state.work_alert.clone()),
                             work_finished_unseen: state
                                 .map_or(false, |state| state.work_finished_unseen),
                         }
@@ -9869,6 +9938,7 @@ impl WorkspaceThreadStore {
             work_waiting_panes: local
                 .map(|thread| thread.work_waiting_panes.clone())
                 .unwrap_or_default(),
+            work_alert: local.and_then(|thread| thread.work_alert.clone()),
             work_finished_unseen: local.map_or(false, |thread| thread.work_finished_unseen),
         };
         // The server's landing project says `~`; a local project path has
@@ -10106,6 +10176,23 @@ impl WorkspaceThreadStore {
             .is_some_and(|session| std::mem::take(&mut session.work_finished_unseen))
     }
 
+    /// A program in `workspace`'s thread rang or posted a notification.
+    fn note_thread_alert_for_workspace(&mut self, workspace: &str, message: &str) -> bool {
+        let Some(session) = self.thread_for_workspace_mut(workspace) else {
+            return false;
+        };
+        // A bare bell after a notification keeps what the notification said.
+        let alert = match &session.work_alert {
+            Some(said) if message.is_empty() => said.clone(),
+            _ => message.to_string(),
+        };
+        if session.work_alert.as_ref() == Some(&alert) {
+            return false;
+        }
+        session.work_alert = Some(alert);
+        true
+    }
+
     fn acknowledge_thread_work_for_workspace(
         &mut self,
         workspace: &str,
@@ -10152,6 +10239,7 @@ impl WorkspaceThreadStore {
                 .unwrap_or_default();
             for session in &project.threads {
                 if let Some(status) = session.notification_status() {
+                    let notice = session.pending_notice();
                     notifications.push(ThreadWorkNotification {
                         space_id: project.space_id.clone(),
                         space_name: space_name.clone(),
@@ -10159,6 +10247,8 @@ impl WorkspaceThreadStore {
                         thread_id: session.id.clone(),
                         thread_name: session.name.clone(),
                         status,
+                        alert: session.work_alert.clone().filter(|alert| !alert.is_empty()),
+                        work_news: notice.waiting || notice.finished,
                     });
                 }
             }
@@ -10782,6 +10872,7 @@ impl WorkspaceThread {
             work_needs_attention: false,
             work_attention_acknowledged: false,
             work_waiting_panes: Default::default(),
+            work_alert: None,
             work_finished_unseen: false,
         }
     }
@@ -10806,6 +10897,7 @@ impl WorkspaceThread {
             work_needs_attention: false,
             work_attention_acknowledged: false,
             work_waiting_panes: Default::default(),
+            work_alert: None,
             work_finished_unseen: false,
         }
     }
@@ -10823,11 +10915,11 @@ impl WorkspaceThread {
     }
 
     /// What the notification bell holds for the thread -- its red dot, its
-    /// list, the Dock count: a wait nobody acknowledged yet
-    /// (`NeedsAttention`), else work that finished unseen.
+    /// list, the Dock count: a wait nobody acknowledged yet or a program
+    /// that rang (both `NeedsAttention`), else work that finished unseen.
     fn notification_status(&self) -> Option<WorkspaceThreadWorkStatus> {
         let notice = self.pending_notice();
-        if notice.waiting {
+        if notice.waiting || notice.alert {
             Some(WorkspaceThreadWorkStatus::NeedsAttention)
         } else if notice.finished {
             Some(WorkspaceThreadWorkStatus::FinishedUnseen)
@@ -10839,18 +10931,20 @@ impl WorkspaceThread {
     fn pending_notice(&self) -> PendingNotice {
         PendingNotice {
             waiting: self.work_needs_attention && !self.work_attention_acknowledged,
+            alert: self.work_alert.is_some(),
             finished: self.work_finished_unseen && !self.work_is_running,
         }
     }
 
-    /// The user has seen the thread: what it finished and the wait it is
-    /// in. A wait stays the thread's state -- the agent still
+    /// The user has seen the thread: what it finished, why it rang, and the
+    /// wait it is in. A wait stays the thread's state -- the agent still
     /// waits -- but leaves the bell until it changes (see
     /// `work_attention_acknowledged`). Whether the store needs saving.
     fn acknowledge_work(&mut self) -> bool {
         if self.work_needs_attention {
             self.work_attention_acknowledged = true;
         }
+        self.work_alert = None;
         std::mem::take(&mut self.work_finished_unseen)
     }
 
@@ -15082,6 +15176,75 @@ mod tests {
         assert_eq!(thread.work_status(), Status::NeedsAttention);
     }
 
+    /// A bell or a program's notification marks its thread until the
+    /// thread is acknowledged, with what the program said.
+    #[test]
+    fn a_bell_or_notification_puts_its_thread_on_the_bell() {
+        use WorkspaceThreadWorkStatus as Status;
+        let mut store = work_store_with_one_thread();
+        assert!(!store.note_thread_alert_for_workspace("no-such-workspace", ""));
+        assert_eq!(store.pending_work_notification_count(), 0);
+
+        assert!(store.note_thread_alert_for_workspace("workspace-1", "Build finished"));
+        let notifications = store.pending_work_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].status, Status::NeedsAttention);
+        assert_eq!(notifications[0].alert.as_deref(), Some("Build finished"));
+        // An alert is news, not a state: the row's own status is untouched.
+        assert_eq!(store.projects[0].threads[0].work_status(), Status::Idle);
+
+        // A bare bell after it keeps what the notification said; the same
+        // notification again changes nothing.
+        assert!(!store.note_thread_alert_for_workspace("workspace-1", ""));
+        assert!(!store.note_thread_alert_for_workspace("workspace-1", "Build finished"));
+        assert_eq!(
+            store.pending_work_notifications()[0].alert.as_deref(),
+            Some("Build finished")
+        );
+
+        // Scans of an idle or running thread do not clear it ...
+        store.observe_thread_work_for_workspace("workspace-1", Status::Running, &[]);
+        store.observe_thread_work_for_workspace("workspace-1", Status::Idle, &[]);
+        assert!(store.projects[0].threads[0].work_alert.is_some());
+
+        // ... an acknowledgement does.
+        let change = store.acknowledge_thread_work_for_workspace("workspace-1");
+        assert!(change.changed);
+        assert_eq!(store.pending_work_notification_count(), 0);
+
+        // A bare bell lists without a message.
+        assert!(store.note_thread_alert_for_workspace("workspace-1", ""));
+        assert_eq!(store.pending_work_notifications()[0].alert, None);
+        let thread_id = store.projects[0].threads[0].id.clone();
+        assert!(store.acknowledge_thread_work_for_thread(&thread_id).changed);
+        assert_eq!(store.pending_work_notification_count(), 0);
+    }
+
+    /// The bell's list lets an agent's reason speak only while its work is
+    /// the news: back on the bell for a notification alone, the thread
+    /// shows what was notified, not the question already acknowledged.
+    #[test]
+    fn an_alert_after_an_acknowledged_wait_is_the_news_not_the_wait() {
+        use WorkspaceThreadWorkStatus as Status;
+        let mut store = work_store_with_one_thread();
+        let waiting = [(4, WorkMoment::NeedsInput)];
+        store.observe_thread_work_for_workspace("workspace-1", Status::NeedsAttention, &waiting);
+        assert!(store.pending_work_notifications()[0].work_news);
+
+        store.acknowledge_thread_work_for_workspace("workspace-1");
+        store.note_thread_alert_for_workspace("workspace-1", "Tests passed");
+        let notifications = store.pending_work_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert!(!notifications[0].work_news);
+        assert_eq!(notifications[0].alert.as_deref(), Some("Tests passed"));
+
+        // Finished unseen work is the thread's own news again.
+        store.acknowledge_thread_work_for_workspace("workspace-1");
+        store.observe_thread_work_for_workspace("workspace-1", Status::Running, &[]);
+        store.observe_thread_work_for_workspace("workspace-1", Status::Idle, &[]);
+        assert!(store.pending_work_notifications()[0].work_news);
+    }
+
     /// A run remembers every pane that worked in it, so its end can be
     /// judged seen only if all of them were on screen.
     #[test]
@@ -15420,6 +15583,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A shell that rings or posts a notification is on the Dock as a
+    /// question is, though no pane of it waits; an acknowledged wait beside
+    /// it does not lend it its own kind.
+    #[test]
+    fn the_dock_counts_a_programs_alert_as_needing_input() {
+        let alert = PendingNotice {
+            alert: true,
+            ..Default::default()
+        };
+        let moments = unseen_work_moments(alert, no_work_moments());
+        assert_eq!(
+            first_work_moment(moments, |m| m == WorkMoment::NeedsInput),
+            Some(WorkMoment::NeedsInput)
+        );
+        let error_only = |m| m == WorkMoment::Error;
+        let attention = collect_work_moments([WorkMoment::Error]);
+        assert_eq!(
+            first_work_moment(unseen_work_moments(alert, attention), error_only),
+            None,
+            "the waiting panes' kinds count only for a wait not yet acknowledged"
+        );
+
+        let mut store = work_store_with_one_thread();
+        store.note_thread_alert_for_workspace("workspace-1", "");
+        assert_eq!(store.projects[0].threads[0].pending_notice(), alert);
     }
 
     #[test]
