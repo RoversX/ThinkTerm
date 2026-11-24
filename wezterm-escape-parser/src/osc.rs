@@ -997,7 +997,8 @@ impl ProgramStatus {
     fn parse(osc: &[&[u8]]) -> Result<Self> {
         ensure!(osc.len() >= 2, "program status without a body");
         // No value may contain `;`, so a body the parser split on one is
-        // put back together and its broken pair skipped like any other.
+        // put back together and its broken pair skipped like any other --
+        // unless it hides an `id`, see below.
         let body = osc[1..].join(&b';');
         // `ESC ] 7501 ;` before the body and `ESC \` after it.
         ensure!(
@@ -1013,13 +1014,45 @@ impl ProgramStatus {
         let (mut state, mut id, mut kind, mut progress) = (None, None, None, None);
         let (mut app, mut title, mut msg) = (None, None, None);
         for pair in body.split(':') {
-            // A pair without `=` is malformed and skipped; the rest of the
-            // report still counts.
+            // An `id` the report hides -- written without `=`, or behind a
+            // stray `;` inside another pair -- costs the report. Skipped like
+            // any malformed pair, it would turn the report into one about
+            // the root record, and with `clear` into one removing every
+            // record.
+            fn key_of(part: &str) -> &str {
+                part.split_once('=').map_or(part, |(key, _)| key).trim()
+            }
+            let mut parts = pair.split(';');
+            let first = parts.next().unwrap_or_default();
+            ensure!(
+                first.trim() != "id" && parts.all(|part| key_of(part) != "id"),
+                "program status with a hidden id"
+            );
+            // A malformed pair -- no `=`, an empty key, a byte outside the
+            // value set -- is skipped; the rest of the report still counts.
             let Some((key, value)) = pair.split_once('=') else {
                 continue;
             };
             let (key, value) = (key.trim(), value.trim());
+            if key.is_empty() {
+                continue;
+            }
             ensure!(key.len() <= Self::MAX_KEY, "program status key too long");
+            // Limits before the value set: a value past one costs the report
+            // even when a stray byte makes it malformed as well.
+            let limit = match key {
+                "app" => Self::MAX_NAME,
+                "title" => Self::MAX_TITLE.0,
+                "msg" => Self::MAX_MSG.0,
+                _ => usize::MAX,
+            };
+            ensure!(value.len() <= limit, "program status {key} too long");
+            // Except a broken `id`: skipped, it would turn the report into
+            // one about the root record and overwrite that. Kept, it fails
+            // the id grammar and the report is ignored.
+            if key != "id" && !value.bytes().all(Self::is_value_byte) {
+                continue;
+            }
             // A repeated key: the last one wins.
             match key {
                 "state" => state = Some(value),
@@ -1043,7 +1076,9 @@ impl ProgramStatus {
             Some("clear") => ProgramState::Clear,
             other => bail!("program status state {:?}", other),
         };
-        let id = match id.filter(|id| !id.is_empty()) {
+        // An empty `id` fails the grammar like any other bad one; it does
+        // not mean the root record.
+        let id = match id {
             Some(id) => {
                 ensure!(
                     id.len() <= Self::MAX_ID
@@ -1056,13 +1091,10 @@ impl ProgramStatus {
             }
             None => None,
         };
-        let app = match app.filter(|app| !app.is_empty()) {
-            Some(app) => {
-                ensure!(Self::is_name(app), "program status app {:?}", app);
-                Some(app.to_string())
-            }
-            None => None,
-        };
+        // An `app` past its limit already cost the report; one with a
+        // character outside its own set is treated as absent. It was still
+        // the last value, so `app=omp:app=a/b` leaves no app at all.
+        let app = app.filter(|app| Self::is_name(app)).map(str::to_string);
         let kind = match (state, kind) {
             (ProgramState::Blocked, Some("permission")) => Some(ProgramBlockedKind::Permission),
             (ProgramState::Blocked, Some("question")) => Some(ProgramBlockedKind::Question),
@@ -1070,7 +1102,9 @@ impl ProgramStatus {
             _ => None,
         };
         let progress = match state {
+            // Digits only: `parse` would also take a sign, as in `+40`.
             ProgramState::Working | ProgramState::Blocked => progress
+                .filter(|value| value.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|value| value.parse::<u8>().ok())
                 .filter(|pct| *pct <= 100),
             _ => None,
@@ -1095,8 +1129,17 @@ impl ProgramStatus {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
     }
 
+    /// The value set, `[A-Za-z0-9_.,+/=-]`.
+    fn is_value_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b',' | b'+' | b'/' | b'=' | b'-')
+    }
+
     /// Standard base64 with optional padding, holding UTF-8 without a
-    /// single control character. Anything else costs the whole report.
+    /// single control character. Anything else that gets here costs the
+    /// whole report: inside the value set but not standard base64 (such as
+    /// base64url), past a limit, or holding a control character. A value
+    /// with a byte outside the set never gets here; it was skipped as a
+    /// malformed pair.
     fn decode_text(value: Option<&str>, limits: (usize, usize)) -> Result<Option<String>> {
         use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
         let Some(value) = value.filter(|value| !value.is_empty()) else {
@@ -2087,6 +2130,44 @@ mod test {
             }))
         );
 
+        // A pair with a byte outside the value set is skipped, so it neither
+        // sets its key nor wins over an earlier one; an `app` outside its own
+        // set is absent, and a signed progress is no progress.
+        assert_eq!(
+            parse(
+                &[
+                    "7501",
+                    "state=working:progress=+40:app=claude/code:title=Rml4 IGl0:msg=not*base64:state=sleep",
+                    "ing:future=x y"
+                ],
+                "\x1b]7501;state=working\x1b\\"
+            ),
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Report(ProgramStatusReport {
+                state: ProgramState::Working,
+                id: None,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                msg: None,
+            }))
+        );
+        assert_eq!(
+            parse(
+                &["7501", "state=idle:app=claude code"],
+                "\x1b]7501;state=idle\x1b\\"
+            ),
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Report(ProgramStatusReport {
+                state: ProgramState::Idle,
+                id: None,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                msg: None,
+            }))
+        );
+
         // Each of these costs the whole report.
         let msg = base64_encode("x".repeat(2049));
         let control = base64_encode("line\nbreak");
@@ -2094,11 +2175,26 @@ mod test {
             "".to_string(),
             "kind=permission".to_string(),
             "state=sleeping".to_string(),
+            "state=sleep;ing".to_string(),
+            // A broken, empty or hidden id never falls back to the root
+            // record: with `clear` that would remove every record.
+            "state=idle:id=".to_string(),
             "state=idle:id=a b".to_string(),
+            "state=idle:id=a;b".to_string(),
             "state=idle:id=a//b".to_string(),
             "state=idle:id=1/2/3/4/5/6/7/8/9".to_string(),
-            "state=idle:app=claude code".to_string(),
-            "state=idle:msg=not*base64".to_string(),
+            "state=clear:id".to_string(),
+            "state=clear:id;x=1".to_string(),
+            "state=clear:app=omp;id=sub".to_string(),
+            "state=clear:x=1; id =foo".to_string(),
+            "state=done:msg=QQ;id=sub".to_string(),
+            "state=done:kind=x;id".to_string(),
+            // A limit counts even for a value that is malformed as well.
+            format!("state=idle:app={}", "a".repeat(33)),
+            format!("state=idle:app={} b", "a".repeat(41)),
+            format!("state=idle:title={} *", "A".repeat(255)),
+            format!("state=idle:msg={msg} x"),
+            "state=idle:msg=not_base64".to_string(),
             format!("state=idle:msg={control}"),
             format!("state=idle:msg={msg}"),
             format!("state=idle:{}=1", "k".repeat(17)),
@@ -2112,6 +2208,11 @@ mod test {
                 "{body:?} was accepted"
             );
         }
+        // The same hidden id as the OSC parser hands it over, split on `;`.
+        assert!(matches!(
+            OperatingSystemCommand::parse(&[b"7501", b"state=clear:app=omp", b"id=sub"]),
+            OperatingSystemCommand::Unspecified(_)
+        ));
     }
 
     #[test]
