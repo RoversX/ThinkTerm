@@ -117,6 +117,9 @@ pub struct View {
     pub enabled: bool,
     /// `thinkterm tailnet up` let the tailnet's machines SSH into this one.
     pub serves_ssh: bool,
+    /// The other ports `thinkterm tailnet serve add` let them reach, each
+    /// the same port here.
+    pub served_ports: Vec<u16>,
     /// A mux server is running to hold the node; the state and the machines
     /// are its, as it last reported them.
     pub server_running: bool,
@@ -342,6 +345,7 @@ mod imp {
         View {
             enabled: settings.enabled,
             serves_ssh: settings.serve_ssh,
+            served_ports: settings.serve_ports.clone(),
             server_running,
             control_url: settings.control_url.unwrap_or_default(),
             hostname: settings.hostname.unwrap_or_default(),
@@ -626,7 +630,8 @@ mod imp {
 
     /// The switch: on has the mux server join; off has it leave, and closes
     /// the machine to SSH from the tailnet if `thinkterm tailnet up` had
-    /// opened it -- the switch never opens it. Decided on the file as it is
+    /// opened it -- the switch never opens it -- as leaving closes the ports
+    /// `thinkterm tailnet serve add` opened (see `thinkterm_tailnet::update`). Decided on the file as it is
     /// when saved, so two clicks before the first is in make two changes.
     pub fn toggle() {
         change(|settings| {

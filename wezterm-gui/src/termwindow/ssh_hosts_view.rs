@@ -6080,6 +6080,21 @@ impl SshHostsView {
                 palette.muted_text,
             ));
         }
+        if view.enabled && !view.served_ports.is_empty() {
+            let ports = view
+                .served_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            notes.push((
+                wrap(
+                    &tr_named("ssh-tailscale-serving-ports", &[("ports", ports)]),
+                    inner,
+                ),
+                palette.muted_text,
+            ));
+        }
         if let Some(error) = &view.error {
             notes.push((
                 wrap(

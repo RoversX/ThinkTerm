@@ -758,6 +758,7 @@ ssh-tailscale-state-failed = Нет подключения: { $error }
 ssh-tailscale-state-elsewhere = Узел занят другим процессом ThinkTerm на этом компьютере.
 ssh-tailscale-server-not-running = Фоновая служба подключения к tailnet не запущена; запускается…
 ssh-tailscale-serving-ssh = Компьютеры tailnet могут подключаться сюда по SSH (thinkterm tailnet up).
+ssh-tailscale-serving-ports = Компьютеры tailnet могут подключаться к этим портам этого компьютера: { $ports } (thinkterm tailnet serve).
 ssh-tailscale-save-error = Не сохранено: { $error }
 ssh-tailscale-read-error = Не удалось прочитать настройки: { $error }
 ssh-tailscale-unreadable = Настройки недоступны

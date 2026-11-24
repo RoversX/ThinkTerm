@@ -776,6 +776,7 @@ ssh-tailscale-state-failed = Nicht verbunden: { $error }
 ssh-tailscale-state-elsewhere = Ein anderer ThinkTerm-Prozess auf diesem Computer hält dessen Knoten.
 ssh-tailscale-server-not-running = Der Hintergrunddienst, der dem Tailnet beitritt, läuft nicht; er wird gestartet …
 ssh-tailscale-serving-ssh = Rechner im Tailnet können sich per SSH mit diesem verbinden (thinkterm tailnet up).
+ssh-tailscale-serving-ports = Rechner im Tailnet erreichen diese Ports dieses Rechners: { $ports } (thinkterm tailnet serve).
 ssh-tailscale-save-error = Nicht gespeichert: { $error }
 ssh-tailscale-read-error = Die Einstellungen konnten nicht gelesen werden: { $error }
 ssh-tailscale-unreadable = Einstellungen unlesbar

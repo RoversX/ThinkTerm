@@ -761,6 +761,7 @@ ssh-tailscale-state-failed = 未接続: { $error }
 ssh-tailscale-state-elsewhere = このコンピュータの別の ThinkTerm プロセスがノードを使用中です。
 ssh-tailscale-server-not-running = tailnet に参加するバックグラウンドサービスが動いていません。起動しています…
 ssh-tailscale-serving-ssh = tailnet のマシンからこのマシンへ SSH できます（thinkterm tailnet up）。
+ssh-tailscale-serving-ports = tailnet のマシンからこのマシンの次のポートに接続できます：{ $ports }（thinkterm tailnet serve）。
 ssh-tailscale-save-error = 保存できませんでした: { $error }
 ssh-tailscale-read-error = 設定ファイルを読めません: { $error }
 ssh-tailscale-unreadable = 設定を読めません
