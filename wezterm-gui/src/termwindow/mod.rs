@@ -2266,6 +2266,12 @@ pub(crate) fn app_has_focus() -> bool {
     FOCUSED_WINDOW.lock().is_some()
 }
 
+/// The window holding the keyboard focus, by its `space_owner_id` (the key
+/// of its `FrontendRecoverySlot::Window`), if a ThinkTerm window does.
+pub(crate) fn focused_window_owner() -> Option<u64> {
+    *FOCUSED_WINDOW.lock()
+}
+
 /// The agents a thread row's hover card lists: those in the thread's
 /// workspace that are up to something. Empty means the row gets no card.
 pub(crate) fn thread_card_agents(item_type: &UIItemType) -> Vec<crate::agent_status::AgentPaneStatus> {
