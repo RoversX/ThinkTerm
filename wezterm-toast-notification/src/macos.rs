@@ -117,8 +117,13 @@ pub fn initialize() {
     }
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        // Badge as well: once the app is registered with Notification
+        // Center, macOS lets the Dock count (`NSDockTile` badge label)
+        // through only with badge permission, and System Settings shows a
+        // Badges switch only for apps that asked for it.
         CENTER.requestAuthorizationWithOptions_completionHandler(
             UNAuthorizationOptions::Alert
+                | UNAuthorizationOptions::Badge
                 | UNAuthorizationOptions::Provisional
                 | UNAuthorizationOptions::Sound,
             &RcBlock::new(|ok: Bool, err| {
