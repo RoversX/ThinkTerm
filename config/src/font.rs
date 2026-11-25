@@ -489,6 +489,98 @@ impl TextStyle {
         }
     }
 
+    /// Make `primary` the main font, when given, and try `fallbacks` right
+    /// after it (see `insert_fallback_families`). The main font replaced
+    /// keeps its attributes for the new one, as `set_primary_family` does;
+    /// when `fallbacks` lists it, it moves there with its own as well.
+    pub fn apply_font_list<S: AsRef<str>>(&mut self, primary: Option<&str>, fallbacks: &[S]) {
+        if let Some(primary) = primary {
+            let displaced = self
+                .font
+                .first()
+                .filter(|configured| {
+                    !configured.family.eq_ignore_ascii_case(primary)
+                        && fallbacks.iter().any(|family| {
+                            family
+                                .as_ref()
+                                .trim()
+                                .eq_ignore_ascii_case(&configured.family)
+                        })
+                })
+                .cloned();
+            self.set_primary_family(primary);
+            // Right after the new one, ahead of any other entry for the
+            // same family, for `insert_fallback_families` to take.
+            if let Some(displaced) = displaced {
+                self.font.insert(1, displaced);
+            }
+        }
+        self.insert_fallback_families(fallbacks);
+    }
+
+    /// Try `families`, in this order, as fallbacks ahead of the ones the
+    /// style has, as a CSS `font-family` list does: a character comes from
+    /// the first of them that has it. Preferred entries stay preferred:
+    /// they are all looked up before any fallback, and one stands in when
+    /// the primary is missing.
+    ///
+    /// A family the list has further down moves up, keeping its attributes
+    /// (a scale or features set for it) under the name as `families`
+    /// writes it: fonts are looked up by name as written, and a fallback
+    /// gets no second, looser lookup the way the primary does. The primary
+    /// stays where it is. A new one takes the primary's weight, stretch and
+    /// style. An empty list gets its implicit primary first, the bundled
+    /// font `font_with_fallback` would stand in with. When nothing is to go
+    /// in, nothing changes.
+    pub fn insert_fallback_families<S: AsRef<str>>(&mut self, families: &[S]) {
+        let implicit_primary = self.font.is_empty();
+        if implicit_primary {
+            self.font.push(FontAttributes::default());
+        }
+        let same = |attr: &FontAttributes, family: &str| attr.family.eq_ignore_ascii_case(family);
+        let mut placed: Vec<FontAttributes> = Vec::with_capacity(families.len());
+        for family in families {
+            let family = family.as_ref().trim();
+            if family.is_empty()
+                || same(&self.font[0], family)
+                || placed.iter().any(|attr| same(attr, family))
+            {
+                continue;
+            }
+            let attr = match self.font[1..].iter().position(|attr| same(attr, family)) {
+                Some(index) => {
+                    let mut attr = self.font.remove(1 + index);
+                    family.clone_into(&mut attr.family);
+                    attr
+                }
+                None => {
+                    let primary = &self.font[0];
+                    FontAttributes {
+                        weight: primary.weight,
+                        stretch: primary.stretch,
+                        style: primary.style,
+                        ..FontAttributes::new_fallback(family)
+                    }
+                }
+            };
+            placed.push(attr);
+        }
+        if placed.is_empty() {
+            if implicit_primary {
+                self.font.clear();
+            }
+            return;
+        }
+        for attr in &mut placed {
+            attr.is_fallback = true;
+        }
+        let at = self.font[1..]
+            .iter()
+            .position(|attr| attr.is_fallback)
+            .map_or(self.font.len(), |index| 1 + index);
+        self.font.splice(at..at, placed);
+    }
+
     /// Make a version of this style where the first entry
     /// has any explicitly named bold/italic components
     /// removed.  The intent is to set it up for make_bold
@@ -757,6 +849,173 @@ mod test {
                 assert_eq!(picked.font[0].resolved_harfbuzz_features(), Some(features));
             }
         }
+    }
+
+    #[test]
+    fn fallback_families_follow_the_primary_in_order() {
+        let families = |style: &TextStyle| -> Vec<(String, bool)> {
+            style
+                .font
+                .iter()
+                .map(|attr| (attr.family.clone(), attr.is_fallback))
+                .collect()
+        };
+        let mut configured = TextStyle::default();
+        configured.font[0].weight = FontWeight::MEDIUM;
+        let mut extra = FontAttributes::new_fallback("Lua Extra");
+        extra.scale = Some(NotNan::new(1.2).unwrap());
+        configured.font.push(extra);
+
+        let mut style = configured.clone();
+        style.insert_fallback_families::<&str>(&[]);
+        assert_eq!(style, configured, "no list changes nothing");
+
+        style.insert_fallback_families(&[
+            "PingFang SC",
+            " ",
+            "pingfang sc",
+            "JetBrains Mono",
+            "Hiragino Sans",
+        ]);
+        assert_eq!(
+            families(&style),
+            [
+                ("JetBrains Mono".to_string(), false),
+                ("PingFang SC".to_string(), true),
+                ("Hiragino Sans".to_string(), true),
+                ("Lua Extra".to_string(), true),
+            ],
+            "after the primary, before the configured extras, without repeats"
+        );
+        assert_eq!(
+            style.font[1].weight,
+            FontWeight::MEDIUM,
+            "the primary's weight"
+        );
+
+        let mut style = configured.clone();
+        style.insert_fallback_families(&["Other", "LUA EXTRA"]);
+        assert_eq!(
+            families(&style),
+            [
+                ("JetBrains Mono".to_string(), false),
+                ("Other".to_string(), true),
+                ("LUA EXTRA".to_string(), true),
+            ],
+            "a configured family moves up under the name the list gives it"
+        );
+        assert_eq!(
+            style.font[2].scale,
+            Some(NotNan::new(1.2).unwrap()),
+            "a configured family moves up with its own attributes"
+        );
+
+        // A list with nothing in it has the bundled font as its primary.
+        let mut empty = TextStyle {
+            font: vec![],
+            foreground: None,
+        };
+        empty.insert_fallback_families(&["Only"]);
+        assert_eq!(
+            families(&empty),
+            [
+                ("JetBrains Mono".to_string(), false),
+                ("Only".to_string(), true)
+            ]
+        );
+
+        // Preferred entries stay preferred, to stand in for a missing
+        // primary; the list goes ahead of the fallbacks.
+        let mut several = TextStyle {
+            font: vec![
+                FontAttributes::new("Main"),
+                FontAttributes::new("Second"),
+                FontAttributes::new_fallback("Lua Fallback"),
+            ],
+            foreground: None,
+        };
+        several.insert_fallback_families(&["Listed"]);
+        assert_eq!(
+            families(&several),
+            [
+                ("Main".to_string(), false),
+                ("Second".to_string(), false),
+                ("Listed".to_string(), true),
+                ("Lua Fallback".to_string(), true),
+            ]
+        );
+        let untouched = several.clone();
+        several.insert_fallback_families(&[" "]);
+        assert_eq!(several, untouched, "a blank list changes nothing");
+
+        // Nothing to put in: preferred entries stay preferred, and an empty
+        // list stays empty.
+        let mut several = TextStyle {
+            font: vec![FontAttributes::new("Main"), FontAttributes::new("Second")],
+            foreground: None,
+        };
+        let untouched = several.clone();
+        several.insert_fallback_families(&["main"]);
+        assert_eq!(several, untouched, "a list of the primary changes nothing");
+        let mut empty = TextStyle {
+            font: vec![],
+            foreground: None,
+        };
+        empty.insert_fallback_families(&["JetBrains Mono"]);
+        assert!(empty.font.is_empty());
+    }
+
+    #[test]
+    fn a_replaced_main_font_listed_after_the_new_one_keeps_its_attributes() {
+        let mut configured = TextStyle::default();
+        configured.font[0].family = "fira code".to_string();
+        configured.font[0].scale = Some(NotNan::new(1.1).unwrap());
+        configured
+            .font
+            .push(FontAttributes::new_fallback("Lua Extra"));
+
+        let mut style = configured.clone();
+        style.apply_font_list(Some("Hack"), &["Fira Code"]);
+        let listed: Vec<(&str, bool, Option<f64>)> = style
+            .font
+            .iter()
+            .map(|attr| {
+                (
+                    attr.family.as_str(),
+                    attr.is_fallback,
+                    attr.scale.map(|scale| *scale),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("Hack", false, Some(1.1)),
+                ("Fira Code", true, Some(1.1)),
+                ("Lua Extra", true, None),
+            ]
+        );
+
+        // Configured again further down, the main font's own entry is the
+        // one that moves.
+        let mut twice = configured.clone();
+        let mut bold = FontAttributes::new_fallback("fira code");
+        bold.weight = FontWeight::BOLD;
+        twice.font.push(bold);
+        twice.apply_font_list(Some("Hack"), &["Fira Code"]);
+        assert_eq!(twice.font[1].family, "Fira Code");
+        assert_eq!(twice.font[1].weight, FontWeight::REGULAR);
+        assert_eq!(twice.font[1].scale, Some(NotNan::new(1.1).unwrap()));
+
+        let mut style = configured.clone();
+        style.apply_font_list::<&str>(None, &[]);
+        assert_eq!(style, configured, "no list changes nothing");
+        style.apply_font_list::<&str>(Some("Hack"), &[]);
+        assert_eq!(
+            style.font.len(),
+            2,
+            "a main font not listed again is replaced"
+        );
     }
 
     #[test]

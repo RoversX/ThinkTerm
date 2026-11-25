@@ -1,6 +1,31 @@
 use super::*;
+use crate::native_settings::{FontStack, MAX_FONT_FALLBACKS};
 
 const PAGE_SIZE: usize = 5;
+
+/// What a font list is shown with: Latin, Chinese, Japanese and German,
+/// each part drawn by the first font of the list that has it.
+const FONT_SAMPLE: [&str; 4] = ["Hello", "你好", "こんにちは", "Grüße"];
+
+/// How many fonts' sample results are kept: the list under a row and an
+/// open picker's preview, with room for the ones they replace.
+const SAMPLE_FACES_KEPT: usize = 4;
+/// Family names that stand for a kind of font rather than one font.
+const GENERIC_FAMILIES: [&str; 13] = [
+    "monospace",
+    "mono",
+    "sans-serif",
+    "sans",
+    "serif",
+    "system-ui",
+    "ui-monospace",
+    "ui-sans-serif",
+    "ui-serif",
+    "ui-rounded",
+    "cursive",
+    "fantasy",
+    "emoji",
+];
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct FontCatalog {
@@ -47,6 +72,216 @@ pub(super) enum FontTarget {
     Terminal,
 }
 
+/// Which place in a font list the picker chooses for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FontSlot {
+    /// The main font, which may be the default.
+    Main,
+    /// A new fallback font, after the others.
+    Add,
+    /// The fallback font at this place.
+    Fallback(u8),
+}
+
+/// What one loaded font is made of: the names of the faces it loaded, the
+/// main one first, and, once the sample has been shaped in it, which
+/// families draw each part of `FONT_SAMPLE`. Names only: the faces
+/// themselves would keep their fonts' data alive after the font is gone.
+#[derive(Debug)]
+pub(super) struct SampleFaces {
+    font: wezterm_font::LoadedFontId,
+    faces: Vec<FaceNames>,
+    /// For each part, the families that draw it in the order they come;
+    /// empty where no font has it. `None` until the sample is shaped.
+    parts: Option<Vec<Vec<String>>>,
+}
+
+/// The names a loaded face answers to.
+#[derive(Debug)]
+struct FaceNames {
+    names: wezterm_font::parser::Names,
+    path: Option<String>,
+}
+
+impl FaceNames {
+    fn of(face: &wezterm_font::parser::ParsedFont) -> Self {
+        Self {
+            names: face.names().clone(),
+            path: face.handle.path_str().map(String::from),
+        }
+    }
+
+    /// Whether the loader takes `family` for this face, as
+    /// `ParsedFont::matches_name` does.
+    fn matches(&self, family: &str) -> bool {
+        let names = &self.names;
+        family == names.family
+            || self.path.as_deref() == Some(family)
+            || family == names.full_name
+            || names.postscript_name.as_deref() == Some(family)
+            || names.aliases.iter().any(|alias| alias == family)
+    }
+}
+
+impl SampleFaces {
+    /// With `shaped`, the sample is shaped as the window draws text,
+    /// waiting for the fallback fonts: what this reports is what is shown.
+    /// Without, nothing is shaped, so nothing is looked up either.
+    fn of(font: &LoadedFont, shaped: bool) -> Self {
+        let drawn_by: Option<Vec<Vec<usize>>> = shaped.then(|| {
+            FONT_SAMPLE
+                .iter()
+                .map(|part| faces_drawing(font, part))
+                .collect()
+        });
+        // After shaping, which may have added the system's fallbacks.
+        let faces: Vec<FaceNames> = font.clone_handles().iter().map(FaceNames::of).collect();
+        let parts = drawn_by.map(|parts| {
+            parts
+                .into_iter()
+                .map(|indices| {
+                    indices
+                        .into_iter()
+                        .filter_map(|index| faces.get(index))
+                        .map(|face| face.names.family.clone())
+                        .collect()
+                })
+                .collect()
+        });
+        Self {
+            font: font.id(),
+            faces,
+            parts,
+        }
+    }
+
+    /// Whether `family` is one of the fonts loaded, by the names the loader
+    /// takes: a family listed but not installed here is not, nor is one
+    /// written so that the loader passes it by.
+    fn has(&self, family: &str) -> bool {
+        self.faces.iter().any(|face| face.matches(family))
+    }
+
+    /// The family standing in for `primary` when the main font loaded is
+    /// not it: the list's next font, or whatever the system offered in its
+    /// place. `None` when it is.
+    fn stand_in_for(&self, primary: &str) -> Option<String> {
+        // A generic family is the system's to resolve to a face.
+        if GENERIC_FAMILIES
+            .iter()
+            .any(|generic| generic.eq_ignore_ascii_case(primary.trim()))
+        {
+            return None;
+        }
+        let main = self.faces.first()?;
+        let names = &main.names;
+        // Fontconfig and Core Text also take a family in another case.
+        let answers = main.matches(primary)
+            || std::iter::once(&names.family)
+                .chain(std::iter::once(&names.full_name))
+                .chain(names.postscript_name.iter())
+                .chain(names.aliases.iter())
+                .any(|name| name.eq_ignore_ascii_case(primary));
+        (!answers).then(|| display_family(&names.family))
+    }
+}
+
+/// The places in `font`'s faces of the ones that draw `text`, each once,
+/// in the order they first come; none for characters no face has.
+fn faces_drawing(font: &LoadedFont, text: &str) -> Vec<usize> {
+    let mut faces = Vec::new();
+    for glyph in font
+        .blocking_shape(text, None, Direction::LeftToRight, None, None)
+        .unwrap_or_default()
+    {
+        if glyph.glyph_pos != 0 && !glyph.is_space && !faces.contains(&glyph.font_idx) {
+            faces.push(glyph.font_idx);
+        }
+    }
+    faces
+}
+
+/// A family as the Settings window names it: the system's own interface
+/// face, hidden under a name starting with a dot, as "System font".
+fn display_family(family: &str) -> String {
+    if family.starts_with('.') {
+        crate::i18n::tr("settings-font-system")
+    } else {
+        family.to_string()
+    }
+}
+
+/// What a picker's choice changes in a font list, so that it can be made
+/// to the latest list rather than the one the picker opened with.
+#[derive(Debug, Clone)]
+struct FontEdit {
+    slot: FontSlot,
+    draft: Option<String>,
+    /// For a fallback's place, the family the picker opened on.
+    replacing: Option<String>,
+}
+
+impl FontEdit {
+    fn apply(&self, stack: &mut FontStack) {
+        match self.slot {
+            FontSlot::Main => stack.primary.clone_from(&self.draft),
+            FontSlot::Add => stack.fallbacks.extend(self.draft.clone()),
+            FontSlot::Fallback(_) => {
+                let Some(draft) = &self.draft else {
+                    return;
+                };
+                // Found by its name: the list may have moved since. One
+                // taken out meanwhile leaves no place, so the choice goes
+                // after the others rather than nowhere.
+                match self.replacing.as_ref().and_then(|replacing| {
+                    stack
+                        .fallbacks
+                        .iter_mut()
+                        .find(|family| family.eq_ignore_ascii_case(replacing))
+                }) {
+                    Some(place) => place.clone_from(draft),
+                    None => stack.fallbacks.push(draft.clone()),
+                }
+            }
+        }
+    }
+
+    /// The family this edit puts in the list, which must be there after.
+    fn adds(&self) -> Option<&str> {
+        match self.slot {
+            FontSlot::Main => None,
+            FontSlot::Add | FontSlot::Fallback(_) => self.draft.as_deref(),
+        }
+    }
+}
+
+/// Move `family` one place up (`true`) or down in `stack`'s fallbacks,
+/// found by name: the list may have moved since it was painted.
+fn move_fallback(stack: &mut FontStack, family: &str, up: bool) {
+    let Some(at) = stack
+        .fallbacks
+        .iter()
+        .position(|listed| listed.eq_ignore_ascii_case(family))
+    else {
+        return;
+    };
+    let other = if up {
+        at.checked_sub(1)
+    } else {
+        at.checked_add(1)
+    };
+    if let Some(other) = other.filter(|&other| other < stack.fallbacks.len()) {
+        stack.fallbacks.swap(at, other);
+    }
+}
+
+/// Take `family` out of `stack`'s fallbacks, found by name.
+fn remove_fallback(stack: &mut FontStack, family: &str) {
+    stack
+        .fallbacks
+        .retain(|listed| !listed.eq_ignore_ascii_case(family));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PreviewKey {
     dpi: usize,
@@ -67,9 +302,22 @@ impl PreviewKey {
 #[derive(Debug, Clone)]
 pub(super) struct FontPicker {
     pub target: FontTarget,
+    pub slot: FontSlot,
     pub search: TextInputState,
+    /// The family picked for `slot`; `None` is the default for the main
+    /// font and nothing picked yet for a fallback.
     pub draft: Option<String>,
     pub page: usize,
+    /// The list as it was when the picker opened: what its preview and
+    /// offers go by. Saving changes only the slot, in the latest list.
+    base: FontStack,
+    /// The main font when `base` leaves it to the configuration: a
+    /// fallback picked is never that, which the list would pass by.
+    default_main: Option<String>,
+    /// The configuration generation `default_main` is from.
+    default_main_generation: Option<usize>,
+    /// For a fallback's place, the family it opened on.
+    replacing: Option<String>,
     preview: Option<Rc<LoadedFont>>,
     preview_key: Option<PreviewKey>,
     filtered: Vec<usize>,
@@ -78,12 +326,31 @@ pub(super) struct FontPicker {
 }
 
 impl FontPicker {
-    fn new(target: FontTarget, draft: Option<String>) -> Self {
+    fn new(
+        target: FontTarget,
+        slot: FontSlot,
+        base: FontStack,
+        default_main: Option<String>,
+    ) -> Self {
+        let replacing = match slot {
+            FontSlot::Fallback(index) => base.fallbacks.get(usize::from(index)).cloned(),
+            FontSlot::Main | FontSlot::Add => None,
+        };
+        let draft = match slot {
+            FontSlot::Main => base.primary.clone(),
+            FontSlot::Add => None,
+            FontSlot::Fallback(_) => replacing.clone(),
+        };
         Self {
             target,
+            slot,
             search: TextInputState::new(),
             draft,
             page: 0,
+            base,
+            default_main,
+            default_main_generation: None,
+            replacing,
             preview: None,
             preview_key: None,
             filtered: Vec::new(),
@@ -97,19 +364,66 @@ impl FontPicker {
         self.preview_key = None;
     }
 
+    fn edit(&self) -> FontEdit {
+        FontEdit {
+            slot: self.slot,
+            draft: self.draft.clone(),
+            replacing: self.replacing.clone(),
+        }
+    }
+
+    /// The list the picker opened with, with the draft in its place. A
+    /// main font picked from the fallbacks leaves them; `FontStack::new`
+    /// drops the repeat.
+    fn draft_stack(&self) -> FontStack {
+        let mut stack = self.base.clone();
+        self.edit().apply(&mut stack);
+        FontStack::new(stack.primary.as_deref(), &stack.fallbacks)
+    }
+
+    /// The families not to offer: a fallback picked is one the list does
+    /// not have yet, nor the main font. Any family may become the main font.
+    fn excluded(&self) -> Vec<String> {
+        let keep = match self.slot {
+            FontSlot::Main => return Vec::new(),
+            FontSlot::Add => None,
+            FontSlot::Fallback(index) => Some(usize::from(index)),
+        };
+        self.base
+            .primary
+            .as_ref()
+            .or(self.default_main.as_ref())
+            .into_iter()
+            .chain(
+                self.base
+                    .fallbacks
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| Some(*index) != keep)
+                    .map(|(_, family)| family),
+            )
+            .map(|family| family.to_lowercase())
+            .collect()
+    }
+
+    /// Whether Apply has something to save.
+    fn can_apply(&self) -> bool {
+        self.preview.is_some() && (self.slot == FontSlot::Main || self.draft.is_some())
+    }
+
     fn load_preview(&mut self, fonts: &FontConfiguration, config: &config::ConfigHandle) {
         let key = PreviewKey::new(fonts, config);
         if self.preview_key == Some(key) {
             return;
         }
+        let stack = self.draft_stack();
         let loaded = match self.target {
-            FontTarget::Interface => fonts.ui_font_preview(self.draft.as_deref(), 14.0),
+            FontTarget::Interface => {
+                fonts.ui_font_preview(stack.primary.as_deref(), &stack.fallbacks, 14.0)
+            }
             FontTarget::Terminal => {
                 let config = config.adjusted(|adjusted| {
-                    if let Some(family) = &self.draft {
-                        adjusted.font =
-                            crate::native_settings::terminal_font_style(config, family);
-                    }
+                    adjusted.font = crate::native_settings::terminal_font_style(config, &stack);
                 });
                 fonts.terminal_font_uncached(&config, 14.0)
             }
@@ -131,17 +445,27 @@ impl FontPicker {
     }
 }
 
-fn ranked_indices(names: &[String], query: &str, target: FontTarget) -> Vec<usize> {
+/// The catalogue's families containing `query`, by their place in it,
+/// without the `excluded` ones (lowercase). `prefer_mono` keeps the
+/// familiar terminal families near the top.
+fn ranked_indices(
+    names: &[String],
+    query: &str,
+    prefer_mono: bool,
+    excluded: &[String],
+) -> Vec<usize> {
     let query = query.trim().to_lowercase();
     let mut found: Vec<usize> = names
         .iter()
         .enumerate()
-        .filter(|(_, name)| name.to_lowercase().contains(&query))
+        .filter(|(_, name)| {
+            let name = name.to_lowercase();
+            name.contains(&query) && !excluded.contains(&name)
+        })
         .map(|(index, _)| index)
         .collect();
-    if target == FontTarget::Terminal {
-        // Keep the familiar terminal families near the top without hiding
-        // other installed choices. This is a suggestion, not a font filter.
+    if prefer_mono {
+        // A suggestion, not a font filter: other installed choices stay.
         found.sort_by_cached_key(|&index| {
             let name = names[index].to_lowercase();
             !(name.contains("mono")
@@ -154,22 +478,36 @@ fn ranked_indices(names: &[String], query: &str, target: FontTarget) -> Vec<usiz
     found
 }
 
+/// Where a part of the font sample goes, from the sample's top left: its
+/// chip's x, y and width, and the caption under the part.
+struct SampleChip {
+    x: f32,
+    y: f32,
+    width: f32,
+    caption: String,
+}
+
 impl SettingsWindow {
-    pub(super) fn open_font_picker(&mut self, target: FontTarget) {
+    pub(super) fn open_font_picker(&mut self, target: FontTarget, slot: FontSlot) {
         let was_open = self
             .ui
             .font_picker
             .as_ref()
-            .is_some_and(|picker| picker.target == target);
+            .is_some_and(|picker| picker.target == target && picker.slot == slot);
         self.close_font_picker();
-        if was_open {
+        let stack = self.font_stack(target);
+        if was_open || (slot == FontSlot::Add && stack.fallbacks.len() >= MAX_FONT_FALLBACKS) {
             return;
         }
-        let draft = match target {
-            FontTarget::Interface => self.native_settings.chrome.ui_font_family.clone(),
-            FontTarget::Terminal => self.native_settings.terminal.font_family.clone(),
-        };
-        self.ui.font_picker = Some(FontPicker::new(target, draft));
+        let config = configuration();
+        let default_main = stack
+            .primary
+            .is_none()
+            .then(|| Self::default_main_family(target, &config))
+            .flatten();
+        let mut picker = FontPicker::new(target, slot, stack, default_main);
+        picker.default_main_generation = Some(config.generation());
+        self.ui.font_picker = Some(picker);
         self.set_focused_input(Some(SettingsAction::FontPickerSearch));
         self.load_font_catalog();
     }
@@ -258,48 +596,207 @@ impl SettingsWindow {
             return;
         };
         if picker.preview_key != Some(PreviewKey::new(&self.fonts, &configuration()))
-            || picker.preview.is_none()
+            || !self.font_picker_can_apply()
         {
             return;
         }
         let target = picker.target;
-        let family = picker.draft.clone();
-        let mut terminal_font_changed = false;
+        let edit = picker.edit();
+        let adds = edit.adds().map(String::from);
+        self.save_font_stack(target, |stack| edit.apply(stack), adds.as_deref());
+    }
+
+    /// Whether the open picker's Apply has something to save to the list
+    /// as this window has it now: a family added must find room there.
+    fn font_picker_can_apply(&self) -> bool {
+        let Some(picker) = &self.ui.font_picker else {
+            return false;
+        };
+        if !picker.can_apply() {
+            return false;
+        }
+        let edit = picker.edit();
+        let Some(adds) = edit.adds() else {
+            return true;
+        };
+        let mut stack = self.font_stack(picker.target);
+        edit.apply(&mut stack);
+        FontStack::new(stack.primary.as_deref(), &stack.fallbacks).has_fallback(adds)
+    }
+
+    /// The family `target`'s main font is when Settings leaves it to
+    /// `config`; `None` where the interface has several.
+    fn default_main_family(target: FontTarget, config: &config::ConfigHandle) -> Option<String> {
+        match target {
+            FontTarget::Interface => wezterm_font::default_ui_font_family(config),
+            FontTarget::Terminal => Some(
+                config
+                    .font
+                    .font
+                    .first()
+                    .map(|attr| attr.family.clone())
+                    .unwrap_or_else(|| config::FontAttributes::default().family),
+            ),
+        }
+    }
+
+    /// The fallback at `index` in the list as painted, moved by name.
+    pub(super) fn move_font_fallback(&mut self, target: FontTarget, index: usize, up: bool) {
+        if let Some(family) = self.font_stack(target).fallbacks.get(index).cloned() {
+            self.save_font_stack(target, |stack| move_fallback(stack, &family, up), None);
+        }
+    }
+
+    /// The fallback at `index` in the list as painted, removed by name.
+    pub(super) fn remove_font_fallback(&mut self, target: FontTarget, index: usize) {
+        if let Some(family) = self.font_stack(target).fallbacks.get(index).cloned() {
+            self.save_font_stack(target, |stack| remove_fallback(stack, &family), None);
+        }
+    }
+
+    /// The font list `target` has in this window's copy of the settings.
+    fn font_stack(&self, target: FontTarget) -> FontStack {
+        match target {
+            FontTarget::Interface => crate::native_settings::ui_font_stack(&self.native_settings),
+            FontTarget::Terminal => {
+                crate::native_settings::terminal_font_stack(&self.native_settings)
+            }
+        }
+    }
+
+    /// Change `target`'s font list with `edit` and save it, then show it
+    /// everywhere. Made to the latest settings, as every change is (see
+    /// `save_and_apply_native_terminal_settings`), so `edit` must work on
+    /// whatever list it is handed. Once saved an open picker closes: it was
+    /// choosing for the list as it was. One that could not save stays, so
+    /// the choice can be tried again, and so does one whose choice, `adds`,
+    /// found no place among the fallbacks meanwhile.
+    fn save_font_stack(
+        &mut self,
+        target: FontTarget,
+        edit: impl FnOnce(&mut FontStack),
+        adds: Option<&str>,
+    ) {
+        let mut changed = false;
+        let mut fits = true;
+        let store = |settings: &mut ThinkTermNativeSettings| {
+            let before = match target {
+                FontTarget::Interface => crate::native_settings::ui_font_stack(settings),
+                FontTarget::Terminal => crate::native_settings::terminal_font_stack(settings),
+            };
+            let mut stack = before.clone();
+            edit(&mut stack);
+            let stack = FontStack::new(stack.primary.as_deref(), &stack.fallbacks);
+            // A family to add that found no place among the fallbacks (the
+            // list full, or the family now its main font) leaves the list
+            // as it was.
+            fits = adds.is_none_or(|family| stack.has_fallback(family));
+            if !fits {
+                return;
+            }
+            changed = stack != before;
+            match target {
+                FontTarget::Interface => {
+                    settings.chrome.ui_font_family = stack.primary;
+                    settings.chrome.ui_font_fallbacks = stack.fallbacks;
+                }
+                FontTarget::Terminal => {
+                    settings.terminal.font_family = stack.primary;
+                    settings.terminal.font_fallbacks = stack.fallbacks;
+                }
+            }
+        };
+        // The interface font is no setting a configuration reload reads.
         let result = match target {
-            FontTarget::Interface => crate::native_settings::update_ui_state(|settings| {
-                settings.chrome.ui_font_family = family;
-            }),
-            FontTarget::Terminal => crate::native_settings::update(|settings| {
-                terminal_font_changed = settings.terminal.font_family != family;
-                settings.terminal.font_family = family;
-            })
-            .map(drop),
+            FontTarget::Interface => crate::native_settings::update_ui_state(store),
+            FontTarget::Terminal => crate::native_settings::update(store).map(drop),
         };
         match result {
+            Ok(()) if !fits => {
+                self.status = settings_tr(
+                    "settings-font-fallbacks-full",
+                    &[("count", MAX_FONT_FALLBACKS.to_string())],
+                );
+            }
+            Ok(()) if !changed => self.close_font_picker(),
             Ok(()) => {
                 self.close_font_picker();
                 let saved = crate::native_settings::load();
-                if target == FontTarget::Interface {
-                    crate::native_settings::apply_ui_font_to_app(&saved);
-                } else {
-                    crate::native_settings::apply_to_app_with_font_changes(
+                match target {
+                    FontTarget::Interface => crate::native_settings::apply_ui_font_to_app(&saved),
+                    FontTarget::Terminal => crate::native_settings::apply_to_app_with_font_changes(
                         &saved,
                         crate::native_settings::FontChanges {
-                            family: terminal_font_changed,
+                            family: true,
                             ..Default::default()
                         },
-                    );
+                    ),
                 }
                 self.set_native_settings(saved);
                 self.status = crate::i18n::tr("settings-font-applied");
             }
             Err(error) => {
+                log::warn!("saving the font list: {error:#}");
                 self.status = settings_tr(
                     "settings-status-terminal-error",
                     &[("error", format!("{error:#}"))],
                 );
             }
         }
+    }
+
+    /// `font`'s `SampleFaces`, worked out once for it; `shaped` when the
+    /// sample is to be shown.
+    fn sample_faces(&mut self, font: &Rc<LoadedFont>, shaped: bool) -> Rc<SampleFaces> {
+        let kept = &mut self.ui.font_sample_faces;
+        if let Some(index) = kept.iter().position(|faces| faces.font == font.id()) {
+            if !shaped || kept[index].parts.is_some() {
+                return Rc::clone(&kept[index]);
+            }
+            kept.remove(index);
+        }
+        let faces = Rc::new(SampleFaces::of(font, shaped));
+        if kept.len() >= SAMPLE_FACES_KEPT {
+            kept.remove(0);
+        }
+        kept.push(Rc::clone(&faces));
+        faces
+    }
+
+    /// The font the list under `target`'s row shows its sample in: the one
+    /// the page already has for it.
+    fn font_sample_font(&mut self, target: FontTarget) -> Rc<LoadedFont> {
+        match target {
+            FontTarget::Interface => Rc::clone(&self.ui_font),
+            FontTarget::Terminal => {
+                let size = self.current_terminal_font_size_value();
+                self.preview_font(PreviewFont::Terminal, size)
+            }
+        }
+    }
+
+    /// The fonts the configuration file lists after its main font, which
+    /// come after `stack`'s: the terminal's only, as the interface goes by
+    /// the terminal's after its own.
+    fn configured_font_extras(&self, target: FontTarget, stack: &FontStack) -> Vec<String> {
+        if target != FontTarget::Terminal {
+            return Vec::new();
+        }
+        let config = configuration();
+        let mut extras: Vec<String> = Vec::new();
+        for attr in config.font.font.iter().skip(1) {
+            let family = attr.family.trim();
+            let listed = |other: &String| other.eq_ignore_ascii_case(family);
+            if family.is_empty()
+                || stack.primary.iter().any(listed)
+                || stack.fallbacks.iter().any(listed)
+                || extras.iter().any(listed)
+            {
+                continue;
+            }
+            extras.push(family.to_string());
+        }
+        extras
     }
 
     pub(super) fn paint_font_choice(
@@ -336,7 +833,7 @@ impl SettingsWindow {
             .ui
             .font_picker
             .as_ref()
-            .is_some_and(|picker| picker.target == target);
+            .is_some_and(|picker| picker.target == target && picker.slot == FontSlot::Main);
         let hovered = self.ui.interaction.hovered == Some(action);
         self.ui_context.push(control, WidgetKind::Button, action);
         self.paint_dropdown_pill(
@@ -358,17 +855,479 @@ impl SettingsWindow {
         let text_width = (cx - x - self.ui_px(24.0)).max(width * 0.45);
         self.draw_text(layers, &font, x, y, &title, palette.text, text_width)?;
         let extra = self.draw_row_description(layers, x, y, &description, text_width)?;
+        let row_bottom = y + self.settings_row_visual_height();
+        let mut bottom = self.paint_font_fallbacks(
+            layers,
+            x,
+            row_bottom + extra + self.ui_px(20.0),
+            width,
+            target,
+        )?;
+        if self
+            .ui
+            .font_picker
+            .as_ref()
+            .is_some_and(|picker| picker.target == target)
+        {
+            bottom = self.paint_font_picker(layers, x, bottom + self.ui_px(24.0), width)?
+                + self.ui_px(8.0);
+        } else {
+            bottom += self.ui_px(28.0);
+        }
+        Ok(bottom - row_bottom)
+    }
+
+    /// The list under a font row: its fallback fonts in order, each to
+    /// move, remove or replace, a row to add one, a word on the order, and
+    /// the sample in the fonts the list makes, with the picker's choice
+    /// while it is open, each part over the family that draws it. Returns
+    /// where it ends.
+    fn paint_font_fallbacks(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        top: f32,
+        width: f32,
+        target: FontTarget,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let accent = self.chrome_palette.accent;
+        let fill = self.chrome_palette.group_bg;
+        let stack = self.font_stack(target);
+        let count = stack.fallbacks.len();
+        // While the picker is open on this list, the sample shows the list
+        // with its choice in it, and none for a choice that cannot load.
+        let picking = self.font_picker_preview(target)?;
+        let picked = picking.clone().flatten();
+        // The sample only with a list or a choice to show it for: shaping
+        // it looks up a font for its Chinese and Japanese, which a page
+        // someone only scrolls past should not wait on.
+        let shaped = match &picking {
+            Some(picked) => picked.is_some(),
+            None => count > 0,
+        };
+        // The rows and notes are about the list as saved.
+        let saved_font = self.font_sample_font(target);
+        let faces = self.sample_faces(&saved_font, count > 0 && picking.is_none());
+        let (sample_font, sample_faces) = match picked {
+            Some(font) => {
+                let faces = self.sample_faces(&font, true);
+                (font, faces)
+            }
+            None => (saved_font, Rc::clone(&faces)),
+        };
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let editing = self
+            .ui
+            .font_picker
+            .as_ref()
+            .filter(|picker| picker.target == target)
+            .map(|picker| picker.slot);
+        let row_height = self.dropdown_row_height();
+        let pad_y = self.ui_px(6.0);
+        let lead = self.ui_px(18.0);
+        let badge = self.ui_px(36.0);
+        let label_x = x + lead + badge + self.ui_px(18.0);
+        let button = (row_height - self.ui_px(14.0)).clamp(self.ui_px(40.0), self.ui_px(52.0));
+        let buttons_x = x + width - self.ui_px(10.0) - button * 3.0;
+        let mut y = top;
+
+        if count > 0 {
+            self.draw_text(
+                layers,
+                &body_font,
+                x,
+                y,
+                &crate::i18n::tr("settings-font-fallbacks"),
+                palette.secondary_text,
+                width,
+            )?;
+            y += self.description_line_step() + self.ui_px(8.0);
+        }
+        let group_height = pad_y * 2.0 + row_height * (count + 1) as f32;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            x,
+            y,
+            width,
+            group_height,
+            fill,
+            self.ui_px(24.0).min(group_height / 2.0),
+        )?;
+        for (index, family) in stack.fallbacks.iter().enumerate() {
+            let place = index.min(usize::from(u8::MAX)) as u8;
+            let row_y = y + pad_y + row_height * index as f32;
+            if index > 0 {
+                self.paint_separator(layers, label_x, row_y, x + width - label_x - lead)?;
+            }
+            let row = rect(x, row_y, width, row_height);
+            let action = SettingsAction::EditFontFallback(target, place);
+            // Short of the buttons, so that a faint one takes no click.
+            self.ui_context.push(
+                rect(x, row_y, buttons_x - x, row_height),
+                WidgetKind::Button,
+                action,
+            );
+            self.paint_font_list_row_ground(
+                layers,
+                row,
+                fill,
+                action,
+                editing == Some(FontSlot::Fallback(place)),
+            )?;
+
+            let badge_y = row_y + (row_height - badge) / 2.0;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                x + lead,
+                badge_y,
+                badge,
+                badge,
+                crate::ui::color::mix(fill, palette.text, 0.12),
+                badge / 2.0,
+            )?;
+            let number = (index + 1).to_string();
+            let number_width = self.measure_text_width(&body_font, &number);
+            self.draw_text(
+                layers,
+                &body_font,
+                (x + lead + (badge - number_width) / 2.0).round(),
+                self.control_text_y(badge_y, badge),
+                &number,
+                palette.secondary_text,
+                badge,
+            )?;
+
+            let label_y = self.control_text_y(row_y, row_height);
+            let room = (buttons_x - label_x - self.ui_px(12.0)).max(0.0);
+            let missing = !faces.has(family);
+            let tag = missing.then(|| crate::i18n::tr("settings-font-not-installed"));
+            let tag_room = tag.as_ref().map_or(0.0, |tag| {
+                self.measure_text_width(&body_font, tag) + self.ui_px(16.0)
+            });
+            let name = self.text_with_ellipsis(&ui_font, family, (room - tag_room).max(0.0));
+            self.draw_text(
+                layers,
+                &ui_font,
+                label_x,
+                label_y,
+                &name,
+                if missing {
+                    palette.secondary_text
+                } else {
+                    palette.text
+                },
+                room,
+            )?;
+            if let Some(tag) = tag {
+                let tag_x = label_x + self.measure_text_width(&ui_font, &name) + self.ui_px(16.0);
+                self.draw_text(
+                    layers,
+                    &body_font,
+                    tag_x,
+                    label_y,
+                    &tag,
+                    palette.muted_text,
+                    (label_x + room - tag_x).max(0.0),
+                )?;
+            }
+
+            let button_y = row_y + (row_height - button) / 2.0;
+            let controls = [
+                (
+                    SvgIcon::ChevronUp,
+                    (index > 0).then_some(SettingsAction::MoveFontFallback(target, place, true)),
+                ),
+                (
+                    SvgIcon::ChevronDown,
+                    (index + 1 < count)
+                        .then_some(SettingsAction::MoveFontFallback(target, place, false)),
+                ),
+                (
+                    SvgIcon::X,
+                    Some(SettingsAction::RemoveFontFallback(target, place)),
+                ),
+            ];
+            for (slot, &(icon, action)) in controls.iter().enumerate() {
+                let button_x = buttons_x + button * slot as f32;
+                match action {
+                    Some(action) => {
+                        self.paint_icon_button(layers, button_x, button_y, button, icon, action)?
+                    }
+                    None => {
+                        // In its place but faint, so the others do not move.
+                        let glyph = (self.metrics.cell_size.height as f32 + 4.0)
+                            .clamp(self.ui_px(24.0), self.ui_px(34.0));
+                        self.draw_svg_icon(
+                            layers,
+                            icon,
+                            button_x + (button - glyph) / 2.0,
+                            button_y + (button - glyph) / 2.0,
+                            glyph,
+                            palette.muted_text.mul_alpha(0.35),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let row_y = y + pad_y + row_height * count as f32;
+        if count > 0 {
+            self.paint_separator(layers, label_x, row_y, x + width - label_x - lead)?;
+        }
+        let (label, color) = if count >= MAX_FONT_FALLBACKS {
+            (
+                settings_tr(
+                    "settings-font-fallbacks-full",
+                    &[("count", MAX_FONT_FALLBACKS.to_string())],
+                ),
+                palette.muted_text,
+            )
+        } else {
+            let row = rect(x, row_y, width, row_height);
+            let action = SettingsAction::AddFontFallback(target);
+            self.ui_context.push(row, WidgetKind::Button, action);
+            self.paint_font_list_row_ground(
+                layers,
+                row,
+                fill,
+                action,
+                editing == Some(FontSlot::Add),
+            )?;
+            (crate::i18n::tr("settings-font-fallbacks-add"), accent)
+        };
+        let glyph = self.ui_px(28.0);
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::Plus,
+            x + lead + (badge - glyph) / 2.0,
+            row_y + (row_height - glyph) / 2.0,
+            glyph,
+            color,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            label_x,
+            self.control_text_y(row_y, row_height),
+            &label,
+            color,
+            x + width - label_x - lead,
+        )?;
+        y += group_height;
+
+        let extras = self.configured_font_extras(target, &stack);
+        let mut notes = Vec::new();
+        // Picked here, then uninstalled: another font draws everything,
+        // the list's next or one the system put in its place.
+        if let Some(primary) = &stack.primary {
+            if let Some(used) = faces.stand_in_for(primary) {
+                notes.push(settings_tr(
+                    "settings-font-main-missing",
+                    &[("font", primary.clone()), ("used", used)],
+                ));
+            }
+        }
+        if !extras.is_empty() {
+            notes.push(settings_tr(
+                "settings-font-fallbacks-config",
+                &[("fonts", extras.join(", "))],
+            ));
+        }
+        if count > 0 {
+            notes.push(crate::i18n::tr("settings-font-fallbacks-note"));
+        }
+        for note in notes {
+            y += self.ui_px(12.0);
+            y += self.draw_row_note_in_lines(layers, x, y, &note, width, 2)?
+                + self.description_line_step();
+        }
+        if !shaped {
+            return Ok(y);
+        }
+        y += self.ui_px(18.0);
+        self.paint_font_sample(layers, &sample_font, &sample_faces, x, y, width)
+    }
+
+    /// The picker's preview when it is open on `target`'s list: the list
+    /// with the choice in it, `None` inside for a choice that cannot load.
+    /// Loaded here for the sample over the picker, which is painted first.
+    fn font_picker_preview(
+        &mut self,
+        target: FontTarget,
+    ) -> anyhow::Result<Option<Option<Rc<LoadedFont>>>> {
         if !self
             .ui
             .font_picker
             .as_ref()
             .is_some_and(|picker| picker.target == target)
         {
-            return Ok(extra);
+            return Ok(None);
         }
-        let top = y + self.settings_row_visual_height() + extra + self.ui_px(20.0);
-        let bottom = self.paint_font_picker(layers, x, top, width)?;
-        Ok(bottom - (y + self.settings_row_visual_height()))
+        let config = configuration();
+        if self.fonts.config().generation() != config.generation() {
+            self.reload_configured_fonts(&config)?;
+        }
+        let Some(picker) = self.ui.font_picker.as_mut() else {
+            return Ok(None);
+        };
+        picker.load_preview(&self.fonts, &config);
+        Ok(Some(picker.preview.clone()))
+    }
+
+    /// A list row's ground: a step towards the text while it is under the
+    /// pointer, and while the picker is choosing for it.
+    fn paint_font_list_row_ground(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        row: window::RectF,
+        fill: LinearRgba,
+        action: SettingsAction,
+        selected: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let step = if self.ui.interaction.pressed == Some(action) {
+            0.12
+        } else if selected {
+            0.09
+        } else if self.ui.interaction.hovered == Some(action) {
+            0.06
+        } else {
+            return Ok(());
+        };
+        let inset_x = self.ui_px(DROPDOWN_HOVER_INSET_X);
+        let inset_y = self.ui_px(DROPDOWN_HOVER_INSET_Y);
+        let height = row.size.height - inset_y * 2.0;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            row.origin.x + inset_x,
+            row.origin.y + inset_y,
+            row.size.width - inset_x * 2.0,
+            height,
+            crate::ui::color::mix(fill, palette.text, step),
+            self.ui_px(DROPDOWN_ROW_RADIUS).min(height / 2.0),
+        )
+    }
+
+    /// How tall one chip of the font sample in `font` is.
+    fn font_sample_chip_height(&self, font: &LoadedFont) -> f32 {
+        let part = RenderMetrics::with_font_metrics(&font.metrics())
+            .cell_size
+            .height as f32;
+        self.ui_px(14.0) * 2.0 + part + self.ui_px(4.0) + self.metrics.cell_size.height as f32
+    }
+
+    /// Where the chips of the font sample in `font` go in `width`, as many
+    /// to a line as fit, and how tall they are together.
+    fn layout_font_sample(
+        &self,
+        font: &Rc<LoadedFont>,
+        faces: &SampleFaces,
+        width: f32,
+    ) -> (Vec<SampleChip>, f32) {
+        let pad_x = self.ui_px(18.0);
+        let gap = self.ui_px(12.0);
+        let chip_height = self.font_sample_chip_height(font);
+        let Some(parts) = &faces.parts else {
+            return (Vec::new(), 0.0);
+        };
+        let mut chips = Vec::with_capacity(FONT_SAMPLE.len());
+        let (mut chip_x, mut chip_y) = (0.0, 0.0);
+        for (part, families) in FONT_SAMPLE.iter().zip(parts) {
+            // Every face that draws some of it: an umlaut can come from
+            // another font than the letters around it.
+            let caption = if families.is_empty() {
+                crate::i18n::tr("settings-font-sample-missing")
+            } else {
+                families
+                    .iter()
+                    .map(|family| display_family(family))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            };
+            let inner = self
+                .measure_text_width(font, part)
+                .max(self.measure_text_width(&self.body_font, &caption))
+                .min((width - pad_x * 2.0).max(0.0));
+            let chip_width = inner + pad_x * 2.0;
+            if chip_x > 0.0 && chip_x + chip_width > width {
+                chip_x = 0.0;
+                chip_y += chip_height + gap;
+            }
+            chips.push(SampleChip {
+                x: chip_x,
+                y: chip_y,
+                width: chip_width,
+                caption,
+            });
+            chip_x += chip_width + gap;
+        }
+        (chips, chip_y + chip_height)
+    }
+
+    /// `FONT_SAMPLE` in `font`, each part on a chip over the name of the
+    /// family that draws it. Returns where it ends.
+    fn paint_font_sample(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        faces: &SampleFaces,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        let (chips, height) = self.layout_font_sample(font, faces, width);
+        let palette = self.palette();
+        let fill = self.chrome_palette.group_bg;
+        let body_font = Rc::clone(&self.body_font);
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let part_height = metrics.cell_size.height as f32;
+        let chip_height = self.font_sample_chip_height(font);
+        let pad_x = self.ui_px(18.0);
+        let pad_y = self.ui_px(14.0);
+        let parts = faces.parts.as_deref().unwrap_or(&[]);
+        for ((chip, part), families) in chips.iter().zip(FONT_SAMPLE).zip(parts) {
+            let (left, top) = (x + chip.x, y + chip.y);
+            let room = chip.width - pad_x * 2.0;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                left,
+                top,
+                chip.width,
+                chip_height,
+                fill,
+                self.ui_px(20.0),
+            )?;
+            self.draw_text(
+                layers,
+                font,
+                left + pad_x,
+                self.text_top_for(&metrics, top + pad_y),
+                part,
+                if families.is_empty() {
+                    palette.muted_text
+                } else {
+                    palette.text
+                },
+                room,
+            )?;
+            let caption = self.text_with_ellipsis(&body_font, &chip.caption, room);
+            self.draw_text(
+                layers,
+                &body_font,
+                left + pad_x,
+                top + pad_y + part_height + self.ui_px(4.0),
+                &caption,
+                palette.muted_text,
+                room,
+            )?;
+        }
+        Ok(y + height)
     }
 
     fn paint_font_picker(
@@ -382,10 +1341,25 @@ impl SettingsWindow {
         if self.fonts.config().generation() != config.generation() {
             self.reload_configured_fonts(&config)?;
         }
+        // The configuration's main font, not to offer as a fallback, as it
+        // is now: the configuration may have been reloaded since.
+        let picker = self.ui.font_picker.as_mut().unwrap();
+        if picker.default_main_generation != Some(config.generation()) {
+            picker.default_main = picker
+                .base
+                .primary
+                .is_none()
+                .then(|| Self::default_main_family(picker.target, &config))
+                .flatten();
+            picker.default_main_generation = Some(config.generation());
+            picker.filter_query = None;
+        }
         let picker = self.ui.font_picker.as_ref().unwrap();
         let query = picker.search.text().to_string();
         let target = picker.target;
+        let slot = picker.slot;
         let draft = picker.draft.clone();
+        let excluded = picker.excluded();
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         let row_height = self.dropdown_row_height();
@@ -419,7 +1393,10 @@ impl SettingsWindow {
             palette.muted_text,
         )?;
         let list_y = search_rect.max_y() + self.ui_px(12.0);
-        let list_height = row_height * (PAGE_SIZE + 1) as f32 + padding * 2.0;
+        // The default is the main font's alone: a fallback is a family.
+        let default_row = slot == FontSlot::Main;
+        let list_height =
+            row_height * (PAGE_SIZE + usize::from(default_row)) as f32 + padding * 2.0;
         let card = self.floating_card_palette();
         self.draw_rounded_frame(
             layers,
@@ -437,7 +1414,8 @@ impl SettingsWindow {
         if picker.filter_query.as_deref() != Some(query.as_str())
             || picker.catalog_len != names.len()
         {
-            picker.filtered = ranked_indices(names, &query, target);
+            let prefer_mono = target == FontTarget::Terminal && slot == FontSlot::Main;
+            picker.filtered = ranked_indices(names, &query, prefer_mono, &excluded);
             picker.filter_query = Some(query.clone());
             picker.catalog_len = names.len();
         }
@@ -452,11 +1430,14 @@ impl SettingsWindow {
             .take(PAGE_SIZE)
             .copied()
             .collect();
-        let mut options = vec![(
-            crate::i18n::tr("settings-font-default"),
-            SettingsAction::FontPickerDefault,
-            draft.is_none(),
-        )];
+        let mut options = Vec::with_capacity(PAGE_SIZE + 1);
+        if default_row {
+            options.push((
+                crate::i18n::tr("settings-font-default"),
+                SettingsAction::FontPickerDefault,
+                draft.is_none(),
+            ));
+        }
         for &index in &indices {
             let name = names[index].clone();
             let selected = draft.as_deref() == Some(name.as_str());
@@ -505,7 +1486,7 @@ impl SettingsWindow {
                 layers,
                 &ui_font,
                 x + padding,
-                list_y + padding + row_height + gap,
+                list_y + padding + row_height * usize::from(default_row) as f32 + gap,
                 &crate::i18n::tr(if self.ui.font_catalog.loading {
                     "settings-font-loading"
                 } else {
@@ -554,10 +1535,38 @@ impl SettingsWindow {
         } else {
             width
         };
+        let inner_width = preview_width - padding * 2.0;
+
+        // What the preview holds decides how tall it is, so it is loaded
+        // and laid out before its card is drawn.
+        self.ui
+            .font_picker
+            .as_mut()
+            .unwrap()
+            .load_preview(&self.fonts, &config);
+        let preview = self.ui.font_picker.as_ref().unwrap().preview.clone();
+        // Which font draws each part of the mixed line shows on the sample
+        // over the picker, which follows the choice while it is open.
+        let mixed = FONT_SAMPLE.join(" ");
+        let samples: [&str; 4] = match target {
+            FontTarget::Interface => ["ThinkTerm", "Aa Bb 0123456789", &mixed, "O0 Il1  → ≠ {} []"],
+            FontTarget::Terminal => [
+                "~/project $ git status",
+                "On branch main",
+                &mixed,
+                "O0 Il1  → ≠ {} []",
+            ],
+        };
+        let step = preview
+            .as_ref()
+            .map(|font| (font.metrics().cell_height.get() as f32).max(self.ui_px(34.0)));
+        let content_height = self.ui_px(120.0)
+            + padding
+            + step.map_or(self.ui_px(40.0), |step| step * samples.len() as f32);
         let preview_height = if side_by_side {
-            list_bottom - top
+            (list_bottom - top).max(content_height)
         } else {
-            self.ui_px(270.0)
+            self.ui_px(270.0).max(content_height)
         };
         self.draw_rounded_frame(
             layers,
@@ -577,41 +1586,26 @@ impl SettingsWindow {
             preview_y + padding,
             &crate::i18n::tr("settings-font-preview"),
             palette.muted_text,
-            preview_width - padding * 2.0,
+            inner_width,
         )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            preview_x + padding,
-            preview_y + padding + self.ui_px(38.0),
-            &draft
-                .clone()
-                .unwrap_or_else(|| crate::i18n::tr("settings-font-default")),
-            palette.text,
-            preview_width - padding * 2.0,
-        )?;
-        self.ui
-            .font_picker
-            .as_mut()
-            .unwrap()
-            .load_preview(&self.fonts, &config);
-        let preview = self.ui.font_picker.as_ref().unwrap().preview.clone();
+        let heading = match (&draft, slot) {
+            (Some(family), _) => Some(family.clone()),
+            (None, FontSlot::Main) => Some(crate::i18n::tr("settings-font-default")),
+            (None, _) => None,
+        };
+        if let Some(heading) = heading {
+            self.draw_text(
+                layers,
+                &ui_font,
+                preview_x + padding,
+                preview_y + padding + self.ui_px(38.0),
+                &heading,
+                palette.text,
+                inner_width,
+            )?;
+        }
         let mut y = preview_y + self.ui_px(120.0);
-        if let Some(font) = preview {
-            let samples = match target {
-                FontTarget::Interface => [
-                    "ThinkTerm",
-                    "Aa Bb 0123456789",
-                    "中文预览 · 日本語",
-                    "O0 Il1  → ≠ {} []",
-                ],
-                FontTarget::Terminal => [
-                    "~/project $ git status",
-                    "On branch main",
-                    "中文预览 · 日本語",
-                    "O0 Il1  → ≠ {} []",
-                ],
-            };
+        if let (Some(font), Some(step)) = (preview, step) {
             for text in samples {
                 self.draw_text(
                     layers,
@@ -620,9 +1614,9 @@ impl SettingsWindow {
                     y,
                     text,
                     palette.text,
-                    preview_width - padding * 2.0,
+                    inner_width,
                 )?;
-                y += (font.metrics().cell_height.get() as f32).max(self.ui_px(34.0));
+                y += step;
             }
         } else {
             self.draw_text(
@@ -632,11 +1626,15 @@ impl SettingsWindow {
                 y,
                 &crate::i18n::tr("settings-font-unavailable"),
                 palette.muted_text,
-                preview_width - padding * 2.0,
+                inner_width,
             )?;
         }
         let footer_y = list_bottom.max(preview_y + preview_height) + gap;
-        let apply_label = crate::i18n::tr("settings-font-apply");
+        let apply_label = crate::i18n::tr(if slot == FontSlot::Add {
+            "settings-font-add"
+        } else {
+            "settings-font-apply"
+        });
         let cancel_label = crate::i18n::tr("settings-font-cancel");
         let apply_width = self
             .button_width_for_label(&apply_label, 130.0)
@@ -653,7 +1651,7 @@ impl SettingsWindow {
             &cancel_label,
             SettingsAction::FontPickerCancel,
         )?;
-        if self.ui.font_picker.as_ref().unwrap().preview.is_none() {
+        if !self.font_picker_can_apply() {
             self.draw_button_enabled(
                 layers,
                 apply_x,
@@ -761,7 +1759,12 @@ mod tests {
         };
         let base = with_family("Roboto");
         let fonts = FontConfiguration::new(Some(base.clone()), 96)?;
-        let mut picker = FontPicker::new(FontTarget::Terminal, None);
+        let mut picker = FontPicker::new(
+            FontTarget::Terminal,
+            FontSlot::Main,
+            FontStack::default(),
+            None,
+        );
         picker.load_preview(&fonts, &base);
         let original = picker.preview.clone().expect("initial preview");
         assert_eq!(original.clone_handles()[0].names().family, "Roboto");
@@ -791,7 +1794,12 @@ mod tests {
         let config = config::ConfigHandle::default_config();
         for target in [FontTarget::Interface, FontTarget::Terminal] {
             let fonts = FontConfiguration::new(Some(config.clone()), 96)?;
-            let mut picker = FontPicker::new(target, Some("JetBrains Mono".into()));
+            let mut picker = FontPicker::new(
+                target,
+                FontSlot::Main,
+                FontStack::new(Some("JetBrains Mono"), &[]),
+                None,
+            );
             picker.load_preview(&fonts, &config);
             let original = picker.preview.clone().expect("font preview");
             picker.load_preview(&fonts, &config);
@@ -822,14 +1830,259 @@ mod tests {
             "Example Mono".into(),
             "Other Face".into(),
         ];
+        assert_eq!(ranked_indices(&names, "example", true, &[]), vec![1, 0]);
+        assert_eq!(ranked_indices(&names, "example", false, &[]), vec![0, 1]);
+        assert!(ranked_indices(&names, "absent", true, &[]).is_empty());
         assert_eq!(
-            ranked_indices(&names, "example", FontTarget::Terminal),
-            vec![1, 0]
+            ranked_indices(&names, "", false, &["example mono".into()]),
+            vec![0, 2],
+            "a family the list has is not offered again"
+        );
+    }
+
+    #[test]
+    fn each_slot_puts_the_draft_in_its_place() {
+        let base = FontStack::new(Some("Main"), &["First".to_string(), "Second".to_string()]);
+        let stack = |slot, draft: Option<&str>| {
+            let mut picker = FontPicker::new(FontTarget::Terminal, slot, base.clone(), None);
+            picker.draft = draft.map(str::to_string);
+            let stack = picker.draft_stack();
+            (stack.primary, stack.fallbacks)
+        };
+        let some = |name: &str| Some(name.to_string());
+        let list = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stack(FontSlot::Main, Some("Other")),
+            (some("Other"), list(&["First", "Second"]))
         );
         assert_eq!(
-            ranked_indices(&names, "example", FontTarget::Interface),
-            vec![0, 1]
+            stack(FontSlot::Main, Some("Second")),
+            (some("Second"), list(&["First"])),
+            "a fallback made the main font leaves the fallbacks"
         );
-        assert!(ranked_indices(&names, "absent", FontTarget::Terminal).is_empty());
+        assert_eq!(
+            stack(FontSlot::Main, None),
+            (None, list(&["First", "Second"]))
+        );
+        assert_eq!(
+            stack(FontSlot::Add, Some("Third")),
+            (some("Main"), list(&["First", "Second", "Third"]))
+        );
+        assert_eq!(
+            stack(FontSlot::Add, None),
+            (some("Main"), list(&["First", "Second"]))
+        );
+        assert_eq!(
+            stack(FontSlot::Fallback(1), Some("Other")),
+            (some("Main"), list(&["First", "Other"]))
+        );
+
+        let picker = FontPicker::new(
+            FontTarget::Terminal,
+            FontSlot::Fallback(0),
+            base.clone(),
+            None,
+        );
+        assert_eq!(picker.draft.as_deref(), Some("First"));
+        assert_eq!(picker.excluded(), ["main", "second"]);
+        let picker = FontPicker::new(FontTarget::Terminal, FontSlot::Add, base.clone(), None);
+        assert!(!picker.can_apply(), "nothing to add yet");
+        assert_eq!(picker.excluded(), ["main", "first", "second"]);
+        let picker = FontPicker::new(FontTarget::Terminal, FontSlot::Main, base.clone(), None);
+        assert!(picker.excluded().is_empty());
+
+        // Left to the configuration, the main font is still not offered:
+        // the list would pass it by.
+        let unset = FontStack::new(None, &base.fallbacks);
+        let picker = FontPicker::new(
+            FontTarget::Terminal,
+            FontSlot::Add,
+            unset.clone(),
+            Some("JetBrains Mono".to_string()),
+        );
+        assert_eq!(picker.excluded(), ["jetbrains mono", "first", "second"]);
+        let picker = FontPicker::new(
+            FontTarget::Terminal,
+            FontSlot::Main,
+            unset,
+            Some("JetBrains Mono".to_string()),
+        );
+        assert!(picker.excluded().is_empty());
+    }
+
+    #[test]
+    fn the_sample_names_the_first_font_of_the_list_with_each_part() -> anyhow::Result<()> {
+        let _turn = wezterm_font::harfbuzz_turn();
+        // Roboto has no box drawing; JetBrains Mono, next in the list, does.
+        let config = config::ConfigHandle::default_config().adjusted(|cfg| {
+            // Only the bundled fonts: the sample's Chinese and Japanese are
+            // missing, which must not reach the desktop as a notification.
+            cfg.warn_about_missing_glyphs = false;
+            cfg.font_locator = config::FontLocatorSelection::ConfigDirsOnly;
+            cfg.font_dirs =
+                vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/fonts")];
+            cfg.font = config::TextStyle {
+                font: vec![config::FontAttributes::new("Roboto")],
+                foreground: None,
+            };
+        });
+        let fonts = FontConfiguration::new(Some(config.clone()), 96)?;
+        let listed = |fallbacks: &[&str]| -> anyhow::Result<Rc<LoadedFont>> {
+            let fallbacks: Vec<String> = fallbacks.iter().map(|f| f.to_string()).collect();
+            let stack = FontStack::new(None, &fallbacks);
+            let config = config.adjusted(|cfg| {
+                cfg.font = crate::native_settings::terminal_font_style(&config, &stack);
+            });
+            fonts.terminal_font_uncached(&config, 14.0)
+        };
+        for (order, expected) in [
+            (["JetBrains Mono", "Fira Code"], "JetBrains Mono"),
+            (["Fira Code", "JetBrains Mono"], "Fira Code"),
+        ] {
+            let font = listed(&order)?;
+            let drawn = font.blocking_shape("─", None, Direction::LeftToRight, None, None)?;
+            let handles = font.clone_handles();
+            assert_eq!(handles[0].names().family, "Roboto");
+            assert_eq!(
+                handles[drawn[0].font_idx].names().family,
+                expected,
+                "{order:?}"
+            );
+            let faces = SampleFaces::of(&font, true);
+            let parts = faces.parts.as_ref().expect("shaped");
+            assert_eq!(parts[0], ["Roboto"], "Latin from the main font");
+            assert!(faces.has("Fira Code") && faces.has("JetBrains Mono"));
+            assert!(!faces.has("Not Installed Anywhere"));
+            // A part two faces draw names both, in the order they come.
+            let mixed: Vec<String> = faces_drawing(&font, "A─")
+                .into_iter()
+                .map(|index| font.clone_handles()[index].names().family.clone())
+                .collect();
+            assert_eq!(mixed, ["Roboto", expected], "{order:?}");
+            assert_eq!(faces.stand_in_for("Roboto"), None);
+        }
+        let font = listed(&["Not Installed Anywhere"])?;
+        let faces = SampleFaces::of(&font, false);
+        assert!(faces.parts.is_none(), "nothing shaped unless asked");
+        assert!(!faces.has("Not Installed Anywhere"));
+        // The loader also takes a face by its PostScript name.
+        assert!(faces.has("Roboto-Regular"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_main_font_names_what_stands_in() -> anyhow::Result<()> {
+        let _turn = wezterm_font::harfbuzz_turn();
+        let config = config::ConfigHandle::default_config().adjusted(|cfg| {
+            cfg.font_locator = config::FontLocatorSelection::ConfigDirsOnly;
+            cfg.font_dirs =
+                vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/fonts")];
+        });
+        let fonts = FontConfiguration::new(Some(config.clone()), 96)?;
+        let stack = FontStack::new(Some("Not Installed Anywhere"), &["Fira Code".to_string()]);
+        let font = fonts.terminal_font_uncached(
+            &config.adjusted(|cfg| {
+                cfg.font = crate::native_settings::terminal_font_style(&config, &stack);
+            }),
+            14.0,
+        )?;
+        let faces = SampleFaces::of(&font, false);
+        let used = faces.stand_in_for("Not Installed Anywhere");
+        assert_eq!(
+            used.as_deref(),
+            Some(font.clone_handles()[0].names().family.as_str())
+        );
+        assert_eq!(
+            used.as_deref(),
+            Some("JetBrains Mono"),
+            "the bundled font, not the list's first"
+        );
+        // A generic family is resolved, not missing.
+        assert_eq!(faces.stand_in_for("monospace"), None);
+        assert_eq!(faces.stand_in_for(" Sans-Serif "), None);
+        // A family written in another case is the one loaded.
+        let font = fonts.terminal_font_uncached(&config, 14.0)?;
+        assert_eq!(
+            SampleFaces::of(&font, false).stand_in_for("jetbrains mono"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn edits_go_by_name_into_the_list_as_it_is_now() {
+        let opened = FontStack::new(Some("Main"), &["First".to_string(), "Second".to_string()]);
+        // Changed elsewhere while the picker was open.
+        let now = || FontStack {
+            primary: Some("Main".to_string()),
+            fallbacks: ["Other", "First", "Second", "New"]
+                .iter()
+                .map(|family| family.to_string())
+                .collect(),
+        };
+        let picked = |slot, draft: &str| {
+            let mut picker = FontPicker::new(FontTarget::Terminal, slot, opened.clone(), None);
+            picker.draft = Some(draft.to_string());
+            let mut stack = now();
+            picker.edit().apply(&mut stack);
+            stack
+        };
+        assert_eq!(
+            picked(FontSlot::Fallback(1), "Replacement").fallbacks,
+            ["Other", "First", "Replacement", "New"],
+            "the family the picker opened on is replaced, wherever it is now"
+        );
+        let main = picked(FontSlot::Main, "Picked");
+        assert_eq!(main.primary.as_deref(), Some("Picked"));
+        assert_eq!(main.fallbacks, now().fallbacks, "the others are kept");
+        assert_eq!(
+            picked(FontSlot::Add, "Added").fallbacks,
+            ["Other", "First", "Second", "New", "Added"]
+        );
+        // The main font meanwhile: no place for it among the fallbacks,
+        // which saving checks before it changes anything.
+        let mut picker = FontPicker::new(
+            FontTarget::Terminal,
+            FontSlot::Fallback(0),
+            opened.clone(),
+            None,
+        );
+        picker.draft = Some("Picked".to_string());
+        let mut stack = FontStack::new(Some("Picked"), &["First".to_string()]);
+        picker.edit().apply(&mut stack);
+        let stack = FontStack::new(stack.primary.as_deref(), &stack.fallbacks);
+        assert!(!stack.has_fallback("Picked"));
+
+        // Gone meanwhile: the choice goes after the others, not nowhere.
+        let mut picker = FontPicker::new(FontTarget::Terminal, FontSlot::Fallback(0), opened, None);
+        picker.draft = Some("Replacement".to_string());
+        assert_eq!(picker.edit().adds(), Some("Replacement"));
+        let mut stack = FontStack::new(Some("Main"), &["Second".to_string()]);
+        picker.edit().apply(&mut stack);
+        assert_eq!(stack.fallbacks, ["Second", "Replacement"]);
+        // Nothing picked, nothing to apply or add.
+        picker.draft = None;
+        assert_eq!(picker.edit().adds(), None);
+        let mut stack = FontStack::new(Some("Main"), &["Second".to_string()]);
+        picker.edit().apply(&mut stack);
+        assert_eq!(stack.fallbacks, ["Second"]);
+
+        let mut stack = now();
+        move_fallback(&mut stack, "second", true);
+        assert_eq!(stack.fallbacks, ["Other", "Second", "First", "New"]);
+        move_fallback(&mut stack, "New", false);
+        assert_eq!(
+            stack.fallbacks,
+            ["Other", "Second", "First", "New"],
+            "already last"
+        );
+        move_fallback(&mut stack, "Absent", true);
+        remove_fallback(&mut stack, "first");
+        assert_eq!(stack.fallbacks, ["Other", "Second", "New"]);
     }
 }

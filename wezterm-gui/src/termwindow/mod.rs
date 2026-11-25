@@ -2575,7 +2575,7 @@ fn window_font_change(
     owned: &mut Option<SettingsOverride<config::TextStyle>>,
     overrides: &wezterm_dynamic::Value,
     base: &config::TextStyle,
-    family: Option<&str>,
+    stack: &crate::native_settings::FontStack,
     new_pick: bool,
 ) -> Option<(&'static str, Option<wezterm_dynamic::Value>)> {
     use wezterm_dynamic::{FromDynamic, ToDynamic, Value};
@@ -2592,9 +2592,9 @@ fn window_font_change(
     if !new_pick && ours.is_none() {
         return None;
     }
-    let Some(family) = family else {
+    if stack.is_empty() {
         return ours.map(|ours| ("font", ours.displaced));
-    };
+    }
     let displaced = match ours {
         Some(ours) => ours.displaced,
         None => current.cloned(),
@@ -2603,7 +2603,7 @@ fn window_font_change(
         .as_ref()
         .and_then(decode)
         .unwrap_or_else(|| base.clone());
-    style.set_primary_family(family);
+    stack.apply_to(&mut style);
     let change =
         (Some(&style) != current_style.as_ref()).then(|| ("font", Some(style.to_dynamic())));
     *owned = Some(SettingsOverride {
@@ -2650,6 +2650,12 @@ mod settings_override_tests {
         Value::Object(map)
     }
 
+    use crate::native_settings::FontStack;
+
+    fn pick(family: &str) -> FontStack {
+        FontStack::new(Some(family), &[])
+    }
+
     #[test]
     fn a_lua_round_trip_preserves_ownership_and_restores_the_displaced_font() {
         use super::window_font_change;
@@ -2664,7 +2670,7 @@ mod settings_override_tests {
         let mut current = with_font(original.clone());
         for family in ["First", "Second"] {
             let (_, Some(picked)) =
-                window_font_change(&mut owner, &current, &base, Some(family), true).unwrap()
+                window_font_change(&mut owner, &current, &base, &pick(family), true).unwrap()
             else {
                 panic!("expected a picked font")
             };
@@ -2679,11 +2685,11 @@ mod settings_override_tests {
                 .eval()
                 .unwrap();
             current = luahelper::lua_value_to_dynamic(updated).unwrap();
-            assert!(window_font_change(&mut owner, &current, &base, Some(family), false).is_none());
+            assert!(window_font_change(&mut owner, &current, &base, &pick(family), false).is_none());
             assert!(owner.is_some());
         }
         assert_eq!(
-            window_font_change(&mut owner, &current, &base, None, true),
+            window_font_change(&mut owner, &current, &base, &FontStack::default(), true),
             Some(("font", Some(original)))
         );
         assert!(owner.is_none());
@@ -2695,14 +2701,14 @@ mod settings_override_tests {
         let mut base = config::TextStyle::default();
         let mut owner = None;
         let (_, Some(first)) =
-            window_font_change(&mut owner, &Value::Null, &base, Some("Picked"), true).unwrap()
+            window_font_change(&mut owner, &Value::Null, &base, &pick("Picked"), true).unwrap()
         else {
             panic!("expected a picked font")
         };
         base.font
             .push(config::FontAttributes::new_fallback("New fallback"));
         let (_, Some(reloaded)) =
-            window_font_change(&mut owner, &with_font(first), &base, Some("Picked"), false)
+            window_font_change(&mut owner, &with_font(first), &base, &pick("Picked"), false)
                 .unwrap()
         else {
             panic!("expected new fallbacks")
@@ -2711,9 +2717,62 @@ mod settings_override_tests {
         expected.set_primary_family("Picked");
         assert_eq!(reloaded, expected.to_dynamic());
         let script = with_font(base.to_dynamic());
-        assert!(window_font_change(&mut owner, &script, &base, Some("Picked"), false).is_none());
+        assert!(window_font_change(&mut owner, &script, &base, &pick("Picked"), false).is_none());
         assert!(owner.is_none());
-        assert!(window_font_change(&mut owner, &script, &base, None, true).is_none());
+        assert!(window_font_change(&mut owner, &script, &base, &FontStack::default(), true).is_none());
+    }
+
+    #[test]
+    fn a_picked_list_goes_after_the_main_font_and_before_the_configured_fallbacks() {
+        use super::window_font_change;
+        let mut base = config::TextStyle::default();
+        base.font
+            .push(config::FontAttributes::new_fallback("Configured fallback"));
+        let families = |value: Value| -> Vec<String> {
+            use wezterm_dynamic::FromDynamic;
+            config::TextStyle::from_dynamic(&value, Default::default())
+                .unwrap()
+                .font
+                .into_iter()
+                .map(|attr| attr.family)
+                .collect()
+        };
+        let fallbacks = ["Listed SC".to_string(), "Listed JP".to_string()];
+        let mut owner = None;
+        // Only fallbacks: the configured main font stays first.
+        let (_, Some(listed)) = window_font_change(
+            &mut owner,
+            &Value::Null,
+            &base,
+            &FontStack::new(None, &fallbacks),
+            true,
+        )
+        .unwrap() else {
+            panic!("expected a font list")
+        };
+        assert_eq!(
+            families(listed.clone()),
+            ["JetBrains Mono", "Listed SC", "Listed JP", "Configured fallback"]
+        );
+        let (_, Some(picked)) = window_font_change(
+            &mut owner,
+            &with_font(listed),
+            &base,
+            &FontStack::new(Some("Picked"), &fallbacks[1..]),
+            true,
+        )
+        .unwrap() else {
+            panic!("expected a font list")
+        };
+        assert_eq!(
+            families(picked.clone()),
+            ["Picked", "Listed JP", "Configured fallback"]
+        );
+        // Emptied, the window goes back to the configured fonts.
+        assert_eq!(
+            window_font_change(&mut owner, &with_font(picked), &base, &FontStack::default(), true),
+            Some(("font", None))
+        );
     }
 
     #[test]
@@ -5208,7 +5267,7 @@ impl TermWindow {
             &mut settings_font_override,
             &wezterm_dynamic::Value::Null,
             &config.font,
-            crate::native_settings::terminal_font_family(&native_settings),
+            &crate::native_settings::terminal_font_stack(&native_settings),
             true,
         ));
         let mut settings_owned_overrides = HashMap::new();
@@ -5262,7 +5321,7 @@ impl TermWindow {
         };
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
-        fontconfig.set_ui_font_family(native_settings.chrome.ui_font_family.clone());
+        crate::native_settings::set_ui_fonts(&fontconfig, &native_settings);
 
         let mux = Mux::get();
         let size = match mux.get_active_tab_for_window(mux_window_id) {
@@ -8946,8 +9005,8 @@ impl TermWindow {
         self.invalidate_window();
     }
 
-    pub(crate) fn apply_ui_font_family(&mut self, family: Option<String>) {
-        if self.fonts.set_ui_font_family(family) {
+    pub(crate) fn apply_ui_fonts(&mut self, stack: crate::native_settings::FontStack) {
+        if self.fonts.set_ui_fonts(stack.primary, stack.fallbacks) {
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
             self.close_command_palette();
@@ -8997,7 +9056,7 @@ impl TermWindow {
 
     pub(crate) fn settings_font_change(
         &mut self,
-        family: Option<&str>,
+        stack: &crate::native_settings::FontStack,
     ) -> Option<(&'static str, Option<wezterm_dynamic::Value>)> {
         let base = if self.settings_font_override.is_some() {
             configuration()
@@ -9008,7 +9067,7 @@ impl TermWindow {
             &mut self.settings_font_override,
             &self.config_overrides,
             &base.font,
-            family,
+            stack,
             true,
         )
     }
@@ -9193,7 +9252,7 @@ impl TermWindow {
                 &mut self.settings_font_override,
                 &self.config_overrides,
                 &configuration().font,
-                crate::native_settings::terminal_font_family(&crate::native_settings::load_shared()),
+                &crate::native_settings::terminal_font_stack(&crate::native_settings::load_shared()),
                 false,
             );
             if let (Some((key, value)), wezterm_dynamic::Value::Object(map)) =

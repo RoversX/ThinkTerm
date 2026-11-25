@@ -679,6 +679,9 @@ struct FontConfigInner {
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
     entity_font_overrides: RefCell<HashMap<(Entity, u64, u16, bool), Rc<LoadedFont>>>,
     ui_font_family: RefCell<Option<String>>,
+    /// Families tried after the interface font, in order, before the
+    /// system's own interface fonts: a font list picked in Settings.
+    ui_font_fallbacks: RefCell<Vec<String>>,
     // The window and pane tab rows each have one configurable point size.
     title_reference_heights: Cell<[Option<(f64, usize)>; 2]>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
@@ -704,6 +707,7 @@ impl FontConfigInner {
             command_palette_font: RefCell::new(None),
             entity_font_overrides: RefCell::new(HashMap::new()),
             ui_font_family: RefCell::new(None),
+            ui_font_fallbacks: RefCell::new(Vec::new()),
             title_reference_heights: Cell::new([None; 2]),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
@@ -773,6 +777,7 @@ impl FontConfigInner {
         config: &ConfigHandle,
         entity: Entity,
         family: Option<&str>,
+        fallbacks: &[String],
     ) -> (TextStyle, f64) {
         fn weighted(family: &str, weight: FontWeight) -> FontAttributes {
             FontAttributes {
@@ -799,9 +804,7 @@ impl FontConfigInner {
         };
         if let Some(style) = configured.or(config.window_frame.font.as_ref()) {
             let mut style = style.clone();
-            if let Some(family) = family {
-                style.set_primary_family(family);
-            }
+            style.apply_font_list(family, fallbacks);
             return (style, font_size);
         }
 
@@ -853,23 +856,62 @@ impl FontConfigInner {
             fonts.insert(0, primary);
         }
 
+        // The interface's own list goes right after its main font. A family
+        // the terminal's list has too brings the scale and features set for
+        // it there, in the interface's weight, stretch and style.
+        let listed = |family: &str| {
+            fallbacks
+                .iter()
+                .any(|listed| listed.trim().eq_ignore_ascii_case(family))
+        };
+        let main = fonts[0].clone();
+        for font in &config.font.font {
+            if !listed(&font.family) {
+                continue;
+            }
+            // One of the interface's own fonts keeps the weight it has.
+            match fonts[1..]
+                .iter_mut()
+                .find(|own| own.family.eq_ignore_ascii_case(&font.family))
+            {
+                Some(own) => {
+                    *own = FontAttributes {
+                        weight: own.weight,
+                        stretch: own.stretch,
+                        style: own.style,
+                        is_fallback: true,
+                        ..font.clone()
+                    }
+                }
+                None => fonts.push(FontAttributes {
+                    weight: main.weight,
+                    stretch: main.stretch,
+                    style: main.style,
+                    is_fallback: true,
+                    ..font.clone()
+                }),
+            }
+        }
+        let mut style = TextStyle {
+            foreground: None,
+            font: fonts,
+        };
+        style.insert_fallback_families(fallbacks);
+
         // Fallback to their main font selection, so that we can pick up
         // any fallback fonts they might have configured in the main
         // config and so that they don't have to replicate that list for
         // the title font.
         for font in &config.font.font {
+            if listed(&font.family) {
+                continue;
+            }
             let mut font = font.clone();
             font.is_fallback = true;
-            fonts.push(font);
+            style.font.push(font);
         }
 
-        (
-            TextStyle {
-                foreground: None,
-                font: fonts,
-            },
-            font_size,
-        )
+        (style, font_size)
     }
 
     fn make_entity_font_impl(
@@ -885,6 +927,7 @@ impl FontConfigInner {
             myself,
             &config,
             self.ui_font_family.borrow().as_deref(),
+            &self.ui_font_fallbacks.borrow(),
             entity,
             override_font_size,
             override_weight,
@@ -899,12 +942,14 @@ impl FontConfigInner {
         myself: &Rc<Self>,
         config: &ConfigHandle,
         ui_family: Option<&str>,
+        ui_fallbacks: &[String],
         entity: Entity,
         override_font_size: Option<f64>,
         override_weight: Option<config::FontWeight>,
         override_italic: bool,
     ) -> anyhow::Result<Rc<LoadedFont>> {
-        let (mut text_style, configured_font_size) = Self::ui_font_style(config, entity, ui_family);
+        let (mut text_style, configured_font_size) =
+            Self::ui_font_style(config, entity, ui_family, ui_fallbacks);
         let font_size = override_font_size.unwrap_or(configured_font_size);
         if override_weight.is_some() || override_italic {
             for attr in &mut text_style.font {
@@ -1436,6 +1481,29 @@ impl FontConfigInner {
     }
 }
 
+/// The family the interface's main font is when Settings picks none, when
+/// it is the same everywhere: the configuration may set one for the window
+/// frame and another for the command palette or the selectors. `None`
+/// where they differ.
+pub fn default_ui_font_family(config: &ConfigHandle) -> Option<String> {
+    let mut main: Option<String> = None;
+    for entity in [
+        Entity::Title,
+        Entity::CommandPalette,
+        Entity::CharSelect,
+        Entity::PaneSelect,
+    ] {
+        let (style, _) = FontConfigInner::ui_font_style(config, entity, None, &[]);
+        let family = style.font.first()?.family.clone();
+        match &main {
+            Some(main) if !main.eq_ignore_ascii_case(&family) => return None,
+            Some(_) => {}
+            None => main = Some(family),
+        }
+    }
+    main
+}
+
 impl FontConfiguration {
     /// Create a new empty configuration
     pub fn new(config: Option<ConfigHandle>, dpi: usize) -> anyhow::Result<Self> {
@@ -1443,18 +1511,23 @@ impl FontConfiguration {
         Ok(Self { inner })
     }
 
-    /// Change only interface font caches; terminal fonts remain loaded.
-    pub fn set_ui_font_family(&self, family: Option<String>) -> bool {
+    /// Use `family` for the interface, `None` for the default, with
+    /// `fallbacks` tried after it in order. Changes only the interface font
+    /// caches; terminal fonts remain loaded. True when anything changed.
+    pub fn set_ui_fonts(&self, family: Option<String>, fallbacks: Vec<String>) -> bool {
         let family = family
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        if *self.inner.ui_font_family.borrow() == family {
+        if *self.inner.ui_font_family.borrow() == family
+            && *self.inner.ui_font_fallbacks.borrow() == fallbacks
+        {
             return false;
         }
         if family.is_none() {
             self.inner.title_reference_heights.set([None; 2]);
         }
         *self.inner.ui_font_family.borrow_mut() = family;
+        *self.inner.ui_font_fallbacks.borrow_mut() = fallbacks;
         self.inner.title_font.borrow_mut().take();
         self.inner.command_palette_font.borrow_mut().take();
         self.inner.char_select_font.borrow_mut().take();
@@ -1463,15 +1536,19 @@ impl FontConfiguration {
         true
     }
 
+    /// The interface font `family` with `fallbacks` would give, at `size`
+    /// points, built for the caller and not cached here.
     pub fn ui_font_preview(
         &self,
         family: Option<&str>,
+        fallbacks: &[String],
         size: f64,
     ) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.make_entity_font_from(
             &self.inner,
             &self.config(),
             family,
+            fallbacks,
             Entity::CommandPalette,
             Some(size),
             None,
@@ -1530,7 +1607,14 @@ impl FontConfiguration {
             return Ok((*reference, selected));
         }
         let font = self.inner.make_entity_font_from(
-            &self.inner, &self.config(), None, Entity::Title, Some(size), None, false,
+            &self.inner,
+            &self.config(),
+            None,
+            &[],
+            Entity::Title,
+            Some(size),
+            None,
+            false,
         )?;
         let reference = line_height(&font);
         self.inner.title_reference_heights.set([Some((size, reference)), cached[0]]);
@@ -1607,6 +1691,7 @@ impl FontConfiguration {
                 &self.inner,
                 &self.config(),
                 None,
+                &[],
                 Entity::CommandPalette,
                 Some(size.clamp(6.0, 72.0)),
                 (weight > 0).then(|| config::FontWeight::from_opentype_weight(weight)),
@@ -1650,6 +1735,7 @@ impl FontConfiguration {
             &self.inner,
             config,
             self.inner.ui_font_family.borrow().as_deref(),
+            &self.inner.ui_font_fallbacks.borrow(),
             Entity::CommandPalette,
             Some(font_size.clamp(6.0, 72.0)),
             (font_weight > 0).then(|| config::FontWeight::from_opentype_weight(font_weight)),
@@ -1910,13 +1996,104 @@ mod font_picker_tests {
             (Entity::CommandPalette, "Palette Symbols"),
         ] {
             let expected = style(fallback);
-            let (original, _) = FontConfigInner::ui_font_style(&config, entity, None);
+            let (original, _) = FontConfigInner::ui_font_style(&config, entity, None, &[]);
             assert_eq!(original, expected);
-            let (picked, _) = FontConfigInner::ui_font_style(&config, entity, Some("Chosen"));
+            let (picked, _) = FontConfigInner::ui_font_style(&config, entity, Some("Chosen"), &[]);
             assert_eq!(picked.font[0].family, "Chosen");
             assert_eq!(picked.font[0].weight, FontWeight::BOLD);
             assert_eq!(picked.font[1..], expected.font[1..]);
+            let listed = ["Listed CJK".to_string()];
+            let (listed, _) =
+                FontConfigInner::ui_font_style(&config, entity, Some("Chosen"), &listed);
+            assert_eq!(listed.font[1].family, "Listed CJK");
+            assert!(listed.font[1].is_fallback);
+            assert_eq!(listed.font[1].weight, FontWeight::BOLD);
+            assert_eq!(listed.font[2..], expected.font[1..]);
         }
+    }
+
+    #[test]
+    fn interface_fallbacks_come_before_the_system_and_terminal_fonts() {
+        let config = ConfigHandle::default_config().adjusted(|cfg| {
+            cfg.font = TextStyle {
+                font: vec![
+                    FontAttributes::new("Terminal Main"),
+                    FontAttributes::new_fallback("Listed CJK"),
+                ],
+                foreground: None,
+            };
+        });
+        let families = |family: Option<&str>, fallbacks: &[String]| -> Vec<String> {
+            let (style, _) =
+                FontConfigInner::ui_font_style(&config, Entity::CommandPalette, family, fallbacks);
+            style.font.iter().map(|attr| attr.family.clone()).collect()
+        };
+        let none = families(None, &[]);
+        let listed = ["Listed CJK".to_string(), "Listed JP".to_string()];
+        for family in [None, Some("Chosen")] {
+            let plain = families(family, &[]);
+            let got = families(family, &listed);
+            // The primary, then the list, then the rest as before, without
+            // the terminal's copy of a family the list already has.
+            assert_eq!(got[0], plain[0]);
+            assert_eq!(got[1..3], ["Listed CJK", "Listed JP"]);
+            let rest: Vec<&String> = plain[1..].iter().filter(|f| *f != "Listed CJK").collect();
+            assert_eq!(got[3..].iter().collect::<Vec<_>>(), rest);
+        }
+        assert_eq!(none, families(None, &[]), "no list, as before");
+
+        // Configured in another case, the terminal's face comes under the
+        // list's spelling, which is the installed name the loader matches,
+        // with its scale but in the interface's weight.
+        let scaled = ConfigHandle::default_config().adjusted(|cfg| {
+            let mut cjk = FontAttributes::new_fallback("listed cjk");
+            cjk.scale = Some(ordered_float::NotNan::new(0.9).unwrap());
+            cfg.font.font.push(cjk);
+        });
+        let listed = ["Listed CJK".to_string()];
+        for entity in [Entity::CommandPalette, Entity::PaneSelect] {
+            let (style, _) = FontConfigInner::ui_font_style(&scaled, entity, None, &listed);
+            let moved: Vec<&FontAttributes> = style
+                .font
+                .iter()
+                .filter(|attr| attr.family.eq_ignore_ascii_case("listed cjk"))
+                .collect();
+            assert_eq!(moved.len(), 1);
+            assert_eq!(moved[0].family, "Listed CJK");
+            assert_eq!(
+                moved[0].scale,
+                Some(ordered_float::NotNan::new(0.9).unwrap())
+            );
+            assert_eq!(moved[0].weight, style.font[0].weight);
+            assert_eq!(
+                style.font[1].family, "Listed CJK",
+                "right after the main font"
+            );
+        }
+
+        // Configured for the interface in Lua, its main font replaced and
+        // listed after the new one keeps what was set for it there.
+        let palette = ConfigHandle::default_config().adjusted(|cfg| {
+            let mut own = FontAttributes::new("Palette Face");
+            own.scale = Some(ordered_float::NotNan::new(1.2).unwrap());
+            cfg.command_palette_font = Some(TextStyle {
+                font: vec![own],
+                foreground: None,
+            });
+        });
+        let (style, _) = FontConfigInner::ui_font_style(
+            &palette,
+            Entity::CommandPalette,
+            Some("Chosen"),
+            &["Palette Face".to_string()],
+        );
+        assert_eq!(style.font[0].family, "Chosen");
+        assert_eq!(style.font[1].family, "Palette Face");
+        assert!(style.font[1].is_fallback);
+        assert_eq!(
+            style.font[1].scale,
+            Some(ordered_float::NotNan::new(1.2).unwrap())
+        );
     }
 
     #[test]
@@ -1956,6 +2133,42 @@ mod font_picker_tests {
     }
 
     #[test]
+    fn the_interface_list_merges_into_the_interfaces_own_fonts() {
+        let config = ConfigHandle::default_config().adjusted(|cfg| {
+            let mut scaled = FontAttributes::new_fallback("Roboto");
+            scaled.scale = Some(ordered_float::NotNan::new(0.9).unwrap());
+            cfg.font.font.push(scaled);
+        });
+        let (style, _) = FontConfigInner::ui_font_style(
+            &config,
+            Entity::Title,
+            Some("Chosen"),
+            &["Roboto".to_string()],
+        );
+        let roboto: Vec<&FontAttributes> = style
+            .font
+            .iter()
+            .filter(|attr| attr.family == "Roboto")
+            .collect();
+        assert_eq!(roboto.len(), 1, "{:?}", style.font);
+        assert_eq!(style.font[1].family, "Roboto");
+        assert_eq!(
+            style.font[1].scale,
+            Some(ordered_float::NotNan::new(0.9).unwrap())
+        );
+
+        // One main font for every place, or none to name.
+        assert!(default_ui_font_family(&ConfigHandle::default_config()).is_some());
+        let palette = ConfigHandle::default_config().adjusted(|cfg| {
+            cfg.command_palette_font = Some(TextStyle {
+                font: vec![FontAttributes::new("Palette Face")],
+                foreground: None,
+            });
+        });
+        assert_eq!(default_ui_font_family(&palette), None);
+    }
+
+    #[test]
     fn button_reference_preserves_localized_label_widths() -> anyhow::Result<()> {
         let _turn = harfbuzz_turn();
         let fonts = FontConfiguration::new(Some(ConfigHandle::default_config()), 144)?;
@@ -1968,7 +2181,7 @@ mod font_picker_tests {
         };
         let original = fonts.command_palette_font_with_size_and_weight(15.0, 500)?;
         assert!(fonts.button_reference_font(15.0, 500)?.is_none());
-        fonts.set_ui_font_family(Some("JetBrains Mono".into()));
+        fonts.set_ui_fonts(Some("JetBrains Mono".into()), vec![]);
         let reference = fonts
             .button_reference_font(15.0, 500)?
             .expect("custom family");
@@ -1977,7 +2190,7 @@ mod font_picker_tests {
             assert!(expected > 0.0);
             assert_eq!(measure(&reference, label)?, expected);
         }
-        fonts.set_ui_font_family(None);
+        fonts.set_ui_fonts(None, vec![]);
         assert!(fonts.button_reference_font(15.0, 500)?.is_none());
         Ok(())
     }
@@ -1989,10 +2202,10 @@ mod font_picker_tests {
         let fonts = FontConfiguration::new(Some(config), 96)?;
         let terminal = fonts.default_font()?;
         let original = fonts.command_palette_font()?;
-        let _preview = fonts.ui_font_preview(Some("JetBrains Mono"), 14.0)?;
+        let _preview = fonts.ui_font_preview(Some("JetBrains Mono"), &[], 14.0)?;
         assert!(Rc::ptr_eq(&original, &fonts.command_palette_font()?));
         assert!(Rc::ptr_eq(&terminal, &fonts.default_font()?));
-        assert!(fonts.set_ui_font_family(Some("JetBrains Mono".to_string())));
+        assert!(fonts.set_ui_fonts(Some("JetBrains Mono".to_string()), vec![]));
         let changed = fonts.command_palette_font()?;
         assert!(!Rc::ptr_eq(&original, &changed));
         assert!(changed
@@ -2000,9 +2213,18 @@ mod font_picker_tests {
             .iter()
             .any(|font| font.names().family == "JetBrains Mono"));
         assert!(Rc::ptr_eq(&terminal, &fonts.default_font()?));
-        assert!(!fonts.set_ui_font_family(Some("JetBrains Mono".to_string())));
-        assert!(Rc::ptr_eq(&changed, &fonts.command_palette_font()?));
-        assert!(fonts.set_ui_font_family(None));
+        assert!(!fonts.set_ui_fonts(Some("JetBrains Mono".to_string()), vec![]));
+        let listed = vec!["Roboto".to_string()];
+        assert!(fonts.set_ui_fonts(Some("JetBrains Mono".to_string()), listed.clone()));
+        let with_list = fonts.command_palette_font()?;
+        assert!(!Rc::ptr_eq(&changed, &with_list));
+        let handles = with_list.clone_handles();
+        assert_eq!(handles[0].names().family, "JetBrains Mono");
+        assert_eq!(handles[1].names().family, "Roboto", "the list comes next");
+        assert!(!fonts.set_ui_fonts(Some("JetBrains Mono".to_string()), listed));
+        assert!(Rc::ptr_eq(&terminal, &fonts.default_font()?));
+        assert!(Rc::ptr_eq(&with_list, &fonts.command_palette_font()?));
+        assert!(fonts.set_ui_fonts(None, vec![]));
         assert!(Rc::ptr_eq(&terminal, &fonts.default_font()?));
         Ok(())
     }

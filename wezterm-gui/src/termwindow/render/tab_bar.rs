@@ -36,7 +36,7 @@ mod tests {
         let config = config::ConfigHandle::default_config();
         let default = FontConfiguration::new(Some(config.clone()), 96)?;
         let custom = FontConfiguration::new(Some(config), 96)?;
-        custom.set_ui_font_family(Some("JetBrains Mono".into()));
+        custom.set_ui_fonts(Some("JetBrains Mono".into()), vec![]);
         for dpi in [96, 192, 96] {
             default.change_scaling(1.0, dpi);
             custom.change_scaling(1.0, dpi);

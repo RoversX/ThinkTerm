@@ -1,5 +1,5 @@
 mod font_picker;
-use font_picker::{FontCatalog, FontPicker, FontTarget};
+use font_picker::{FontCatalog, FontPicker, FontSlot, FontTarget, SampleFaces};
 use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
@@ -1951,6 +1951,18 @@ fn segmented_track_and_fill(palette: &SettingsPalette) -> (LinearRgba, LinearRgb
     }
 }
 
+/// The configuration this window's fonts are built from: the terminal
+/// windows' own, without the notice about characters no font has. The
+/// font samples here are none of the user's text, and a machine without
+/// Chinese or Japanese fonts was not to be told so for opening a page.
+fn settings_font_config(
+    settings: &ThinkTermNativeSettings,
+    base: &config::ConfigHandle,
+) -> config::ConfigHandle {
+    crate::native_settings::font_fallback_config(settings, base)
+        .adjusted(|config| config.warn_about_missing_glyphs = false)
+}
+
 fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
     let mut args = FluentArgs::new();
     for (name, value) in values {
@@ -2462,7 +2474,15 @@ enum SettingsAction {
     IncreaseSettingsFontWeight,
     ResetSettingsFontWeight,
     FontFamilyInput,
+    /// Open the picker for the main font of a list.
     OpenFontPicker(FontTarget),
+    /// Open the picker to add a fallback font at the end of a list.
+    AddFontFallback(FontTarget),
+    /// Open the picker to replace the fallback font at this place.
+    EditFontFallback(FontTarget, u8),
+    /// Move the fallback font at this place one up (`true`) or down.
+    MoveFontFallback(FontTarget, u8, bool),
+    RemoveFontFallback(FontTarget, u8),
     FontPickerSearch,
     FontPickerDefault,
     FontPickerChoose(u16, u64),
@@ -3063,6 +3083,9 @@ struct SettingsUiState {
     font_family_input_dirty: bool,
     font_catalog: FontCatalog,
     font_picker: Option<FontPicker>,
+    /// Which family draws each part of the font sample, for the last few
+    /// fonts it was shown in: shaping it again every frame would be waste.
+    font_sample_faces: Vec<Rc<SampleFaces>>,
     font_advanced_expanded: bool,
     remote_drop_input: TextInputState,
     remote_drop_input_dirty: bool,
@@ -3211,6 +3234,7 @@ impl SettingsUiState {
             font_family_input_dirty: false,
             font_catalog: FontCatalog::default(),
             font_picker: None,
+            font_sample_faces: Vec::new(),
             font_advanced_expanded: false,
             remote_drop_input: TextInputState::new(),
             remote_drop_input_dirty: false,
@@ -4217,11 +4241,10 @@ impl SettingsWindow {
 
     async fn open(instance_id: u64) -> anyhow::Result<()> {
         let native_settings = Self::load_native_settings();
-        let config =
-            crate::native_settings::font_fallback_config(&native_settings, &configuration());
+        let config = settings_font_config(&native_settings, &configuration());
         let dpi = window::default_dpi() as usize;
         let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
-        fonts.set_ui_font_family(native_settings.chrome.ui_font_family.clone());
+        crate::native_settings::set_ui_fonts(&fonts, &native_settings);
         let active_main_renderer =
             crate::native_settings::main_window_renderer(&native_settings, config.front_end);
         let settings_font_size = crate::native_settings::settings_font_size(&native_settings);
@@ -4507,14 +4530,16 @@ impl SettingsWindow {
         #[cfg(debug_assertions)]
         if let Ok(target) = std::env::var("THINKTERM_SETTINGS_EXPAND") {
             let target = match target.as_str() {
-                "interface-font" => Some(FontTarget::Interface),
-                "terminal-font" => Some(FontTarget::Terminal),
+                "interface-font" => Some((FontTarget::Interface, FontSlot::Main)),
+                "terminal-font" => Some((FontTarget::Terminal, FontSlot::Main)),
+                "interface-font-add" => Some((FontTarget::Interface, FontSlot::Add)),
+                "terminal-font-add" => Some((FontTarget::Terminal, FontSlot::Add)),
                 _ => None,
             };
-            if let (Some(target), Some(settings)) =
+            if let (Some((target, slot)), Some(settings)) =
                 (target, settings_window_for_instance(instance_id))
             {
-                settings.borrow_mut().open_font_picker(target);
+                settings.borrow_mut().open_font_picker(target, slot);
             }
         }
 
@@ -6016,7 +6041,7 @@ impl SettingsWindow {
         // picked here, which apply under the same generation. Listing every
         // installed family again is for a reload only.
         let reloaded = self.fonts.config().generation() != base.generation();
-        let config = crate::native_settings::font_fallback_config(&self.native_settings, base);
+        let config = settings_font_config(&self.native_settings, base);
         self.ui.preview_fonts.clear();
         if let Some(picker) = &mut self.ui.font_picker {
             picker.clear_preview();
@@ -6039,9 +6064,9 @@ impl SettingsWindow {
     ) {
         let mut family_changed = false;
         match crate::native_settings::update(|settings| {
-            let before = settings.terminal.font_family.clone();
+            let before = crate::native_settings::terminal_font_stack(settings);
             edit(&mut settings.terminal);
-            family_changed = settings.terminal.font_family != before;
+            family_changed = crate::native_settings::terminal_font_stack(settings) != before;
         }) {
             Ok(saved) => {
                 self.set_native_settings((*saved).clone());
@@ -6464,10 +6489,9 @@ impl SettingsWindow {
             .fontconfig_prefer_system_fallback
             != settings.terminal.fontconfig_prefer_system_fallback;
         let terminal_family_changed =
-            self.native_settings.terminal.font_family != settings.terminal.font_family;
-        let ui_family_changed = self
-            .fonts
-            .set_ui_font_family(settings.chrome.ui_font_family.clone());
+            crate::native_settings::terminal_font_stack(&self.native_settings)
+                != crate::native_settings::terminal_font_stack(&settings);
+        let ui_family_changed = crate::native_settings::set_ui_fonts(&self.fonts, &settings);
         self.native_settings = settings;
         let configured = terminal_family_changed
             || (fallback_changed && cfg!(all(unix, not(target_os = "macos"))));
@@ -6792,7 +6816,17 @@ impl SettingsWindow {
 
     fn perform_action(&mut self, action: SettingsAction, window: &Window) {
         match action {
-            SettingsAction::OpenFontPicker(target) => self.open_font_picker(target),
+            SettingsAction::OpenFontPicker(target) => self.open_font_picker(target, FontSlot::Main),
+            SettingsAction::AddFontFallback(target) => self.open_font_picker(target, FontSlot::Add),
+            SettingsAction::EditFontFallback(target, index) => {
+                self.open_font_picker(target, FontSlot::Fallback(index))
+            }
+            SettingsAction::MoveFontFallback(target, index, up) => {
+                self.move_font_fallback(target, usize::from(index), up)
+            }
+            SettingsAction::RemoveFontFallback(target, index) => {
+                self.remove_font_fallback(target, usize::from(index))
+            }
             SettingsAction::FontPickerDefault => self.choose_font(None),
             SettingsAction::FontPickerChoose(index, generation) => {
                 self.choose_font(Some((index, generation)))
@@ -15544,8 +15578,7 @@ impl SettingsWindow {
             // The one it replaces leaves its glyphs in the atlas.
             self.ui.stale_glyphs = true;
         }
-        let config =
-            crate::native_settings::font_fallback_config(&self.native_settings, &configuration());
+        let config = settings_font_config(&self.native_settings, &configuration());
         let built = match which {
             PreviewFont::Terminal => self.fonts.terminal_font_uncached(&config, size),
             PreviewFont::Quote => self.fonts.command_palette_font_uncached(&config, size, 500),

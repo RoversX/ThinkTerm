@@ -912,7 +912,9 @@ pub(crate) fn window_opacity_preview(percent: u8) -> (f32, i64) {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct FontChanges {
+    /// The terminal's font list (`terminal_font_stack`) moved.
     pub family: bool,
+    /// The system fallback preference moved.
     pub fallback: bool,
 }
 
@@ -938,18 +940,99 @@ pub(crate) fn settings_config_overrides(
     overrides
 }
 
-pub(crate) fn terminal_font_family(settings: &ThinkTermNativeSettings) -> Option<&str> {
-    settings
-        .terminal
-        .font_family
-        .as_deref()
-        .map(str::trim)
-        .filter(|family| !family.is_empty())
+/// The most fallback fonts a list keeps. Each is looked up whenever a
+/// window loads its fonts, though only read once a character needs it.
+pub(crate) const MAX_FONT_FALLBACKS: usize = 8;
+
+/// A font list as Settings keeps one, for the terminal or the interface:
+/// the main font, then the fonts tried after it in order, as a CSS
+/// `font-family` list. A character comes from the first that has it, then
+/// from the fonts the configuration lists after its own main font, then
+/// from the system's. Chinese and Japanese share most Han characters, so
+/// those come from whichever of their fonts is first: a terminal has no
+/// language to pick by.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FontStack {
+    /// `None` keeps the configured main font.
+    pub(crate) primary: Option<String>,
+    pub(crate) fallbacks: Vec<String>,
 }
 
-pub(crate) fn terminal_font_style(config: &ConfigHandle, family: &str) -> config::TextStyle {
+impl FontStack {
+    /// The list `primary` and `fallbacks` make, as Settings stores them:
+    /// trimmed, without blanks or repeats (in any case), the main font not
+    /// again among the fallbacks, and at most `MAX_FONT_FALLBACKS` of them.
+    pub(crate) fn new(primary: Option<&str>, fallbacks: &[String]) -> Self {
+        let primary = primary
+            .map(str::trim)
+            .filter(|family| !family.is_empty())
+            .map(str::to_string);
+        let mut kept: Vec<String> = Vec::new();
+        for family in fallbacks {
+            let family = family.trim();
+            let taken = |other: &String| other.eq_ignore_ascii_case(family);
+            if family.is_empty() || primary.iter().any(taken) || kept.iter().any(taken) {
+                continue;
+            }
+            if kept.len() == MAX_FONT_FALLBACKS {
+                break;
+            }
+            kept.push(family.to_string());
+        }
+        Self {
+            primary,
+            fallbacks: kept,
+        }
+    }
+
+    /// Whether this leaves the configured fonts as they are.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.primary.is_none() && self.fallbacks.is_empty()
+    }
+
+    /// Whether `family` is among this list's fallbacks.
+    pub(crate) fn has_fallback(&self, family: &str) -> bool {
+        self.fallbacks
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(family))
+    }
+
+    /// `style` with this list in it: the main font in place of the
+    /// configured one, keeping its attributes, and the fallbacks after it,
+    /// ahead of the ones the configuration lists. A configured main font
+    /// the list keeps as a fallback keeps its own attributes there.
+    pub(crate) fn apply_to(&self, style: &mut config::TextStyle) {
+        style.apply_font_list(self.primary.as_deref(), &self.fallbacks);
+    }
+}
+
+pub(crate) fn terminal_font_stack(settings: &ThinkTermNativeSettings) -> FontStack {
+    FontStack::new(
+        settings.terminal.font_family.as_deref(),
+        &settings.terminal.font_fallbacks,
+    )
+}
+
+pub(crate) fn ui_font_stack(settings: &ThinkTermNativeSettings) -> FontStack {
+    FontStack::new(
+        settings.chrome.ui_font_family.as_deref(),
+        &settings.chrome.ui_font_fallbacks,
+    )
+}
+
+/// Give `fonts` the interface font list `settings` has. True when that
+/// changed anything.
+pub(crate) fn set_ui_fonts(
+    fonts: &wezterm_font::FontConfiguration,
+    settings: &ThinkTermNativeSettings,
+) -> bool {
+    let stack = ui_font_stack(settings);
+    fonts.set_ui_fonts(stack.primary, stack.fallbacks)
+}
+
+pub(crate) fn terminal_font_style(config: &ConfigHandle, stack: &FontStack) -> config::TextStyle {
     let mut style = config.font.clone();
-    style.set_primary_family(family.trim());
+    stack.apply_to(&mut style);
     style
 }
 
@@ -961,9 +1044,9 @@ pub(crate) fn font_fallback_config(
         .terminal
         .fontconfig_prefer_system_fallback
         .filter(|_| cfg!(all(unix, not(target_os = "macos"))));
-    let family = terminal_font_family(settings);
+    let stack = terminal_font_stack(settings);
     if prefer.is_none_or(|prefer| prefer == config.fontconfig_prefer_system_fallback)
-        && family.is_none()
+        && stack.is_empty()
     {
         return config.clone();
     }
@@ -971,21 +1054,22 @@ pub(crate) fn font_fallback_config(
         if let Some(prefer) = prefer {
             adjusted.fontconfig_prefer_system_fallback = prefer;
         }
-        if let Some(family) = family {
-            adjusted.font = terminal_font_style(config, family);
+        if !stack.is_empty() {
+            adjusted.font = terminal_font_style(config, &stack);
         }
     })
 }
 
 pub(crate) fn apply_ui_font_to_app(settings: &ThinkTermNativeSettings) {
     if let Some(front_end) = crate::frontend::try_front_end() {
+        let stack = ui_font_stack(settings);
         for gui_window in front_end.gui_windows() {
-            let family = settings.chrome.ui_font_family.clone();
+            let stack = stack.clone();
             gui_window
                 .window
                 .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                     move |window| {
-                        window.apply_ui_font_family(family);
+                        window.apply_ui_fonts(stack);
                     },
                 )));
         }
@@ -1048,7 +1132,17 @@ pub(crate) struct NativeTerminalSettings {
     #[serde(default = "default_true")]
     pub(crate) split_animation: bool,
     pub(crate) font_size: Option<f64>,
+    /// The terminal's main font; `None` follows the configuration.
     pub(crate) font_family: Option<String>,
+    /// Fonts tried after the main one, in order, for characters it lacks:
+    /// see `FontStack`. Left out of the file while empty, so a file
+    /// without it is a list of one.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "choice_or_default"
+    )]
+    pub(crate) font_fallbacks: Vec<String>,
     pub(crate) fontconfig_prefer_system_fallback: Option<bool>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
     pub(crate) scroll_mode: NativeScrollMode,
@@ -1097,6 +1191,7 @@ impl Default for NativeTerminalSettings {
             split_animation: true,
             font_size: None,
             font_family: None,
+            font_fallbacks: Vec::new(),
             fontconfig_prefer_system_fallback: None,
             remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
             scroll_mode: NativeScrollMode::default(),
@@ -1284,7 +1379,15 @@ pub(crate) fn default_shell() -> Option<Vec<String>> {
 #[serde(default)]
 pub(crate) struct NativeChromeSettings {
     pub(crate) settings_font_size: Option<f64>,
+    /// The interface's main font; `None` is the default.
     pub(crate) ui_font_family: Option<String>,
+    /// As `NativeTerminalSettings::font_fallbacks`, for the interface.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "choice_or_default"
+    )]
+    pub(crate) ui_font_fallbacks: Vec<String>,
     pub(crate) settings_font_weight: Option<u16>,
     pub(crate) home_font_size: Option<f64>,
     pub(crate) sidebar_font_size: Option<f64>,
@@ -2632,13 +2735,13 @@ fn take_in_external_settings(data: &[u8]) {
 /// and the like) is picked up by the next window, as it is when another
 /// window changes it.
 fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNativeSettings) {
-    if before.chrome.ui_font_family != after.chrome.ui_font_family {
+    if ui_font_stack(before) != ui_font_stack(after) {
         apply_ui_font_to_app(after);
     }
     let language = before.localization.language != after.localization.language
         || before.onboarding.language != after.onboarding.language;
     let fonts = FontChanges {
-        family: before.terminal.font_family != after.terminal.font_family,
+        family: terminal_font_stack(before) != terminal_font_stack(after),
         fallback: before.terminal.fontconfig_prefer_system_fallback
             != after.terminal.fontconfig_prefer_system_fallback,
     };
@@ -3097,21 +3200,21 @@ pub(crate) fn apply_to_app_with_font_changes(
     // default -- costs nothing.
     // All at once, so a window reloads its configuration once for them.
     let overrides = settings_config_overrides(settings, &config::configuration(), fonts.fallback);
-    let family = if fonts.family {
-        terminal_font_family(settings)
+    let stack = if fonts.family {
+        terminal_font_stack(settings)
     } else {
-        None
+        FontStack::default()
     };
     if let Some(front_end) = crate::frontend::try_front_end() {
         for gui_window in front_end.gui_windows() {
             let mut overrides = overrides.clone();
-            let family = family.map(str::to_owned);
+            let stack = stack.clone();
             gui_window
                 .window
                 .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                     move |term_window| {
                         if fonts.family {
-                            overrides.extend(term_window.settings_font_change(family.as_deref()));
+                            overrides.extend(term_window.settings_font_change(&stack));
                         }
                         term_window.apply_settings_overrides(&overrides);
                         term_window.refresh_chrome();
@@ -4154,6 +4257,153 @@ mod tests {
         );
         settings.terminal.font_family = None;
         assert_eq!(font_fallback_config(&settings, &config).font, original);
+    }
+
+    #[test]
+    fn a_one_font_file_reads_as_a_list_of_one_and_the_list_round_trips() {
+        // As every build before font lists wrote it.
+        let old = r#"{"terminal":{"font_family":"Example Mono"},"chrome":{"ui_font_family":"Example Sans"}}"#;
+        let settings: ThinkTermNativeSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            terminal_font_stack(&settings),
+            FontStack {
+                primary: Some("Example Mono".to_string()),
+                fallbacks: vec![],
+            }
+        );
+        assert_eq!(
+            ui_font_stack(&settings).primary.as_deref(),
+            Some("Example Sans")
+        );
+        assert!(ui_font_stack(&settings).fallbacks.is_empty());
+        // Saved again, it says no more than it did: older builds read it.
+        let saved: serde_json::Value = serde_json::to_value(&settings).unwrap();
+        assert!(saved["terminal"].get("font_fallbacks").is_none());
+        assert!(saved["chrome"].get("ui_font_fallbacks").is_none());
+
+        let mut settings = settings;
+        settings.terminal.font_fallbacks = vec!["PingFang SC".into(), "Hiragino Sans".into()];
+        settings.chrome.ui_font_fallbacks = vec!["PingFang SC".into()];
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let loaded: ThinkTermNativeSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            loaded.terminal.font_fallbacks,
+            ["PingFang SC", "Hiragino Sans"]
+        );
+        assert_eq!(loaded.chrome.ui_font_fallbacks, ["PingFang SC"]);
+        assert_eq!(loaded.terminal.font_family.as_deref(), Some("Example Mono"));
+
+        // A list this build cannot read costs that list, not the file.
+        let odd = r#"{"terminal":{"font_family":"Example Mono","font_fallbacks":"PingFang SC","font_size":15.0}}"#;
+        let loaded: ThinkTermNativeSettings = serde_json::from_str(odd).unwrap();
+        assert!(loaded.terminal.font_fallbacks.is_empty());
+        assert_eq!(loaded.terminal.font_size, Some(15.0));
+        assert_eq!(loaded.terminal.font_family.as_deref(), Some("Example Mono"));
+    }
+
+    #[test]
+    fn a_configured_main_font_kept_as_a_fallback_keeps_its_attributes() {
+        // Written in another case than the installed name the list has.
+        let mut configured = config::TextStyle {
+            font: vec![config::FontAttributes::new("fira code")],
+            foreground: None,
+        };
+        configured.font[0].harfbuzz_features = Some(vec!["calt=0".into()]);
+        configured.font[0].scale = Some(ordered_float::NotNan::new(0.9).unwrap());
+        let stack = FontStack::new(
+            Some("JetBrains Mono"),
+            &["PingFang SC".to_string(), "Fira Code".to_string()],
+        );
+        let mut style = configured.clone();
+        stack.apply_to(&mut style);
+        let families: Vec<&str> = style.font.iter().map(|attr| attr.family.as_str()).collect();
+        assert_eq!(
+            families,
+            ["JetBrains Mono", "PingFang SC", "Fira Code"],
+            "under the list's name, which a fallback is looked up by"
+        );
+        assert_eq!(style.font[2], {
+            let mut kept = configured.font[0].clone();
+            kept.family = "Fira Code".into();
+            kept.is_fallback = true;
+            kept
+        });
+        // Not listed, it is simply replaced, as before font lists.
+        let mut style = configured.clone();
+        FontStack::new(Some("JetBrains Mono"), &[]).apply_to(&mut style);
+        assert_eq!(style.font.len(), 1);
+        assert_eq!(style.font[0].family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn a_font_list_is_trimmed_without_repeats_and_capped() {
+        let many: Vec<String> = (0..MAX_FONT_FALLBACKS + 3)
+            .map(|index| format!("Font {index}"))
+            .collect();
+        let mut listed = vec![
+            " Example Mono ".to_string(),
+            "".to_string(),
+            "PingFang SC".to_string(),
+            "pingfang sc".to_string(),
+        ];
+        listed.extend(many);
+        let stack = FontStack::new(Some(" example mono "), &listed);
+        assert_eq!(stack.primary.as_deref(), Some("example mono"));
+        assert_eq!(stack.fallbacks[0], "PingFang SC");
+        assert_eq!(stack.fallbacks.len(), MAX_FONT_FALLBACKS);
+        assert!(FontStack::new(Some("  "), &[" ".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn the_terminal_font_list_goes_into_the_configured_fonts_in_order() {
+        let config = ConfigHandle::default_config().adjusted(|config| {
+            config
+                .font
+                .font
+                .push(config::FontAttributes::new_fallback("Configured CJK"));
+        });
+        let mut settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        let families = |settings: &ThinkTermNativeSettings| -> Vec<(String, bool)> {
+            font_fallback_config(settings, &config)
+                .font
+                .font
+                .iter()
+                .map(|attr| (attr.family.clone(), attr.is_fallback))
+                .collect()
+        };
+        settings.terminal.font_fallbacks =
+            vec!["Noto Sans CJK JP".into(), "Noto Sans CJK SC".into()];
+        assert_eq!(
+            families(&settings),
+            [
+                ("JetBrains Mono".to_string(), false),
+                ("Noto Sans CJK JP".to_string(), true),
+                ("Noto Sans CJK SC".to_string(), true),
+                ("Configured CJK".to_string(), true),
+            ],
+            "the configured main font keeps its place; the list follows it"
+        );
+        settings.terminal.font_family = Some("Example Mono".into());
+        settings.terminal.font_fallbacks.reverse();
+        assert_eq!(
+            families(&settings),
+            [
+                ("Example Mono".to_string(), false),
+                ("Noto Sans CJK SC".to_string(), true),
+                ("Noto Sans CJK JP".to_string(), true),
+                ("Configured CJK".to_string(), true),
+            ]
+        );
+        settings.terminal.font_fallbacks = vec!["configured cjk".into()];
+        settings.terminal.font_family = None;
+        assert_eq!(
+            families(&settings),
+            [
+                ("JetBrains Mono".to_string(), false),
+                ("configured cjk".to_string(), true),
+            ],
+            "a configured fallback listed again comes once, as the list writes it"
+        );
     }
 
     #[test]
