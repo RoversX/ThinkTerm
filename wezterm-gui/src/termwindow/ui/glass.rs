@@ -269,6 +269,13 @@ fn glass_light_on_light(depth: f32) -> f32 {
     )
 }
 
+/// How strongly New Thread and the bell are glass, next to a selected row's
+/// 1: a share of everything the glass lays over a plain fill -- its edge's
+/// light and dark, and over a see-through window what it clears and the
+/// light it adds. One step fainter, so that the row the sidebar is on stays
+/// the glass that stands out.
+pub(crate) const GLASS_BUTTON_STRENGTH: f32 = 0.6;
+
 /// Over a see-through window, how much more of what is behind the window
 /// shows through a glass capsule in the dark than round it, as a share of
 /// what shows round it. Read off a Mac's own Liquid Glass row in a
@@ -423,9 +430,14 @@ struct CoatRing {
     white: f32,
 }
 
-/// The coats worked out last, by their ground, mixing, corners and scale:
-/// the same few capsules are painted every frame.
-type CoatsKey = (bool, u32, u32, u32, u32, u32);
+/// The coats worked out last, by their ground, mixing, corners, scale and
+/// strength: the same few capsules are painted every frame.
+type CoatsKey = (bool, u32, u32, u32, u32, u32, u32);
+
+/// How many coats are kept: enough for every capsule of a few windows --
+/// selected rows, buttons at rest and under the pointer, tabs -- or each
+/// frame would work all of them out again.
+const COATS_KEPT: usize = 32;
 
 thread_local! {
     static COATS: std::cell::RefCell<Vec<(CoatsKey, Coats)>> =
@@ -548,7 +560,10 @@ impl ThroughGlass {
     /// light as fits is added, and the ground is kept back only as far as
     /// the light it buys, so that one with no room at all is still cleared
     /// as asked.
-    fn coats(&self, radius: f32, pixel: f32) -> Coats {
+    ///
+    /// Glass of less `strength` is asked that share of the clearing and the
+    /// light (`GLASS_BUTTON_STRENGTH`).
+    fn coats_at(&self, radius: f32, pixel: f32, strength: f32) -> Coats {
         let key = (
             self.linear,
             self.solid.to_bits(),
@@ -556,6 +571,7 @@ impl ThroughGlass {
             self.peak.to_bits(),
             radius.to_bits(),
             pixel.to_bits(),
+            strength.to_bits(),
         );
         if let Some(coats) = COATS.with(|cache| {
             cache
@@ -566,10 +582,10 @@ impl ThroughGlass {
         }) {
             return coats;
         }
-        let coats = self.work_out_coats(radius, pixel);
+        let coats = self.work_out_coats(radius, pixel, strength);
         COATS.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache.len() >= 8 {
+            if cache.len() >= COATS_KEPT {
                 cache.remove(0);
             }
             cache.push((key, coats.clone()));
@@ -577,7 +593,15 @@ impl ThroughGlass {
         coats
     }
 
-    fn work_out_coats(&self, radius: f32, pixel: f32) -> Coats {
+    /// `coats_at` for a selected capsule's glass.
+    #[cfg(test)]
+    fn coats(&self, radius: f32, pixel: f32) -> Coats {
+        self.coats_at(radius, pixel, 1.0)
+    }
+
+    fn work_out_coats(&self, radius: f32, pixel: f32, strength: f32) -> Coats {
+        // What the fill clears, the rings' clearing going on top of it.
+        let clear_fill = THROUGH_GLASS_CLEAR * strength;
         // Each ring of the edge, in from it, with how much more shows
         // through there and how much lighter it is asked to be.
         let mut asked = vec![];
@@ -585,15 +609,15 @@ impl ThroughGlass {
         while radius - inset >= 1.0 {
             let depth = inset / pixel;
             let next = depth + 1.0 / pixel;
-            let clear = across_pixel(glass_clear_through, depth, next);
-            let lift = across_pixel(glass_light_through, depth, next);
+            let clear = across_pixel(glass_clear_through, depth, next) * strength;
+            let lift = across_pixel(glass_light_through, depth, next) * strength;
             if clear <= 0.0 && lift <= 0.0 {
                 break;
             }
             asked.push((inset, clear, lift));
             inset += 1.0;
         }
-        let fill_white = |kept: f32| self.light(self.held(kept), THROUGH_GLASS_LIFT);
+        let fill_white = |kept: f32| self.light(self.held(kept), THROUGH_GLASS_LIFT * strength);
         let ring_white = |kept: f32, fill: f32, lift: f32| self.light(self.lit(kept, fill), lift);
         let brightest = asked.iter().map(|&(_, _, lift)| lift).fold(0.0, f32::max);
         let needs = |kept: f32| {
@@ -610,7 +634,7 @@ impl ThroughGlass {
         } else {
             0.0
         };
-        let asked_fill = self.kept(THROUGH_GLASS_CLEAR).max(floor);
+        let asked_fill = self.kept(clear_fill).max(floor);
         let fill = Self::least(asked_fill, 1.0, |kept| self.white_room(kept) >= needs(kept))
             .unwrap_or_else(|| {
                 let buys = (self.white_room(1.0) / needs(1.0).max(f32::EPSILON)).clamp(0.0, 1.0);
@@ -623,10 +647,7 @@ impl ThroughGlass {
                 // A fill kept back keeps its rings back with it, each as
                 // much more see-through than the fill as asked, so the edge
                 // meets the fill where its clearing runs out.
-                let (asked, plain) = (
-                    self.kept(THROUGH_GLASS_CLEAR + clear),
-                    self.kept(THROUGH_GLASS_CLEAR),
-                );
+                let (asked, plain) = (self.kept(clear_fill + clear), self.kept(clear_fill));
                 let asked = if fill > plain && plain > 0.0 {
                     fill * asked / plain
                 } else {
@@ -730,6 +751,21 @@ impl crate::TermWindow {
             .map_or(false, |webgpu| webgpu.config.borrow().format.is_srgb())
     }
 
+    /// `top` laid over `bottom` as this window's frame mixes them: in
+    /// linear light, or the sRGB values themselves
+    /// (`glass_mixes_in_linear`). What glass is worked out for has to be
+    /// what the frame holds under it.
+    pub(crate) fn laid_over(&self, top: LinearRgba, bottom: LinearRgba) -> LinearRgba {
+        use crate::termwindow::ui::sidebar::over;
+        if self.glass_mixes_in_linear() {
+            return over(top, bottom);
+        }
+        let srgb =
+            |c: LinearRgba| LinearRgba::with_components(encode(c.0), encode(c.1), encode(c.2), c.3);
+        let laid = over(srgb(top), srgb(bottom));
+        LinearRgba::with_components(decode(laid.0), decode(laid.1), decode(laid.2), laid.3)
+    }
+
     /// A glass capsule's edge, as Liquid Glass on the iPhone has it, drawn
     /// over its fill: `rect` with corners of `radius`, on the ground `edge`
     /// was chosen for.
@@ -770,6 +806,28 @@ impl crate::TermWindow {
         fill: LinearRgba,
         ground: LinearRgba,
     ) -> anyhow::Result<()> {
+        self.paint_glass_edge_at(
+            layers, layer_num, rect, radius, edge, dark, over_line, fill, ground, 1.0,
+        )
+    }
+
+    /// `paint_glass_edge` with `strength` of its light and dark: 1 for a
+    /// selected capsule, less for glass that stays behind one
+    /// (`GLASS_BUTTON_STRENGTH`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_glass_edge_at(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        edge: GlassEdge,
+        dark: bool,
+        over_line: bool,
+        fill: LinearRgba,
+        ground: LinearRgba,
+        strength: f32,
+    ) -> anyhow::Result<()> {
         let radius = snapped_rounded_corner_radius(rect, radius);
         // Pixels to a point: the chrome is authored in 2x backing pixels.
         let pixel = self.ui_f32(2.0);
@@ -807,7 +865,7 @@ impl crate::TermWindow {
                         rect,
                         radius,
                         -outset,
-                        mix.shade_outside(alpha),
+                        mix.shade_outside(alpha * strength),
                         GlassRing::Ends,
                     )?;
                     outset += 1.0;
@@ -828,7 +886,7 @@ impl crate::TermWindow {
                         lifted,
                         (radius - light_from).max(0.0),
                         mix.light(0.0),
-                        mix.light(LIGHT_GLASS_LIFT),
+                        mix.light(LIGHT_GLASS_LIFT * strength),
                     )?;
                 }
                 if dark {
@@ -842,7 +900,7 @@ impl crate::TermWindow {
                             rect,
                             radius,
                             0.0,
-                            mix.shade(alpha),
+                            mix.shade(alpha * strength),
                             ring,
                         )?;
                     }
@@ -864,7 +922,7 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 inset,
-                mix.light(alpha),
+                mix.light(alpha * strength),
                 GlassRing::Lit,
             )?;
             inset += 1.0;
@@ -907,13 +965,32 @@ impl crate::TermWindow {
         edge: GlassEdge,
         ground: LinearRgba,
     ) -> anyhow::Result<()> {
+        self.paint_through_glass_at(layers, layer_num, rect, radius, edge, ground, 1.0)
+    }
+
+    /// `paint_through_glass` with `strength` of what it clears and the
+    /// light and dark it adds: 1 for a selected capsule, less for glass that
+    /// stays behind one (`GLASS_BUTTON_STRENGTH`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_through_glass_at(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        edge: GlassEdge,
+        ground: LinearRgba,
+        strength: f32,
+    ) -> anyhow::Result<()> {
         let radius = snapped_rounded_corner_radius(rect, radius);
         let pixel = self.ui_f32(2.0);
         if !(pixel > 0.0) || radius < 1.0 {
             return Ok(());
         }
         if edge == GlassEdge::Light {
-            return self.paint_through_glass_light(layers, layer_num, rect, radius, pixel, ground);
+            return self.paint_through_glass_light(
+                layers, layer_num, rect, radius, pixel, ground, strength,
+            );
         }
         let through = ThroughGlass::new(self.glass_mixes_in_linear(), ground);
         // A cleared quad's colour is not used. A renderer that cannot clear
@@ -927,7 +1004,7 @@ impl crate::TermWindow {
             fill: kept,
             light: fill_light,
             rings,
-        } = through.coats(radius, pixel);
+        } = through.coats_at(radius, pixel, strength);
         let result = (|| {
             layers.set_blend(layer_num, QuadBlend::Clear);
             self.fill_rounded_rectangle(layers, layer_num, rect, clearing(1.0 - kept), radius)?;
@@ -979,7 +1056,7 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 -outset,
-                mix.shade_outside(alpha),
+                mix.shade_outside(alpha * strength),
                 GlassRing::Ends,
             )?;
             outset += 1.0;
@@ -987,8 +1064,9 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// `paint_through_glass` in the light, with `radius` already snapped and
-    /// `pixel` pixels to a point.
+    /// `paint_through_glass` in the light, with `radius` already snapped,
+    /// `pixel` pixels to a point and `strength` of every coat.
+    #[allow(clippy::too_many_arguments)]
     fn paint_through_glass_light(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -997,6 +1075,7 @@ impl crate::TermWindow {
         radius: f32,
         pixel: f32,
         ground: LinearRgba,
+        strength: f32,
     ) -> anyhow::Result<()> {
         // What the frame holds under the capsule as each coat goes on, in
         // sRGB, for laying the next one over it.
@@ -1016,20 +1095,21 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 outset,
-                through.shade(above, held),
-                through.shade(below, held),
+                through.shade(above * strength, held),
+                through.shade(below * strength, held),
             )?;
             outset += 1.0;
         }
 
+        let veil = THROUGH_LIGHT_GLASS_VEIL * strength;
         self.fill_rounded_rectangle(
             layers,
             layer_num,
             rect,
-            through.over(1.0, THROUGH_LIGHT_GLASS_VEIL, held),
+            through.over(1.0, veil, held),
             radius,
         )?;
-        let held = THROUGH_LIGHT_GLASS_VEIL + (1.0 - THROUGH_LIGHT_GLASS_VEIL) * held;
+        let held = veil + (1.0 - veil) * held;
         if let Some(gl_state) = self.render_state.as_ref() {
             let light =
                 |lift: f32| LinearRgba::with_components(1.0, 1.0, 1.0, through.light(held, lift));
@@ -1041,13 +1121,14 @@ impl crate::TermWindow {
                         layer_num,
                         rect,
                         radius,
-                        light(THROUGH_LIGHT_GLASS_LIFT_TOP),
-                        light(THROUGH_LIGHT_GLASS_LIFT_BOTTOM),
+                        light(THROUGH_LIGHT_GLASS_LIFT_TOP * strength),
+                        light(THROUGH_LIGHT_GLASS_LIFT_BOTTOM * strength),
                     );
             layers.set_blend(layer_num, QuadBlend::Over);
             result?;
         }
-        let held = held + (THROUGH_LIGHT_GLASS_LIFT_TOP + THROUGH_LIGHT_GLASS_LIFT_BOTTOM) / 2.0;
+        let held = held
+            + (THROUGH_LIGHT_GLASS_LIFT_TOP + THROUGH_LIGHT_GLASS_LIFT_BOTTOM) / 2.0 * strength;
         for (alpha, ring) in [
             (LIGHT_GLASS_OUTLINE, GlassRing::Even),
             (LIGHT_GLASS_OUTLINE_ENDS, GlassRing::Ends),
@@ -1058,7 +1139,7 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 0.0,
-                through.shade(alpha, held),
+                through.shade(alpha * strength, held),
                 ring,
             )?;
         }
@@ -1075,7 +1156,7 @@ impl crate::TermWindow {
                 rect,
                 radius,
                 inset,
-                through.over(1.0, alpha, held),
+                through.over(1.0, alpha * strength, held),
                 GlassRing::Lit,
             )?;
             inset += 1.0;
@@ -1263,6 +1344,38 @@ mod test {
     /// A see-through window's dark sidebar, as it is painted there.
     fn see_through_sidebar() -> LinearRgba {
         LinearRgba::with_srgba(18, 18, 20, 198)
+    }
+
+    /// Glass a step behind a selected capsule (`GLASS_BUTTON_STRENGTH`)
+    /// clears less of a see-through ground and adds less light to it; at no
+    /// strength it is no glass at all.
+    #[test]
+    fn fainter_glass_clears_and_lights_less() {
+        for linear in [false, true] {
+            let through = ThroughGlass::new(linear, see_through_sidebar());
+            let full = through.work_out_coats(25.0, 2.0, 1.0);
+            let faint = through.work_out_coats(25.0, 2.0, GLASS_BUTTON_STRENGTH);
+            let none = through.work_out_coats(25.0, 2.0, 0.0);
+            assert_eq!(none.fill, 1.0, "linear {}: nothing cleared", linear);
+            assert_eq!(none.light, 0.0, "linear {}: no light", linear);
+            assert!(none.rings.is_empty(), "linear {}: no edge", linear);
+            assert!(
+                faint.fill > full.fill,
+                "linear {}: keeps more ground",
+                linear
+            );
+            assert!(
+                faint.light < full.light,
+                "linear {}: adds less light",
+                linear
+            );
+            let edge = |coats: &Coats| coats.rings.first().map_or(0.0, |ring| ring.white);
+            assert!(
+                edge(&faint) < edge(&full),
+                "linear {}: a dimmer edge",
+                linear
+            );
+        }
     }
 
     #[test]

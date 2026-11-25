@@ -7,7 +7,7 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::ui::glass::GlassEdge;
+use crate::termwindow::ui::glass::{GlassEdge, GLASS_BUTTON_STRENGTH};
 use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, MaterialIcon, SvgIcon};
 use crate::termwindow::ui::platform_chrome;
 use crate::termwindow::ui::sidebar_jump::{CurrentRow, Fold, JumpList};
@@ -2064,7 +2064,7 @@ impl crate::TermWindow {
             notification_action_size,
             notification_action_size,
         );
-        self.paint_sidebar_action_button(
+        self.paint_sidebar_glass_button(
             layers,
             1,
             euclid::rect(
@@ -2075,10 +2075,9 @@ impl crate::TermWindow {
             ),
             chrome,
             top_action_hovered,
-            false,
         )
         .context("sidebar add thread button")?;
-        self.paint_sidebar_action_button(
+        self.paint_sidebar_glass_button(
             layers,
             1,
             euclid::rect(
@@ -2089,7 +2088,6 @@ impl crate::TermWindow {
             ),
             chrome,
             notification_action_hovered,
-            false,
         )
         .context("sidebar notifications button")?;
         if let Some(project_id) = active_project_id.clone() {
@@ -3805,7 +3803,7 @@ impl crate::TermWindow {
                 );
             // The repaint over the scrolled list; it is what ends up visible,
             // so it has to use the same treatment as the layer-1 fill.
-            self.paint_sidebar_action_button(
+            self.paint_sidebar_glass_button(
                 layers,
                 2,
                 euclid::rect(
@@ -3816,7 +3814,6 @@ impl crate::TermWindow {
                 ),
                 chrome,
                 top_action_hovered,
-                false,
             )
             .context("sidebar add thread button repaint")?;
             let notification_action_hovered = self.is_pointer_over_ui_rect(
@@ -3825,7 +3822,7 @@ impl crate::TermWindow {
                 notification_action_size,
                 notification_action_size,
             );
-            self.paint_sidebar_action_button(
+            self.paint_sidebar_glass_button(
                 layers,
                 2,
                 euclid::rect(
@@ -3836,7 +3833,6 @@ impl crate::TermWindow {
                 ),
                 chrome,
                 notification_action_hovered,
-                false,
             )
             .context("sidebar notifications button repaint")?;
             let top_action_fg = if active_project_id.is_some() {
@@ -4347,14 +4343,15 @@ impl crate::TermWindow {
                 .is_some_and(|until| until > std::time::Instant::now())
     }
 
-    /// A sidebar action button: circle or pill, with the same shadow and
-    /// hairline border a selected sidebar row gets.
+    /// A sidebar action button: circle or pill, with a shadow and hairline
+    /// border.
     ///
-    /// Four call sites paint these (New Thread and the bell, each of which is
-    /// also repainted on a higher layer over the scrolled list, plus the
-    /// per-section add buttons), and they used to carry the radius and the
-    /// fill separately. Keeping the treatment in one place is what stops one
-    /// of them from staying a rounded square when the others become pills.
+    /// The per-section add buttons, the reconnect row and the right
+    /// sidebar's paint these; New Thread and the bell are glass
+    /// (`paint_sidebar_glass_button`). They
+    /// used to carry the radius and the fill separately. Keeping the
+    /// treatment in one place is what stops one of them from staying a
+    /// rounded square when the others become pills.
     pub(crate) fn paint_sidebar_action_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -4388,7 +4385,7 @@ impl crate::TermWindow {
     /// The chrome the sidebar's list paints with. Over a see-through window
     /// its rows' highlights let some of what is behind it through, rather
     /// than standing over it as solid blocks.
-    fn sidebar_chrome(&self) -> UiPalette {
+    pub(crate) fn sidebar_chrome(&self) -> UiPalette {
         let mut chrome = self.chrome();
         if self.chrome_see_through() {
             for color in [
@@ -4418,12 +4415,51 @@ impl crate::TermWindow {
         fill: LinearRgba,
         border: LinearRgba,
     ) -> anyhow::Result<()> {
-        let radius = rect.height() / 2.0;
-        let ground = self.chrome().workspace_sidebar_bg;
+        self.paint_sidebar_glass(
+            layers,
+            0,
+            rect,
+            rect.height() / 2.0,
+            fill,
+            border,
+            None,
+            1.0,
+            false,
+        )
+    }
+
+    /// A glass capsule on a sidebar, `fill`ed: the selected row's, and the
+    /// right sidebar's selected panel, at `strength` 1, and fainter the
+    /// buttons beside them (`GLASS_BUTTON_STRENGTH`). It sits on the
+    /// sidebar's ground, with `groove` laid on that under it if given, as
+    /// drawn. `border` is the hairline high contrast keeps under the glass.
+    /// `hovered` shows `fill` as it is even where it is lighter than light
+    /// glass keeps its own (`GlassEdge::fill`), so that the pointer still
+    /// lights the capsule there.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_sidebar_glass(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        fill: LinearRgba,
+        border: LinearRgba,
+        groove: Option<LinearRgba>,
+        strength: f32,
+        hovered: bool,
+    ) -> anyhow::Result<()> {
+        let sidebar = self.chrome().workspace_sidebar_bg;
+        let laid = |ground| groove.map_or(ground, |groove| self.laid_over(groove, ground));
+        // What the capsule sits on as an opaque window paints it, which the
+        // glass is chosen and mixed for.
+        let ground = laid(sidebar);
         let edge = GlassEdge::over(ground);
         if self.glass_lets_through() {
-            let ground = self.sidebar_surface(ground);
-            return self.paint_through_glass(layers, 0, rect, radius, edge, ground);
+            // As this window's frame holds it, see-through-ness and all.
+            let held = laid(self.sidebar_surface(sidebar));
+            return self
+                .paint_through_glass_at(layers, layer_num, rect, radius, edge, held, strength);
         }
         let see_through = self.chrome_see_through();
         // Each way gives back the fill it drew, which the edge is mixed with.
@@ -4432,24 +4468,23 @@ impl crate::TermWindow {
                 return Ok(());
             };
             let boost = SEE_THROUGH_BORDER_BOOST.min(1.0 / border.3.max(f32::EPSILON));
-            DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
-                .draw_rounded_frame(
-                    layers,
-                    0,
-                    rect.min_x(),
-                    rect.min_y(),
-                    rect.width(),
-                    rect.height(),
-                    fill,
-                    border.mul_alpha(boost),
-                    radius,
-                )?;
+            DrawContext::new(gl_state, self.dimensions, &self.render_metrics).draw_rounded_frame(
+                layers,
+                layer_num,
+                rect.min_x(),
+                rect.min_y(),
+                rect.width(),
+                rect.height(),
+                fill,
+                border.mul_alpha(boost),
+                radius,
+            )?;
             fill
         } else if self.glass_high_contrast() {
-            self.paint_active_surface_shadow(layers, 0, rect, radius)?;
+            self.paint_active_surface_shadow(layers, layer_num, rect, radius)?;
             self.fill_rounded_rectangle_with_border(
                 layers,
-                0,
+                layer_num,
                 rect,
                 fill,
                 border,
@@ -4458,17 +4493,21 @@ impl crate::TermWindow {
             )?;
             fill
         } else {
-            let drawn = edge.fill(fill, ground, self.glass_mixes_in_linear());
-            self.fill_rounded_rectangle(layers, 0, rect, drawn, radius)?;
+            let drawn = if hovered {
+                fill
+            } else {
+                edge.fill(fill, ground, self.glass_mixes_in_linear())
+            };
+            self.fill_rounded_rectangle(layers, layer_num, rect, drawn, radius)?;
             drawn
         };
         // Over a see-through window the edge takes none of its dark, which
         // would darken what shows through, as a shadow would. Both that
         // window's frame and high contrast's hairline are a line under the
         // glass, which it keeps clear of.
-        self.paint_glass_edge(
+        self.paint_glass_edge_at(
             layers,
-            0,
+            layer_num,
             rect,
             radius,
             edge,
@@ -4476,6 +4515,38 @@ impl crate::TermWindow {
             see_through || self.glass_high_contrast(),
             drawn,
             ground,
+            strength,
+        )
+    }
+
+    /// New Thread and the bell: glass on the sidebar as a selected row is
+    /// (`paint_sidebar_glass`), on the button's own fill and one step
+    /// fainter (`GLASS_BUTTON_STRENGTH`), so that the row stays the one
+    /// that stands out; under the pointer, on the hover fill and as strong
+    /// as the row.
+    fn paint_sidebar_glass_button(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        chrome: UiPalette,
+        hovered: bool,
+    ) -> anyhow::Result<()> {
+        let (fill, strength) = if hovered {
+            (chrome.sidebar_button_hover_bg, 1.0)
+        } else {
+            (chrome.sidebar_button_bg, GLASS_BUTTON_STRENGTH)
+        };
+        self.paint_sidebar_glass(
+            layers,
+            layer_num,
+            rect,
+            rect.height().min(rect.width()) / 2.0,
+            fill,
+            chrome.sidebar_row_active_border,
+            None,
+            strength,
+            hovered,
         )
     }
 
