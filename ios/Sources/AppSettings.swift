@@ -86,6 +86,12 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(chatText, forKey: "chat.text") }
     }
 
+    /// How a reply shows while the agent writes it: "stream", growing as it
+    /// is written, or "blocks", each part shown once written whole.
+    @Published var chatReveal: String {
+        didSet { defaults.set(chatReveal, forKey: "chat.reveal") }
+    }
+
     /// How the sidebar shows the Spaces: "list", every Space a row that
     /// folds, or "menu", the Space on show with the others in its menu,
     /// as the desktop's sidebar has them.
@@ -179,6 +185,7 @@ final class AppSettings: ObservableObject {
         paneBars = d.object(forKey: "ui.panebars") as? Bool ?? true
         chatFirst = d.object(forKey: "chat.first") as? Bool ?? false
         chatText = d.string(forKey: "chat.text") ?? "m"
+        chatReveal = d.string(forKey: "chat.reveal") ?? "stream"
         spaces = d.string(forKey: "ui.spaces") ?? "list"
         agentsOnly = d.object(forKey: "home.agents") as? Bool ?? false
         skyHaptics = d.object(forKey: "sky.haptics") as? Bool ?? true

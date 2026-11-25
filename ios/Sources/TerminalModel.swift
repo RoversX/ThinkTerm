@@ -490,6 +490,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             connection = "failed: " + tr("jump.missing")
             return
         }
+        if draftsOf != host.id {
+            chatDrafts = [:]
+            draftsOf = host.id
+        }
         let account = host.id.uuidString
         let secret = Keychain.load(account: account) ?? ""
         let passphrase = Keychain.load(account: account + ".passphrase")
@@ -1191,6 +1195,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// rows name them by: each comes once ("chat_picture").
     @Published private(set) var chatThumbs: [String: UIImage] = [:] { didSet { chatFeed.thumbs = chatThumbs } }
     private var chatFilesTimer: Timer?
+    /// What was typed in each pane's chat and not sent: there again when
+    /// the chat is. A pane's number is its host's: another host's drafts
+    /// are let go.
+    var chatDrafts: [Int: String] = [:]
+    private var draftsOf: UUID?
 
     /// Put what the phone has -- a photo, the clipboard's picture -- in the
     /// host's uploads folder, to go with what is said next.
@@ -1254,6 +1263,27 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if file.path == nil && file.error == nil { core.cancelUpload(id: file.id) }
         chatFiles.removeAll { $0.id == file.id }
         try? FileManager.default.removeItem(at: file.file.deletingLastPathComponent())
+    }
+
+    /// A picked file that did not reach the host, sent again from the app's
+    /// copy of it; why it failed is said meanwhile.
+    func chatRetry(_ file: ChatFile) {
+        if let error = file.error { note("\(file.name): \(error)") }
+        guard FileManager.default.fileExists(atPath: file.file.path) else {
+            chatFiles.removeAll { $0.id == file.id }
+            return
+        }
+        let id = core.uploadBegin()
+        core.uploadFile(id: id, name: file.name, path: file.file.path)
+        var again = ChatFile(id: id, name: file.name, image: file.image, size: file.size, preview: file.preview, file: file.file)
+        again.sent = 0
+        if let at = chatFiles.firstIndex(where: { $0.id == file.id }) {
+            chatFiles[at] = again
+        } else {
+            chatFiles.append(again)
+        }
+        guard chatFilesTimer == nil else { return }
+        chatFilesTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.pollChatFiles() }
     }
 
     private static var chatFilesFolder: URL {

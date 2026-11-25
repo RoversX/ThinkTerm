@@ -37,6 +37,10 @@ struct ChatState: Decodable {
     /// The agent runs an older ThinkTerm extension than the one in its
     /// folder: said over the field, with the button that loads the new one.
     var outdated: ChatOutdated?
+    /// When each row came about (unix seconds), by row id, where known.
+    var times: [String: Int64]?
+    /// The replies still being written, by row id.
+    var writing: [String]?
 }
 
 /// The agent runs an older ThinkTerm extension than the one in its
@@ -87,13 +91,29 @@ struct ChatStat: Decodable, Equatable, Identifiable {
 
 /// A command the field offers: as typed (`/compact`), what it does, what
 /// may follow it (a pick then puts it in the field rather than run it),
-/// and `here` for one the app does itself ("model": the model menu).
+/// `here` for one the app does itself ("model": the model menu), what it
+/// is ("skill", "command", "prompt") and the heading of its group.
 struct ChatCommand: Decodable, Hashable, Identifiable {
     var name: String
     var description: String
     var args: String?
     var here: String?
+    var kind: String
+    var group: String
     var id: String { name }
+
+    private enum Key: String, CodingKey { case name, description, args, here, kind, group }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        name = try c.decode(String.self, forKey: .name)
+        description = (try? c.decode(String.self, forKey: .description)) ?? ""
+        args = try? c.decode(String.self, forKey: .args)
+        here = try? c.decode(String.self, forKey: .here)
+        // An older core says no kind: the name tells a skill.
+        kind = (try? c.decode(String.self, forKey: .kind)) ?? (name.hasPrefix("$") || name.hasPrefix("/skill:") ? "skill" : "command")
+        group = (try? c.decode(String.self, forKey: .group)) ?? ""
+    }
 }
 
 /// The model button: what it says, and what it opens on -- the models,
@@ -131,7 +151,8 @@ struct ChatSent: Decodable, Hashable {
 
 enum ChatRow: Decodable, Identifiable {
     case user(id: String, text: String, attachments: [ChatSent])
-    case text(id: String, blocks: [MdBlock])
+    /// `copy`: the words as written, for the last reply of a turn.
+    case text(id: String, blocks: [MdBlock], copy: String?)
     case fold(ChatFold)
     case note(id: String, text: String)
     case group(ChatGroup)
@@ -139,13 +160,14 @@ enum ChatRow: Decodable, Identifiable {
     var id: String {
         switch self {
         case let .user(id, _, _): return id
-        case let .text(id, _), let .note(id, _): return id
+        case let .text(id, _, _): return id
+        case let .note(id, _): return id
         case let .fold(fold): return fold.id
         case let .group(group): return group.id
         }
     }
 
-    private enum Key: String, CodingKey { case kind, id, text, blocks, attachments }
+    private enum Key: String, CodingKey { case kind, id, text, blocks, attachments, copy }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Key.self)
@@ -157,7 +179,7 @@ enum ChatRow: Decodable, Identifiable {
                 text: try c.decode(String.self, forKey: .text),
                 attachments: (try? c.decode([ChatSent].self, forKey: .attachments)) ?? []
             )
-        case "text": self = .text(id: id, blocks: try c.decode([MdBlock].self, forKey: .blocks))
+        case "text": self = .text(id: id, blocks: try c.decode([MdBlock].self, forKey: .blocks), copy: try? c.decode(String.self, forKey: .copy))
         case "fold": self = .fold(try ChatFold(from: decoder))
         case "group": self = .group(try ChatGroup(from: decoder))
         default: self = .note(id: id, text: (try? c.decode(String.self, forKey: .text)) ?? "")
@@ -274,6 +296,8 @@ struct MdSpan: Decodable, Hashable {
     var code: Bool?
     var strike: Bool?
     var link: String?
+    /// How much of its colour it shows, for words just come in.
+    var fade: Double?
 }
 
 struct ChatAsk: Decodable {
@@ -309,6 +333,8 @@ struct ChatAction: Decodable {
 struct ChatNotice: Decodable, Equatable {
     var seq: Int64
     var text: String
+    /// What was typed and not sent: back in the field, to be put right.
+    var kept: String?
 }
 
 // MARK: the page
@@ -323,6 +349,15 @@ func chatTextScale(_ setting: String) -> CGFloat {
     }
 }
 
+/// The chat's text scale: its own setting, times what the system's text
+/// size (Dynamic Type) makes of body text -- kept within twice, past which
+/// a phone's width holds too few words.
+func chatTextScale(_ setting: String, _ size: DynamicTypeSize) -> CGFloat {
+    let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(size))
+    let system = UIFontMetrics(forTextStyle: .body).scaledValue(for: 17, compatibleWith: traits) / 17
+    return chatTextScale(setting) * min(max(system, 0.85), 2)
+}
+
 private struct ChatTextScaleKey: EnvironmentKey {
     static let defaultValue: CGFloat = 1
 }
@@ -332,6 +367,23 @@ extension EnvironmentValues {
     var chatTextScale: CGFloat {
         get { self[ChatTextScaleKey.self] }
         set { self[ChatTextScaleKey.self] = newValue }
+    }
+}
+
+/// Whether a code block is being scrolled sideways: the swipe for the
+/// times leaves the rows where they are meanwhile.
+final class CodeScroll: @unchecked Sendable {
+    var active = false
+}
+
+private struct CodeScrollKey: EnvironmentKey {
+    static let defaultValue = CodeScroll()
+}
+
+extension EnvironmentValues {
+    var codeScroll: CodeScroll {
+        get { self[CodeScrollKey.self] }
+        set { self[CodeScrollKey.self] = newValue }
     }
 }
 
@@ -367,9 +419,38 @@ struct ChatPage: View {
     /// The chat's text size is one of its settings.
     @ObservedObject private var settings = AppSettings.shared
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var still
+    /// How much of each reply on its way is on show.
+    @StateObject private var reveal = ChatReveal()
+    /// Swiped left: the rows move aside for when each came about, and back
+    /// once let go (or the touch is taken for something else).
+    @GestureState(resetTransaction: Transaction(animation: .snappy(duration: 0.28))) private var swipe: CGFloat = 0
+    @State private var codeScroll = CodeScroll()
 
     var body: some View {
         let chat = feed.chat
+        let scale = chatTextScale(settings.chatText, typeSize)
+        // A reply on its way shows as it is written, its words coming in at
+        // a steady pace; or, set to blocks, only once written whole.
+        let streaming = settings.chatReveal != "blocks"
+        let writing = Set(chat?.writing ?? [])
+        let rows = (chat?.rows ?? []).filter { row in
+            if streaming { return true }
+            if case .text = row { return !writing.contains(row.id) }
+            return true
+        }
+        let texts: [(String, [MdBlock])] = rows.compactMap { row in
+            if case let .text(id, blocks, _) = row { return (id, blocks) }
+            return nil
+        }
+        // What a reply on its way has come to, counted for those only (the
+        // last may just have been written whole): more of it, and the
+        // reveal goes on.
+        let lastText = texts.last?.0
+        let wanted = texts.reduce(0) { sum, text in
+            writing.contains(text.0) || text.0 == lastText || reveal.moving(text.0) ? sum + mdLength(text.1) : sum
+        }
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
@@ -419,8 +500,28 @@ struct ChatPage: View {
                         .padding(.top, 180)
                         .transition(.opacity)
                     }
-                    ForEach(chat?.rows ?? []) { row in
-                        rowView(row)
+                    ForEach(rows) { row in
+                        let shown = streaming && !still ? reveal.shownOf(row, writing: writing) : nil
+                        rowView(row, shown: shown)
+                            // The full width: its time sits at the right edge
+                            // however short the row.
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .offset(x: swipe)
+                            .overlay(alignment: .topTrailing) {
+                                // When it came about, out of sight to its right until
+                                // the rows are swiped aside.
+                                if swipe < 0, let at = chat?.times?[row.id] {
+                                    Text(chatTimeWords(at))
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                        .multilineTextAlignment(.trailing)
+                                        .frame(width: timeGutter - 8, alignment: .trailing)
+                                        .padding(.top, 2)
+                                        .offset(x: swipe + timeGutter)
+                                        .opacity(Double(min(1, -swipe / timeGutter)))
+                                        .allowsHitTesting(false)
+                                }
+                            }
                             .modifier(Entrance(fresh: !known.isEmpty && !known.contains(row.id)))
                             .id(row.id)
                     }
@@ -431,10 +532,21 @@ struct ChatPage: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
-                // The chat's text as large as its setting makes it; the bars
-                // keep theirs.
-                .environment(\.chatTextScale, chatTextScale(settings.chatText))
             }
+            // A swipe to the left over the rows moves them aside for their
+            // times; not one that scrolls a code block, nor one from the
+            // left edge, which goes back.
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 20, coordinateSpace: .global)
+                    .updating($swipe) { drag, state, _ in
+                        guard drag.startLocation.x >= 28, !codeScroll.active,
+                              abs(drag.translation.width) > abs(drag.translation.height) else { return }
+                        let dx = min(0, drag.translation.width)
+                        // Past the times, it gives less and less.
+                        state = dx < -timeGutter ? -timeGutter + (dx + timeGutter) / 3 : dx
+                    }
+            )
+            .environment(\.codeScroll, codeScroll)
             .scrollDismissesKeyboard(.interactively)
             // What scrolls under the bars blurs and fades into them, softly:
             // a hard edge drew a line across and a band of frost over the
@@ -484,6 +596,24 @@ struct ChatPage: View {
             }
             .onChange(of: chat?.rows.map(\.id) ?? []) { _, ids in
                 known.formUnion(ids)
+                reveal.prime(chat?.rows ?? [])
+                reveal.prune(Set(ids))
+            }
+            // Replies on their way catch up with what has come of them, a
+            // little each frame, the list following the end as they grow
+            // when the person reads there. It rests once all have caught up,
+            // until more comes.
+            .task(id: streaming && !still ? wanted : -1) {
+                guard streaming && !still else { return }
+                var last = Date()
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(16))
+                    let now = Date()
+                    let seconds = min(0.1, now.timeIntervalSince(last))
+                    last = now
+                    guard reveal.step(texts, writing: writing, seconds: seconds) else { break }
+                    if atEnd && !follow { proxy.scrollTo("end", anchor: .bottom) }
+                }
             }
             .onChange(of: chat?.rows.last?.id) {
                 guard atEnd || follow else { return }
@@ -495,8 +625,14 @@ struct ChatPage: View {
                 proxy.scrollTo("end", anchor: .bottom)
             }
         }
+        // The chat's text, and the field's, as large as its setting and the
+        // system's text size make it; the bars keep theirs.
+        .environment(\.chatTextScale, scale)
         .background(Color.chromeBackdrop.ignoresSafeArea())
-        .onAppear { known.formUnion(chat?.rows.map(\.id) ?? []) }
+        .onAppear {
+            known.formUnion(chat?.rows.map(\.id) ?? [])
+            reveal.prime(chat?.rows ?? [])
+        }
         .fullScreenCover(item: $shownPicture) { picture in
             PictureView(
                 file: picture,
@@ -515,11 +651,12 @@ struct ChatPage: View {
         }
         // A swipe in from the left edge goes back, as a pushed page's does.
         .simultaneousGesture(
-            DragGesture(minimumDistance: 20, coordinateSpace: .global).onEnded { drag in
-                if drag.startLocation.x < 28 && drag.translation.width > 80 && abs(drag.translation.height) < 80 {
-                    model.closeChat()
+            DragGesture(minimumDistance: 20, coordinateSpace: .global)
+                .onEnded { drag in
+                    if drag.startLocation.x < 28 && drag.translation.width > 80 && abs(drag.translation.height) < 80 {
+                        model.closeChat()
+                    }
                 }
-            }
         )
     }
 
@@ -577,14 +714,21 @@ struct ChatPage: View {
         return Button {
             showContext = true
         } label: {
+            // A whole ring under the part filled, and how full in its
+            // middle: a gauge, not a spinner.
             ZStack {
-                Circle().stroke(Color.primary.opacity(0.16), lineWidth: 2.6)
+                Circle().stroke(Color.primary.opacity(0.26), lineWidth: 2.4)
                 Circle()
                     .trim(from: 0, to: fill > 0 ? max(fill, 0.02) : 0)
-                    .stroke(contextLevelColor(context.level), style: StrokeStyle(lineWidth: 2.6, lineCap: .round))
+                    .stroke(contextLevelColor(context.level), style: StrokeStyle(lineWidth: 2.4, lineCap: .round))
                     .rotationEffect(.degrees(-90))
+                Text({ let digits = context.percent.filter(\.isNumber); return digits.isEmpty ? "–" : digits }())
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.85))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
-            .frame(width: 21, height: 21)
+            .frame(width: 28, height: 28)
             .animation(.smooth(duration: 0.5), value: fill)
             .frame(width: 40, height: 40)
             .glassEffect(.regular.interactive(), in: .circle)
@@ -606,7 +750,7 @@ struct ChatPage: View {
     // MARK: what it said and did
 
     @ViewBuilder
-    private func rowView(_ row: ChatRow) -> some View {
+    private func rowView(_ row: ChatRow, shown: Int? = nil) -> some View {
         switch row {
         case let .user(_, text, attachments):
             VStack(alignment: .trailing, spacing: 6) {
@@ -617,7 +761,7 @@ struct ChatPage: View {
                     HStack {
                         Spacer(minLength: 48)
                         Text(text)
-                            .font(.system(size: 16 * chatTextScale(settings.chatText)))
+                            .font(.system(size: 16 * chatTextScale(settings.chatText, typeSize)))
                             .lineSpacing(3)
                             .textSelection(.enabled)
                             .padding(.horizontal, 14)
@@ -630,12 +774,19 @@ struct ChatPage: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
-        case let .text(_, blocks):
+        case let .text(_, blocks, copy):
             // Grows as more of what it says comes, at once: an animated
             // growth a few times a second kept the list moving under the
             // words.
-            MarkdownBlocks(blocks: blocks)
-                .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 2) {
+                // As far as it has come in: the newest words fading in.
+                MarkdownBlocks(blocks: shown.map { mdHead(blocks, $0) } ?? blocks, whole: shown == nil ? nil : blocks)
+                    .textSelection(.enabled)
+                // The answer whole, as written.
+                if let copy {
+                    CopyButton(size: 14) { UIPasteboard.general.string = copy }
+                }
+            }
         case let .fold(fold):
             FoldView(fold: fold) { model.chatToggle(fold.id) }
         case let .group(group):
@@ -681,6 +832,7 @@ struct ChatPage: View {
                 // come, nor as the list scrolls.
                 ChatComposer(
                     model: model,
+                    pane: feed.with?.pane ?? -1,
                     placeholder: chat?.placeholder ?? "",
                     canSend: chat?.can_send == true,
                     canStop: chat?.can_stop == true,
@@ -688,6 +840,7 @@ struct ChatPage: View {
                     menu: chat?.model,
                     commands: chat?.commands ?? [],
                     files: feed.files,
+                    notice: chat?.notice,
                     onSent: { follow = true }
                 )
                 .equatable()
@@ -803,14 +956,25 @@ struct ChatPage: View {
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
             if !problem.detail.isEmpty {
-                Text(problem.detail)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
+                // Whoever wants the detail can copy it.
+                ScrollView {
+                    Text(problem.detail)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 96)
+                .fixedSize(horizontal: false, vertical: true)
             }
             if let action = problem.action {
                 Button {
-                    model.chatAction(action.id)
+                    // The terminal is the app's to show; the rest the core's.
+                    if action.id == "terminal" {
+                        model.closeChat(toTerminal: true)
+                    } else {
+                        model.chatAction(action.id)
+                    }
                 } label: {
                     Text(action.label)
                         .font(.body.weight(.semibold))
@@ -990,11 +1154,13 @@ private struct ContextSheet: View {
 
 /// The field to say something in, in one card with what goes with it:
 /// the + for files and pictures, the model, and send -- or stop, while the
-/// agent works and nothing is typed. Over it, as a `/` is typed, the
-/// commands the agent takes. Its draft is its own: typing redraws the
-/// field, not the chat.
+/// agent works and nothing is typed; with something typed, both. Over it,
+/// as a `/` is typed, the commands the agent takes. Its draft is its own:
+/// typing redraws the field, not the chat; and what is typed and not sent
+/// is kept for the pane's chat, as it comes and goes.
 private struct ChatComposer: View, Equatable {
     let model: TerminalModel
+    let pane: Int
     let placeholder: String
     let canSend: Bool
     let canStop: Bool
@@ -1002,6 +1168,9 @@ private struct ChatComposer: View, Equatable {
     let menu: ChatModelMenu?
     let commands: [ChatCommand]
     let files: [TerminalModel.ChatFile]
+    /// What the core did not send (a command only the terminal takes) comes
+    /// back with its notice, to be put right or sent again as words.
+    let notice: ChatNotice?
     /// Something was said: the chat follows what comes of it.
     let onSent: () -> Void
 
@@ -1012,14 +1181,21 @@ private struct ChatComposer: View, Equatable {
     /// Bumped on each thing said, for the tap felt.
     @State private var sent = 0
     @FocusState private var typing: Bool
+    @Environment(\.chatTextScale) private var scale
 
     static func == (a: ChatComposer, b: ChatComposer) -> Bool {
-        a.model === b.model && a.placeholder == b.placeholder && a.canSend == b.canSend && a.canStop == b.canStop
+        a.model === b.model && a.pane == b.pane && a.placeholder == b.placeholder && a.canSend == b.canSend && a.canStop == b.canStop
             && a.canAttach == b.canAttach && a.menu == b.menu && a.commands == b.commands && a.files == b.files
+            && a.notice == b.notice
     }
 
     var body: some View {
         field
+            .onAppear { if text.isEmpty { text = model.chatDrafts[pane] ?? "" } }
+            .onChange(of: text) { _, now in model.chatDrafts[pane] = now.isEmpty ? nil : now }
+            .onChange(of: notice?.seq) { _, _ in
+                if let kept = notice?.kept, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { text = kept }
+            }
             .sensoryFeedback(.impact(weight: .light), trigger: sent)
             .photosPicker(
                 isPresented: $pickingPhotos, selection: $photos, maxSelectionCount: 5,
@@ -1064,14 +1240,14 @@ private struct ChatComposer: View, Equatable {
             }
             VStack(alignment: .leading, spacing: 0) {
                 if !files.isEmpty {
-                    PickedFiles(files: files) { model.chatDetach($0) }
+                    PickedFiles(files: files, retry: { model.chatRetry($0) }) { model.chatDetach($0) }
                         .padding(.horizontal, 10)
                         .padding(.top, 10)
                         .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
                 TextField(placeholder, text: $text, axis: .vertical)
                     .lineLimit(1...6)
-                    .font(.system(size: 16))
+                    .font(.system(size: 16 * scale))
                     .focused($typing)
                     .padding(.horizontal, 14)
                     .padding(.top, 13)
@@ -1084,8 +1260,14 @@ private struct ChatComposer: View, Equatable {
                         modelChip(menu)
                     }
                     Spacer(minLength: 0)
+                    // Something typed while it works: stopping stays at hand.
+                    if canStop && !stop {
+                        stopButton
+                            .transition(.scale(scale: 0.8).combined(with: .opacity))
+                    }
                     sendButton(canSend: sendable, stop: stop)
                 }
+                .animation(.snappy(duration: 0.16), value: canStop && !stop)
                 .padding(.horizontal, 4)
                 .padding(.bottom, 2)
             }
@@ -1112,10 +1294,30 @@ private struct ChatComposer: View, Equatable {
         }
     }
 
+    /// Stop, beside send while something is typed: the agent can be
+    /// stopped without giving up what was typed.
+    private var stopButton: some View {
+        Button {
+            model.chatInterrupt()
+            sent += 1
+        } label: {
+            Image(systemName: "stop.fill")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(.primary)
+                .frame(width: 40, height: 40)
+                .background(Circle().fill(Color.primary.opacity(0.12)))
+                .frame(width: 46, height: 46)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(tr("chat.stop"))
+    }
+
     private func sendButton(canSend: Bool, stop: Bool) -> some View {
         Button {
             if stop {
                 model.chatInterrupt()
+                sent += 1
             } else {
                 model.chatSend(text.trimmingCharacters(in: .whitespacesAndNewlines))
                 text = ""
@@ -1243,64 +1445,111 @@ private struct ModelMenu: View {
 }
 
 /// The word being typed, when it calls up commands: `/` at the start of
-/// the field, or a `$` word (a skill) anywhere; and those it may be.
+/// the field, which offers them all; or, anywhere, a word begun with a
+/// skill's own sign (`$` for Codex, `@` for OpenCode), which offers those.
+/// `from` is where the word begins: a pick takes its place.
 private struct CommandOffer {
     let from: String.Index
     let commands: [ChatCommand]
+}
+
+/// A command's name without its sign: what is matched against what is
+/// typed (`/skill:review` and `$review` are both "review").
+private func bareName(_ name: String) -> String {
+    var bare = name.dropFirst()
+    if bare.hasPrefix("skill:") { bare = bare.dropFirst(6) }
+    return bare.lowercased()
 }
 
 private func commandOffer(_ commands: [ChatCommand], text: String) -> CommandOffer? {
     guard !commands.isEmpty else { return nil }
     let from = text.hasPrefix("/") ? text.startIndex : (text.lastIndex(where: \.isWhitespace).map { text.index(after: $0) } ?? text.startIndex)
     let word = text[from...]
-    guard let sign = word.first, sign == "/" || sign == "$", !word.contains(where: \.isWhitespace) else { return nil }
-    let typed = word.lowercased()
-    let signed = commands.filter { $0.name.first == sign }
-    // Those it begins first, then those whose names hold it.
-    let first = signed.filter { $0.name.lowercased().hasPrefix(typed) }
-    let rest = String(typed.dropFirst())
-    let then = rest.isEmpty ? [] : signed.filter { !first.contains($0) && $0.name.lowercased().contains(rest) }
-    let all = first + then
+    guard let sign = word.first, !word.contains(where: \.isWhitespace) else { return nil }
+    let signs = Set(commands.filter { $0.kind == "skill" }.compactMap(\.name.first)).subtracting(["/"])
+    let offered: [ChatCommand]
+    if sign == "/" && from == text.startIndex {
+        offered = commands
+    } else if signs.contains(sign) {
+        offered = commands.filter { $0.name.first == sign }
+    } else {
+        return nil
+    }
+    let typed = String(word.dropFirst()).lowercased()
+    // Those whose names begin with it, then those whose names hold it, then
+    // those whose words on what they do hold it -- each group kept whole,
+    // and in its place.
+    func rank(_ command: ChatCommand) -> Int? {
+        if typed.isEmpty { return 0 }
+        let bare = bareName(command.name)
+        if bare.hasPrefix(typed) || command.name.lowercased().hasPrefix(word.lowercased()) { return 0 }
+        if bare.contains(typed) { return 1 }
+        if command.description.lowercased().contains(typed) { return 2 }
+        return nil
+    }
+    var groups: [String] = []
+    for command in offered where !groups.contains(command.group) { groups.append(command.group) }
+    let ranked = offered.enumerated().compactMap { at, command in rank(command).map { (command, $0, at) } }
+    let all = ranked.sorted {
+        let (a, b) = (groups.firstIndex(of: $0.0.group) ?? 0, groups.firstIndex(of: $1.0.group) ?? 0)
+        return a != b ? a < b : $0.1 != $1.1 ? $0.1 < $1.1 : $0.2 < $1.2
+    }.map(\.0)
     return all.isEmpty ? nil : CommandOffer(from: from, commands: all)
 }
 
-/// The commands the word typed may be, over the field: a tap runs one
-/// that runs as it is, or puts one in the field to be followed.
+/// The commands the word typed may be, over the field, by group: a tap
+/// runs one that runs as it is, or puts one in the field to be followed.
 private struct CommandPalette: View {
     let commands: [ChatCommand]
     let menu: ChatModelMenu?
     let pick: (ChatCommand) -> Void
     let setModel: (String, String?) -> Void
 
-    private let rowHeight: CGFloat = 50
+    private let rowHeight: CGFloat = 54
+    private let headingHeight: CGFloat = 30
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(commands) { command in
-                    if command.here == "model", let menu {
-                        Menu {
-                            ModelMenu(menu: menu, set: setModel)
-                        } label: {
-                            CommandRow(command: command).frame(height: rowHeight)
+        let headed = Set(commands.map(\.group)).count > 1
+        let headings = headed ? Set(commands.map(\.group)).count : 0
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(commands.enumerated()), id: \.element.id) { at, command in
+                        if headed && !command.group.isEmpty && (at == 0 || commands[at - 1].group != command.group) {
+                            Text(command.group)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 16)
+                                .frame(height: headingHeight, alignment: .bottomLeading)
+                                .accessibilityAddTraits(.isHeader)
                         }
-                        .menuStyle(.button)
-                        .buttonStyle(.plain)
-                    } else {
-                        Button {
-                            pick(command)
-                        } label: {
-                            CommandRow(command: command).frame(height: rowHeight)
+                        if command.here == "model", let menu {
+                            Menu {
+                                ModelMenu(menu: menu, set: setModel)
+                            } label: {
+                                CommandRow(command: command).frame(height: rowHeight)
+                            }
+                            .menuStyle(.button)
+                            .buttonStyle(.plain)
+                        } else {
+                            Button {
+                                pick(command)
+                            } label: {
+                                CommandRow(command: command).frame(height: rowHeight)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
+                .padding(.vertical, 6)
+                .id("top")
             }
-            .padding(.vertical, 6)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(CGFloat(commands.count) * rowHeight + CGFloat(headings) * headingHeight + 12, 300))
+            // A new word offers from its top.
+            .onChange(of: commands.first?.id) { proxy.scrollTo("top", anchor: .top) }
         }
-        .scrollBounceBehavior(.basedOnSize)
-        .frame(height: min(CGFloat(commands.count) * rowHeight + 12, 300))
         .glassEffect(.regular, in: shape)
         .overlay { shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5) }
     }
@@ -1333,7 +1582,7 @@ private struct CommandRow: View {
                     Text(command.description)
                         .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                 }
             }
             Spacer(minLength: 0)
@@ -1344,9 +1593,199 @@ private struct CommandRow: View {
 
     private var symbol: String {
         if command.here == "model" { return "cpu" }
-        if command.name.hasPrefix("$") || command.name.hasPrefix("/skill:") { return "sparkles" }
+        if command.kind == "skill" { return "sparkles" }
+        if command.kind == "prompt" { return "doc.text" }
         return "slash.circle"
     }
+}
+
+/// How far a left swipe moves the rows aside, for their times.
+private let timeGutter: CGFloat = 64
+
+/// When something came about, as the app's language words it: the time,
+/// and the day above it when not today.
+private func chatTimeWords(_ at: Int64) -> String {
+    let then = Date(timeIntervalSince1970: TimeInterval(at))
+    let locale = Locale(identifier: L10n.currentTag)
+    let time = then.formatted(Date.FormatStyle(date: .omitted, time: .shortened).locale(locale))
+    let calendar = Calendar.current
+    if calendar.isDateInToday(then) { return time }
+    let sameYear = calendar.component(.year, from: then) == calendar.component(.year, from: Date())
+    let day = sameYear
+        ? then.formatted(Date.FormatStyle().month(.abbreviated).day().locale(locale))
+        : then.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted).locale(locale))
+    return day + "\n" + time
+}
+
+/// How many characters at the growing end of a reply fade in.
+private let fading = 24
+/// The slowest a reply comes in, in characters a second; and, faster, all
+/// it is behind over this many seconds, again each frame: a burst comes in
+/// quickly at first and eases as it catches up.
+private let revealPace = 90.0
+private let revealBehind = 0.6
+
+/// How much of each reply on its way is on show. Only one begun while the
+/// chat is open is stepped (from nothing), until it has caught up and is
+/// written whole; the rest show whole and are not counted.
+@MainActor
+final class ChatReveal: ObservableObject {
+    @Published private var shown: [String: Int] = [:]
+    private var carry: [String: Double] = [:]
+    private var initial: Set<String> = []
+    private var primed = false
+
+    func prime(_ rows: [ChatRow]) {
+        guard !primed, !rows.isEmpty else { return }
+        primed = true
+        initial = Set(rows.map(\.id))
+    }
+
+    /// What the core let go of is let go here too.
+    func prune(_ ids: Set<String>) {
+        let gone = shown.keys.filter { !ids.contains($0) }
+        guard !gone.isEmpty else { return }
+        for id in gone {
+            shown[id] = nil
+            carry[id] = nil
+        }
+    }
+
+    /// Whether the reply `id` is being stepped: what it has come to counts.
+    func moving(_ id: String) -> Bool {
+        shown[id] != nil
+    }
+
+    private func begins(_ id: String, writing: Set<String>) -> Bool {
+        primed && writing.contains(id) && !initial.contains(id)
+    }
+
+    func shownOf(_ row: ChatRow, writing: Set<String>) -> Int? {
+        guard case let .text(id, blocks, _) = row else { return nil }
+        guard shown[id] != nil || begins(id, writing: writing) else { return nil }
+        let at = shown[id] ?? 0
+        return at < mdLength(blocks) ? at : nil
+    }
+
+    /// One frame on: each reply behind what came of it catches up a
+    /// little. False when none is behind.
+    func step(_ texts: [(String, [MdBlock])], writing: Set<String>, seconds: Double) -> Bool {
+        var moved = false
+        var next = shown
+        for (id, blocks) in texts {
+            guard next[id] != nil || begins(id, writing: writing) else { continue }
+            let full = mdLength(blocks)
+            let at = next[id] ?? 0
+            if at >= full {
+                // Caught up: let go once no more is to come of it.
+                if !writing.contains(id) {
+                    next[id] = nil
+                    carry[id] = nil
+                } else if next[id] != full {
+                    next[id] = full
+                }
+                continue
+            }
+            let pace = max(revealPace, Double(full - at) / revealBehind)
+            let gone = (carry[id] ?? 0) + pace * seconds
+            let whole = Int(gone)
+            carry[id] = gone - Double(whole)
+            next[id] = min(full, at + whole)
+            moved = true
+        }
+        if next != shown { shown = next }
+        return moved
+    }
+}
+
+/// How many characters `blocks` show: what a reply's growth is counted in.
+func mdLength(_ blocks: [MdBlock]) -> Int {
+    blocks.reduce(0) { $0 + mdLength($1) }
+}
+
+private func spansLength(_ spans: [MdSpan]) -> Int {
+    spans.reduce(0) { $0 + $1.text.count }
+}
+
+func mdLength(_ block: MdBlock) -> Int {
+    switch block {
+    case let .para(spans), let .heading(_, spans), let .item(_, _, spans), let .quote(spans): return spansLength(spans)
+    case let .code(_, text): return text.count
+    case .rule: return 1
+    case let .table(_, head, rows): return ([head] + rows).reduce(0) { $0 + $1.reduce(0) { $0 + spansLength($1) } }
+    }
+}
+
+/// The first `n` characters of `blocks`, the newest of them fading in.
+func mdHead(_ blocks: [MdBlock], _ n: Int) -> [MdBlock] {
+    var out: [MdBlock] = []
+    var left = n
+    for block in blocks {
+        guard left > 0 else { break }
+        let size = mdLength(block)
+        let whole = size <= left
+        switch block {
+        case let .para(spans): out.append(.para(spansHead(spans, left)))
+        case let .heading(level, spans): out.append(.heading(level, spansHead(spans, left)))
+        case let .item(depth, mark, spans): out.append(.item(depth: depth, mark: mark, spansHead(spans, left)))
+        case let .quote(spans): out.append(.quote(spansHead(spans, left)))
+        case let .code(lang, text): out.append(whole ? block : .code(lang: lang, text: String(text.prefix(left))))
+        case .rule: out.append(block)
+        // A table comes in row by row.
+        case let .table(align, head, rows):
+            if whole {
+                out.append(block)
+            } else {
+                var room = left - head.reduce(0) { $0 + spansLength($1) }
+                var kept: [[[MdSpan]]] = []
+                for row in rows where room > 0 {
+                    room -= row.reduce(0) { $0 + spansLength($1) }
+                    kept.append(row)
+                }
+                out.append(.table(align: align, head: head, rows: kept))
+            }
+        }
+        left -= size
+    }
+    return out
+}
+
+/// `spans` cut to `n` characters, the last of them fading in: the newest
+/// faintest.
+private func spansHead(_ spans: [MdSpan], _ n: Int) -> [MdSpan] {
+    var cut: [MdSpan] = []
+    var left = n
+    for span in spans {
+        guard left > 0 else { break }
+        var piece = span
+        if span.text.count > left { piece.text = String(span.text.prefix(left)) }
+        cut.append(piece)
+        left -= span.text.count
+    }
+    let total = spansLength(cut)
+    guard total > 0, n < spansLength(spans) else { return cut }
+    // Three bands at the end, each fainter than the one before it.
+    let bands = [total - fading, total - fading * 2 / 3, total - fading / 3, total]
+    let fades = [1.0, 0.75, 0.5, 0.25]
+    var out: [MdSpan] = []
+    var at = 0
+    for span in cut {
+        let characters = Array(span.text)
+        let start = at
+        let end = at + characters.count
+        at = end
+        var from = start
+        while from < end {
+            let band = bands.firstIndex { $0 > from } ?? 0
+            let to = min(end, max(bands[band], from + 1))
+            var piece = span
+            piece.text = String(characters[(from - start)..<(to - start)])
+            piece.fade = min(span.fade ?? 1, fades[band])
+            out.append(piece)
+            from = to
+        }
+    }
+    return out
 }
 
 /// A row added while the chat is on show comes in: up a little, from
@@ -1375,6 +1814,8 @@ private struct Entrance: ViewModifier {
 /// name and size; each on its way shows how far, and each can be taken off.
 private struct PickedFiles: View {
     let files: [TerminalModel.ChatFile]
+    /// A file that did not go: sent again, and why said.
+    let retry: (TerminalModel.ChatFile) -> Void
     let remove: (TerminalModel.ChatFile) -> Void
 
     var body: some View {
@@ -1393,9 +1834,16 @@ private struct PickedFiles: View {
                                 FileCard(name: file.name, under: ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file), image: file.image)
                                     .frame(height: 64)
                             }
-                            if file.error != nil {
-                                RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.red.opacity(0.45))
-                                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.white)
+                            if let error = file.error {
+                                Button { retry(file) } label: {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.red.opacity(0.45))
+                                        Image(systemName: "arrow.clockwise").font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("\(file.name): \(error)")
+                                .accessibilityHint(tr("chat.attach.retry"))
                             } else if file.path == nil {
                                 RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.black.opacity(0.35))
                                 ProgressView(value: file.total > 0 ? Double(file.sent) / Double(file.total) : 0)
@@ -1465,6 +1913,13 @@ private struct SentFiles: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(file.name)
+                    } else if let path = file.path {
+                        // Where it is on the host, to be pasted wherever it is wanted.
+                        Button { UIPasteboard.general.string = path } label: {
+                            FileCard(name: file.name, under: nil, image: file.image)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint(tr("copy"))
                     } else {
                         FileCard(name: file.name, under: nil, image: file.image)
                     }
@@ -1492,27 +1947,114 @@ extension ChatSent: Identifiable {
     var id: String { (path ?? "") + name + (picture ?? "") }
 }
 
-/// A picture over everything, as large as it fits. A tap puts it away.
+/// A small copy button: its symbol turns to a check for a moment once it
+/// has copied.
+struct CopyButton: View {
+    let size: CGFloat
+    let copy: () -> Void
+    @State private var done = false
+
+    var body: some View {
+        Button {
+            copy()
+            done = true
+            Task {
+                try? await Task.sleep(for: .seconds(1.5))
+                done = false
+            }
+        } label: {
+            Image(systemName: done ? "checkmark" : "doc.on.doc")
+                .font(.system(size: size, weight: .medium))
+                .foregroundStyle(done ? AnyShapeStyle(Color.green) : AnyShapeStyle(.secondary))
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: size + 22, height: size + 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .sensoryFeedback(.success, trigger: done) { _, now in now }
+        .accessibilityLabel(tr(done ? "copied" : "copy"))
+    }
+}
+
+/// A picture over everything, as large as it fits. Two fingers zoom it, a
+/// double tap zooms in or back; a tap puts it away. Share hands it to
+/// another app (to save it, or send it on).
 private struct PictureView: View {
     let file: ChatSent
     let thumb: UIImage?
     let local: URL?
     let close: () -> Void
+    @State private var zoom: CGFloat = 1
+    @GestureState private var pinch: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @GestureState private var drag: CGSize = .zero
+    /// The phone's own copy, made ready once: not again with each step of
+    /// a pinch.
+    @State private var own: UIImage?
 
     var body: some View {
-        ZStack {
+        let picture = own ?? thumb
+        let scale = max(1, min(zoom * pinch, 6))
+        ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
-            if let picture = chatPicture(thumb: thumb, local: local, side: 2048) {
+            if let picture {
                 Image(uiImage: picture)
                     .resizable()
                     .scaledToFit()
+                    .scaleEffect(scale)
+                    .offset(x: offset.width + drag.width, y: offset.height + drag.height)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea()
+                    .gesture(
+                        MagnifyGesture()
+                            .updating($pinch) { value, state, _ in state = value.magnification }
+                            .onEnded { value in
+                                zoom = max(1, min(zoom * value.magnification, 6))
+                                if zoom == 1 { offset = .zero }
+                            }
+                            .simultaneously(with: DragGesture()
+                                .updating($drag) { value, state, _ in if zoom > 1 { state = value.translation } }
+                                .onEnded { value in
+                                    if zoom > 1 { offset = CGSize(width: offset.width + value.translation.width, height: offset.height + value.translation.height) }
+                                })
+                    )
+                // The phone's own file as it is, else the small one shown.
+                Group {
+                    if let local {
+                        ShareLink(item: local, preview: SharePreview(file.name, image: Image(uiImage: picture))) { shareLabel }
+                    } else {
+                        ShareLink(item: Image(uiImage: picture), preview: SharePreview(file.name, image: Image(uiImage: picture))) { shareLabel }
+                    }
+                }
+                .padding(12)
+                .accessibilityLabel(tr("chat.share"))
             }
         }
         .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            withAnimation(.snappy(duration: 0.25)) {
+                if zoom > 1 {
+                    zoom = 1
+                    offset = .zero
+                } else {
+                    zoom = 2.5
+                }
+            }
+        }
         .onTapGesture(perform: close)
         .accessibilityAddTraits(.isButton)
+        .onAppear {
+            if own == nil, let local { own = chatPicture(thumb: nil, local: local, side: 2048) }
+        }
         .accessibilityLabel(file.name)
+    }
+
+    private var shareLabel: some View {
+        Image(systemName: "square.and.arrow.up")
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 44, height: 44)
+            .glassEffect(.regular.interactive(), in: .circle)
     }
 }
 
@@ -1718,7 +2260,7 @@ private struct FoldBodyView: View {
     var body: some View {
         switch shown {
         case let .blocks(blocks):
-            MarkdownBlocks(blocks: blocks).foregroundStyle(.secondary)
+            MarkdownBlocks(blocks: blocks, copies: false).foregroundStyle(.secondary)
         case let .output(text):
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(text)
@@ -1884,19 +2426,32 @@ private struct TableLayout: Layout {
 /// Markdown's blocks as text views.
 struct MarkdownBlocks: View {
     let blocks: [MdBlock]
+    /// Code blocks carry a copy button (what the agent said, not a fold's).
+    var copies = true
+    /// The blocks in full when `blocks` is only as far as they have come
+    /// in: a code block's copy takes its code from it.
+    var whole: [MdBlock]? = nil
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.codeScroll) private var codeScroll
+
+    /// The code of block `at` of `whole`, when there is one.
+    private static func code(_ whole: [MdBlock]?, _ at: Int) -> String? {
+        guard let whole, at < whole.count, case let .code(_, text) = whole[at] else { return nil }
+        return text
+    }
     @Environment(\.chatTextScale) private var scale
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { at, block in
-                blockView(block, first: at == 0)
+                blockView(block, at: at)
             }
         }
     }
 
     @ViewBuilder
-    private func blockView(_ block: MdBlock, first: Bool) -> some View {
+    private func blockView(_ block: MdBlock, at: Int) -> some View {
+        let first = at == 0
         switch block {
         case let .para(spans):
             Text(Self.attributed(spans, size: 16 * scale))
@@ -1925,13 +2480,22 @@ struct MarkdownBlocks: View {
             }
             .fixedSize(horizontal: false, vertical: true)
         case let .code(lang, text):
-            VStack(alignment: .leading, spacing: 4) {
-                if !lang.trimmingCharacters(in: .whitespaces).isEmpty {
-                    Text(lang)
-                        .font(.system(size: 11.5 * scale))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
-                        .padding(.top, 8)
+            let named = !lang.trimmingCharacters(in: .whitespaces).isEmpty
+            VStack(alignment: .leading, spacing: copies ? 0 : 4) {
+                // Its language, and a way to copy it whole.
+                if named || copies {
+                    HStack(spacing: 0) {
+                        Text(lang)
+                            .font(.system(size: 11.5 * scale))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        if copies {
+                            CopyButton(size: 12) { UIPasteboard.general.string = Self.code(whole, at) ?? text }
+                        }
+                    }
+                    .padding(.leading, 12)
+                    .padding(.trailing, 2)
+                    .padding(.top, copies ? 0 : 8)
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     Text(text)
@@ -1939,9 +2503,10 @@ struct MarkdownBlocks: View {
                         .lineSpacing(2)
                         .fixedSize()
                         .padding(.horizontal, 12)
-                        .padding(.top, lang.trimmingCharacters(in: .whitespaces).isEmpty ? 10 : 0)
+                        .padding(.top, named || copies ? 0 : 10)
                         .padding(.bottom, 10)
                 }
+                .onScrollPhaseChange { _, phase in codeScroll.active = phase != .idle }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
@@ -1964,6 +2529,8 @@ struct MarkdownBlocks: View {
             if span.italic == true { font = font.italic() }
             piece.font = font
             if span.code == true { piece.backgroundColor = Color.primary.opacity(0.08) }
+            // Words just come in, still fading in.
+            if let fade = span.fade, fade < 1 { piece.foregroundColor = Color.primary.opacity(fade) }
             if span.strike == true { piece.strikethroughStyle = .single }
             if let link = span.link, let url = URL(string: link) {
                 piece.link = url

@@ -240,6 +240,10 @@ struct SettingsPageView: View {
                     PickerOption("l", tr("chat.text.l")),
                     PickerOption("xl", tr("chat.text.xl")),
                 ])
+                push(tr("chat.reveal"), selection: $settings.chatReveal, options: [
+                    PickerOption("stream", tr("chat.reveal.stream")),
+                    PickerOption("blocks", tr("chat.reveal.blocks")),
+                ])
             } footer: {
                 Text(tr("chat.first.note"))
             }
