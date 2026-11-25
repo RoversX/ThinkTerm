@@ -303,16 +303,6 @@ pub const BUILTIN_CARDS: &[BuiltinCard] = &[
         programs: &["claude"],
     },
     BuiltinCard {
-        id: "codebuddy",
-        name: "CodeBuddy",
-        glyph: BuiltinGlyph::CodeBuddy,
-        // CodeBuddy's own mint, from its app mark.
-        circle: Rgb(0x00, 0xBC, 0x90),
-        glyph_color: WHITE,
-        agents: &["codebuddy"],
-        programs: &["codebuddy", "codebuddy-code", "cbc", "codebuddy-lowmem"],
-    },
-    BuiltinCard {
         id: "codex",
         name: "Codex",
         glyph: BuiltinGlyph::OpenAi,
@@ -385,6 +375,16 @@ pub const BUILTIN_CARDS: &[BuiltinCard] = &[
         glyph_color: INK,
         agents: &["pi"],
         programs: &["pi"],
+    },
+    BuiltinCard {
+        id: "codebuddy",
+        name: "CodeBuddy",
+        glyph: BuiltinGlyph::CodeBuddy,
+        // CodeBuddy's own mint, from its app mark.
+        circle: Rgb(0x00, 0xBC, 0x90),
+        glyph_color: WHITE,
+        agents: &["codebuddy"],
+        programs: &["codebuddy", "codebuddy-code", "cbc", "codebuddy-lowmem"],
     },
     BuiltinCard {
         id: "agent",
