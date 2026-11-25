@@ -38,5 +38,16 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keeps the SSH terminal sessions the user opened connected while the app is in the background, as an SSH client does; it runs only while a session is connected or connecting and ends with the last one." />
         </service>
+        <!-- A picture from a chat handed to another app (Share): only the
+             copies made for that, in the cache's shared/ folder. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/shared_files" />
+        </provider>
     </application>
 </manifest>

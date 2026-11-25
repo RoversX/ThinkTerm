@@ -220,7 +220,8 @@ fun ThreadsHome(
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .progressiveBlur(backdrop, ground, top = false)
-                    .padding(start = 14.dp + extra, end = 14.dp + extra, top = 14.dp, bottom = 20.dp + foot.calculateBottomPadding()),
+                    // Clear of a large rounded screen corner too.
+                    .padding(start = 14.dp + extra, end = 14.dp + extra, top = 14.dp, bottom = 20.dp + foot.calculateBottomPadding() + cornerClearance(14.dp + extra, 24.dp, 20.dp + foot.calculateBottomPadding())),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 NewThreadButton(

@@ -3,7 +3,10 @@ package com.roversx.thinkterm
 import android.graphics.RenderEffect
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CornerBasedShape
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -106,4 +109,26 @@ half4 main(float2 coord) {
 /// builds never read the flag.
 object GlassProbe {
     var on = false
+}
+
+/// Room to add under something drawn `bottom` above the screen's lower edge
+/// and `side` in from its sides, its corners rounded by `radius`, so they
+/// clear the screen's own rounded corners: on a screen with large ones,
+/// what sits close to the bottom is cut off there. Nothing on a screen that
+/// tells of no rounded corners.
+@Composable
+internal fun cornerClearance(side: Dp, radius: Dp, bottom: Dp): Dp {
+    val insets = LocalView.current.rootWindowInsets ?: return 0.dp
+    val corner = listOfNotNull(
+        insets.getRoundedCorner(android.view.RoundedCorner.POSITION_BOTTOM_LEFT),
+        insets.getRoundedCorner(android.view.RoundedCorner.POSITION_BOTTOM_RIGHT),
+    ).maxOfOrNull { it.radius } ?: return 0.dp
+    val screen = with(LocalDensity.current) { corner.toDp() }.value
+    // The thing's corner lies inside the screen's when its centre is no
+    // farther from the screen corner's centre than the two radii differ.
+    val across = screen - side.value - radius.value
+    val room = screen - radius.value
+    if (across <= 0f || room <= 0f) return 0.dp
+    val need = room - kotlin.math.sqrt(room * room - across * across) + 2f
+    return (need - bottom.value).coerceAtLeast(0f).dp
 }

@@ -481,6 +481,10 @@ class TerminalModel(
         lastViews = null
         connectionBefore = core.viewsConnection()
         val h = host
+        if (draftsOf != h.id) {
+            chatDrafts.clear()
+            draftsOf = h.id
+        }
         // One whose jump host is gone is not dialled some other way.
         val jump = store.jumpOf(h)
         if (h.jumpHost != null && jump == null) {
@@ -786,6 +790,12 @@ class TerminalModel(
         showCopied()
     }
 
+    /// Copy with no word on screen: the button that copied says so itself.
+    fun copyQuietly(text: String) {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+        cm.setPrimaryClip(ClipData.newPlainText("thinkterm", text))
+    }
+
     private fun takeCtrl(): Boolean = ctrlSticky.also { if (it) ctrlSticky = false }
     private fun takeAlt(): Boolean = altSticky.also { if (it) altSticky = false }
 
@@ -956,6 +966,12 @@ class TerminalModel(
     /// What goes with what is said next.
     val chatFiles = mutableStateListOf<ChatFile>()
 
+    /// What was typed in each pane's chat and not sent: there again when
+    /// the chat is. A pane's number is its host's: another host's drafts
+    /// are let go.
+    val chatDrafts = HashMap<Int, String>()
+    private var draftsOf: String? = null
+
     /// The phone's own copies of the pictures sent, by where they are on
     /// the host: what a tap shows big, and what shows before the host's
     /// small picture comes.
@@ -1006,6 +1022,25 @@ class TerminalModel(
         if (file.path == null && file.error == null) core.cancelUpload(file.id)
         chatFiles.removeAll { it.id == file.id }
         chatCopies.remove(file.id)?.parentFile?.deleteRecursively()
+    }
+
+    /// A picked file that did not reach the host, sent again from the app's
+    /// copy of it; why it failed is said meanwhile.
+    fun chatRetryFile(file: ChatFile) {
+        val copy = chatCopies.remove(file.id)
+        file.error?.let { note("${file.name}: $it") }
+        if (copy == null || !copy.exists()) {
+            chatFiles.removeAll { it.id == file.id }
+            return
+        }
+        val id = core.uploadBegin()
+        core.uploadFile(id, file.name, copy.path)
+        chatCopies[id] = copy
+        val at = chatFiles.indexOfFirst { it.id == file.id }
+        val again = file.copy(id = id, sent = 0uL, total = 0uL, path = null, error = null)
+        if (at >= 0) chatFiles[at] = again else chatFiles.add(again)
+        main.removeCallbacks(pollChatFiles)
+        main.postDelayed(pollChatFiles, 150)
     }
 
     private val pollChatFiles: Runnable = object : Runnable {

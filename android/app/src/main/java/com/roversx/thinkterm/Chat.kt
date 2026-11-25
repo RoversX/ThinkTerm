@@ -116,6 +116,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -146,6 +147,22 @@ import kotlinx.coroutines.launch
 import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.spring
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.graphics.isSpecified
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.navigationBars
 
 // MARK: the chat as the core makes it (thinkterm_agent_chat::view::ChatView)
 
@@ -183,6 +200,10 @@ data class ChatView(
     /// The agent runs an older ThinkTerm extension than the one in its
     /// folder: said over the field, with the button that loads the new one.
     val outdated: ChatOutdated?,
+    /// When each row came about (unix seconds), by row id, where known.
+    val times: Map<String, Long> = emptyMap(),
+    /// The replies still being written, by row id.
+    val writing: Set<String> = emptySet(),
 )
 
 data class ChatOutdated(val text: String, val action: ChatAction)
@@ -210,8 +231,16 @@ data class ChatContextPart(val kind: String, val label: String, val amount: Stri
 
 /// A command the field offers: as typed (`/compact`), what it does, what
 /// may follow it (a pick then puts it in the field rather than run it),
-/// and `here` for one the app does itself ("model": the model menu).
-data class ChatCommand(val name: String, val description: String, val args: String?, val here: String?)
+/// `here` for one the app does itself ("model": the model menu), what it
+/// is ("skill", "command", "prompt") and the heading of its group.
+data class ChatCommand(
+    val name: String,
+    val description: String,
+    val args: String?,
+    val here: String?,
+    val kind: String = "command",
+    val group: String = "",
+)
 
 /// The model button: what it says, and what it opens on -- the models,
 /// each opening on how hard it can think.
@@ -236,7 +265,8 @@ sealed class ChatRow {
     abstract val id: String
 
     data class User(override val id: String, val text: String, val attachments: List<ChatSent>) : ChatRow()
-    data class Text(override val id: String, val blocks: List<MdBlock>) : ChatRow()
+    /// `copy`: the words as written, for the last reply of a turn.
+    data class Text(override val id: String, val blocks: List<MdBlock>, val copy: String? = null) : ChatRow()
     data class Fold(
         override val id: String,
         /// "think", "look", "run", "edit", "tool".
@@ -296,7 +326,8 @@ sealed class MdBlock {
     data class Table(val align: List<String>, val head: List<List<MdSpan>>, val rows: List<List<List<MdSpan>>>) : MdBlock()
 }
 
-data class MdSpan(val text: String, val bold: Boolean, val italic: Boolean, val code: Boolean, val strike: Boolean, val link: String?)
+/// `fade`: how much of its colour it shows, for words just come in.
+data class MdSpan(val text: String, val bold: Boolean, val italic: Boolean, val code: Boolean, val strike: Boolean, val link: String?, val fade: Float = 1f)
 
 data class ChatAsk(
     val id: String,
@@ -314,7 +345,8 @@ data class ChatAsk(
 data class ChatChoice(val id: String, val label: String, val lead: Boolean)
 data class ChatProblem(val text: String, val detail: String, val action: ChatAction?)
 data class ChatAction(val id: String, val label: String)
-data class ChatNotice(val seq: Long, val text: String)
+/// `kept`: what was typed and not sent, back in the field to be put right.
+data class ChatNotice(val seq: Long, val text: String, val kept: String? = null)
 
 object ChatViews {
     fun parse(json: String): ChatView? = runCatching {
@@ -353,7 +385,7 @@ object ChatViews {
                     action = p.optJSONObject("action")?.let { ChatAction(it.optString("id"), it.optString("label")) },
                 )
             },
-            notice = o.optJSONObject("notice")?.let { ChatNotice(it.optLong("seq"), it.optString("text")) },
+            notice = o.optJSONObject("notice")?.let { ChatNotice(it.optLong("seq"), it.optString("text"), it.optStringOrNull("kept")) },
             placeholder = o.optString("placeholder"),
             canSend = o.optBoolean("can_send"),
             canStop = o.optBoolean("can_stop"),
@@ -376,11 +408,21 @@ object ChatViews {
                 )
             },
             commands = o.optJSONArray("commands").objects().map {
-                ChatCommand(it.optString("name"), it.optString("description"), it.optStringOrNull("args"), it.optStringOrNull("here"))
+                ChatCommand(
+                    it.optString("name"),
+                    it.optString("description"),
+                    it.optStringOrNull("args"),
+                    it.optStringOrNull("here"),
+                    // An older core says no kind: the name tells a skill.
+                    it.optStringOrNull("kind") ?: if (it.optString("name").let { n -> n.startsWith("$") || n.startsWith("/skill:") }) "skill" else "command",
+                    it.optString("group"),
+                )
             },
             outdated = o.optJSONObject("outdated")?.let { u ->
                 u.optJSONObject("action")?.let { a -> ChatOutdated(u.optString("text"), ChatAction(a.optString("id"), a.optString("label"))) }
             },
+            times = o.optJSONObject("times")?.let { t -> t.keys().asSequence().associateWith { t.optLong(it) } }.orEmpty(),
+            writing = o.optJSONArray("writing").strings().toSet(),
             context = o.optJSONObject("context")?.let { c ->
                 ChatContext(
                     fill = if (c.has("fill") && !c.isNull("fill")) c.optDouble("fill").toFloat() else null,
@@ -412,7 +454,7 @@ object ChatViews {
                     ChatSent(it.optString("name"), it.optBoolean("image"), it.optStringOrNull("picture"), it.optStringOrNull("path"))
                 },
             )
-            "text" -> ChatRow.Text(id, blocks(r.optJSONArray("blocks")))
+            "text" -> ChatRow.Text(id, blocks(r.optJSONArray("blocks")), r.optStringOrNull("copy"))
             "fold" -> ChatRow.Fold(
                 id = id,
                 icon = r.optString("icon"),
@@ -542,6 +584,7 @@ private val Removed = Color(0xFFFF6961)
 /// The chat with the agent of a pane, over that pane's terminal: what it
 /// said and did, what it asks, and a field to say something. Going back
 /// is going to its terminal.
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
     val target = model.chatWith ?: return
@@ -563,9 +606,16 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
     var showContext by remember(target.pane) { mutableStateOf(false) }
     BackHandler { onBack() }
 
+    // A reply on its way shows as it is written, its words coming in at a
+    // steady pace; or, set to blocks, only once written whole.
+    val streaming = model.settings.chatReveal != "blocks"
+    val still = rememberReducedMotion()
+    val reveal = remember(target.pane) { Reveal() }
     // Opened at the end, and kept there while the person reads the end:
     // what comes next is in view as it comes.
-    val rows = chat?.rows.orEmpty()
+    val rows = chat?.rows.orEmpty().let { all ->
+        if (streaming) all else all.filter { it !is ChatRow.Text || it.id !in chat?.writing.orEmpty() }
+    }
     val last = rows.lastOrNull()
     var opened by remember(target.pane) { mutableStateOf(false) }
     // Just said something: what comes of it is shown, wherever the person was.
@@ -608,6 +658,43 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             list.scrollToItem(before + rows.size - 1 + (if (chat?.busy != null) 1 else 0), TO_THE_END)
         }
     }
+    // The rows on show when the chat opened come as they are; later ones
+    // come in.
+    LaunchedEffect(target.pane, rows.isNotEmpty()) {
+        if (rows.isNotEmpty()) reveal.prime(rows)
+    }
+    // What the core let go of (past what it keeps, another session) is
+    // let go here too.
+    LaunchedEffect(rows) { reveal.prune(rows.mapTo(HashSet()) { it.id }) }
+    // Replies on their way catch up with what has come of them, a little
+    // each frame, the list following the end as they grow when the person
+    // reads there. It rests once all have caught up, until more comes.
+    val texts = rows.filterIsInstance<ChatRow.Text>()
+    val wanted = texts.sumOf { reveal.lengthOf(it) }
+    val writingNow by rememberUpdatedState(chat?.writing.orEmpty())
+    val textsNow by rememberUpdatedState(texts)
+    val toEnd by rememberUpdatedState(suspend {
+        if (reading && !list.isScrollInProgress && rows.isNotEmpty()) {
+            val before = (if (chat?.more == true) 1 else 0) + (if (chat?.guessed != null) 1 else 0)
+            list.scrollToItem(before + rows.size - 1 + (if (chat?.busy != null) 1 else 0), TO_THE_END)
+        }
+    })
+    LaunchedEffect(target.pane, wanted, streaming, still) {
+        if (!streaming || still) return@LaunchedEffect
+        var last = 0L
+        while (true) {
+            val moved = withFrameNanos { now ->
+                val seconds = if (last == 0L) 1f / 60 else ((now - last) / 1e9f).coerceIn(0f, 0.1f)
+                last = now
+                reveal.step(textsNow, writingNow, seconds)
+            }
+            if (!moved) break
+            toEnd()
+        }
+    }
+    // Swiped left: the rows move aside for when each came about.
+    var swipe by remember { mutableFloatStateOf(0f) }
+    val gutterPx = with(density) { TIME_GUTTER.toPx() }
 
     Box(Modifier.fillMaxSize().background(ground)) {
         // Whatever no part of the page takes stays here: under the page is
@@ -626,7 +713,21 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
         CompositionLocalProvider(LocalDensity provides scaled) {
         LazyColumn(
             state = list,
-            modifier = Modifier.fillMaxSize().layerBackdrop(backdrop).background(ground),
+            modifier = Modifier
+                .fillMaxSize()
+                .layerBackdrop(backdrop)
+                .background(ground)
+                .pointerInput(target.pane) {
+                    detectHorizontalDragGestures(
+                        onDragEnd = { scope.launch { animate(swipe, 0f, animationSpec = spring(dampingRatio = 0.8f, stiffness = 500f)) { at, _ -> swipe = at } } },
+                        onDragCancel = { swipe = 0f },
+                    ) { change, dx ->
+                        change.consume()
+                        // Past the times, it gives less and less.
+                        val next = swipe + dx
+                        swipe = if (next < -gutterPx) -gutterPx + (next + gutterPx) / 3 else next.coerceAtMost(0f)
+                    }
+                },
             contentPadding = PaddingValues(
                 start = 16.dp,
                 end = 16.dp,
@@ -697,8 +798,12 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             // One that goes is gone at once (a fading one was left behind
             // on screen).
             items(rows, key = { it.id }) { row ->
-                Box(Modifier.animateItem(fadeInSpec = tween(260), placementSpec = null, fadeOutSpec = null)) {
-                    ChatRowView(row, model, dark)
+                val fresh = reveal.fresh(row.id, rows)
+                Entering(fresh && !still) {
+                    TimedRow(chat?.times?.get(row.id), swipe, gutterPx) {
+                        val shown = (row as? ChatRow.Text)?.let { reveal.shownOf(it, chat?.writing.orEmpty(), streaming && !still) }
+                        ChatRowView(row, model, dark, shown)
+                    }
                 }
             }
             chat?.busy?.let { busy ->
@@ -792,7 +897,9 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             }
         }
 
-        // What it asks, or what is wrong, over the field to answer in.
+        val keyboardUp = WindowInsets.isImeVisible
+    val footClearance = cornerClearance(side = 10.dp, radius = 24.dp, bottom = 8.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding())
+    // What it asks, or what is wrong, over the field to answer in.
         // What scrolls under them blurs and fades into the ground toward
         // the screen's edge, as under iOS's bars: never read through them.
         Column(
@@ -803,7 +910,8 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                 .imePadding()
                 .navigationBarsPadding()
                 .onSizeChanged { footPx = it.height }
-                .padding(start = 10.dp, end = 10.dp, top = 14.dp, bottom = 8.dp),
+                // Clear of a large rounded screen corner, the keyboard down.
+                .padding(start = 10.dp, end = 10.dp, top = 14.dp, bottom = 8.dp + if (keyboardUp) 0.dp else footClearance),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             // A chat's notices are numbered from one again: the count of
@@ -820,7 +928,7 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
 }
 
 @Composable
-private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean) {
+private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean, shown: Int? = null) {
     val ink = LocalChrome.current.ink
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     when (row) {
@@ -848,7 +956,13 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean) {
         }
         // Grows as more of what it says comes, at once: an animated growth
         // a few times a second kept the list moving under the words.
-        is ChatRow.Text -> SelectionContainer { MdBlocks(row.blocks, ink, dark) }
+        is ChatRow.Text -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // As far as it has come in: the newest words fading in.
+            val blocks = if (shown != null) remember(row.blocks, shown) { mdHead(row.blocks, shown) } else row.blocks
+            SelectionContainer { MdBlocks(blocks, ink, dark, onCopy = model::copyQuietly, whole = row.blocks) }
+            // The answer whole, as written.
+            row.copy?.let { words -> CopyButton(secondary, size = 15.dp) { model.copyQuietly(words) } }
+        }
         is ChatRow.Fold -> FoldView(row, model, dark, secondary)
         is ChatRow.Group -> GroupView(row, model, dark, secondary)
         is ChatRow.Note -> Text(
@@ -1079,16 +1193,18 @@ private fun FoldBodyView(body: FoldBody, dark: Boolean, secondary: Color) {
 
 /// Markdown's blocks as text views.
 @Composable
-fun MdBlocks(blocks: List<MdBlock>, color: Color, dark: Boolean) {
+/// `whole`: the blocks in full when `blocks` is only as far as they have
+/// come in; a code block's copy takes its code from it.
+fun MdBlocks(blocks: List<MdBlock>, color: Color, dark: Boolean, onCopy: ((String) -> Unit)? = null, whole: List<MdBlock>? = null) {
     val mono = monoFamily()
     val codeGround = if (dark) Color(0xFF17181B) else Color(0xFFF2F2F5)
     val inlineGround = if (dark) Color(0x1CFFFFFF) else Color(0x10000000)
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         for ((at, block) in blocks.withIndex()) {
             when (block) {
-                is MdBlock.Para -> Text(spans(block.spans, mono, inlineGround), fontSize = 16.sp, lineHeight = 24.sp, color = color)
+                is MdBlock.Para -> Text(spans(block.spans, mono, inlineGround, color), fontSize = 16.sp, lineHeight = 24.sp, color = color)
                 is MdBlock.Heading -> Text(
-                    spans(block.spans, mono, inlineGround),
+                    spans(block.spans, mono, inlineGround, color),
                     fontSize = when (block.level) { 1 -> 20.sp; 2 -> 18.sp; else -> 16.5.sp },
                     lineHeight = when (block.level) { 1 -> 27.sp; 2 -> 25.sp; else -> 23.sp },
                     fontWeight = FontWeight.SemiBold,
@@ -1097,12 +1213,12 @@ fun MdBlocks(blocks: List<MdBlock>, color: Color, dark: Boolean) {
                 )
                 is MdBlock.Item -> Row(Modifier.padding(start = (block.depth * 18).dp)) {
                     Text(block.mark, fontSize = 16.sp, lineHeight = 24.sp, color = color.copy(alpha = 0.55f), modifier = Modifier.width(22.dp))
-                    Text(spans(block.spans, mono, inlineGround), fontSize = 16.sp, lineHeight = 24.sp, color = color)
+                    Text(spans(block.spans, mono, inlineGround, color), fontSize = 16.sp, lineHeight = 24.sp, color = color)
                 }
                 is MdBlock.Quote -> Row(Modifier.height(IntrinsicSize.Min)) {
                     Box(Modifier.width(3.dp).fillMaxHeight().clip(CircleShape).background(color.copy(alpha = 0.25f)))
                     Text(
-                        spans(block.spans, mono, inlineGround),
+                        spans(block.spans, mono, inlineGround, color.copy(alpha = 0.72f)),
                         fontSize = 16.sp,
                         lineHeight = 24.sp,
                         color = color.copy(alpha = 0.72f),
@@ -1115,19 +1231,22 @@ fun MdBlocks(blocks: List<MdBlock>, color: Color, dark: Boolean) {
                         .clip(RoundedCornerShape(12.dp))
                         .background(codeGround),
                 ) {
-                    if (block.lang.isNotBlank()) {
-                        Text(
-                            block.lang,
-                            fontSize = 11.5.sp,
-                            color = color.copy(alpha = 0.5f),
-                            modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp),
-                        )
+                    // Its language, and a way to copy it whole.
+                    val headed = block.lang.isNotBlank() || onCopy != null
+                    if (headed) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(block.lang, fontSize = 11.5.sp, color = color.copy(alpha = 0.5f), modifier = Modifier.weight(1f))
+                            if (onCopy != null) CopyButton(color.copy(alpha = 0.5f), size = 14.dp) { onCopy((whole?.getOrNull(at) as? MdBlock.Code)?.text ?: block.text) }
+                        }
                     }
                     Box(
                         Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState())
-                            .padding(start = 12.dp, end = 12.dp, top = if (block.lang.isNotBlank()) 4.dp else 10.dp, bottom = 10.dp),
+                            .padding(start = 12.dp, end = 12.dp, top = if (headed) 0.dp else 10.dp, bottom = 10.dp),
                     ) {
                         Text(block.text, fontFamily = mono, fontSize = 13.sp, lineHeight = 19.sp, color = color, softWrap = false)
                     }
@@ -1211,7 +1330,7 @@ private fun MdTable(table: MdBlock.Table, color: Color, mono: FontFamily, inline
     }
 }
 
-private fun spans(spans: List<MdSpan>, mono: FontFamily, inlineGround: Color): AnnotatedString = buildAnnotatedString {
+private fun spans(spans: List<MdSpan>, mono: FontFamily, inlineGround: Color, color: Color = Color.Unspecified): AnnotatedString = buildAnnotatedString {
     for (span in spans) {
         val style = SpanStyle(
             fontWeight = if (span.bold) FontWeight.SemiBold else null,
@@ -1226,7 +1345,12 @@ private fun spans(spans: List<MdSpan>, mono: FontFamily, inlineGround: Color): A
                 span.link != null -> TextDecoration.Underline
                 else -> null
             },
-            color = if (span.link != null) LeadBlue else Color.Unspecified,
+            color = when {
+                span.link != null -> LeadBlue.copy(alpha = span.fade)
+                // Words just come in, still fading in.
+                span.fade < 1f && color.isSpecified -> color.copy(alpha = color.alpha * span.fade)
+                else -> Color.Unspecified
+            },
         )
         if (span.link != null) {
             withLink(LinkAnnotation.Url(span.link)) { withStyle(style) { append(span.text) } }
@@ -1243,6 +1367,263 @@ private fun monoFamily(): FontFamily {
 }
 
 /// While it works: what it is doing, and how long it has been at it.
+/// How far a left swipe moves the rows aside, for their times.
+private val TIME_GUTTER = 64.dp
+/// How many characters at the growing end of a reply fade in.
+private const val FADING = 24
+/// The slowest a reply comes in, in characters a second; and, faster, all
+/// it is behind over this many seconds, again each frame: a burst comes in
+/// quickly at first and eases as it catches up.
+private const val REVEAL_PACE = 90f
+private const val REVEAL_BEHIND = 0.6f
+
+/// How much of each reply on its way is on show, and which rows came after
+/// the chat opened (they come in; the rest are as they are).
+private class Reveal {
+    private val shown = mutableStateMapOf<String, Int>()
+    private val carry = HashMap<String, Float>()
+    private val lengths = HashMap<String, Pair<List<MdBlock>, Int>>()
+    private val known = HashSet<String>()
+    /// The rows on show when the chat opened: one being written then shows
+    /// as far as it had come.
+    private val initial = HashSet<String>()
+    private var primed = false
+
+    fun prime(rows: List<ChatRow>) {
+        if (primed) return
+        primed = true
+        known += rows.map { it.id }
+        initial += rows.map { it.id }
+    }
+
+    /// Where a reply not yet stepped begins: from nothing for one begun
+    /// while the chat is open, else whole.
+    private fun start(id: String, writing: Set<String>, full: Int): Int =
+        if (primed && id in writing && id !in initial) 0 else full
+
+    /// Whether `id` came after the chat opened and has not come in yet: the
+    /// newest few rows only (older ones loaded above are as they are).
+    fun fresh(id: String, rows: List<ChatRow>): Boolean {
+        if (!primed || id in known) return false
+        known += id
+        return rows.takeLast(3).any { it.id == id }
+    }
+
+    fun prune(ids: Set<String>) {
+        shown.keys.retainAll(ids)
+        carry.keys.retainAll(ids)
+        lengths.keys.retainAll(ids)
+    }
+
+    fun lengthOf(row: ChatRow.Text): Int {
+        val held = lengths[row.id]
+        if (held != null && held.first === row.blocks) return held.second
+        return mdLength(row.blocks).also { lengths[row.id] = row.blocks to it }
+    }
+
+    /// How much of `row` shows: none of one begun after the chat opened
+    /// until it comes in; all of one seen whole.
+    fun shownOf(row: ChatRow.Text, writing: Set<String>, moving: Boolean): Int? {
+        if (!moving) return null
+        val full = lengthOf(row)
+        val at = shown[row.id] ?: start(row.id, writing, full)
+        return at.takeIf { it < full }
+    }
+
+    /// One frame on: each reply behind what came of it catches up a little.
+    /// False when none is behind.
+    fun step(rows: List<ChatRow.Text>, writing: Set<String>, seconds: Float): Boolean {
+        var moved = false
+        for (row in rows) {
+            val full = lengthOf(row)
+            val at = shown[row.id] ?: start(row.id, writing, full)
+            if (at >= full) {
+                if (shown[row.id] != full) shown[row.id] = full
+                continue
+            }
+            val pace = maxOf(REVEAL_PACE, (full - at) / REVEAL_BEHIND)
+            val gone = (carry[row.id] ?: 0f) + pace * seconds
+            val whole = gone.toInt()
+            carry[row.id] = gone - whole
+            shown[row.id] = minOf(full, at + whole)
+            moved = true
+        }
+        return moved
+    }
+}
+
+/// How many characters `blocks` show: what a reply's growth is counted in.
+private fun mdLength(blocks: List<MdBlock>): Int = blocks.sumOf { mdLength(it) }
+
+private fun mdLength(block: MdBlock): Int = when (block) {
+    is MdBlock.Para -> block.spans.sumOf { it.text.length }
+    is MdBlock.Heading -> block.spans.sumOf { it.text.length }
+    is MdBlock.Item -> block.spans.sumOf { it.text.length }
+    is MdBlock.Quote -> block.spans.sumOf { it.text.length }
+    is MdBlock.Code -> block.text.length
+    MdBlock.Rule -> 1
+    is MdBlock.Table -> (listOf(block.head) + block.rows).sumOf { row -> row.sumOf { cell -> cell.sumOf { it.text.length } } }
+}
+
+/// `text` cut at about `n`, never inside a character.
+private fun cut(text: String, n: Int): String {
+    var end = n.coerceIn(0, text.length)
+    if (end in 1 until text.length && Character.isHighSurrogate(text[end - 1])) end++
+    return text.substring(0, end)
+}
+
+/// The first `n` characters of `blocks`, the newest of them fading in.
+private fun mdHead(blocks: List<MdBlock>, n: Int): List<MdBlock> {
+    val out = ArrayList<MdBlock>()
+    var left = n
+    for (block in blocks) {
+        if (left <= 0) break
+        val size = mdLength(block)
+        val whole = size <= left
+        out += when (block) {
+            is MdBlock.Para -> block.copy(spans = spansHead(block.spans, left))
+            is MdBlock.Heading -> block.copy(spans = spansHead(block.spans, left))
+            is MdBlock.Item -> block.copy(spans = spansHead(block.spans, left))
+            is MdBlock.Quote -> block.copy(spans = spansHead(block.spans, left))
+            is MdBlock.Code -> if (whole) block else block.copy(text = cut(block.text, left))
+            // A table comes in row by row.
+            is MdBlock.Table -> if (whole) block else {
+                var room = left - block.head.sumOf { cell -> cell.sumOf { it.text.length } }
+                block.copy(rows = block.rows.takeWhile { row -> room > 0 && run { room -= row.sumOf { cell -> cell.sumOf { it.text.length } }; true } })
+            }
+            MdBlock.Rule -> block
+        }
+        left -= size
+    }
+    return out
+}
+
+/// `spans` cut to `n` characters, the last of them fading in: the newest
+/// faintest.
+private fun spansHead(spans: List<MdSpan>, n: Int): List<MdSpan> {
+    val cutSpans = ArrayList<MdSpan>()
+    var left = n
+    for (span in spans) {
+        if (left <= 0) break
+        if (span.text.length <= left) cutSpans += span else cutSpans += span.copy(text = cut(span.text, left))
+        left -= span.text.length
+    }
+    val total = cutSpans.sumOf { it.text.length }
+    if (total == 0 || n >= spans.sumOf { it.text.length }) return cutSpans
+    // Three bands at the end, each fainter than the one before it.
+    val bands = intArrayOf(total - FADING, total - FADING * 2 / 3, total - FADING / 3, total)
+    val fades = floatArrayOf(1f, 0.75f, 0.5f, 0.25f)
+    val out = ArrayList<MdSpan>()
+    var at = 0
+    for (span in cutSpans) {
+        val start = at
+        val end = at + span.text.length
+        at = end
+        var from = start
+        while (from < end) {
+            val band = bands.indexOfFirst { it > from }.coerceAtLeast(0)
+            var to = minOf(end, bands[band].coerceAtLeast(from + 1))
+            if (to < end && Character.isHighSurrogate(span.text[to - start - 1])) to++
+            out += span.copy(text = span.text.substring(from - start, to - start), fade = minOf(span.fade, fades[band]))
+            from = to
+        }
+    }
+    return out
+}
+
+/// A row that came after the chat opened comes in: it fades in as it rises
+/// into its place.
+@Composable
+private fun Entering(fresh: Boolean, content: @Composable () -> Unit) {
+    val rise = remember { Animatable(if (fresh) 1f else 0f) }
+    LaunchedEffect(Unit) { if (rise.value > 0f) rise.animateTo(0f, tween(320, easing = FastOutSlowInEasing)) }
+    Box(
+        Modifier.graphicsLayer {
+            alpha = 1f - rise.value
+            translationY = rise.value * 10.dp.toPx()
+        }
+    ) { content() }
+}
+
+/// A row, and when it came about beside it: out of sight to its right until
+/// the rows are swiped aside.
+@Composable
+private fun TimedRow(at: Long?, swipe: Float, gutterPx: Float, content: @Composable () -> Unit) {
+    Box(Modifier.fillMaxWidth()) {
+        Box(Modifier.graphicsLayer { translationX = swipe }) { content() }
+        if (at != null && swipe < 0f) {
+            val words = remember(at) { timeWords(at) }
+            Text(
+                words,
+                fontSize = 11.sp,
+                lineHeight = 14.sp,
+                textAlign = TextAlign.End,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .width(TIME_GUTTER - 8.dp)
+                    .padding(top = 2.dp)
+                    .graphicsLayer {
+                        translationX = swipe + gutterPx
+                        alpha = (-swipe / gutterPx).coerceIn(0f, 1f)
+                    },
+            )
+        }
+    }
+}
+
+/// When something came about, as the app's language words it: the time,
+/// and the day above it when not today.
+private fun timeWords(at: Long): String {
+    val locale = java.util.Locale.forLanguageTag(L10n.currentTag(AppLanguage.tag))
+    val then = java.time.Instant.ofEpochSecond(at).atZone(java.time.ZoneId.systemDefault())
+    val today = java.time.LocalDate.now()
+    val time = java.time.format.DateTimeFormatter.ofLocalizedTime(java.time.format.FormatStyle.SHORT).withLocale(locale).format(then)
+    if (then.toLocalDate() == today) return time
+    val skeleton = if (then.year == today.year) "MMMd" else "yMMMd"
+    val day = java.time.format.DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(locale, skeleton), locale).format(then)
+    return "$day\n$time"
+}
+
+/// Whether the system asks for less motion (animations turned off in its
+/// accessibility or developer settings).
+@Composable
+internal fun rememberReducedMotion(): Boolean {
+    val context = LocalContext.current
+    return remember { android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f }
+}
+
+/// A small copy button: its icon turns to a check for a moment once it has
+/// copied.
+@Composable
+private fun CopyButton(tint: Color, size: Dp, onCopy: () -> Unit) {
+    var done by remember { mutableStateOf(false) }
+    LaunchedEffect(done) {
+        if (done) {
+            delay(1500)
+            done = false
+        }
+    }
+    val view = LocalView.current
+    val label = tr(if (done) "copied" else "copy")
+    Box(
+        Modifier
+            .size(size + 22.dp)
+            .clip(CircleShape)
+            .clickable(role = Role.Button) {
+                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                onCopy()
+                done = true
+            }
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        Crossfade(done, animationSpec = tween(160), label = "copied") { copied ->
+            DesktopIcon(if (copied) "check" else "copy", size = size, tint = if (copied) Added else tint)
+        }
+    }
+}
+
 @Composable
 private fun Busy(text: String, since: Long?, secondary: Color) {
     val now by produceState(System.currentTimeMillis() / 1000) {
@@ -1251,13 +1632,15 @@ private fun Busy(text: String, since: Long?, secondary: Color) {
             value = System.currentTimeMillis() / 1000
         }
     }
+    // Still, when the system asks for less motion.
+    val still = rememberReducedMotion()
     val pulse = rememberInfiniteTransition(label = "busy")
     val phase by pulse.animateFloat(0f, 3f, infiniteRepeatable(tween(1200), RepeatMode.Restart), label = "dots")
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             for (i in 0 until 3) {
-                val lit = (phase.toInt() % 3) == i
-                Box(Modifier.size(6.dp).clip(CircleShape).background(secondary.copy(alpha = if (lit) 0.9f else 0.35f)))
+                val lit = !still && (phase.toInt() % 3) == i
+                Box(Modifier.size(6.dp).clip(CircleShape).background(secondary.copy(alpha = if (lit || (still && i == 0)) 0.9f else 0.35f)))
             }
         }
         val secs = since?.let { (now - it).coerceAtLeast(0) }
@@ -1274,7 +1657,7 @@ private fun Busy(text: String, since: Long?, secondary: Color) {
         )
         Text(
             said,
-            style = TextStyle(brush = brush, fontSize = 13.5.sp),
+            style = if (still) TextStyle(color = secondary, fontSize = 13.5.sp) else TextStyle(brush = brush, fontSize = 13.5.sp),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.onSizeChanged { wide = it.width.coerceAtLeast(1) },
@@ -1336,9 +1719,11 @@ private fun AskCard(ask: ChatAsk, model: TerminalModel, backdrop: Backdrop, dark
                     .heightIn(max = 140.dp)
                     .clip(RoundedCornerShape(12.dp))
                     .background(if (dark) Color(0x5C000000) else Color(0x0F000000))
+                    // A long command scrolls rather than being cut.
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 12.dp, vertical = 10.dp),
             ) {
-                Text(ask.body, fontFamily = monoFamily(), fontSize = 13.sp, lineHeight = 19.sp, color = ink)
+                SelectionContainer { Text(ask.body, fontFamily = monoFamily(), fontSize = 13.sp, lineHeight = 19.sp, color = ink) }
             }
         }
         ask.reason?.let { Text(it, fontSize = 13.sp, lineHeight = 18.sp, color = secondary) }
@@ -1403,7 +1788,16 @@ private fun ProblemCard(problem: ChatProblem, model: TerminalModel, backdrop: Ba
     ) {
         Text(problem.text, fontSize = 15.sp, lineHeight = 21.sp, color = ink)
         if (problem.detail.isNotEmpty()) {
-            Text(problem.detail, fontFamily = monoFamily(), fontSize = 11.5.sp, color = secondary, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            // Whoever wants the detail can copy it.
+            SelectionContainer {
+                Text(
+                    problem.detail,
+                    fontFamily = monoFamily(),
+                    fontSize = 11.5.sp,
+                    color = secondary,
+                    modifier = Modifier.heightIn(max = 96.dp).verticalScroll(rememberScrollState()),
+                )
+            }
         }
         problem.action?.let { action ->
             Box(
@@ -1412,7 +1806,10 @@ private fun ProblemCard(problem: ChatProblem, model: TerminalModel, backdrop: Ba
                     .height(46.dp)
                     .clip(CircleShape)
                     .background(LeadBlue)
-                    .clickable { model.chatAction(action.id) },
+                    .clickable(role = Role.Button) {
+                        // The terminal is the app's to show; the rest the core's.
+                        if (action.id == "terminal") model.closeChat(toTerminal = true) else model.chatAction(action.id)
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 Text(action.label, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
@@ -1489,15 +1886,25 @@ private fun ContextRing(context: ChatContext, backdrop: Backdrop, dark: Boolean,
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
-        Canvas(Modifier.size(21.dp)) {
-            val stroke = 2.6.dp.toPx()
+        // A whole ring under the part filled, and how full in its middle:
+        // a gauge, not a spinner.
+        Canvas(Modifier.size(28.dp)) {
+            val stroke = 2.4.dp.toPx()
             val inset = stroke / 2
             val arc = Size(size.width - stroke, size.height - stroke)
-            drawArc(ink.copy(alpha = 0.16f), 0f, 360f, false, Offset(inset, inset), arc, style = Stroke(stroke))
+            drawArc(ink.copy(alpha = 0.26f), 0f, 360f, false, Offset(inset, inset), arc, style = Stroke(stroke))
             if (fill > 0f) {
                 drawArc(color, -90f, 360f * fill.coerceAtLeast(0.02f), false, Offset(inset, inset), arc, style = Stroke(stroke, cap = StrokeCap.Round))
             }
         }
+        Text(
+            context.percent.filter { it.isDigit() }.ifEmpty { "–" },
+            fontSize = 9.sp,
+            lineHeight = 9.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = ink.copy(alpha = 0.85f),
+            maxLines = 1,
+        )
     }
 }
 
@@ -1640,21 +2047,39 @@ private fun ContextSheet(context: ChatContext, dark: Boolean, onDismiss: () -> U
 
 /// The field to say something in, in one card with what goes with it:
 /// the + for files and pictures, the model, and send -- or stop, while
-/// the agent works and nothing is typed. Over it, as a `/` is typed, the
-/// commands the agent takes.
+/// the agent works and nothing is typed; with something typed, both. Over
+/// it, as a `/` is typed, the commands the agent takes. What is typed and
+/// not sent is kept for the pane's chat, as it comes and goes.
 @Composable
 private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: TerminalModel, backdrop: Backdrop, dark: Boolean, onSend: () -> Unit) {
     val ink = LocalChrome.current.ink
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     val view = LocalView.current
-    var field by rememberSaveable(target.pane, stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
+    var field by remember(target.pane) {
+        val kept = model.chatDrafts[target.pane].orEmpty()
+        mutableStateOf(TextFieldValue(kept, TextRange(kept.length)))
+    }
     val text = field.text
+    LaunchedEffect(target.pane, text) {
+        if (text.isEmpty()) model.chatDrafts.remove(target.pane) else model.chatDrafts[target.pane] = text
+    }
+    // What the core did not send (a command only the terminal takes) comes
+    // back, to be put right or sent again as words.
+    var keptSeen by remember(target.pane) { mutableStateOf(chat?.notice?.seq ?: 0L) }
+    LaunchedEffect(chat?.notice?.seq) {
+        val notice = chat?.notice ?: return@LaunchedEffect
+        if (notice.seq <= keptSeen) return@LaunchedEffect
+        keptSeen = notice.seq
+        val kept = notice.kept ?: return@LaunchedEffect
+        if (field.text.isBlank()) field = TextFieldValue(kept, TextRange(kept.length))
+    }
     val files = model.chatFiles
     // What is picked goes when all of it is there.
     val waiting = files.any { it.path == null && it.error == null }
     val ready = files.any { it.path != null }
     val canSend = chat?.canSend == true && !waiting && (text.isNotBlank() || ready)
-    val stop = chat?.canStop == true && text.isBlank() && files.isEmpty()
+    val working = chat?.canStop == true
+    val stop = working && text.isBlank() && files.isEmpty()
     val offer = remember(chat?.commands, text) { offerFor(chat?.commands.orEmpty(), text) }
     // What was offered stays on show while it goes.
     var lastOffer by remember { mutableStateOf<Offer?>(null) }
@@ -1705,17 +2130,19 @@ private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: 
             Appearing(target.pane, files.takeIf { it.isNotEmpty() }) { picked ->
                 Box(Modifier.padding(start = 8.dp, end = 8.dp, top = 8.dp)) { PickedFiles(picked, model, dark) }
             }
+            // As large as the chat's text is set to be.
+            val scale = chatTextScale(model.settings.chatText)
             BasicTextField(
                 value = field,
                 onValueChange = { field = it },
-                textStyle = TextStyle(color = ink, fontSize = 16.sp, lineHeight = 22.sp),
+                textStyle = TextStyle(color = ink, fontSize = (16 * scale).sp, lineHeight = (22 * scale).sp),
                 cursorBrush = SolidColor(LeadBlue),
                 maxLines = 6,
                 modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 2.dp),
                 decorationBox = { inner ->
                     Box {
                         if (text.isEmpty()) {
-                            Text(chat?.placeholder.orEmpty(), fontSize = 16.sp, lineHeight = 22.sp, color = secondary.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(chat?.placeholder.orEmpty(), fontSize = (16 * scale).sp, lineHeight = (22 * scale).sp, color = secondary.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         inner()
                     }
@@ -1730,8 +2157,20 @@ private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: 
                 Box(Modifier.weight(1f)) {
                     chat?.model?.let { ModelChip(it, model, dark) }
                 }
+                // Something typed while it works: stopping stays at hand.
+                AnimatedVisibility(
+                    visible = working && !stop,
+                    enter = fadeIn(tween(160)) + scaleIn(tween(160), initialScale = 0.8f),
+                    exit = fadeOut(tween(120)) + scaleOut(tween(120), targetScale = 0.8f),
+                ) {
+                    StopButton(dark) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        model.chatInterrupt()
+                    }
+                }
                 SendButton(stop, canSend, dark) {
                     if (stop) {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                         model.chatInterrupt()
                     } else {
                         view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
@@ -1741,6 +2180,26 @@ private fun ChatField(chat: ChatView?, target: TerminalModel.ChatTarget, model: 
                 }
             }
         }
+    }
+}
+
+/// Stop, beside send while something is typed: the agent can be stopped
+/// without giving up what was typed.
+@Composable
+private fun StopButton(dark: Boolean, onClick: () -> Unit) {
+    val ink = LocalChrome.current.ink
+    val label = tr("chat.stop")
+    Box(
+        Modifier
+            .minimumInteractiveComponentSize()
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(ink.copy(alpha = if (dark) 0.14f else 0.10f))
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(Modifier.size(11.dp).clip(RoundedCornerShape(2.5.dp)).background(ink))
     }
 }
 
@@ -1781,8 +2240,14 @@ private fun SendButton(stop: Boolean, canSend: Boolean, dark: Boolean, onClick: 
 }
 
 /// The word being typed, when it calls up commands: `/` at the start of
-/// the field, or a `$` word (a skill) anywhere; and those it may be.
+/// the field, which offers them all; or, anywhere, a word begun with a
+/// skill's own sign (`$` for Codex, `@` for OpenCode), which offers those.
+/// `from` is where the word begins: a pick takes its place.
 private class Offer(val from: Int, val commands: List<ChatCommand>)
+
+/// A command's name without its sign: what is matched against what is
+/// typed (`/skill:review` and `$review` are both "review").
+private fun bareName(name: String): String = name.drop(1).removePrefix("skill:").lowercase()
 
 private fun offerFor(commands: List<ChatCommand>, text: String): Offer? {
     if (commands.isEmpty()) return null
@@ -1790,19 +2255,35 @@ private fun offerFor(commands: List<ChatCommand>, text: String): Offer? {
     val word = text.substring(from)
     if (word.isEmpty() || word.any { it.isWhitespace() }) return null
     val sign = word[0]
-    if (sign != '/' && sign != '$') return null
-    val typed = word.lowercase()
-    val signed = commands.filter { it.name.startsWith(sign) }
-    // Those it begins first, then those whose names hold it.
-    val first = signed.filter { it.name.lowercase().startsWith(typed) }
-    val rest = typed.drop(1)
-    val then = if (rest.isEmpty()) emptyList() else signed.filter { it !in first && it.name.lowercase().contains(rest) }
-    val all = first + then
+    val signs = commands.filter { it.kind == "skill" }.mapNotNull { it.name.firstOrNull() }.toSet() - '/'
+    val offered = when {
+        sign == '/' && from == 0 -> commands
+        sign in signs -> commands.filter { it.name.startsWith(sign) }
+        else -> return null
+    }
+    val typed = word.drop(1).lowercase()
+    // Those whose names begin with it, then those whose names hold it, then
+    // those whose words on what they do hold it -- each group kept whole,
+    // and in its place.
+    fun rank(command: ChatCommand): Int? {
+        if (typed.isEmpty()) return 0
+        val bare = bareName(command.name)
+        return when {
+            bare.startsWith(typed) || command.name.lowercase().startsWith(word.lowercase()) -> 0
+            bare.contains(typed) -> 1
+            command.description.lowercase().contains(typed) -> 2
+            else -> null
+        }
+    }
+    val groups = offered.map { it.group }.distinct()
+    val all = offered.mapNotNull { command -> rank(command)?.let { command to it } }
+        .sortedWith(compareBy({ groups.indexOf(it.first.group) }, { it.second }))
+        .map { it.first }
     return if (all.isEmpty()) null else Offer(from, all)
 }
 
-/// The commands the word typed may be, over the field: a tap runs one
-/// that runs as it is, or puts one in the field to be followed.
+/// The commands the word typed may be, over the field, by group: a tap
+/// runs one that runs as it is, or puts one in the field to be followed.
 @Composable
 private fun CommandPalette(
     commands: List<ChatCommand>,
@@ -1814,18 +2295,34 @@ private fun CommandPalette(
     onModelPicked: () -> Unit,
 ) {
     val ink = LocalChrome.current.ink
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     val shape = RoundedCornerShape(22.dp)
-    Column(
-        Modifier
+    val list = rememberLazyListState()
+    // A new word offers from its top.
+    LaunchedEffect(commands.firstOrNull()?.name) { list.scrollToItem(0) }
+    val headed = commands.map { it.group }.distinct().size > 1
+    LazyColumn(
+        state = list,
+        modifier = Modifier
             .fillMaxWidth()
             .glass(backdrop, dark, shape)
             .border(0.5.dp, ink.copy(alpha = if (dark) 0.12f else 0.08f), shape)
-            .heightIn(max = 292.dp)
-            .verticalScroll(rememberScrollState())
-            .padding(vertical = 6.dp),
+            .heightIn(max = 300.dp),
+        contentPadding = PaddingValues(vertical = 6.dp),
     ) {
-        for (command in commands) {
-            key(command.name) {
+        commands.forEachIndexed { at, command ->
+            if (headed && command.group.isNotEmpty() && (at == 0 || commands[at - 1].group != command.group)) {
+                item(key = "group:${command.group}") {
+                    Text(
+                        command.group,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = secondary,
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = if (at == 0) 6.dp else 12.dp, bottom = 2.dp).semantics { heading() },
+                    )
+                }
+            }
+            item(key = command.name) {
                 if (command.here == "model" && menu != null) {
                     var open by remember { mutableStateOf(false) }
                     var into by remember { mutableStateOf<String?>(null) }
@@ -1866,7 +2363,8 @@ private fun CommandRow(command: ChatCommand, onClick: () -> Unit) {
         ) {
             val icon = when {
                 command.here == "model" -> "cpu"
-                command.name.startsWith("$") || command.name.startsWith("/skill:") -> "sparkles"
+                command.kind == "skill" -> "sparkles"
+                command.kind == "prompt" -> "scroll-text"
                 else -> "square-slash"
             }
             DesktopIcon(icon, size = 16.dp, tint = secondary)
@@ -1879,7 +2377,7 @@ private fun CommandRow(command: ChatCommand, onClick: () -> Unit) {
                 }
             }
             if (command.description.isNotBlank()) {
-                Text(command.description, fontSize = 12.5.sp, lineHeight = 16.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(command.description, fontSize = 12.5.sp, lineHeight = 16.sp, color = secondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -1959,6 +2457,7 @@ private fun AttachMenu(model: TerminalModel, dark: Boolean) {
 private fun PickedFiles(files: List<TerminalModel.ChatFile>, model: TerminalModel, dark: Boolean) {
     val ink = LocalChrome.current.ink
     val remove = tr("chat.attach.remove")
+    val retry = tr("chat.attach.retry")
     Row(
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1977,10 +2476,16 @@ private fun PickedFiles(files: List<TerminalModel.ChatFile>, model: TerminalMode
                     FileCard(file.name, sizeWords(file.size), file.image, dark, Modifier.height(64.dp))
                 }
                 when {
+                    // Why it did not go, and a tap to send it again.
                     file.error != null -> Box(
-                        Modifier.matchParentSize().clip(shape).background(Color(0x99FF453A)),
+                        Modifier
+                            .matchParentSize()
+                            .clip(shape)
+                            .background(Color(0x99FF453A))
+                            .clickable(role = Role.Button, onClickLabel = retry) { model.chatRetryFile(file) }
+                            .semantics { contentDescription = "${file.name}: ${file.error}" },
                         contentAlignment = Alignment.Center,
-                    ) { DesktopIcon("triangle-alert", size = 18.dp, tint = Color.White) }
+                    ) { DesktopIcon("rotate-cw", size = 18.dp, tint = Color.White) }
                     file.path == null -> Box(
                         Modifier.matchParentSize().clip(shape).background(Color(0x59000000)),
                         contentAlignment = Alignment.Center,
@@ -2067,7 +2572,15 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
                         .clickable(role = Role.Image) { shown = file },
                 )
             } else {
-                FileCard(file.name, null, file.image, dark)
+                // Where it is on the host, to be pasted wherever it is wanted.
+                val path = file.path
+                FileCard(
+                    file.name,
+                    null,
+                    file.image,
+                    dark,
+                    if (path != null) Modifier.clip(RoundedCornerShape(12.dp)).clickable(role = Role.Button) { model.copyToClipboard(path) } else Modifier,
+                )
             }
         }
     }
@@ -2077,21 +2590,117 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
 }
 
 /// A picture over everything, as large as it fits: the phone's own copy
-/// when it sent it, else the host's small one. A tap puts it away.
+/// when it sent it, else the host's small one. Two fingers zoom it, a
+/// double tap zooms in or back; a tap puts it away. Share hands it to
+/// another app (to save it, or send it on).
 @Composable
 private fun PictureView(file: ChatSent, thumb: ImageBitmap?, local: File?, onClose: () -> Unit) {
     val picture = rememberPicture(thumb, local, 2048)
+    val context = LocalContext.current
+    var scale by remember { mutableStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Box(
-            Modifier.fillMaxSize().background(Color.Black).clickable(onClick = onClose),
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = { onClose() },
+                        onDoubleTap = { at ->
+                            if (scale > 1f) {
+                                scale = 1f
+                                offset = Offset.Zero
+                            } else {
+                                scale = 2.5f
+                                // The point tapped stays under the finger.
+                                offset = (Offset(size.width / 2f, size.height / 2f) - at) * 1.5f
+                            }
+                        },
+                    )
+                }
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        scale = (scale * zoom).coerceIn(1f, 6f)
+                        offset = if (scale == 1f) Offset.Zero else offset + pan
+                    }
+                },
             contentAlignment = Alignment.Center,
         ) {
             if (picture != null) {
-                Image(picture, contentDescription = file.name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
+                Image(
+                    picture,
+                    contentDescription = file.name,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize().graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                        translationX = offset.x
+                        translationY = offset.y
+                    },
+                )
+            }
+            val share = tr("chat.share")
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(12.dp)
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.16f))
+                    .clickable(role = Role.Button) { sharePicture(context, file.name, local, picture) }
+                    .semantics { contentDescription = share },
+                contentAlignment = Alignment.Center,
+            ) {
+                DesktopIcon("share-2", size = 19.dp, tint = Color.White)
             }
         }
     }
 }
+
+/// The picture to another app, by the system's share sheet: the phone's own
+/// copy as it is, else the small one shown, as a JPEG. Each share is a
+/// file of its own (an app given one reads that one only), named after the
+/// picture but never put anywhere else by its name; those over an hour old
+/// go. The files are written off the main thread.
+private fun sharePicture(context: android.content.Context, name: String, local: File?, shown: ImageBitmap?) {
+    val own = local?.takeIf { it.exists() }
+    val bitmap = if (own == null) shown?.asAndroidBitmap() ?: return else null
+    val main = androidx.core.content.ContextCompat.getMainExecutor(context)
+    kotlin.concurrent.thread(name = "share-picture") {
+        runCatching {
+            val root = File(context.cacheDir, "shared")
+            val now = System.currentTimeMillis()
+            root.listFiles()?.filter { now - it.lastModified() > SHARED_KEPT_MS }?.forEach { it.deleteRecursively() }
+            val folder = File(root, java.util.UUID.randomUUID().toString()).apply { mkdirs() }
+            val base = File(name).name.substringBeforeLast('.').replace(Regex("[^\\w .-]"), "_").trim('.', ' ').take(60).ifEmpty { "picture" }
+            val file = if (own != null) {
+                val ext = own.extension.filter { it.isLetterOrDigit() }.take(5).ifEmpty { "jpg" }
+                own.copyTo(File(folder, "$base.$ext"))
+            } else {
+                File(folder, "$base.jpg").also { out ->
+                    out.outputStream().use { bitmap!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, it) }
+                }
+            }
+            check(file.canonicalPath.startsWith(folder.canonicalPath + File.separator))
+            val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".files", file)
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = context.contentResolver.getType(uri) ?: "image/*"
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            main.execute {
+                runCatching {
+                    context.startActivity(android.content.Intent.createChooser(send, null).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            }
+        }
+    }
+}
+
+/// How long a shared picture's file is kept for the app it went to.
+private const val SHARED_KEPT_MS = 60 * 60 * 1000L
 
 /// A picture to show: the phone's own file when there is one (`side` its
 /// longest side at most), else the host's small one.

@@ -388,6 +388,11 @@ private fun SettingsSection(
                     sizes.map { tr("chat.text.$it") },
                     sizes.indexOf(settings.chatText).coerceAtLeast(0),
                 ) { settings.chatText = sizes[it] }
+                SegmentRow(
+                    tr("chat.reveal"),
+                    listOf(tr("chat.reveal.stream"), tr("chat.reveal.blocks")),
+                    if (settings.chatReveal == "blocks") 1 else 0,
+                ) { settings.chatReveal = if (it == 1) "blocks" else "stream" }
             }
             "keyboard" -> Group {
                 PushRow(tr("k.keybar"), keyCaps.size.toString()) { onPush("k.keybar") }

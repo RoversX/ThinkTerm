@@ -85,6 +85,9 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     var chatFirst by pref("chat.first", false)
     /// How large the chat's text is: "s", "m", "l" or "xl".
     var chatText by pref("chat.text", "m")
+    /// How a reply shows while the agent writes it: "stream", growing as it
+    /// is written, or "blocks", each part shown once written whole.
+    var chatReveal by pref("chat.reveal", "stream")
 
     // MARK: keyboard
 
