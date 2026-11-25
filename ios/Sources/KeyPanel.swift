@@ -41,13 +41,17 @@ struct KeyCap: Identifiable {
 /// into input.
 enum KeyCaps {
     /// The bar under the terminal: the keys a soft keyboard has not got,
-    /// the four a terminal asks for all the time in sight and the rest a
-    /// swipe along the bar away. The arrows are in the panel.
+    /// the four a terminal asks for all the time in sight, then the
+    /// arrows and the rest a swipe along the bar away, as on Android.
     static var bar: [KeyCap] { [
         .dom("esc", "Escape"),
         .dom("tab", "Tab"),
         KeyCap(label: "ctrl", action: .sticky(.ctrl)),
         KeyCap(label: "alt", action: .sticky(.alt)),
+        .dom("↑", "ArrowUp"),
+        .dom("↓", "ArrowDown"),
+        .dom("←", "ArrowLeft"),
+        .dom("→", "ArrowRight"),
         .dom("home", "Home"),
         .dom("end", "End"),
         .dom("pgup", "PageUp"),
