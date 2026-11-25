@@ -745,6 +745,14 @@ pub(crate) trait ContentView {
     /// have when it opened stops matching the terminal it came from.
     fn set_host_preview_aspect(&mut self, _aspect: f32) {}
 
+    /// Tell a view that paints its own ground (`host_paints_ground` false)
+    /// how see-through the window has the terminal's ground, apart from the
+    /// alpha of its colour: less than whole in a see-through window, whole
+    /// over a background image. A view that ignores it stays as it was.
+    /// Pushed every frame, as the window can go see-through or opaque while
+    /// the view is up.
+    fn set_ground_opacity(&mut self, _opacity: f32) {}
+
     /// Terminal tabs to paint as read-only live thumbnails after the view's
     /// regular UI layers have been prepared.
     fn terminal_previews(&self) -> Vec<TerminalPreviewRequest> {

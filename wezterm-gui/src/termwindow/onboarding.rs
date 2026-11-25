@@ -349,13 +349,16 @@ struct CurtainColumn {
 /// with this frame's characters and what they shaped to. Bounded by the
 /// window's size and the character set; it goes with the page.
 struct Curtain {
-    key: [u32; 15],
+    key: [u32; 16],
     font: usize,
     top: f32,
     line_h: f32,
     rows: usize,
+    /// The page's ground as painted: see-through, in a see-through window.
     ground: LinearRgba,
     ink: LinearRgba,
+    /// Whether the window lets what is behind it through the page.
+    see_through: bool,
     columns: Vec<CurtainColumn>,
     glyphs: Vec<(char, f32, f32, LinearRgba)>,
     /// How lit each row of the column being laid out is: where two strands
@@ -381,13 +384,14 @@ impl Curtain {
         ink: LinearRgba,
     ) -> Self {
         let mut curtain = Self {
-            key: [0; 15],
+            key: [0; 16],
             font: 0,
             top: area.origin.y,
             line_h,
             rows: 0,
             ground,
             ink,
+            see_through: false,
             columns: Vec::new(),
             glyphs: Vec::new(),
             lit_rows: Vec::new(),
@@ -481,13 +485,26 @@ impl Curtain {
                 // Eased in at the top and bottom of the page rather than cut
                 // off by them.
                 let edge = (row.min(rows - 1 - row) as f32 / 3.0).min(1.0);
+                let colour = self.lit(strength * column.outward * edge);
                 self.glyphs.push((
                     CURTAIN_CHARS[pick] as char,
                     column.x,
                     self.top + row as f32 * self.line_h,
-                    mix(self.ground, self.ink, strength * column.outward * edge),
+                    colour,
                 ));
             }
+        }
+    }
+
+    /// A character lit `strength` of the way from the ground to the ink.
+    /// In a see-through window there is no one colour behind to mix with,
+    /// so the ink itself goes as faint: mixed with the ground, it would
+    /// paint its cell more solid than the page round it.
+    fn lit(&self, strength: f32) -> LinearRgba {
+        if self.see_through {
+            self.ink.mul_alpha(strength)
+        } else {
+            mix(self.ground, self.ink, strength)
         }
     }
 }
@@ -529,6 +546,9 @@ pub(crate) struct OnboardingView {
     /// What this page's strings shaped to. The curtain repaints the page
     /// many times a second, and its text never changes in between.
     shaped: ShapedText,
+    /// How solid the page's ground is: as solid as the terminal's, which is
+    /// less than whole in a see-through window (`set_ground_opacity`).
+    ground_opacity: f32,
 }
 
 impl OnboardingView {
@@ -566,6 +586,7 @@ impl OnboardingView {
             intro: None,
             mark: None,
             shaped: ShapedText::default(),
+            ground_opacity: 1.0,
         }
     }
 
@@ -863,6 +884,9 @@ impl OnboardingView {
     ) -> anyhow::Result<()> {
         self.widgets.clear();
         let skin = Skin::new(palette);
+        // In a see-through window the desktop shows through the page as it
+        // does through the terminal. The controls on it stay solid.
+        let page = skin.ground.mul_alpha(self.ground_opacity);
 
         ctx.draw_rect(
             layers,
@@ -871,7 +895,7 @@ impl OnboardingView {
             area.origin.y,
             area.size.width,
             area.size.height,
-            skin.ground,
+            page,
         )?;
 
         let body_h = Self::text_h(font);
@@ -886,7 +910,7 @@ impl OnboardingView {
             .px(COL_W)
             .min((area.size.width - ctx.px(SIDE_PAD) * 2.0).max(ctx.px(MIN_COL_W)));
         let col_x = area.origin.x + ((area.size.width - col_w) / 2.0).max(0.0);
-        self.paint_curtain(ctx, layers, area, col_x, col_w, skin, caption_font)?;
+        self.paint_curtain(ctx, layers, area, col_x, col_w, skin, page, caption_font)?;
 
         // --- measure everything first so the column can be centred vertically
         let languages: Vec<String> = LANGUAGE_OPTIONS
@@ -1254,6 +1278,8 @@ impl OnboardingView {
     /// The curtain in both side margins. Its columns are laid out again only
     /// when something they depend on changes -- the page, the column, the
     /// font or the theme; each frame only moves the strands along them.
+    /// `page` is the ground as painted, see-through or not.
+    #[allow(clippy::too_many_arguments)]
     fn paint_curtain(
         &mut self,
         ctx: &DrawContext,
@@ -1262,6 +1288,7 @@ impl OnboardingView {
         col_x: f32,
         col_w: f32,
         skin: Skin,
+        page: LinearRgba,
         font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
@@ -1279,9 +1306,10 @@ impl OnboardingView {
             clear,
             char_w,
             line_h,
-            skin.ground.0,
-            skin.ground.1,
-            skin.ground.2,
+            page.0,
+            page.1,
+            page.2,
+            page.3,
             skin.text.0,
             skin.text.1,
             skin.text.2,
@@ -1306,13 +1334,14 @@ impl OnboardingView {
                 0.45,
             );
             let mut curtain =
-                Curtain::lay_out(area, col_x, col_w, clear, char_w, line_h, skin.ground, ink);
+                Curtain::lay_out(area, col_x, col_w, clear, char_w, line_h, page, ink);
             curtain.key = key;
             curtain.font = font_id;
             curtain.shaped = shaped;
             self.curtain = Some(curtain);
         }
         let curtain = self.curtain.as_mut().unwrap();
+        curtain.see_through = self.ground_opacity < 1.0;
         curtain.frame(self.opened.elapsed().as_secs_f32());
         ctx.draw_glyphs_on_layer(layers, 0, font, &curtain.glyphs, &mut curtain.shaped)
     }
@@ -2199,6 +2228,10 @@ impl ContentView for OnboardingView {
         false
     }
 
+    fn set_ground_opacity(&mut self, opacity: f32) {
+        self.ground_opacity = opacity.clamp(0.0, 1.0);
+    }
+
     fn title(&self) -> String {
         crate::i18n::tr("onboarding-window-title")
     }
@@ -2285,6 +2318,7 @@ impl ContentView for OnboardingView {
                 layers,
                 area,
                 page_ground(palette),
+                self.ground_opacity,
                 frame,
                 page_under,
                 self.mark,

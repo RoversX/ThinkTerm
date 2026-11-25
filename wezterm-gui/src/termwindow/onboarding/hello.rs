@@ -14,7 +14,7 @@
 //! many times, so a frame uploads nothing and draws the same on either
 //! renderer.
 
-use crate::quad::TripleLayerQuadAllocator;
+use crate::quad::{QuadBlend, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::ui::DrawContext;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -205,21 +205,25 @@ impl Intro {
         true
     }
 
-    /// `page_under`: the page was painted first this frame, so the ground
-    /// goes over it rather than under everything. `mark`: where the page's
-    /// icon was last laid out.
+    /// `opacity`: how see-through the window has the page's ground, on top
+    /// of the alpha of its own colour; less than whole in a see-through
+    /// window. `page_under`: the page was painted first this
+    /// frame, so the ground goes over it rather than under everything.
+    /// `mark`: where the page's icon was last laid out.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn paint(
         &self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         area: RectF,
         ground: LinearRgba,
+        opacity: f32,
         frame: Frame,
         page_under: bool,
         mark: Option<RectF>,
     ) -> anyhow::Result<()> {
         self.hello
-            .paint(ctx, layers, area, ground, frame, page_under, mark)
+            .paint(ctx, layers, area, ground, opacity, frame, page_under, mark)
     }
 }
 
@@ -398,25 +402,21 @@ impl Hello {
 
     /// The intro over the whole content area. When the page is painted
     /// first this lays the ground over it, as see-through as the page has
-    /// faded in, and what is left of the word on top.
+    /// faded in (`cover_over_page`), and what is left of the word on top.
+    #[allow(clippy::too_many_arguments)]
     fn paint(
         &self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         area: RectF,
         ground: LinearRgba,
+        opacity: f32,
         frame: Frame,
         page_under: bool,
         mark: Option<RectF>,
     ) -> anyhow::Result<()> {
         let page_in = frame.page_in.unwrap_or(0.0);
-        let (layer, cover) = if page_under {
-            (2, ground.mul_alpha(1.0 - page_in))
-        } else {
-            (0, ground)
-        };
-        // Once the page is fully in, the ground over it is gone.
-        if !page_under || page_in < 1.0 {
+        let rect = |layers: &mut TripleLayerQuadAllocator<'_>, layer, colour| {
             ctx.draw_rect(
                 layers,
                 layer,
@@ -424,8 +424,21 @@ impl Hello {
                 area.origin.y,
                 area.size.width,
                 area.size.height,
-                cover,
-            )?;
+                colour,
+            )
+        };
+        if !page_under {
+            rect(layers, 0, ground.mul_alpha(opacity))?;
+        } else if page_in < 1.0 {
+            // Once the page is fully in, the ground over it is gone.
+            let (clear, cover) = cover_over_page(ground.3, opacity, page_in);
+            if clear > 0.0 {
+                layers.set_blend(2, QuadBlend::Clear);
+                let cleared = rect(layers, 2, ground.mul_alpha(clear));
+                layers.set_blend(2, QuadBlend::Over);
+                cleared?;
+            }
+            rect(layers, 2, LinearRgba(ground.0, ground.1, ground.2, cover))?;
         }
         let width = ctx
             .px(WORD_W)
@@ -773,6 +786,27 @@ impl Course {
     }
 }
 
+/// How the ground goes over the page as it comes in, `page_in` of the way,
+/// for a ground whose colour has `alpha` in a window that has it `opacity`
+/// see-through: how much of what is under it to clear first, and the
+/// alpha to lay the ground over that with. The page shows `page_in` of
+/// itself and the ground the rest, so what shows behind them both, in a
+/// see-through window, stays as it was. Laying the ground over alone would
+/// make the page's own ground and the cover add up to more than either. In
+/// an opaque window it clears nothing and is the cover it always was: the
+/// window's own ground is under it.
+fn cover_over_page(alpha: f32, opacity: f32, page_in: f32) -> (f32, f32) {
+    let page_in = page_in.clamp(0.0, 1.0);
+    if opacity >= 1.0 {
+        return (0.0, alpha * (1.0 - page_in));
+    }
+    let cover = alpha * opacity * (1.0 - page_in);
+    // Kept of the page under the clear, so that `cover` over it leaves
+    // `page_in` of it: (1 - clear) * (1 - cover) = page_in.
+    let kept = page_in / (1.0 - cover).max(f32::EPSILON);
+    ((1.0 - kept).clamp(0.0, 1.0), cover)
+}
+
 /// Whether a disc `d` wide at (`x`, `y`) lies wholly inside `area`.
 fn within(area: RectF, x: f32, y: f32, d: f32) -> bool {
     let r = d / 2.0;
@@ -814,6 +848,37 @@ fn colour_at(turn: f32) -> LinearRgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page comes in over the ground as a crossfade, whatever the
+    /// ground's opacity: `page_in` of the page, the rest the ground, and
+    /// what is behind the window let through as the ground lets it through.
+    #[test]
+    fn the_page_crossfades_in_and_lets_through_what_its_ground_does() {
+        for alpha in [1.0, 0.6] {
+            for opacity in [0.95, 0.8, 0.5, 0.3] {
+                let ground = alpha * opacity;
+                for step in 0..=20 {
+                    let page_in = step as f32 / 20.0;
+                    let (clear, cover) = cover_over_page(alpha, opacity, page_in);
+                    assert!((0.0..=1.0).contains(&clear) && (0.0..=1.0).contains(&cover));
+                    let kept = (1.0 - clear) * (1.0 - cover);
+                    assert!((kept - page_in).abs() < 1e-5, "{ground} {page_in}: {kept}");
+                    assert!((cover - ground * (1.0 - page_in)).abs() < 1e-6);
+                    // Where the page is only its ground, as solid as that.
+                    let solid = cover + kept * ground;
+                    assert!((solid - ground).abs() < 1e-5, "{ground} {page_in}: {solid}");
+                }
+            }
+        }
+        // In an opaque window it is the cover it always was, nothing
+        // cleared, even when the ground's own colour has some alpha.
+        assert_eq!(cover_over_page(1.0, 1.0, 0.25), (0.0, 0.75));
+        let (clear, cover) = cover_over_page(0.6, 1.0, 0.25);
+        assert_eq!(clear, 0.0);
+        assert!((cover - 0.45).abs() < 1e-6);
+        // Once the page is in, nothing is left of the ground.
+        assert_eq!(cover_over_page(1.0, 0.8, 1.0), (0.0, 0.0));
+    }
 
     #[test]
     fn stamps_run_the_whole_path_at_an_even_spacing() {
