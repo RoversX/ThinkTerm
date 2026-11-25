@@ -1,5 +1,6 @@
 """Exercise real Git indexes and hook chaining without touching the caller's repo."""
 
+import codecs
 import importlib.util
 import os
 from pathlib import Path
@@ -18,6 +19,10 @@ SPEC.loader.exec_module(GUARD)
 def personal_path():
     # Build synthetic rejected data at runtime; do not commit a real identity.
     return b"/Users/" + b"synthetic-private-person" + b"/project"
+
+
+def tailnet_key():
+    return b"tskey-auth-" + b"sampleID123-" + b"Z" * 32
 
 
 class Rules(unittest.TestCase):
@@ -47,6 +52,11 @@ class Rules(unittest.TestCase):
             hostname.assert_not_called()
             opened.assert_not_called()
 
+    def test_local_list_permission_error_is_reported(self):
+        with mock.patch.object(GUARD, "git", side_effect=(b"true\n", b".\n")), mock.patch("builtins.open", side_effect=PermissionError):
+            with self.assertRaises(GUARD.LocalListError):
+                list(GUARD.local_list_names())
+
     def test_native_and_escaped_windows_paths(self):
         for data in (personal_path(), b"C:\\Users\\" + b"synthetic-person\\work", b"C:\\\\Users\\\\" + b"synthetic-person\\\\work"):
             self.assertTrue(GUARD.content_issues("example.rs", data))
@@ -72,14 +82,76 @@ class Rules(unittest.TestCase):
         self.assertFalse(GUARD.content_issues("key.rs", b'let header = "' + header + b'\\n";'))
 
     def test_token_and_ci_credentials(self):
-        for data in (b"ghp" + b"_" + b"A" * 36, b"ENCRYPTED" + b"[fake-ciphertext]"):
+        for data in (b"ghp" + b"_" + b"A" * 36, b"github_pat_" + b"A" * 64, b"ENCRYPTED" + b"[fake-ciphertext]"):
             self.assertTrue(GUARD.content_issues("settings.txt", data))
+
+    def test_tailnet_auth_key_and_placeholders(self):
+        self.assertIn("provider-token: remove the credential", GUARD.content_issues("env.txt", tailnet_key()))
+        for sample in (b"tskey-example", b"tskey-auth-example", "tskey-auth-…".encode()):
+            self.assertFalse(GUARD.content_issues("env.txt", sample))
 
     def test_endpoint_examples(self):
         prefix = b"ssh://alice@"
         self.assertTrue(GUARD.content_issues("test.rs", prefix + b"10.8.9.10"))
         for ip in (b"192.0.2.10", b"198.51.100.8", b"203.0.113.1", b"127.0.0.1"):
             self.assertFalse(GUARD.content_issues("test.rs", prefix + ip))
+
+    def test_ssh_destinations_and_configuration(self):
+        ipv4 = b"10.8.9.10"
+        ipv6 = b"fd00::42"
+        for data in (
+            b"ssh alice@" + ipv4, b"ssh " + ipv6, b"ssh://[" + ipv6 + b"]:2222/path",
+            b"ssh -vp 2222 -i 'sample key' -- \"alice@[" + ipv6 + b"]\" uptime",
+            rb"ssh -i C:\keys\sample alice@" + ipv4, b"ssh alice@" + ipv6 + b"%eth0",
+            b"ssh -p2222 alice@" + ipv6, b"ssh://" + ipv4 + b":22",
+            b"Host lab\n\tHostName " + ipv4 + b"\r\n", b'hOsTnAmE = "' + ipv6 + b'" # fixture',
+        ):
+            with self.subTest(data=data):
+                self.assertIn("ssh-endpoint: use a documentation IP in examples", GUARD.content_issues("settings", data))
+        for prefix in (b"ssh alice@", b"ssh://", b"HostName="):
+            for host in (b"node.team" + b".lan", b"node" + b".home.arpa", b"node" + b".internal"):
+                self.assertIn("personal-hostname: use an example host in fixtures", GUARD.content_issues("settings", prefix + host))
+        for data in (
+            b"ssh alice@buildbox", b"HostName myhost.local", b"ssh -p 22 alice@192.0.2.5",
+            b"ssh://[2001:db8::42]:22", b"HostName ::1", b"ssh alice@[::ffff:127.0.0.1]",
+            b"ssh jump echo " + ipv4, b"outside SSH: alice@" + ipv4, b"not-ssh alice@" + ipv4,
+            b'hostname = "' + ipv4 + b'",',
+        ):
+            with self.subTest(data=data):
+                self.assertFalse(GUARD.content_issues("settings", data))
+
+    def test_ssh_fixture_exceptions_require_both_path_and_spelling(self):
+        config = b"HostName " + b"10.0.0.1"
+        command = b"ssh " + b"-T -o BatchMode=yes me@" + b"10.0.0.5"
+        for path, fixture in (
+            ("wezterm-ssh/src/config.rs", config), ("wezterm-gui/src/ssh_hosts.rs", config),
+            ("docs/config/lua/SshDomain.md", command),
+        ):
+            self.assertFalse(GUARD.content_issues(path, fixture))
+            self.assertTrue(GUARD.content_issues("new-fixture", fixture))
+            self.assertTrue(GUARD.content_issues(path, fixture + b"9"))
+        self.assertTrue(GUARD.content_issues("docs/config/lua/SshDomain.md", command.replace(b"me@", b"other@")))
+
+    def test_utf16_uses_the_same_rules_as_utf8(self):
+        name = b"synthetic-private-machine"
+        personal = GUARD.personal_pattern([name])
+        data = b"\n".join((name, personal_path(), tailnet_key(), b"ssh alice@" + b"fd00::42"))
+        expected = GUARD.content_issues("settings", data, personal)
+        self.assertEqual({rule.split(":", 1)[0] for rule in expected}, {"personal-machine", "personal-home", "provider-token", "ssh-endpoint"})
+        for bom, encoding in ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")):
+            with self.subTest(encoding=encoding):
+                self.assertEqual(GUARD.content_issues("settings", bom + data.decode().encode(encoding), personal), expected)
+                self.assertFalse(GUARD.content_issues("settings", bom + "ssh alice@example.local".encode(encoding), personal))
+        self.assertFalse(GUARD.content_issues("asset.bin", b"\0" + tailnet_key(), personal))
+
+    def test_path_rules_handle_dashed_and_non_utf8_components(self):
+        raw = b"reports/\xff/-Users-" + b"synthetic-private-person-src/notes.txt"
+        path = raw.decode("utf-8", "surrogateescape")
+        issues, shown = GUARD.inspect_blob(path, b"")
+        self.assertTrue(issues)
+        self.assertEqual(shown.encode("utf-8", "surrogateescape"), b"reports/\xff/[redacted]/notes.txt")
+        for path in ("Users/alice/notes.txt", "logs/myhost.local/safe.txt", "keys/tskey-auth-example"):
+            self.assertEqual(GUARD.inspect_blob(path, b""), (set(), path))
 
     def test_packaging_template_is_not_a_blanket_exemption(self):
         self.assertFalse(GUARD.path_issues("assets/macos/ThinkTerm.app/Contents/Info.plist"))
@@ -152,6 +224,69 @@ class GitIntegration(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(name, result.stdout + result.stderr)
         self.git("add", "test.txt")
+        self.assertEqual(self.scan().returncode, 0)
+
+    def test_private_paths_are_blocked_and_redacted_in_index_and_tree(self):
+        self.env.pop("CI", None)
+        local = self.repo / GUARD.LOCAL_LIST
+        local.parent.mkdir()
+        name = "synthetic-unit-machine"
+        local.write_text(name + "\n")
+        user = "synthetic-unit-person"
+        key = tailnet_key().decode()
+        host = "synthetic-unit-node" + ".lan"
+        paths = (
+            Path("Users", user, "report.txt"),
+            Path("notes", name.upper() + "-backup", "info.txt"),
+            Path("notes", host, "trace.txt"),
+            Path("keys", key + ".zip"),
+            Path("exports", host + ".tar.gz"),
+        )
+        for relative in paths:
+            path = self.repo / relative
+            path.parent.mkdir(parents=True)
+            path.touch()
+        self.git("add", "--", *(str(path) for path in paths))
+        tree = self.git("write-tree").strip().decode()
+        for mode in (("--staged",), ("--tree", tree)):
+            with self.subTest(mode=mode):
+                result = self.scan(*mode)
+                self.assertEqual(result.returncode, 1)
+                log = result.stdout + result.stderr
+                for value in (user, name, key, host):
+                    self.assertNotIn(value.lower().encode(), log.lower())
+                for rule in (b"personal-home", b"personal-machine", b"personal-hostname", b"provider-token", b"release-artifact"):
+                    self.assertIn(rule, log)
+                for shown in (b"Users/[redacted]/report.txt", b"notes/[redacted]/info.txt", b"notes/[redacted]/trace.txt", b"keys/[redacted]", b"exports/[redacted]"):
+                    self.assertIn(shown, log)
+
+    def test_content_match_also_redacts_an_ordinary_filename(self):
+        self.env["CI"] = "true"
+        user = "synthetic-content-user"
+        path = self.repo / (user + ".txt")
+        path.write_bytes(("/home/" + user + "/projects").encode("utf-16"))
+        self.git("add", "--", path.name)
+        result = self.scan()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"personal-home", result.stderr)
+        self.assertIn(b"[redacted]", result.stderr)
+        self.assertNotIn(user.encode(), result.stdout + result.stderr)
+
+    def test_unreadable_local_list_blocks_without_printing_its_contents(self):
+        self.env.pop("CI", None)
+        local = self.repo / GUARD.LOCAL_LIST
+        self.assertEqual(self.scan().returncode, 0)
+        local.mkdir(parents=True)
+        result = self.scan()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(GUARD.LOCAL_LIST.encode(), result.stderr)
+        self.assertNotIn(str(self.repo).encode(), result.stderr)
+        local.rmdir()
+        local.write_bytes(b"synthetic-private-name\n\xff")
+        result = self.scan()
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(b"synthetic-private-name", result.stderr)
+        self.env["CI"] = "true"
         self.assertEqual(self.scan().returncode, 0)
 
     def test_scans_staged_bytes_and_redacts_values(self):

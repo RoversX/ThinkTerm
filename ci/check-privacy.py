@@ -2,6 +2,7 @@
 """Check Git blobs, never unstaged files. Requires only Python 3 and Git."""
 
 import argparse
+import codecs
 import ipaddress
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import socket
 import subprocess
 import sys
+from itertools import chain
 from pathlib import PurePosixPath
 
 
@@ -42,15 +44,44 @@ HOME = re.compile(rb"(?:/(?:Users|home)/|[A-Za-z]:[\\/]+Users[\\/]+)([A-Za-z_\x8
 # letter, digit or dash, so words like nav-home-link and --home-dir pass.
 DASHED_HOME = re.compile(rb"(?<![A-Za-z0-9_.-])(?:[A-Za-z]-)?-(?:Users|home)-([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)")
 # Match actual multiline key material, not the header strings used by SSH code.
-PRIVATE_KEY = re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?:\r?\n|\\n)(?:(?:Proc-Type:|DEK-Info:)[^\r\n]+\r?\n)*[\r\n]*(?:[A-Za-z0-9+/=]{32,})(?:\r?\n|\\n)")
-TOKENS = re.compile(rb"(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk-(?:proj-|ant-)[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16})")
-SSH_IP = re.compile(rb"ssh://[^\s/@\"'<>]+@((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?=[:/\s\"'<>]|$)")
-DOCUMENTATION_NETS = tuple(ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"))
+PRIVATE_KEY = re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?:\r?\n|\\n)(?:(?:Proc-Type:|DEK-Info:)[^\r\n]+\r?\n)*[\r\n]*([A-Za-z0-9+/=]{32,})(?:\r?\n|\\n)")
+TOKENS = re.compile(
+    rb"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,}|xox[baprs]-[A-Za-z0-9-]{20,}"
+    rb"|sk-(?:proj-|ant-)[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}|tskey-auth-(?:[A-Za-z0-9_]+-)?[A-Za-z0-9_]{16,}"
+)
+TOKEN_MARKERS = (b"gh", b"github_pat_", b"xox", b"sk-", b"AKIA", b"tskey-auth-")
+CI_CREDENTIAL = re.compile(rb"ENCRYPTED" rb"\[([^\]\r\n]*)")
+DOCUMENTATION_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32", "3fff::/20",
+))
 # A machine name in a value position: quoted, after `@`, or inside a URL. A
 # bare foo.local is deliberately not read as a host, because in source it is
 # far more often a field access -- catalog.local, entry.local -- and the
 # leak this looks for is a real name committed as a literal.
-HOSTNAME = re.compile(rb"(?:['\"`]|@|://)([A-Za-z0-9][A-Za-z0-9_-]{0,62})\.(?:local|lan|home\.arpa)(?![A-Za-z0-9_.-])", re.IGNORECASE)
+DNS_LABEL = rb"[A-Za-z0-9][A-Za-z0-9_-]{0,62}"
+HOST_LABELS = rb"(" + DNS_LABEL + rb"(?:\." + DNS_LABEL + rb")*)\."
+LOCAL_SUFFIX = rb"(?:local|lan|home\.arpa)"
+HOSTNAME = re.compile(rb"""(?:['"`]|@|://)(""" + DNS_LABEL + rb")\." + LOCAL_SUFFIX + rb"(?![A-Za-z0-9_.-])", re.IGNORECASE)
+REPORT_SUFFIXES = rb"|".join(re.escape(s.encode()) for s in (*ARCHIVES, ".txt", ".log", ".csv"))
+PATH_HOSTNAME = re.compile(rb"(?:/|@)" + HOST_LABELS + LOCAL_SUFFIX + rb"(?=/|$|(?:" + REPORT_SUFFIXES + rb")\Z)", re.IGNORECASE)
+SSH_LOCAL_HOST = re.compile(HOST_LABELS + rb"(?:local|lan|home\.arpa|internal|corp)", re.IGNORECASE)
+SSH_URL = re.compile(
+    rb"""\bssh://(?:[^\s/@"'<>`]+@)?(\[[\w.:%-]+\]|[\w.%-]+)(?=[:/?#\s"'<>`]|$)""",
+    re.IGNORECASE,
+)
+SSH_CONFIG = re.compile(
+    rb"""^[ \t]*hostname(?:[ \t]*=[ \t]*|[ \t]+)["']?([\w.:%\[\]-]+)["']?[ \t]*(?=#|\r?$)""",
+    re.IGNORECASE | re.MULTILINE,
+)
+SSH_COMMAND = re.compile(rb"(?<![\w.-])ssh[ \t]+", re.IGNORECASE)
+SSH_WORD = re.compile(rb"""[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|((?:\\[^\r\n]|[^\s"'`\\;|&<>()])+))""")
+SSH_OPTION_WITH_VALUE = re.compile(rb"[BbcDEeFIiJLlmOoPpQRSWw]")
+# Match only the existing fixture directive or command arguments in each file.
+SSH_FIXTURES = {
+    "wezterm-ssh/src/config.rs": b"HostName 10.0.0.1",
+    "wezterm-gui/src/ssh_hosts.rs": b"HostName 10.0.0.1",
+    "docs/config/lua/SshDomain.md": b"-T -o BatchMode=yes me@10.0.0.5",
+}
 SAMPLE_HOSTS = set(b"alice bob example host hostname localhost machine myhost server test".split())
 # Vendored labels that share the shape without naming a machine.
 VENDOR_HOSTS = {
@@ -62,8 +93,28 @@ VENDOR_HOSTS = {
 LOCAL_LIST = "ci/privacy-local.txt"
 
 
+class LocalListError(OSError):
+    """The local name list is present but could not be read."""
+
+
 def git(*args):
     return subprocess.check_output(["git", *args], stderr=subprocess.PIPE)
+
+
+def local_list_names():
+    # A tree can also be scanned in a bare repository with no working files.
+    if git("rev-parse", "--is-inside-work-tree").strip() == b"false":
+        return
+    root = git("rev-parse", "--show-toplevel").rstrip(b"\r\n").decode("utf-8", "surrogateescape")
+    filename = os.path.join(root, LOCAL_LIST)
+    try:
+        with open(filename, encoding="utf-8-sig") as handle:
+            for line in handle:
+                yield line.split("#", 1)[0]
+    except (OSError, UnicodeError) as error:
+        if isinstance(error, FileNotFoundError) and not os.path.lexists(filename):
+            return
+        raise LocalListError from error
 
 
 def local_names():
@@ -88,13 +139,7 @@ def local_names():
                 names.add(subprocess.check_output(["scutil", "--get", key], stderr=subprocess.DEVNULL, timeout=5).decode("utf-8", "replace"))
             except (OSError, subprocess.SubprocessError):
                 pass
-    try:
-        root = git("rev-parse", "--show-toplevel").strip().decode("utf-8", "surrogateescape")
-        with open(os.path.join(root, LOCAL_LIST), "rb") as handle:
-            for line in handle:
-                names.add(line.split(b"#", 1)[0].decode("utf-8", "replace"))
-    except (OSError, subprocess.CalledProcessError):
-        pass
+    names.update(local_list_names())
     found = set()
     for name in names:
         bare = name.strip().strip(".")
@@ -106,63 +151,160 @@ def local_names():
     return tuple(sorted(found))
 
 
-def personal_pattern(names=None):
+def personal_pattern(names=None, *, filename=False):
     names = local_names() if names is None else names
     if not names:
         return None
-    return re.compile(rb"(?<![A-Za-z0-9_-])(?:" + rb"|".join(re.escape(n) for n in names) + rb")(?![A-Za-z0-9_-])", re.IGNORECASE)
+    boundary = rb"[A-Za-z0-9]" if filename else rb"[A-Za-z0-9_-]"
+    return re.compile(rb"(?<!" + boundary + rb")(?:" + rb"|".join(re.escape(n) for n in names) + rb")(?!" + boundary + rb")", re.IGNORECASE)
 
 
-def path_issues(path):
+def redacted_path(path, values):
+    if not values:
+        return path
+    hidden = {part.lower() for value in values for part in value.split(b"/") if part}
+    parts = path.encode("utf-8", "surrogateescape").split(b"/")
+    for index, part in enumerate(parts):
+        # A dashed home path can contain more of the username after the match.
+        folded_part = part.lower()
+        if any(value in folded_part for value in hidden):
+            parts[index] = b"[redacted]"
+    return b"/".join(parts).decode("utf-8", "surrogateescape")
+
+
+def path_findings(path, personal):
     parts = PurePosixPath(path).parts
     name = parts[-1].lower()
-    issues = set()
+    # Include root-level home directories. Upstream content exceptions do not cover filenames.
+    data = b"/" + path.encode("utf-8", "surrogateescape")
+    yield from private_literals("", data, personal, host_pattern=PATH_HOSTNAME)
     if path == LOCAL_LIST:
-        issues.add("personal-host-list: keep this file untracked")
+        yield "personal-host-list: keep this file untracked", None
     if path not in APP_TEMPLATE and (name.endswith(ARCHIVES) or any(p.lower().endswith(".app") for p in parts)):
-        issues.add("release-artifact: distribute packages outside Git")
+        yield "release-artifact: distribute packages outside Git", None
     if any(p in ("target", "XCBuildData", "DerivedData") for p in parts) or path.startswith(("ios/build/", "android/build/", "android/app/build/")):
-        issues.add("build-output: ignore generated files")
+        yield "build-output: ignore generated files", None
     if (name.startswith(".env") and name not in (".env.example", ".env.sample", ".env.template")) or name in ("probe_key", "probe_user", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "local.xcconfig", "local.properties") or name.endswith((".p12", ".pfx", ".keystore", ".jks")):
-        issues.add("local-credentials: keep this file untracked")
-    return issues
+        yield "local-credentials: keep this file untracked", None
+
+
+def path_issues(path, personal=None):
+    return {issue for issue, _ in path_findings(path, personal)}
+
+
+def example_host(path, label):
+    label = label.lower()
+    return label in SAMPLE_HOSTS or any(path.startswith(prefix) for prefix in VENDOR_HOSTS.get(label, ()))
+
+
+def private_literals(path, data, personal, *, text=True, host_pattern=HOSTNAME):
+    if b"PRIVATE KEY-----" in data:
+        for match in PRIVATE_KEY.finditer(data):
+            yield "private-key: remove key material", match[1]
+    if any(marker in data for marker in (b"/Users/", b"/home/", b"Users\\", b"Users/", b"-Users-", b"-home-")):
+        for pattern in (HOME, DASHED_HOME):
+            for match in pattern.finditer(data):
+                user = match[1].lower()
+                if user in SAMPLE_USERS:
+                    continue
+                if any(path == prefix or (prefix.endswith("/") and path.startswith(prefix)) for prefix in UPSTREAM_USERS.get(user, ())):
+                    continue
+                yield "personal-home: use an environment variable or an alice/example fixture", match[1]
+    if not text:
+        return
+    for match in host_pattern.finditer(data):
+        if not example_host(path, match[1]):
+            yield "personal-hostname: use an example host in fixtures", match[1]
+    if personal is not None:
+        for match in personal.finditer(data):
+            yield "personal-machine: remove the local machine name", match[0]
+    if any(marker in data for marker in TOKEN_MARKERS):
+        for match in TOKENS.finditer(data):
+            yield "provider-token: remove the credential", match[0]
+    if b"ENCRYPTED" + b"[" in data:
+        for match in CI_CREDENTIAL.finditer(data):
+            yield "embedded-ci-credential: use repository secrets", match[1] or match[0]
+
+
+def ssh_command_host(data, offset):
+    skip_value = False
+    while True:
+        match = SSH_WORD.match(data, offset)
+        if not match:
+            return None
+        word = match[match.lastindex]
+        offset = match.end()
+        if skip_value:
+            skip_value = False
+        elif word.startswith(b"-"):
+            # A short option may take its argument in the same word or the next.
+            option = SSH_OPTION_WITH_VALUE.search(word, 1)
+            skip_value = option is not None and option.end() == len(word)
+        else:
+            host = word.rsplit(b"@", 1)[-1].partition(b"\\")[0]
+            return host, offset
+
+
+def ssh_hosts(path, data):
+    lower = data.lower()
+    fixture = SSH_FIXTURES.get(path)
+    if b"ssh://" in lower:
+        for match in SSH_URL.finditer(data):
+            yield match[1]
+    if b"hostname" in lower:
+        for match in SSH_CONFIG.finditer(data):
+            if match[0].strip() != fixture:
+                yield match[1]
+    if b"ssh " in lower or b"ssh\t" in lower:
+        for match in SSH_COMMAND.finditer(data):
+            target = ssh_command_host(data, match.end())
+            if target:
+                host, end = target
+                if fixture is None or data[match.end():end] != fixture:
+                    yield host
+
+
+def byte_findings(path, data, personal):
+    text = b"\0" not in data[:8000]
+    yield from private_literals(path, data, personal, text=text)
+    if not text:
+        return
+    for host in ssh_hosts(path, data):
+        host = host.strip(b"[]").rstrip(b".")
+        try:
+            address = ipaddress.ip_address(host.decode("ascii"))
+        except ValueError:
+            match = SSH_LOCAL_HOST.fullmatch(host)
+            if match and not example_host(path, match[1]):
+                yield "personal-hostname: use an example host in fixtures", match[1]
+            continue
+        if address.version == 6 and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if not address.is_loopback and not any(address in net for net in DOCUMENTATION_NETS):
+            yield "ssh-endpoint: use a documentation IP in examples", host
+
+
+def content_findings(path, data, personal):
+    yield from byte_findings(path, data, personal)
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) and not data.startswith(codecs.BOM_UTF32_LE):
+        decoded = data.decode("utf-16", errors="replace").encode("utf-8")
+        yield from byte_findings(path, decoded, personal)
 
 
 def content_issues(path, data, personal=None):
+    return {issue for issue, _ in content_findings(path, data, personal)}
+
+
+def inspect_blob(path, data, personal=None, filename_personal=None):
+    folded_path = b"/" + path.encode("utf-8", "surrogateescape").lower()
     issues = set()
-    if b"PRIVATE KEY-----" in data and PRIVATE_KEY.search(data):
-        issues.add("private-key: remove key material")
-    if any(marker in data for marker in (b"/Users/", b"/home/", b"Users\\", b"Users/", b"-Users-", b"-home-")):
-        for match in [*HOME.finditer(data), *DASHED_HOME.finditer(data)]:
-            user = match[1].lower()
-            if user in SAMPLE_USERS:
-                continue
-            if any(path == prefix or (prefix.endswith("/") and path.startswith(prefix)) for prefix in UPSTREAM_USERS.get(user, ())):
-                continue
-            issues.add("personal-home: use an environment variable or an alice/example fixture")
-    # Binary assets are not interpreted as text tokens or endpoint examples.
-    if b"\0" not in data[:8000]:
-        for match in HOSTNAME.finditer(data):
-            host = match[1].lower()
-            if host in SAMPLE_HOSTS:
-                continue
-            if any(path.startswith(prefix) for prefix in VENDOR_HOSTS.get(host, ())):
-                continue
-            issues.add("personal-hostname: use an example host in fixtures")
-        if personal is not None and personal.search(data):
-            issues.add("personal-machine: remove the local machine name")
-        if any(marker in data for marker in (b"gh", b"github_pat_", b"xox", b"sk-", b"AKIA")) and TOKENS.search(data):
-            issues.add("provider-token: remove the credential")
-        if b"ENCRYPTED" + b"[" in data:
-            issues.add("embedded-ci-credential: use repository secrets")
-        for match in SSH_IP.finditer(data):
-            try:
-                address = ipaddress.ip_address(match[1].decode("ascii"))
-            except ValueError:
-                continue
-            if not address.is_loopback and not any(address in net for net in DOCUMENTATION_NETS):
-                issues.add("ssh-endpoint: use a documentation IP in examples")
-    return issues
+    hidden = set()
+    for issue, value in chain(path_findings(path, filename_personal), content_findings(path, data, personal)):
+        issues.add(issue)
+        # A name identified in the content can also occur in an ordinary filename.
+        if value and len(value) <= len(folded_path) and value.lower() in folded_path:
+            hidden.add(value)
+    return issues, redacted_path(path, hidden)
 
 
 def entries(tree=None):
@@ -190,7 +332,9 @@ def entries(tree=None):
 def check(tree=None):
     failures = 0
     count = 0
-    personal = personal_pattern()
+    names = local_names()
+    personal = personal_pattern(names)
+    filename_personal = personal_pattern(names, filename=True)
     with subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as batch:
         try:
             for path, oid in entries(tree):
@@ -203,12 +347,13 @@ def check(tree=None):
                 data = batch.stdout.read(size)
                 if len(data) != size or batch.stdout.read(1) != b"\n":
                     raise ValueError("Incomplete Git blob")
-                issues = path_issues(path) | content_issues(path, data, personal)
+                issues, display = inspect_blob(path, data, personal, filename_personal)
                 count += 1
-                for issue in sorted(issues):
+                if issues:
                     # No matched values, snippets or key material in terminal/CI logs.
-                    print("privacy:", json.dumps(path), "-", issue, file=sys.stderr)
-                    failures += 1
+                    for issue in sorted(issues):
+                        print("privacy:", json.dumps(display), "-", issue, file=sys.stderr)
+                    failures += len(issues)
         finally:
             batch.stdin.close()
             batch.stdout.close()
@@ -229,6 +374,9 @@ def main():
     args = parser.parse_args()
     try:
         return check(args.tree)
+    except LocalListError:
+        print(f"Privacy check could not read {LOCAL_LIST}; commit blocked. Check its permissions and UTF-8 encoding.", file=sys.stderr)
+        return 2
     except (OSError, ValueError, subprocess.CalledProcessError):
         print("Privacy check could not complete; commit blocked. Check Python 3, Git and the index.", file=sys.stderr)
         return 2
