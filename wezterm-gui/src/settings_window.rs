@@ -22305,9 +22305,15 @@ impl SettingsWindow {
         let render_state = self.render_state.as_ref()?;
         let mut glyph_cache = render_state.glyph_cache.borrow_mut();
         let style = font.style();
+        // Each glyph as wide as the cells its text takes, as the terminal
+        // draws it: taken as one, a Han character from a fallback font is
+        // shrunk to fit a single cell of the main font, and in a terminal
+        // font's preview came out smaller than the kana beside it.
         let glyphs = infos
             .into_iter()
-            .map(|info| glyph_cache.cached_glyph(&info, style, false, font, &self.metrics, 1))
+            .map(|info| {
+                glyph_cache.cached_glyph(&info, style, false, font, &self.metrics, info.num_cells)
+            })
             .collect::<anyhow::Result<Vec<Rc<CachedGlyph>>>>();
         drop(glyph_cache);
         let glyphs = match glyphs {
