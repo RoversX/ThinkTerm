@@ -201,6 +201,11 @@ impl crate::TermWindow {
     /// lands `TAB_CONTENT_INSET` from the tab's right edge — the same inset the
     /// leading icon keeps on the left. Derived rather than a fixed gap so the
     /// two stay symmetric whatever the icon and button sizes work out to.
+    ///
+    /// Never nearer the end than the box that fills the pill's rounded end,
+    /// where the hover ring is concentric with that end, as the leading icon's
+    /// circle is with the other. Placed by the glyph alone, a tall tab (a
+    /// large tab font) grew its ring out to the edge and its target past it.
     pub(crate) fn tab_close_button_x(
         &self,
         tab_right: usize,
@@ -218,7 +223,9 @@ impl crate::TermWindow {
         let inset = self
             .ui_px(crate::termwindow::ui::tokens::TAB_CONTENT_INSET)
             .saturating_sub(optical);
-        tab_right.saturating_sub(inset + icon_size + glyph_pad)
+        tab_right
+            .saturating_sub(inset + icon_size + glyph_pad)
+            .min(tab_right.saturating_sub(button_size))
     }
 
     pub(crate) fn pane_nav_bar_height(&self) -> usize {
