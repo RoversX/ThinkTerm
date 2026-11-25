@@ -1,9 +1,8 @@
 import CoreHaptics
 
 /// What the starry sky feels like (`LaunchSky`, the connection page's
-/// sky): a swell that grows with the stars as they rush past, and a soft
-/// landing as the app comes out from behind them. The launch's is the
-/// fullest, with a faint stir while the stars draw near before it; a
+/// sky): a swell that grows with the stars as they rush past and ends as
+/// the app comes out from behind them. The launch's is the fullest, with a faint stir while the stars draw near before it; a
 /// connection's is lighter and shorter, a connection being made far more
 /// often than the app is opened. Off with the setting; on a phone with no
 /// haptics, nothing.
@@ -19,7 +18,7 @@ enum SkyHaptics {
         play(stir(endingAt: LaunchSky.rush) + rushEvents(at: LaunchSky.rush, strength: 1))
     }
 
-    /// The rush and the landing, from now: the welcome pages let go.
+    /// The rush, from now: the welcome pages let go.
     static func rush() {
         play(rushEvents(at: 0, strength: 1))
     }
@@ -44,11 +43,6 @@ enum SkyHaptics {
     private static let swellIntensity: [(TimeInterval, Float)] = [(0, 0.08), (0.15, 0.16), (0.28, 0.32), (0.38, 0.5), (0.42, 0.56)]
     private static let swellSharpness: [(TimeInterval, Float)] = [(0, 0.1), (0.42, 0.4)]
 
-    /// The landing: a soft, low tap as the app settles.
-    private static let landingAt: TimeInterval = 0.5
-    private static let landingIntensity: Float = 0.5
-    private static let landingSharpness: Float = 0.2
-
     /// A connection's rush, as a share of the launch's.
     private static let connectStrength: Float = 0.6
     /// A sky up for less than this was a flicker, not a wait.
@@ -64,14 +58,11 @@ enum SkyHaptics {
     }
 
     private static func rushEvents(at start: TimeInterval, strength: Float) -> [Piece] {
-        [
-            .swell(
-                at: start, length: swellLength,
-                intensity: swellIntensity.map { ($0.0, $0.1 * strength) },
-                sharpness: swellSharpness
-            ),
-            .tap(at: start + landingAt, intensity: landingIntensity * strength, sharpness: landingSharpness),
-        ]
+        [.swell(
+            at: start, length: swellLength,
+            intensity: swellIntensity.map { ($0.0, $0.1 * strength) },
+            sharpness: swellSharpness
+        )]
     }
 
     // MARK: playing it
@@ -80,7 +71,6 @@ enum SkyHaptics {
         /// A continuous vibration whose strength and sharpness follow the
         /// points given, in seconds from its own start.
         case swell(at: TimeInterval, length: TimeInterval, intensity: [(TimeInterval, Float)], sharpness: [(TimeInterval, Float)])
-        case tap(at: TimeInterval, intensity: Float, sharpness: Float)
     }
 
     private static var engine: CHHapticEngine?
@@ -103,15 +93,6 @@ enum SkyHaptics {
                 ))
                 curves.append(curve(.hapticIntensityControl, at: at, intensity))
                 curves.append(curve(.hapticSharpnessControl, at: at, sharpness))
-            case let .tap(at, intensity, sharpness):
-                events.append(CHHapticEvent(
-                    eventType: .hapticTransient,
-                    parameters: [
-                        CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
-                        CHHapticEventParameter(parameterID: .hapticSharpness, value: sharpness),
-                    ],
-                    relativeTime: at
-                ))
             }
         }
         do {
