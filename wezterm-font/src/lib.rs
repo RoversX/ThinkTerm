@@ -80,16 +80,27 @@ const FALLBACK_RESOLVE_MEMO_CAP: usize = 512;
 #[derive(Default)]
 struct FallbackResolveMemo {
     generation: usize,
-    entries: HashMap<Vec<char>, Vec<ParsedFont>>,
-    system_entries: HashMap<Vec<char>, Vec<ParsedFont>>,
+    entries: HashMap<Vec<char>, FallbackResolveAnswer>,
+    system_entries: HashMap<Vec<char>, FallbackResolveAnswer>,
+}
+
+struct FallbackResolveAnswer {
+    handles: Vec<ParsedFont>,
+    /// Some of the codepoints were left without a font by a lookup that
+    /// was not to warn about that (the Settings window's samples): one
+    /// that would warn must look again, or it would never warn.
+    unwarned_gaps: bool,
 }
 
 impl FallbackResolveMemo {
+    /// The answer recorded for `chars`, for a lookup that `warns` of the
+    /// codepoints no font has.
     fn get(
         &self,
         generation: usize,
         chars: &[char],
         prefer_system: bool,
+        warns: bool,
     ) -> Option<Vec<ParsedFont>> {
         if self.generation != generation {
             return None;
@@ -99,7 +110,10 @@ impl FallbackResolveMemo {
         } else {
             &self.entries
         };
-        entries.get(chars).cloned()
+        entries
+            .get(chars)
+            .filter(|answer| !(warns && answer.unwarned_gaps))
+            .map(|answer| answer.handles.clone())
     }
 
     fn insert(
@@ -108,6 +122,7 @@ impl FallbackResolveMemo {
         chars: Vec<char>,
         handles: Vec<ParsedFont>,
         prefer_system: bool,
+        unwarned_gaps: bool,
     ) {
         // Async resolves can complete out of order across a config reload;
         // a straggler from an older generation must not clear the newer
@@ -135,7 +150,13 @@ impl FallbackResolveMemo {
         } else {
             &mut self.entries
         };
-        entries.insert(chars, handles);
+        entries.insert(
+            chars,
+            FallbackResolveAnswer {
+                handles,
+                unwarned_gaps,
+            },
+        );
     }
 }
 
@@ -350,11 +371,14 @@ impl LoadedFont {
             // away every shape cache in the window.
             if !no_glyphs.is_empty() && !consulted_memo {
                 if let Some(font_config) = self.font_config.upgrade() {
-                    let generation = font_config.config.borrow().generation();
-                    let memo = FALLBACK_RESOLVE_MEMO
-                        .lock()
-                        .unwrap()
-                        .get(generation, &no_glyphs, font_config.config.borrow().fontconfig_prefer_system_fallback);
+                    let config = font_config.config.borrow();
+                    let memo = FALLBACK_RESOLVE_MEMO.lock().unwrap().get(
+                        config.generation(),
+                        &no_glyphs,
+                        config.fontconfig_prefer_system_fallback,
+                        config.warn_about_missing_glyphs,
+                    );
+                    drop(config);
                     if let Some(handles) = memo {
                         consulted_memo = true;
                         let inserted = if handles.is_empty() {
@@ -561,6 +585,7 @@ impl FallbackResolveInfo {
             memo_glyphs.clone(),
             extra_handles.clone(),
             self.config.fontconfig_prefer_system_fallback,
+            !self.config.warn_about_missing_glyphs && !wanted.is_empty(),
         );
 
         if !extra_handles.is_empty() {
@@ -1109,6 +1134,34 @@ impl FontConfigInner {
                             loaded.insert(attr.clone());
                             handles.push(p.clone().synthesize(attr))
                         });
+                    }
+                }
+            }
+
+            if !is_fallback && loaded.is_empty() && purpose == FontPurpose::Terminal {
+                // Nothing answers to the main font, not even a substitute
+                // the system offers for it: the bundled default stands in,
+                // in its place. A fallback would otherwise, and the first
+                // face sets the cell size: a CJK or symbol font makes a poor
+                // grid. Left out of `loaded`, so that the font configured
+                // is still reported missing.
+                if let Some(primary) = attrs.first() {
+                    let stand_in = FontAttributes {
+                        family: FontAttributes::default().family,
+                        ..primary.clone()
+                    };
+                    let bundled = built_in.candidates(&stand_in);
+                    if let Some(&face) =
+                        ParsedFont::best_matching_index(&stand_in, &bundled, pixel_size)
+                            .and_then(|idx| bundled.get(idx))
+                    {
+                        handles.push(face.clone().synthesize(&stand_in));
+                        // Not loaded once more as the fallback it also is.
+                        for attr in &fallback_attributes {
+                            if attr.family == stand_in.family {
+                                loaded.insert(attr.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -1706,12 +1759,12 @@ mod fallback_memo_test {
     #[test]
     fn fallback_policies_do_not_share_answers_at_the_same_generation() {
         let mut memo = FallbackResolveMemo::default();
-        memo.insert(1, vec!['中'], vec![], false);
-        assert!(memo.get(1, &['中'], false).is_some());
-        assert!(memo.get(1, &['中'], true).is_none());
-        memo.insert(1, vec!['中'], vec![], true);
-        assert!(memo.get(1, &['中'], true).is_some());
-        assert!(memo.get(1, &['中'], false).is_some());
+        memo.insert(1, vec!['中'], vec![], false, false);
+        assert!(memo.get(1, &['中'], false, true).is_some());
+        assert!(memo.get(1, &['中'], true, true).is_none());
+        memo.insert(1, vec!['中'], vec![], true, false);
+        assert!(memo.get(1, &['中'], true, true).is_some());
+        assert!(memo.get(1, &['中'], false, true).is_some());
 
         for n in 0..FALLBACK_RESOLVE_MEMO_CAP as u32 {
             memo.insert(
@@ -1719,45 +1772,69 @@ mod fallback_memo_test {
                 vec![char::from_u32(0x4e01 + n).unwrap()],
                 vec![],
                 n % 2 == 0,
+                false,
             );
             assert!(memo.entries.len() + memo.system_entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
         }
-        memo.insert(2, vec!['新'], vec![], false);
+        memo.insert(2, vec!['新'], vec![], false, false);
         assert!(memo.system_entries.is_empty());
-        assert!(memo.get(2, &['中'], false).is_none());
+        assert!(memo.get(2, &['中'], false, true).is_none());
+    }
+
+    #[test]
+    fn a_lookup_that_warns_looks_again_where_a_quiet_one_found_nothing() {
+        let mut memo = FallbackResolveMemo::default();
+        memo.insert(1, vec!['你', '好'], vec![], false, true);
+        assert!(
+            memo.get(1, &['你', '好'], false, false).is_some(),
+            "quiet lookups share the answer"
+        );
+        assert!(
+            memo.get(1, &['你', '好'], false, true).is_none(),
+            "one that warns must find the gap itself"
+        );
+        memo.insert(1, vec!['你', '好'], vec![], false, false);
+        assert!(memo.get(1, &['你', '好'], false, true).is_some());
+        assert!(memo.get(1, &['你', '好'], false, false).is_some());
     }
 
     #[test]
     fn memo_is_scoped_to_one_generation_and_bounded() {
         let mut memo = FallbackResolveMemo::default();
-        memo.insert(1, vec!['a'], vec![], false);
-        assert!(memo.get(1, &['a'], false).is_some());
+        memo.insert(1, vec!['a'], vec![], false, false);
+        assert!(memo.get(1, &['a'], false, true).is_some());
         assert!(
-            memo.get(2, &['a'], false).is_none(),
+            memo.get(2, &['a'], false, true).is_none(),
             "other generations must miss"
         );
 
-        memo.insert(2, vec!['b'], vec![], false);
+        memo.insert(2, vec!['b'], vec![], false, false);
         assert!(
-            memo.get(1, &['a'], false).is_none(),
+            memo.get(1, &['a'], false, true).is_none(),
             "a new generation drops the old one's entries"
         );
-        assert!(memo.get(2, &['b'], false).is_some());
+        assert!(memo.get(2, &['b'], false, true).is_some());
 
-        memo.insert(1, vec!['c'], vec![], false);
+        memo.insert(1, vec!['c'], vec![], false, false);
         assert!(
-            memo.get(2, &['b'], false).is_some(),
+            memo.get(2, &['b'], false, true).is_some(),
             "a straggler from an older generation must not clear newer entries"
         );
-        assert!(memo.get(1, &['c'], false).is_none());
-        assert!(memo.get(2, &['c'], false).is_none());
+        assert!(memo.get(1, &['c'], false, true).is_none());
+        assert!(memo.get(2, &['c'], false, true).is_none());
 
         for n in 0..FALLBACK_RESOLVE_MEMO_CAP as u32 {
-            memo.insert(2, vec![char::from_u32(0x4e00 + n).unwrap()], vec![], false);
+            memo.insert(
+                2,
+                vec![char::from_u32(0x4e00 + n).unwrap()],
+                vec![],
+                false,
+                false,
+            );
         }
         assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
-        memo.insert(2, vec!['z'], vec![], false);
-        assert!(memo.get(2, &['z'], false).is_some());
+        memo.insert(2, vec!['z'], vec![], false, false);
+        assert!(memo.get(2, &['z'], false, true).is_some());
         assert!(memo.entries.len() <= FALLBACK_RESOLVE_MEMO_CAP);
     }
 
@@ -1840,6 +1917,42 @@ mod font_picker_tests {
             assert_eq!(picked.font[0].weight, FontWeight::BOLD);
             assert_eq!(picked.font[1..], expected.font[1..]);
         }
+    }
+
+    #[test]
+    fn the_bundled_font_stands_in_for_a_missing_terminal_main_font() -> anyhow::Result<()> {
+        let _turn = harfbuzz_turn();
+        let config = ConfigHandle::default_config().adjusted(|cfg| {
+            cfg.font_locator = config::FontLocatorSelection::ConfigDirsOnly;
+            cfg.font_dirs =
+                vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/fonts")];
+            cfg.warn_about_missing_glyphs = false;
+            cfg.font = TextStyle {
+                font: vec![
+                    FontAttributes::new("Not Installed Anywhere"),
+                    FontAttributes::new_fallback("Fira Code"),
+                ],
+                foreground: None,
+            };
+        });
+        let fonts = FontConfiguration::new(Some(config), 96)?;
+        let families: Vec<String> = fonts
+            .default_font()?
+            .clone_handles()
+            .iter()
+            .map(|face| face.names().family.clone())
+            .collect();
+        // Not the first fallback, which would set the cell size.
+        assert_eq!(families[..2], ["JetBrains Mono", "Fira Code"]);
+        assert_eq!(
+            families
+                .iter()
+                .filter(|family| *family == "JetBrains Mono")
+                .count(),
+            1,
+            "not loaded again as the fallback it also is"
+        );
+        Ok(())
     }
 
     #[test]
