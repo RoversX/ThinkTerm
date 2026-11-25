@@ -5307,18 +5307,6 @@ impl TermWindow {
         };
         let main_renderer =
             crate::native_settings::main_window_renderer(&native_settings, config.front_end);
-        // Only OpenGL draws onto DirectComposition: a window that will be
-        // drawn any other way is made the usual way, or it would show nothing.
-        let config = if config.win32_backdrop_trial == config::Win32BackdropTrial::Composition
-            && (main_renderer != crate::native_settings::NativeRendererBackend::OpenGL
-                || crate::renderer_choice::has_failed(
-                    crate::native_settings::NativeRendererBackend::OpenGL,
-                ))
-        {
-            config.adjusted(|config| config.win32_backdrop_trial = config::Win32BackdropTrial::Off)
-        } else {
-            config
-        };
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
         crate::native_settings::set_ui_fonts(&fontconfig, &native_settings);
@@ -10668,7 +10656,6 @@ impl TermWindow {
             != (before.window_background_opacity >= 1.0)
             || config.macos_window_background_blur != before.macos_window_background_blur
             || config.win32_system_backdrop != before.win32_system_backdrop
-            || config.win32_backdrop_trial != before.win32_backdrop_trial
             || config.macos_window_glass != before.macos_window_glass;
         if !platform_changed && config.window_background_opacity == before.window_background_opacity
         {

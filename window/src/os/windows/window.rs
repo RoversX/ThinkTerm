@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop, Win32BackdropTrial};
+use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use lazy_static::lazy_static;
 use promise::{Future, Promise};
 use raw_window_handle::{
@@ -30,7 +30,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -110,7 +110,20 @@ lazy_static! {
         if unsafe { GetVersionExW(&osver as *const _ as _) } == winapi::shared::minwindef::TRUE {
             osver.dwBuildNumber >= 22621
         } else {
-            true
+            false
+        }
+    };
+    /// Acrylic through `SetWindowCompositionAttribute` needs Windows 10 1809.
+    static ref HAS_LEGACY_ACRYLIC: bool = {
+        let osver = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as _,
+            ..Default::default()
+        };
+
+        if unsafe { GetVersionExW(&osver as *const _ as _) } == winapi::shared::minwindef::TRUE {
+            osver.dwBuildNumber >= 17763
+        } else {
+            false
         }
     };
 }
@@ -150,10 +163,6 @@ pub(crate) struct WindowInner {
     /// reason as `occlusion_visible`: the owner wants the edges, not a message
     /// per pixel of a drag.
     last_frame_event: Option<(ScreenRect, bool)>,
-    /// The EGL this window draws through onto DirectComposition, when it was
-    /// made for `Win32BackdropTrial::Composition`: without a redirection
-    /// bitmap, nothing it draws any other way would show.
-    composition: Option<Rc<crate::egl::GlConnection>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -567,24 +576,6 @@ impl WindowInner {
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let conn = Connection::get().unwrap();
 
-        if let Some(glconn) = self.composition.as_ref() {
-            let gl_state = crate::egl::GlState::create_for_composition(glconn, self.hwnd.0)
-                .and_then(|state| unsafe {
-                    Ok(glium::backend::Context::new(
-                        Rc::new(state),
-                        true,
-                        callback_behavior(),
-                    )?)
-                })
-                .map_err(|err| {
-                    // Later windows are made the usual way.
-                    COMPOSITION_FAILED.store(true, Ordering::Relaxed);
-                    err
-                })?;
-            self.gl_state.replace(gl_state.clone());
-            return Ok(gl_state);
-        }
-
         let gl_state = if self.config.prefer_egl {
             match conn.gl_connection.borrow().as_ref() {
                 None => crate::egl::GlState::create(None, self.hwnd.0),
@@ -893,7 +884,6 @@ impl Window {
         name: &str,
         geometry: ResolvedGeometry,
         frame_rect: Option<ScreenRect>,
-        ex_style: u32,
         lparam: *const RefCell<WindowInner>,
     ) -> anyhow::Result<HWND> {
         let class_name = wide_string(class_name);
@@ -936,7 +926,7 @@ impl Window {
             let name = wide_string(name);
             let hwnd = unsafe {
                 CreateWindowExW(
-                    ex_style,
+                    0,
                     class_name.as_ptr(),
                     name.as_ptr(),
                     style,
@@ -1005,7 +995,7 @@ impl Window {
         let name = wide_string(name);
         let hwnd = unsafe {
             CreateWindowExW(
-                ex_style,
+                0,
                 class_name.as_ptr(),
                 name.as_ptr(),
                 style,
@@ -1071,7 +1061,6 @@ impl Window {
             invalidated: true,
             occlusion_visible: None,
             last_frame_event: None,
-            composition: None,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -1088,25 +1077,12 @@ impl Window {
         let frame_rect = geometry.windows_frame_rect;
         let geometry = conn.resolve_geometry(geometry);
 
-        // Chosen for good when the window is made: the extended style that
-        // lets DirectComposition through cannot be taken off again.
-        let composition = (config.win32_backdrop_trial == Win32BackdropTrial::Composition)
-            .then(|| composition_connection(&conn))
-            .flatten();
-        let ex_style = if composition.is_some() {
-            WS_EX_NOREDIRECTIONBITMAP
-        } else {
-            0
-        };
-        inner.borrow_mut().composition = composition;
-
         let hwnd = match Self::create_window(
             config.clone(),
             class_name,
             name,
             geometry.clone(),
             frame_rect,
-            ex_style,
             raw,
         ) {
             Ok(hwnd) => HWindow(hwnd),
@@ -1143,9 +1119,6 @@ impl Window {
         }
 
         apply_theme(hwnd.0);
-        // DirectComposition carries the window's alpha itself; the rest
-        // need the old blur behind for it.
-        blur_behind(hwnd.0, inner.borrow().composition.is_none());
 
         // Make window capable of accepting drag and drop
         unsafe {
@@ -2301,36 +2274,6 @@ fn get_window_state(hwnd: HWND) -> WindowState {
     }
 }
 
-/// A window made for DirectComposition could not be drawn that way: the
-/// rest are made the usual way, as nothing else shows in one.
-static COMPOSITION_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// The EGL to draw a new window through onto DirectComposition: the one
-/// already open when it can, else one found for it. `None` when no EGL here
-/// can, and the window is made the usual way.
-fn composition_connection(conn: &Connection) -> Option<Rc<crate::egl::GlConnection>> {
-    if COMPOSITION_FAILED.load(Ordering::Relaxed) {
-        return None;
-    }
-    if let Some(glconn) = conn.gl_connection.borrow().as_ref() {
-        if glconn.has_extension("EGL_ANGLE_direct_composition") {
-            return Some(Rc::clone(glconn));
-        }
-    }
-    match crate::egl::GlState::connect_for_composition() {
-        Ok(glconn) => {
-            conn.gl_connection
-                .borrow_mut()
-                .get_or_insert_with(|| Rc::clone(&glconn));
-            Some(glconn)
-        }
-        Err(err) => {
-            log::warn!("DirectComposition backdrop unavailable: {err:#}");
-            None
-        }
-    }
-}
-
 /// "Blur behind" is the old vista term for a cool blurring
 /// effect that the DWM could enable.  Subsequent windows
 /// versions have removed the blurring.  We use this call
@@ -2406,6 +2349,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
 
     #[allow(non_camel_case_types)]
     #[allow(dead_code)]
+    #[derive(Debug)]
     #[repr(C)]
     enum DWM_SYSTEMBACKDROP_TYPE {
         DWMSBT_AUTO = 0,
@@ -2451,14 +2395,22 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
         if let Some(inner) = rc_from_hwnd(hwnd) {
             let mut inner = inner.borrow_mut();
 
-            // Set Acrylic or Mica system Backdrop; a window drawn onto
-            // DirectComposition was made for acrylic, and keeps it.
-            let composition = inner.composition.is_some();
-            let accent = !*IS_WIN11_22H2;
-            let acrylic =
-                composition || inner.config.win32_system_backdrop == SystemBackdrop::Acrylic;
-            let pv_attribute = match inner.config.win32_system_backdrop {
-                _ if composition => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
+            // The blur behind is only DWM's opt-in for per-pixel alpha on
+            // Windows 8 and later; the material itself is asked for below.
+            let see_through = inner.config.window_background_opacity < 1.0;
+            blur_behind(hwnd, see_through);
+
+            // `Auto` is the terminal's default: a see-through window wants
+            // the blur that makes its text readable over what is behind it.
+            // An opaque one needs no material, and explicit choices stand.
+            let requested = match (inner.config.win32_system_backdrop, see_through) {
+                (SystemBackdrop::Auto, true) => SystemBackdrop::Acrylic,
+                (SystemBackdrop::Auto, false) => SystemBackdrop::Disable,
+                (SystemBackdrop::Acrylic, false) => SystemBackdrop::Disable,
+                (other, _) => other,
+            };
+
+            let pv_attribute = match requested {
                 SystemBackdrop::Auto => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_AUTO,
                 SystemBackdrop::Disable => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_NONE,
                 SystemBackdrop::Acrylic => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
@@ -2466,17 +2418,11 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                 SystemBackdrop::Tabbed => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TABBEDWINDOW,
             };
 
+            // A standard title bar is the one piece of non-client chrome the
+            // backdrop has to reach into; the rest of our windows draw their
+            // own, and extending the frame there lets DWM paint its caption
+            // buttons over ours.
             let margins = match inner.config.window_decorations {
-                // The frame the backdrop shows on, over the whole window: the
-                // side bands as wide as any window, and none at the top. One
-                // there (or -1) has DWM draw its own caption into it, and the
-                // caption buttons over ours.
-                _ if composition => MARGINS {
-                    cxLeftWidth: 0xFF_FFFF,
-                    cxRightWidth: 0xFF_FFFF,
-                    cyTopHeight: 0,
-                    cyBottomHeight: 0,
-                },
                 WindowDecorations::TITLE => MARGINS {
                     cxLeftWidth: -1,
                     cxRightWidth: -1,
@@ -2493,20 +2439,30 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
 
             DwmExtendFrameIntoClientArea(hwnd, &margins);
 
-            // Apply Acrylic or Mica Backdrop
+            // Desktop Acrylic is a Windows 11 22H2 material; before that the
+            // attribute does not exist, and the legacy accent policy below is
+            // the best a see-through window can ask for.
             if *IS_WIN11_22H2 {
-                DwmSetWindowAttribute(
+                let hr = DwmSetWindowAttribute(
                     hwnd,
                     DWMWA_SYSTEMBACKDROP_TYPE,
                     &pv_attribute as *const _ as _,
                     std::mem::size_of_val(&pv_attribute) as u32,
                 );
+                if FAILED(hr) {
+                    log::warn!(
+                        "DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE={pv_attribute:?}) failed: {hr:#x}"
+                    );
+                }
             }
 
-            // The accent policy: acrylic before 22H2.
+            // The accent policy: acrylic before 22H2. It is a private API,
+            // so a failure here only means the window stays see-through
+            // without a blur.
+            let accent = !*IS_WIN11_22H2 && *HAS_LEGACY_ACRYLIC;
+            let on = accent && requested == SystemBackdrop::Acrylic;
             let mut colour = inner.config.win32_acrylic_accent_color.to_srgb_u8();
             colour.3 = if colour.3 == 0 { 1 } else { colour.3 }; // acrylic doesn't like to have 0 alpha
-            let on = accent && acrylic;
 
             let mut policy = ACCENT_POLICY {
                 AccentState: if on {
@@ -2522,7 +2478,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                 AnimationId: 0,
             };
 
-            if accent {
+            if !*IS_WIN11_22H2 {
                 if let Ok(user) = User32::open(std::path::Path::new("user32.dll")) {
                     (user.SetWindowCompositionAttribute)(
                         hwnd,
@@ -2537,12 +2493,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
 
             if !*IS_WIN10 && !*IS_WIN11_22H2 {
                 // For build versions less than 22h2 but are still win11
-                let mica_enabled: u32 =
-                    if inner.config.win32_system_backdrop == SystemBackdrop::Mica {
-                        1
-                    } else {
-                        0
-                    };
+                let mica_enabled: u32 = if requested == SystemBackdrop::Mica { 1 } else { 0 };
                 DwmSetWindowAttribute(
                     hwnd,
                     DWMWA_MICA_EFFECT,

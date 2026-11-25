@@ -26,7 +26,7 @@ use crate::{
     default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
     IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MacosWindowGlass,
     MouseEventTriggerMods, RgbaColor,
-    SerialDomain, SystemBackdrop, WebGpuPowerPreference, Win32BackdropTrial, CONFIG_DIRS,
+    SerialDomain, SystemBackdrop, WebGpuPowerPreference, CONFIG_DIRS,
     CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
 };
 use anyhow::Context;
@@ -645,17 +645,13 @@ pub struct Config {
     #[dynamic(default)]
     pub kde_window_background_blur: bool,
 
-    /// Only works on Windows
+    /// Only works on Windows. `Auto` asks for Acrylic behind a see-through
+    /// window, and for nothing behind an opaque one.
     #[dynamic(default)]
     pub win32_system_backdrop: SystemBackdrop,
 
     #[dynamic(default = "default_win32_acrylic_accent_color")]
     pub win32_acrylic_accent_color: RgbaColor,
-
-    /// Only works on Windows: tries another way of asking for the acrylic
-    /// backdrop, which it then asks for (see `Win32BackdropTrial`).
-    #[dynamic(default)]
-    pub win32_backdrop_trial: Win32BackdropTrial,
 
     /// Specifies the alpha value to use when rendering the background
     /// of the window.  The background is taken either from the

@@ -6130,11 +6130,6 @@ impl SettingsWindow {
         // Merged into the freshest settings, as `apply_text_contrast` does:
         // this window's copy can be older than what other windows saved.
         let mut merged = crate::native_settings::load();
-        // On Windows the acrylic behind a see-through window is drawn the way
-        // a window was made: windows made opaque show it after a restart.
-        let see_through = |opacity: Option<u8>| opacity.is_some_and(|percent| percent < 100);
-        let acrylic_after_restart =
-            cfg!(windows) && !see_through(merged.appearance.window_opacity) && see_through(opacity);
         merged.appearance.window_opacity = opacity;
         self.set_native_settings(merged);
         let setting = crate::i18n::tr("settings-window-opacity");
@@ -6142,11 +6137,7 @@ impl SettingsWindow {
             Ok(()) => {
                 crate::native_settings::apply_window_opacity_to_app(&self.native_settings);
                 self.status = settings_tr(
-                    if acrylic_after_restart {
-                        "settings-status-window-acrylic-after-restart"
-                    } else {
-                        "settings-status-value-now"
-                    },
+                    "settings-status-value-now",
                     &[
                         ("setting", setting),
                         ("value", window_opacity_label(opacity)),

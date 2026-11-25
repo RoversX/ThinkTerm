@@ -913,7 +913,6 @@ settings-status-stop-session-server-error = Der Sitzungsserver konnte nicht gest
 settings-status-window-restore-off = Wiederherstellen des Fensterrahmens für neue macOS-Fenster deaktiviert.
 settings-status-window-restore-error = Einstellung zum Wiederherstellen des Fensters konnte nicht gespeichert werden: { $error }
 settings-status-renderer = Renderer auf { $renderer } gesetzt; starten Sie ThinkTerm neu, um ihn anzuwenden.
-settings-status-window-acrylic-after-restart = { $setting } ist jetzt { $value }; das Milchglas erscheint nach einem Neustart von ThinkTerm (mit dem OpenGL-Renderer).
 settings-status-renderer-error = Renderer-Einstellung konnte nicht gespeichert werden: { $error }
 settings-status-restarting = ThinkTerm wird neu gestartet…
 settings-status-restart-error = ThinkTerm konnte nicht neu gestartet werden: { $error }

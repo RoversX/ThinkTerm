@@ -301,17 +301,6 @@ pub enum SystemBackdrop {
     Tabbed,
 }
 
-/// Acrylic behind a see-through window drawn with OpenGL, which the usual
-/// way of asking for it leaves opaque (wezterm#6265). `Composition` draws
-/// through ANGLE onto a DirectComposition surface, whose alpha the system
-/// acrylic shows through; a window takes it, or leaves it, when opened.
-#[derive(Debug, Copy, Clone, FromDynamic, ToDynamic, PartialEq, Eq, Default)]
-pub enum Win32BackdropTrial {
-    #[default]
-    Off,
-    Composition,
-}
-
 /// What a see-through window on macOS shows behind it: the blur of
 /// `macos_window_background_blur`, the system's frosted material, or Liquid
 /// Glass (macOS 26 and later) in its regular or clear style.

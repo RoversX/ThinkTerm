@@ -913,7 +913,6 @@ settings-status-stop-session-server-error = Could not stop the session server: {
 settings-status-window-restore-off = Main window frame restore disabled for new macOS windows.
 settings-status-window-restore-error = Unable to save window restore setting: { $error }
 settings-status-renderer = Renderer set to { $renderer }; restart ThinkTerm to apply it.
-settings-status-window-acrylic-after-restart = { $setting } is now { $value }; the frosted glass shows after ThinkTerm restarts (with the OpenGL renderer).
 settings-status-renderer-error = Unable to save renderer setting: { $error }
 settings-status-restarting = Restarting ThinkTerm…
 settings-status-restart-error = Unable to restart ThinkTerm: { $error }
