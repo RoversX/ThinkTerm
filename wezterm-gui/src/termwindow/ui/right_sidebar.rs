@@ -9545,20 +9545,31 @@ impl crate::TermWindow {
         if mode_height == 0 {
             return Ok(());
         }
-        self.fill_rounded_rectangle_with_border(
-            layers,
-            1,
-            euclid::rect(
-                content_x as f32,
-                mode_y as f32,
-                content_width as f32,
-                mode_height as f32,
-            ),
-            chrome.sidebar_button_bg,
-            chrome.control_border,
-            WINDOW_TAB_ADD_BUTTON_RADIUS,
-            CAPSULE_BORDER_WIDTH,
-        )
+        let strip = euclid::rect(
+            content_x as f32,
+            mode_y as f32,
+            content_width as f32,
+            mode_height as f32,
+        );
+        // A groove: the ground's own grey, as a row under the pointer has
+        // it, flat -- no lift, no edge -- so that the selected segment, glass
+        // in it, is what stands up. High contrast keeps its outline. Both
+        // are the left sidebar's rows', see-through-ness and all.
+        let row_chrome = self.sidebar_chrome();
+        let groove = row_chrome.sidebar_row_hover_bg;
+        if self.glass_high_contrast() {
+            self.fill_rounded_rectangle_with_border(
+                layers,
+                1,
+                strip,
+                groove,
+                chrome.control_border,
+                WINDOW_TAB_ADD_BUTTON_RADIUS,
+                CAPSULE_BORDER_WIDTH,
+            )
+        } else {
+            self.fill_rounded_rectangle(layers, 1, strip, groove, WINDOW_TAB_ADD_BUTTON_RADIUS)
+        }
         .context("right sidebar mode selector")?;
 
         let modes = RightSidebarMode::enabled_panels();
@@ -9661,14 +9672,17 @@ impl crate::TermWindow {
                 )
             };
             if active {
-                self.fill_rounded_rectangle_with_border(
+                // Glass in the groove, as the selected row is on its sidebar.
+                self.paint_sidebar_glass(
                     layers,
                     2,
                     pill,
-                    chrome.control_bg,
-                    chrome.control_border,
-                    WINDOW_TAB_ADD_BUTTON_RADIUS,
-                    CAPSULE_BORDER_WIDTH,
+                    pill.height().min(pill.width()) / 2.0,
+                    row_chrome.sidebar_row_active_bg,
+                    row_chrome.sidebar_row_active_border,
+                    Some(groove),
+                    1.0,
+                    false,
                 )
                 .context("right sidebar active mode")?;
             } else if hovered {
