@@ -41,16 +41,17 @@ struct KeyCap: Identifiable {
 /// into input.
 enum KeyCaps {
     /// The bar under the terminal: the keys a soft keyboard has not got,
-    /// the four a terminal asks for all the time in sight, then the
-    /// arrows and the rest a swipe along the bar away, as on Android.
+    /// the four a terminal asks for all the time in sight, then a line
+    /// (`barLineBefore` is the first arrow's place), the arrows left to
+    /// right and the rest a swipe along the bar away, as on Android.
     static var bar: [KeyCap] { [
         .dom("esc", "Escape"),
         .dom("tab", "Tab"),
         KeyCap(label: "ctrl", action: .sticky(.ctrl)),
         KeyCap(label: "alt", action: .sticky(.alt)),
+        .dom("←", "ArrowLeft"),
         .dom("↑", "ArrowUp"),
         .dom("↓", "ArrowDown"),
-        .dom("←", "ArrowLeft"),
         .dom("→", "ArrowRight"),
         .dom("home", "Home"),
         .dom("end", "End"),
@@ -67,6 +68,10 @@ enum KeyCaps {
         .dom("⌫", "Backspace"),
         KeyCap(label: tr("paste"), action: .paste),
     ] }
+
+    /// The place in `bar` the bar draws a thin line before: between the
+    /// modifiers and the arrows.
+    static let barLineBefore = 4
 
     /// The panes and tabs: what the desktop keeps in its menus, as keys.
     static var layout: [KeyCap] { [

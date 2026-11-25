@@ -2,6 +2,7 @@ package com.roversx.thinkterm
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,9 +18,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.East
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardHide
+import androidx.compose.material.icons.filled.North
+import androidx.compose.material.icons.filled.South
+import androidx.compose.material.icons.filled.West
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -32,7 +37,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -62,6 +73,7 @@ fun KeyBar(
     val tap = rememberKeyTap(model)
     var tab by remember { mutableStateOf(KeyPanelTab.KEYS) }
     val chrome = LocalChrome.current
+    val scroll = rememberScrollState()
 
     // The keyboard coming up takes the panel's place: the two never stack.
     LaunchedEffect(keyboardUp) {
@@ -69,12 +81,12 @@ fun KeyBar(
     }
 
     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        // Tight enough that the usual eight keys show on a phone held
-        // upright beside the buttons; more of them scroll.
+        // Keys wide enough to hit, with room between them; what does not
+        // fit beside the buttons scrolls, and the bar fades where it does.
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             if (hardKeyboard) Spacer(Modifier.weight(1f))
             Row(
@@ -86,11 +98,14 @@ fun KeyBar(
                 if (!hardKeyboard) Row(
                     Modifier
                         .weight(1f)
-                        .horizontalScroll(rememberScrollState())
+                        .fadeAtEnds(scroll)
+                        .horizontalScroll(scroll)
                         .padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(KEY_GAP),
                 ) {
-                    for (cap in KeyCaps.bar) {
+                    for ((i, cap) in KeyCaps.bar.withIndex()) {
+                        if (i == KeyCaps.BAR_LINE_BEFORE) BarLine()
                         BarKey(cap, held = isHeld(cap, model)) {
                             KeyCaps.send(cap, model, history, tap)
                         }
@@ -139,8 +154,47 @@ fun KeyBar(
 
 /// A piece's height: the keys' capsule and the buttons beside it.
 private val BAR_HEIGHT = 46.dp
-/// A button's width: narrower than it is high, the room being the keys'.
-private val BUTTON_WIDTH = 40.dp
+/// A button's width: as wide as it is high, round, as on the iPhone.
+private val BUTTON_WIDTH = BAR_HEIGHT
+/// Between two keys, besides each key's own padding.
+private val KEY_GAP = 2.dp
+/// How far in from an end the keys fade while more lie past it.
+private val KEY_FADE = 28.dp
+
+/// The keys fade out at an end of the bar while more of them lie past
+/// it: as strongly as there is left to scroll, up to the fade's width, so
+/// it comes in with the scroll and is gone at the end.
+private fun Modifier.fadeAtEnds(scroll: ScrollState): Modifier = this
+    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+    .drawWithContent {
+        drawContent()
+        val fade = KEY_FADE.toPx()
+        if (size.width <= fade * 2) return@drawWithContent
+        val before = (scroll.value / fade).coerceIn(0f, 1f)
+        val after = ((scroll.maxValue - scroll.value) / fade).coerceIn(0f, 1f)
+        if (before == 0f && after == 0f) return@drawWithContent
+        val inEdge = fade / size.width
+        drawRect(
+            Brush.horizontalGradient(
+                0f to Color.Black.copy(alpha = 1f - before),
+                inEdge to Color.Black,
+                1f - inEdge to Color.Black,
+                1f to Color.Black.copy(alpha = 1f - after),
+            ),
+            blendMode = BlendMode.DstIn,
+        )
+    }
+
+/// The thin upright line between two groups of keys.
+@Composable
+private fun BarLine() {
+    Box(
+        Modifier
+            .padding(horizontal = 4.dp)
+            .size(width = 1.dp, height = 20.dp)
+            .background(ink.copy(alpha = 0.25f)),
+    )
+}
 
 /// A sticky modifier shows as pressed until the next key spends it.
 private fun isHeld(cap: KeyCap, model: TerminalModel): Boolean = when {
@@ -153,22 +207,38 @@ private fun isHeld(cap: KeyCap, model: TerminalModel): Boolean = when {
 private fun BarKey(cap: KeyCap, held: Boolean, onClick: () -> Unit) {
     Box(
         Modifier
-            .defaultMinSize(minWidth = 26.dp, minHeight = 34.dp)
+            .defaultMinSize(minWidth = 34.dp, minHeight = 34.dp)
             .clip(CircleShape)
             .background(if (held) LeadBlue else Color.Transparent)
             .clickable(onClick = onClick)
-            .padding(horizontal = 5.dp),
+            .padding(horizontal = 7.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
+        val arrow = arrowIcon(cap.label)
+        if (arrow != null) Icon(
+            arrow,
+            contentDescription = cap.label,
+            tint = ink,
+            modifier = Modifier.size(18.dp),
+        ) else Text(
             cap.label,
             color = if (held) Color.White else ink,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             fontFamily = FontFamily.Monospace,
             maxLines = 1,
             softWrap = false,
         )
     }
+}
+
+/// An arrow key drawn as an icon: the monospace font has no arrows, and
+/// the fallback's are small beside the letters.
+private fun arrowIcon(label: String): ImageVector? = when (label) {
+    "←" -> Icons.Filled.West
+    "↑" -> Icons.Filled.North
+    "↓" -> Icons.Filled.South
+    "→" -> Icons.Filled.East
+    else -> null
 }
 
 @Composable

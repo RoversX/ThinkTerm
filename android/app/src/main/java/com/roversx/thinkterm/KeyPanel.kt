@@ -90,14 +90,16 @@ object KeyCaps {
         KeyCap.Dom(label, name, ctrl, shift)
 
     /// The bar under the terminal: the keys a soft keyboard has not got.
+    /// The modifiers first, then a line, then the arrows left to right
+    /// (BAR_LINE_BEFORE is the first arrow's place), then the rest.
     val bar: List<KeyCap> get() = listOf(
         dom("esc", "Escape"),
         dom("tab", "Tab"),
         KeyCap.Sticky("ctrl", KeyCap.Mod.CTRL),
         KeyCap.Sticky("alt", KeyCap.Mod.ALT),
+        dom("←", "ArrowLeft"),
         dom("↑", "ArrowUp"),
         dom("↓", "ArrowDown"),
-        dom("←", "ArrowLeft"),
         dom("→", "ArrowRight"),
         dom("home", "Home"),
         dom("end", "End"),
@@ -114,6 +116,10 @@ object KeyCaps {
         dom("⌫", "Backspace"),
         KeyCap.Paste(tr("paste")),
     )
+
+    /// The place in [bar] the bar draws a thin line before: between the
+    /// modifiers and the arrows.
+    const val BAR_LINE_BEFORE = 4
 
     val functions: List<KeyCap> = (1..12).map { dom("F$it", "F$it") }
 

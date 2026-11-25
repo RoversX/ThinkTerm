@@ -18,6 +18,7 @@ struct KeyBar: View {
     @State private var pickingFiles = false
     @State private var photos: [PhotosPickerItem] = []
     @State private var tab: KeyPanelTab = KeyBar.debugTab
+    @State private var edgeRoom = EdgeRoom()
     @ObservedObject private var settings = AppSettings.shared
 
     /// `--keypanel snippets` also picks the face it opens on (debug builds).
@@ -36,15 +37,26 @@ struct KeyBar: View {
         VStack(spacing: 8) {
             HStack(spacing: 8) {
                 HStack(spacing: 0) {
-                    // Room between the keys: four show, the rest scroll.
+                    // Room between the keys: four show, the rest scroll,
+                    // and the bar fades where it does.
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            ForEach(KeyCaps.bar) { cap in
+                            ForEach(Array(KeyCaps.bar.enumerated()), id: \.offset) { i, cap in
+                                if i == KeyCaps.barLineBefore { line }
                                 key(cap)
                             }
                         }
                         .padding(.horizontal, 8)
                     }
+                    .onScrollGeometryChange(for: EdgeRoom.self) { g in
+                        EdgeRoom(
+                            before: max(0, g.visibleRect.minX),
+                            after: max(0, g.contentSize.width - g.visibleRect.maxX)
+                        )
+                    } action: { _, room in
+                        edgeRoom = room
+                    }
+                    .mask { fadeMask }
                     more
                 }
                 .frame(height: Self.height)
@@ -87,16 +99,68 @@ struct KeyBar: View {
         }
     }
 
+    /// How much of the keys lies past each end of the bar.
+    private struct EdgeRoom: Equatable {
+        var before: CGFloat = 0
+        var after: CGFloat = 0
+    }
+
+    /// How far in from an end the keys fade while more lie past it.
+    private static let fade: CGFloat = 28
+
+    /// The keys fade out at an end of the bar while more of them lie past
+    /// it: as strongly as there is left to scroll, up to the fade's width,
+    /// so it comes in with the scroll and is gone at the end.
+    private var fadeMask: some View {
+        let before = min(1, edgeRoom.before / Self.fade)
+        let after = min(1, edgeRoom.after / Self.fade)
+        return HStack(spacing: 0) {
+            LinearGradient(colors: [.black.opacity(1 - before), .black], startPoint: .leading, endPoint: .trailing)
+                .frame(width: Self.fade)
+            Color.black
+            LinearGradient(colors: [.black, .black.opacity(1 - after)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: Self.fade)
+        }
+    }
+
+    /// The thin upright line between two groups of keys.
+    private var line: some View {
+        Rectangle()
+            .fill(model.ink.opacity(0.25))
+            .frame(width: 1, height: 20)
+            .padding(.horizontal, 2)
+    }
+
+    /// An arrow key drawn as a symbol: beside the letters the font's
+    /// arrows are small.
+    private static func arrowSymbol(_ label: String) -> String? {
+        switch label {
+        case "←": return "arrow.left"
+        case "↑": return "arrow.up"
+        case "↓": return "arrow.down"
+        case "→": return "arrow.right"
+        default: return nil
+        }
+    }
+
     private func key(_ cap: KeyCap) -> some View {
         Button { KeyCaps.send(cap, to: model) } label: {
-            Text(cap.label)
-                .font(.system(size: 15, design: .monospaced))
-                .lineLimit(1)
-                .fixedSize()
-                .padding(.horizontal, 8)
-                .frame(minWidth: 40, minHeight: 34)
-                .background(isHeld(cap) ? Color.accentColor : Color.clear, in: Capsule())
-                .contentShape(Capsule())
+            Group {
+                if let arrow = Self.arrowSymbol(cap.label) {
+                    Image(systemName: arrow)
+                        .font(.system(size: 15, weight: .medium))
+                        .accessibilityLabel(cap.label)
+                } else {
+                    Text(cap.label)
+                        .font(.system(size: 15, design: .monospaced))
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(minWidth: 40, minHeight: 34)
+            .background(isHeld(cap) ? Color.accentColor : Color.clear, in: Capsule())
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .foregroundColor(isHeld(cap) ? .white : model.ink)
