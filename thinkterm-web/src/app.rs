@@ -1508,12 +1508,37 @@ impl<P: Platform, L: Link> App<P, L> {
     pub fn set_selection(self: &Rc<Self>, anchor: (usize, usize), head: (usize, usize)) {
         {
             let mut inner = self.inner.borrow_mut();
-            let Some((pane_id, selection)) = Self::visible_selection(&inner, anchor, head) else {
+            let Some(place) = Self::focused_placement(&inner) else {
+                return;
+            };
+            let (cols, rows) = Self::shown_in(&inner, &place);
+            let Some((pane_id, mut selection)) = Self::visible_selection(&inner, anchor, head) else {
                 return;
             };
             let Some(cell) = inner.panes.get_mut(&pane_id) else {
                 return;
             };
+            // An end gone out of sight is told as the edge cell it went past
+            // (`screen_text`): handed back as that, it stays where it is,
+            // and a handle dragged moves only its own end.
+            if let Some(held) = cell.selection {
+                let dims = Self::shown_dims(&cell.session);
+                let visible = visible_rows(&dims, rows, cell.scroll_from_bottom);
+                let told = |end: (StableRowIndex, usize)| {
+                    let row = (end.0 - visible.start).clamp(0, rows.max(1) as StableRowIndex - 1) as usize;
+                    (row, end.1.min(cols.saturating_sub(1)))
+                };
+                for end in [held.anchor, held.head] {
+                    if visible.contains(&end.0) {
+                        continue;
+                    }
+                    if told(end) == anchor {
+                        selection.anchor = end;
+                    } else if told(end) == head {
+                        selection.head = end;
+                    }
+                }
+            }
             cell.selection = Some(selection);
             inner.selecting = false;
         }

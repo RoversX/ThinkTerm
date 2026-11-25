@@ -3,6 +3,9 @@ package com.roversx.thinkterm
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.Looper
@@ -24,8 +27,10 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.OverScroller
+import androidx.compose.ui.graphics.toArgb
 import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.hypot
 
 /// The terminal itself: a TextureView the core draws on (a plain view, so
 /// the overview can scale and clip it like any other), with a
@@ -114,11 +119,20 @@ class TerminalHostView(context: Context, private val model: TerminalModel) : Fra
     }
 }
 
-/// Touches, hardware keys and the IME. Invisible: it only takes input.
-/// A tap raises the keyboard, one finger scrolls (smooth with a fling, or
-/// by whole rows), a horizontal flick switches tabs, a pinch steps the
-/// text size, two fingers swiped down put the keyboard away, and a long
-/// press starts a selection the finger then extends.
+/// A word ends at a blank and at these, as it does on the desktop.
+private const val WORD_BREAKS = " \t\n{[}]()\"'`"
+
+/// The round of a selection handle, and how far from it a press still
+/// takes it, in dp.
+private const val HANDLE_RADIUS = 11f
+private const val HANDLE_REACH = 28f
+
+/// Touches, hardware keys and the IME. Invisible but for a selection's
+/// handles: it takes input. A tap raises the keyboard, one finger scrolls
+/// (smooth with a fling, or by whole rows), a horizontal flick switches
+/// tabs, a pinch steps the text size, two fingers swiped down put the
+/// keyboard away, and a long press selects the word under it, which the
+/// finger then extends, or the handles at its ends do afterwards.
 @SuppressLint("ViewConstructor")
 class TerminalInputView(context: Context, private val model: TerminalModel) : View(context) {
     private val settings get() = model.settings
@@ -151,6 +165,18 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
     private var head: Pair<Int, Int>? = null
     private var screen: ScreenText? = null
     private val longPress = Runnable { startSelection() }
+    /// The word a long press selected, first and last cell, while the
+    /// finger that pressed is still down: a drag from it runs from the
+    /// word to the finger.
+    private var pressWord: Pair<Pair<Int, Int>, Pair<Int, Int>>? = null
+    /// From the finger to the middle of the end it took by its handle, in
+    /// pixels: the end follows the finger without jumping to it.
+    private var grabDx = 0f
+    private var grabDy = 0f
+    /// The screen is to be read again this frame (`followScreen`).
+    private var following = false
+    private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = LeadBlue.toArgb() }
+    private val handlePath = Path()
 
     /// The composition the IME is building. Nothing reaches the pane
     /// while it is open; it is sent once, when it is committed.
@@ -165,8 +191,13 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
     private var imeSending = false
 
     /// While the overview is up the shrunken terminal is a card: any
-    /// touch on it is a tap on the card, not input.
+    /// touch on it is a tap on the card, not input, and a selection's
+    /// handles are not drawn on it.
     var touchOverride: (() -> Unit)? = null
+        set(value) {
+            field = value
+            invalidate()
+        }
 
     private val density: Float get() = resources.displayMetrics.density
 
@@ -206,7 +237,9 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         isClickable = true
         // A mouse over the terminal shows the text cursor, as the desktop's.
         pointerIcon = PointerIcon.getSystemIcon(context, PointerIcon.TYPE_TEXT)
-        model.onScreenChanged = { if (anchor != null) screen = null }
+        // The view draws the selection's handles over the terminal.
+        setWillNotDraw(false)
+        model.onScreenChanged = { if (anchor != null) followScreen() }
         model.onDropComposition = { dropComposition() }
         model.onImeOptionsChanged = {
             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -217,6 +250,8 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             anchor = null
             head = null
             screen = null
+            pressWord = null
+            invalidate()
         }
     }
 
@@ -288,7 +323,8 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                 selecting = false
                 twoFingerStartY = null
                 twoFingerDone = false
-                // A press on an end of a standing selection moves that end.
+                // A press on a handle, or an end, of a standing selection
+                // moves that end.
                 if (anchor != null && grabEnd(event.x, event.y)) {
                     selecting = true
                 } else if (settings.longPressSelects) {
@@ -320,7 +356,7 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             MotionEvent.ACTION_MOVE -> {
                 velocity?.addMovement(event)
                 if (selecting) {
-                    extendSelection(event.x, event.y)
+                    if (pressWord != null) extendFromWord(event.x, event.y) else extendSelection(event.x, event.y)
                     return true
                 }
                 if (event.pointerCount > 1) {
@@ -344,6 +380,7 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                 dropLongPress()
                 if (selecting) {
                     selecting = false
+                    pressWord = null
                     finishSelection()
                     return true
                 }
@@ -369,6 +406,7 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             MotionEvent.ACTION_CANCEL -> {
                 dropLongPress()
                 selecting = false
+                pressWord = null
                 velocity?.recycle()
                 velocity = null
             }
@@ -614,37 +652,83 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         return Pair(row, col)
     }
 
+    /// A long press selects the word under the finger, as a double click
+    /// does on the desktop; on a blank, the cell alone.
     private fun startSelection() {
         if (dragging || pinching || twoFingerStartY != null) return
+        // The screen as it is now, not as a selection before this one saw it.
+        screen = null
         val cell = cellAt(downX, downY) ?: return
+        val word = screen?.let { wordAt(it, cell) } ?: Pair(cell, cell)
         selecting = true
-        anchor = cell
-        head = cell
+        pressWord = word
+        // Its start the head: the chip comes up over the word's start.
+        anchor = word.second
+        head = word.first
         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-        model.core.setSelection(cell.first.toUInt(), cell.second.toUInt(), cell.first.toUInt(), cell.second.toUInt())
+        select()
         model.selectionMenuAt = null
     }
 
-    private fun extendSelection(x: Float, y: Float) {
-        val a = anchor ?: return
+    /// The finger that made the selection, still down: from its word to
+    /// the finger, whichever side of the word that is.
+    private fun extendFromWord(x: Float, y: Float) {
+        val word = pressWord ?: return
         val cell = cellAt(x, y) ?: return
-        if (cell == head) return
-        head = cell
-        model.core.setSelection(a.first.toUInt(), a.second.toUInt(), cell.first.toUInt(), cell.second.toUInt())
+        val (a, h) = when {
+            before(cell, word.first) -> Pair(word.second, cell)
+            before(word.second, cell) -> Pair(word.first, cell)
+            else -> Pair(word.second, word.first)
+        }
+        if (a == anchor && h == head) return
+        anchor = a
+        head = h
+        performHapticFeedback(HapticFeedbackConstants.TEXT_HANDLE_MOVE)
+        select()
     }
 
-    /// A press within a cell of an end takes that end along; the other
-    /// end becomes the anchor.
+    /// An end taken by its handle follows the finger, from where it was.
+    private fun extendSelection(x: Float, y: Float) {
+        if (anchor == null) return
+        val cell = cellAt(x + grabDx, y + grabDy) ?: return
+        if (cell == head) return
+        head = cell
+        performHapticFeedback(HapticFeedbackConstants.TEXT_HANDLE_MOVE)
+        select()
+    }
+
+    /// The selection between the two ends, in the core and in the handles.
+    private fun select() {
+        val a = anchor ?: return
+        val h = head ?: return
+        model.core.setSelection(a.first.toUInt(), a.second.toUInt(), h.first.toUInt(), h.second.toUInt())
+        invalidate()
+    }
+
+    /// A press on a handle, or within a cell of an end, takes that end
+    /// along; the other end becomes the anchor. The chip goes while the
+    /// end moves, and comes back where it is let go.
     private fun grabEnd(x: Float, y: Float): Boolean {
         val cell = cellAt(x, y) ?: return false
-        val a = anchor ?: return false
-        val h = head ?: return false
+        val s = screen ?: return false
+        val (first, last) = ends() ?: return false
         fun near(p: Pair<Int, Int>) = abs(p.first - cell.first) <= 1 && abs(p.second - cell.second) <= 1
-        return when {
-            near(h) -> true
-            near(a) -> { anchor = h; head = a; true }
-            else -> false
+        fun reach(p: Pair<Float, Float>) = hypot(p.first - x, p.second - y)
+        val toFirst = reach(handleCentre(s, first, start = true))
+        val toLast = reach(handleCentre(s, last, start = false))
+        val taken = when {
+            minOf(toFirst, toLast) <= HANDLE_REACH * density -> if (toFirst < toLast) first else last
+            near(last) -> last
+            near(first) -> first
+            else -> return false
         }
+        anchor = if (taken == first) last else first
+        head = taken
+        grabDx = ((s.originX + (taken.second + 0.5) * s.cellW) * density).toFloat() - x
+        grabDy = ((s.originY + (taken.first + 0.5) * s.cellH) * density).toFloat() - y
+        pressWord = null
+        model.selectionMenuAt = null
+        return true
     }
 
     private fun finishSelection() {
@@ -657,7 +741,110 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         anchor = null
         head = null
         screen = null
+        pressWord = null
+        invalidate()
         model.clearSelection()
+    }
+
+    /// The word around a cell, as the desktop's double click takes it: the
+    /// cells either side of it up to a blank, a bracket or a quote. Null
+    /// on one of those.
+    private fun wordAt(s: ScreenText, cell: Pair<Int, Int>): Pair<Pair<Int, Int>, Pair<Int, Int>>? {
+        // Each row is `cols` UTF-16 units and its line break.
+        val start = cell.first * (s.cols + 1)
+        if (start + s.cols > s.text.length) return null
+        fun inWord(col: Int) = s.text[start + col] !in WORD_BREAKS
+        if (!inWord(cell.second)) return null
+        var a = cell.second
+        var b = cell.second
+        while (a > 0 && inWord(a - 1)) a--
+        while (b < s.cols - 1 && inWord(b + 1)) b++
+        return Pair(Pair(cell.first, a), Pair(cell.first, b))
+    }
+
+    private fun before(p: Pair<Int, Int>, q: Pair<Int, Int>) = p.first < q.first || (p.first == q.first && p.second < q.second)
+
+    /// The selection's first and last cell, in reading order.
+    private fun ends(): Pair<Pair<Int, Int>, Pair<Int, Int>>? {
+        val a = anchor ?: return null
+        val h = head ?: return null
+        return if (before(h, a)) Pair(h, a) else Pair(a, h)
+    }
+
+    /// Output or a scroll moved the screen under a selection made here:
+    /// it is read again once this frame, the ends as the core holds them
+    /// now, so the handles stay on the text they mark. A selection the
+    /// core let go of (a key typed) goes here too, with its chip.
+    private fun followScreen() {
+        if (following) return
+        following = true
+        postOnAnimation {
+            following = false
+            if (anchor == null) return@postOnAnimation
+            val s = Views.screenText(model.core.screenText()) ?: return@postOnAnimation
+            screen = s
+            val held = s.selection
+            val ends = ends()
+            if (held == null) {
+                if (!selecting) {
+                    anchor = null
+                    head = null
+                    pressWord = null
+                    model.selectionMenuAt = null
+                }
+            } else if (ends != null && held != ends) {
+                // The same way round: the anchor stays the end not taken.
+                if (anchor == ends.first) {
+                    anchor = held.first
+                    head = held.second
+                } else {
+                    anchor = held.second
+                    head = held.first
+                }
+            }
+            invalidate()
+        }
+    }
+
+    // MARK: the handles
+
+    /// Where a handle points: the foot of the first cell's left edge, or
+    /// of the last cell's right edge, in pixels.
+    private fun handlePoint(s: ScreenText, cell: Pair<Int, Int>, start: Boolean): Pair<Float, Float> {
+        val col = if (start) cell.second else cell.second + 1
+        val x = ((s.originX + col * s.cellW) * density).toFloat()
+        val y = ((s.originY + (cell.first + 1) * s.cellH) * density).toFloat()
+        return Pair(x, y)
+    }
+
+    /// The round of a handle, under its point: to the left of it for the
+    /// first end, to the right for the last.
+    private fun handleCentre(s: ScreenText, cell: Pair<Int, Int>, start: Boolean): Pair<Float, Float> {
+        val (x, y) = handlePoint(s, cell, start)
+        val r = HANDLE_RADIUS * density
+        return Pair(if (start) x - r else x + r, y + r)
+    }
+
+    /// The two handles of a selection made by touch, as the system's text
+    /// fields draw theirs: a drop whose square corner points at the end.
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (touchOverride != null) return
+        val s = screen ?: return
+        val (first, last) = ends() ?: return
+        val r = HANDLE_RADIUS * density
+        for ((cell, start) in listOf(first to true, last to false)) {
+            val (x, y) = handlePoint(s, cell, start)
+            val (cx, cy) = handleCentre(s, cell, start)
+            handlePath.reset()
+            handlePath.addCircle(cx, cy, r, Path.Direction.CW)
+            if (start) {
+                handlePath.addRect(x - r, y, x, y + r, Path.Direction.CW)
+            } else {
+                handlePath.addRect(x, y, x + r, y + r, Path.Direction.CW)
+            }
+            canvas.drawPath(handlePath, handlePaint)
+        }
     }
 
     // MARK: hardware keys (and `adb shell input text`)
