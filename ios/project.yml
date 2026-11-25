@@ -50,6 +50,10 @@ targets:
     dependencies:
       - sdk: Metal.framework
       - sdk: QuartzCore.framework
+      # The app lock, linked into the app's binary rather than embedded:
+      # the app's privacy manifest covers what it calls.
+      - target: AppLockKit
+        embed: false
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
@@ -68,6 +72,8 @@ targets:
         # host there, or a tailnet's machine reached directly rather than
         # through a relay.
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: ThinkTerm connects to the machines you add, including ones on your local network.
+        # Asked the first time the app lock (Settings > Security) checks.
+        INFOPLIST_KEY_NSFaceIDUsageDescription: ThinkTerm uses Face ID to unlock the app when its lock is on.
         PRODUCT_BUNDLE_IDENTIFIER: com.roversx.thinkterm.ios
         ASSETCATALOG_COMPILER_APPICON_NAME: ThinkTerm
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
@@ -88,3 +94,21 @@ targets:
           # build has no keychain entitlement, and every Keychain call
           # fails with -34018, so no host's key or password would be kept.
           "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]": "-"
+  # The app lock (Settings > Security): Face ID or the passcode on opening,
+  # a module of its own that the app reaches only through AppLock and
+  # AppLockGate. Android's is android/applock.
+  AppLockKit:
+    type: framework.static
+    platform: iOS
+    sources:
+      - path: AppLockKit
+    dependencies:
+      - sdk: LocalAuthentication.framework
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.roversx.thinkterm.ios.applock
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.9"
+        SWIFT_UPCOMING_FEATURE_CONCISE_MAGIC_FILE: YES
+        CODE_SIGN_STYLE: Automatic

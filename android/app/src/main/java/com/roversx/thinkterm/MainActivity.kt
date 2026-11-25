@@ -24,6 +24,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import com.roversx.thinkterm.applock.AppLock
+import com.roversx.thinkterm.applock.AppLockGate
+import com.roversx.thinkterm.applock.AppLockTexts
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -37,6 +40,9 @@ class MainActivity : ComponentActivity() {
         L10n.load(this)
         Schemes.load(this)
         AppLanguage.tag = AppSettings.get(this).language
+        // On, a fresh start opens locked (Settings > Security).
+        AppLock.init(this)
+        restoreHeld(savedInstanceState)
         val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         GlassProbe.on = debuggable && intent.getBooleanExtra("glass_probe", false)
         // Opened from an agent's notification: it is shown once the app is up.
@@ -62,7 +68,7 @@ class MainActivity : ComponentActivity() {
                     play = sky,
                     onboard = firstRun,
                     pages = { enter, travel -> Onboarding(store, travel) { settings.onboarded = true; enter() } },
-                ) { Root(store, debuggable) }
+                ) { Locked { Root(store, debuggable) } }
             }
         }
     }
@@ -73,6 +79,80 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         AgentLinks.take(intent)
     }
+
+    /// What another app hands back (a file or a photo picked) while the app
+    /// is locked waits for the lock to lift, so nothing picked is uploaded
+    /// before the check passes. The result API's launchers hear it from
+    /// here, whichever screen launched them. Kept as data, in the saved
+    /// state too, so a screen made again still has it.
+    @Deprecated("Overridden only to hold results while locked")
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        val result = Bundle().apply {
+            putInt(HELD_REQUEST, requestCode)
+            putInt(HELD_RESULT, resultCode)
+            putParcelable(HELD_DATA, data)
+        }
+        if (!hold(result)) super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    private val held = ArrayList<Bundle>()
+
+    /// Keeps `result` until the lock lifts; false, and nothing kept, when
+    /// the app is not locked.
+    private fun hold(result: Bundle): Boolean {
+        held += result
+        if (AppLock.holdWhileLocked { deliver(result) }) return true
+        held.remove(result)
+        return false
+    }
+
+    /// A screen gone since hands nothing on: the one made in its place
+    /// took its results over (`restoreHeld`).
+    @Suppress("DEPRECATION")
+    private fun deliver(result: Bundle) {
+        if (isDestroyed || !held.remove(result)) return
+        super.onActivityResult(
+            result.getInt(HELD_REQUEST),
+            result.getInt(HELD_RESULT),
+            result.getParcelable(HELD_DATA, Intent::class.java),
+        )
+    }
+
+    /// Held results of the screen this one replaces: kept again while
+    /// locked, handed on at once otherwise.
+    private fun restoreHeld(saved: Bundle?) {
+        val results = saved?.getParcelableArrayList(HELD_KEY, Bundle::class.java) ?: return
+        for (result in results) {
+            if (hold(result)) continue
+            held += result
+            deliver(result)
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (held.isNotEmpty()) outState.putParcelableArrayList(HELD_KEY, ArrayList(held))
+    }
+
+    private companion object {
+        const val HELD_KEY = "applock.held"
+        const val HELD_REQUEST = "request"
+        const val HELD_RESULT = "result"
+        const val HELD_DATA = "data"
+    }
+}
+
+/// The app under its lock (android/applock), in the app's words. Locked,
+/// a fresh start shows the lock at once, over the sky: what the app opens
+/// meanwhile (a dialog of a terminal a notification opened) stays under it.
+@Composable
+private fun Locked(content: @Composable () -> Unit) {
+    AppLanguage.tag
+    AppLockGate(
+        texts = AppLockTexts(locked = tr("lock.locked"), unlock = tr("lock.unlock"), prompt = tr("lock.reason")),
+        content = content,
+    )
 }
 
 /// The threads of every host, and over them a host's terminal, the hosts

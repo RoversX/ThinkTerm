@@ -14,3 +14,6 @@ dependencyResolutionManagement {
 }
 rootProject.name = "ThinkTerm"
 include(":app")
+// The app lock (Face, fingerprint or the screen lock on opening), a module
+// of its own: the app reaches it only through AppLock and AppLockGate.
+include(":applock")

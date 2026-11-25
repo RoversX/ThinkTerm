@@ -458,6 +458,53 @@ EXTRA = {
         "Maintien des connexions",
         "Verbindungen bleiben offen",
     ],
+    # The app lock (ios/AppLockKit, android/applock) and its Settings page
+    "sec.security": ["Security", "安全", "セキュリティ", "Sécurité", "Sicherheit"],
+    "lock.app": ["Lock ThinkTerm", "锁定 ThinkTerm", "ThinkTerm をロック", "Verrouiller ThinkTerm", "ThinkTerm sperren"],
+    "lock.after": ["Lock After", "离开多久后锁定", "ロックまでの時間", "Verrouiller après", "Sperren nach"],
+    "lock.after.60": ["1 minute", "1 分钟", "1 分", "1 minute", "1 Minute"],
+    "lock.after.300": ["5 minutes", "5 分钟", "5 分", "5 minutes", "5 Minuten"],
+    "lock.after.600": ["10 minutes", "10 分钟", "10 分", "10 minutes", "10 Minuten"],
+    "lock.after.1200": ["20 minutes", "20 分钟", "20 分", "20 minutes", "20 Minuten"],
+    "lock.after.3600": ["1 hour", "1 小时", "1 時間", "1 heure", "1 Stunde"],
+    "lock.note.ios": [
+        "Opening ThinkTerm asks for Face ID or your passcode. Back within the time set, it does not ask again.",
+        "打开 ThinkTerm 时需要面容 ID 或密码。离开不超过设定的时间，回来不用再验证。",
+        "ThinkTerm を開くと Face ID またはパスコードを求めます。設定した時間内に戻れば、もう一度は求めません。",
+        "À l’ouverture, ThinkTerm demande Face ID ou votre code. De retour dans le délai choisi, il ne redemande pas.",
+        "Beim Öffnen fragt ThinkTerm nach Face ID oder Ihrem Code. Zurück innerhalb der eingestellten Zeit, fragt es nicht erneut.",
+    ],
+    "lock.note.android": [
+        "Opening ThinkTerm asks for your fingerprint, face or screen lock. Back within the time set, it does not ask again.",
+        "打开 ThinkTerm 时需要指纹、人脸或屏幕锁。离开不超过设定的时间，回来不用再验证。",
+        "ThinkTerm を開くと指紋、顔、または画面ロックを求めます。設定した時間内に戻れば、もう一度は求めません。",
+        "À l’ouverture, ThinkTerm demande votre empreinte, votre visage ou le verrouillage de l’écran. De retour dans le délai choisi, il ne redemande pas.",
+        "Beim Öffnen fragt ThinkTerm nach Fingerabdruck, Gesicht oder Displaysperre. Zurück innerhalb der eingestellten Zeit, fragt es nicht erneut.",
+    ],
+    "lock.nopasscode.ios": [
+        "Set a passcode in the iPhone’s Settings first.",
+        "请先在 iPhone 的设置里设置密码。",
+        "先に iPhone の設定でパスコードを設定してください。",
+        "Définissez d’abord un code dans les Réglages de l’iPhone.",
+        "Legen Sie zuerst in den Einstellungen des iPhone einen Code fest.",
+    ],
+    "lock.nopasscode.android": [
+        "Set a screen lock in the phone’s Settings first.",
+        "请先在手机的设置里设置屏幕锁。",
+        "先にスマートフォンの設定で画面ロックを設定してください。",
+        "Définissez d’abord un verrouillage de l’écran dans les paramètres du téléphone.",
+        "Richten Sie zuerst in den Einstellungen des Telefons eine Displaysperre ein.",
+    ],
+    "lock.locked": ["ThinkTerm is locked", "ThinkTerm 已锁定", "ThinkTerm はロックされています", "ThinkTerm est verrouillé", "ThinkTerm ist gesperrt"],
+    "lock.unlock": ["Unlock", "解锁", "ロック解除", "Déverrouiller", "Entsperren"],
+    "lock.reason": ["Unlock ThinkTerm", "解锁 ThinkTerm", "ThinkTerm のロックを解除", "Déverrouiller ThinkTerm", "ThinkTerm entsperren"],
+    "lock.reason.on": [
+        "Confirm it’s you to turn on the lock",
+        "验证身份以开启锁定",
+        "本人確認してロックをオンにします",
+        "Confirmez votre identité pour activer le verrouillage",
+        "Bestätigen Sie Ihre Identität, um die Sperre einzuschalten",
+    ],
 }
 
 

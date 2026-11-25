@@ -1,3 +1,4 @@
+import AppLockKit
 import SwiftUI
 
 @main
@@ -19,6 +20,9 @@ struct ThinkTermApp: App {
                     ThreadsHome()
                 }
             }
+            // Locked, a fresh start shows the lock at once, over the sky:
+            // what the app puts up meanwhile stays under it.
+            .modifier(LockGate())
             // A fresh start opens on the starry sky; the automated flows do
             // not. A first run with no host kept has its pages on it. Inside
             // the objects below, so the pages' own screens have them too.
@@ -81,5 +85,20 @@ struct ThinkTermApp: App {
         #else
         return nil
         #endif
+    }
+}
+
+/// The app under its lock (ios/AppLockKit), in the app's words.
+struct LockGate: ViewModifier {
+    @ObservedObject private var lang = AppLanguage.shared
+
+    func body(content: Content) -> some View {
+        content.modifier(AppLockGate(
+            texts: AppLockTexts(locked: tr("lock.locked"), unlock: tr("lock.unlock"), reason: tr("lock.reason"))
+        ) {
+            Image("OnboardingIcon")
+                .resizable()
+                .frame(width: 84, height: 84)
+        })
     }
 }

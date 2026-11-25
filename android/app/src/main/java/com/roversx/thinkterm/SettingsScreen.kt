@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -79,6 +80,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.roversx.thinkterm.applock.AppLock
 import java.util.Locale
 import kotlinx.coroutines.delay
 
@@ -112,6 +114,9 @@ fun SettingsScreen(model: TerminalModel?, showLog: MutableState<Boolean>?, onDon
             "contrast" -> OptionScreen(tr("contrast"), contrasts(), settings.contrast, back) { settings.contrast = it }
             "cursor" -> OptionScreen(tr("cursor"), cursors(), settings.cursorStyle, back) { settings.cursorStyle = it }
             "resize.mode" -> OptionScreen(tr("resize.mode"), resizes(), settings.resizeMode, back) { settings.resizeMode = it }
+            "lock.after" -> OptionScreen(tr("lock.after"), lockAfters(), AppLock.lockAfterSeconds.toString(), back) {
+                AppLock.setLockAfter(it.toInt())
+            }
             "k.keybar" -> KeyCapsScreen(back)
             "tailscale" -> TailnetSettingsScreen(onBack = back)
             "licenses" -> LicensesScreen(onBack = back)
@@ -140,6 +145,7 @@ internal object TileColors {
 
 private val SETTINGS_PAGES = listOf(
     SettingsPage("general", { tr("sec.general") }, "settings", TileColors.gray),
+    SettingsPage("security", { tr("sec.security") }, "lock", TileColors.green),
     SettingsPage("appearance", { tr("sec.appearance") }, "palette", TileColors.blue),
     SettingsPage("terminal", { tr("sec.terminal") }, "square-terminal", TileColors.indigo),
     SettingsPage("interface", { tr("sec.interface") }, "panels-top-left", TileColors.teal),
@@ -160,7 +166,7 @@ private fun settingsPage(key: String) = SETTINGS_PAGES.first { it.key == key }
 private fun SettingsHome(diagnostics: Boolean, onDone: (() -> Unit)?, push: (String) -> Unit) {
     GroupedPage(tr("settings"), onBack = null, onDone = onDone) {
         Group {
-            for (key in listOf("general", "appearance", "terminal", "interface", "agents")) SettingsHomeRow(settingsPage(key), push)
+            for (key in listOf("general", "security", "appearance", "terminal", "interface", "agents")) SettingsHomeRow(settingsPage(key), push)
         }
         Spacer(Modifier.height(18.dp))
         Group {
@@ -347,6 +353,23 @@ private fun SettingsSection(
         when (key) {
             "general" -> Group {
                 PushRow(tr("language"), label(languages(), settings.language)) { onPush("language") }
+            }
+            "security" -> {
+                // The app lock (android/applock): turned on only once the
+                // phone's check passes, so it can always be lifted.
+                val context = LocalContext.current
+                val activity = LocalActivity.current
+                // On with no screen lock left (taken off since), the app is
+                // not held shut: the footer says what puts it back.
+                val canLock = AppLock.available(context)
+                Group(footer = tr(if (canLock) "lock.note.android" else "lock.nopasscode.android")) {
+                    SwitchRow(tr("lock.app"), AppLock.enabled) { on ->
+                        if (!on) AppLock.turnOff() else if (activity != null) AppLock.turnOn(activity, tr("lock.reason.on"))
+                    }
+                    if (AppLock.enabled) {
+                        PushRow(tr("lock.after"), label(lockAfters(), AppLock.lockAfterSeconds.toString())) { onPush("lock.after") }
+                    }
+                }
             }
             "appearance" -> Group {
                 val scheme = settings.schemeName
@@ -645,6 +668,9 @@ private fun cursors(): List<Choice> = listOf(
     Choice("bar", tr("cursor.bar")),
     Choice("underline", tr("cursor.underline")),
 )
+
+/// How long the app may be away before the lock asks again.
+private fun lockAfters(): List<Choice> = AppLock.choices.map { Choice(it.toString(), tr("lock.after.$it")) }
 
 private fun resizes(): List<Choice> = listOf(
     Choice("auto", tr("resize.auto")),

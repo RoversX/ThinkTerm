@@ -72,6 +72,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(project(":applock"))
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation(platform("androidx.compose:compose-bom:2026.03.00"))
     implementation("androidx.compose.ui:ui")

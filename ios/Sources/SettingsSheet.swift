@@ -1,3 +1,4 @@
+import AppLockKit
 import SwiftUI
 
 /// The app's preferences, as iOS's own Settings lays them out: a list of
@@ -14,6 +15,7 @@ struct SettingsView: View {
         List {
             Section {
                 row(.general)
+                row(.security)
                 row(.appearance)
                 row(.terminal)
                 row(.interface)
@@ -51,11 +53,12 @@ struct SettingsView: View {
 
 /// What Settings has a page for.
 enum SettingsPage {
-    case general, appearance, terminal, interface, agents, keyboard, gestures, connection, diagnostics, about
+    case general, security, appearance, terminal, interface, agents, keyboard, gestures, connection, diagnostics, about
 
     var title: String {
         switch self {
         case .general: return tr("sec.general")
+        case .security: return tr("sec.security")
         case .appearance: return tr("sec.appearance")
         case .terminal: return tr("sec.terminal")
         case .interface: return tr("sec.interface")
@@ -72,6 +75,7 @@ enum SettingsPage {
     var symbol: String {
         switch self {
         case .general: return "gearshape.fill"
+        case .security: return "lock.fill"
         case .appearance: return "paintbrush.pointed.fill"
         case .terminal: return "apple.terminal.fill"
         case .interface: return "rectangle.split.2x1.fill"
@@ -93,7 +97,7 @@ enum SettingsPage {
         case .interface: return GlassTile.teal
         case .agents: return GlassTile.purple
         case .gestures: return GlassTile.orange
-        case .connection: return GlassTile.green
+        case .connection, .security: return GlassTile.green
         case .diagnostics: return GlassTile.red
         }
     }
@@ -172,6 +176,7 @@ struct SettingsPageView: View {
     var close: () -> Void
     @ObservedObject var settings = AppSettings.shared
     @ObservedObject private var lang = AppLanguage.shared
+    @ObservedObject private var lock = AppLock.shared
 
     var body: some View {
         List { content }
@@ -186,6 +191,31 @@ struct SettingsPageView: View {
         case .general:
             Section {
                 push(tr("language"), selection: $settings.language, options: Self.languages)
+            }
+        case .security:
+            // The app lock (ios/AppLockKit): turned on only once the
+            // phone's check passes, so it can always be lifted.
+            Section {
+                Toggle(tr("lock.app"), isOn: Binding(
+                    get: { lock.enabled },
+                    set: { on in
+                        if on {
+                            Task { await lock.turnOn(reason: tr("lock.reason.on")) }
+                        } else {
+                            lock.turnOff()
+                        }
+                    }
+                ))
+                if lock.enabled {
+                    push(tr("lock.after"), selection: Binding(
+                        get: { String(lock.lockAfter) },
+                        set: { lock.setLockAfter(Int($0) ?? AppLock.defaultAfter) }
+                    ), options: AppLock.choices.map { PickerOption(String($0), tr("lock.after.\($0)")) })
+                }
+            } footer: {
+                // On with no passcode left (turned off since), the app is
+                // not held shut: the footer says what puts it back.
+                Text(tr(lock.available ? "lock.note.ios" : "lock.nopasscode.ios"))
             }
         case .appearance:
             Section {
