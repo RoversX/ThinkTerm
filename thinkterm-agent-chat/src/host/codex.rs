@@ -11,7 +11,7 @@
 
 use super::rollout::Rollout;
 use super::{head, now, read_ops, tail, ws, Input, Out, Target};
-use crate::{AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need, NoteKind, Op, Status};
+use crate::{AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, CommandKind, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need, NoteKind, Op, Status};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -316,6 +316,9 @@ struct Chat {
     /// How long the turns read worked (`Ev::Worked`): each said after the
     /// page holding what it follows.
     worked: Vec<Ev>,
+    /// When the items read came about (`Ev::Times`), said after the page
+    /// holding them.
+    times: Vec<(String, u64)>,
     /// The last item sent, which a turn that ends is said to have worked
     /// after.
     last_item: Option<String>,
@@ -326,6 +329,12 @@ struct Writing {
     text: String,
     sent: Instant,
     owed: bool,
+    /// What it thinks, not what it says.
+    thinking: bool,
+    /// For thinking: from its summary (rather than the reasoning itself,
+    /// which a summary takes the place of), and the part of it written now.
+    summary: bool,
+    part: Option<u64>,
 }
 
 /// A skill, as `skills/list` gives it.
@@ -336,22 +345,59 @@ struct Skill {
     description: String,
 }
 
+impl Writing {
+    fn new(id: &str, text: &str, thinking: bool, summary: bool, part: Option<u64>) -> Self {
+        Writing {
+            id: id.to_string(),
+            text: text.to_string(),
+            // The first words go at once.
+            sent: Instant::now().checked_sub(WRITING_EVERY).unwrap_or_else(Instant::now),
+            owed: false,
+            thinking,
+            summary,
+            part,
+        }
+    }
+}
+
 impl Chat {
     /// More of what the agent writes: sent as it grows, a few times a
     /// second.
     fn wrote(&mut self, out: &Out, id: &str, delta: &str) -> Result<()> {
         match &mut self.writing {
             Some(writing) if writing.id == id => writing.text.push_str(delta),
-            _ => {
-                self.writing = Some(Writing {
-                    id: id.to_string(),
-                    text: delta.to_string(),
-                    // The first words go at once.
-                    sent: Instant::now().checked_sub(WRITING_EVERY).unwrap_or_else(Instant::now),
-                    owed: false,
-                })
-            }
+            _ => self.writing = Some(Writing::new(id, delta, false, false, None)),
         }
+        self.grew(out)
+    }
+
+    /// More of what the agent thinks: of its summary, or of the reasoning
+    /// itself, `part` the summary's part (or the reasoning's) it is in.
+    /// The summary is what is shown once whole, so it is what is shown as it
+    /// comes: reasoning goes only until a summary begins.
+    fn thought(&mut self, out: &Out, id: &str, delta: &str, summary: bool, part: Option<u64>) -> Result<()> {
+        match &mut self.writing {
+            Some(writing) if writing.id == id && writing.thinking => {
+                if summary && !writing.summary {
+                    *writing = Writing::new(id, delta, true, true, part);
+                } else if summary == writing.summary {
+                    // A new part goes after a blank line, as when whole.
+                    if part != writing.part && !writing.text.trim().is_empty() {
+                        writing.text.push_str("\n\n");
+                    }
+                    writing.part = part;
+                    writing.text.push_str(delta);
+                } else {
+                    return Ok(());
+                }
+            }
+            _ => self.writing = Some(Writing::new(id, delta, true, summary, part)),
+        }
+        self.grew(out)
+    }
+
+    /// What was written goes now if it is due, else when it is.
+    fn grew(&mut self, out: &Out) -> Result<()> {
         let due = self.writing.as_ref().is_some_and(|w| w.sent.elapsed() >= WRITING_EVERY);
         if due {
             self.send_writing(out)?;
@@ -369,6 +415,21 @@ impl Chat {
             .map(|w| WRITING_EVERY.saturating_sub(w.sent.elapsed()))
     }
 
+    /// The turn is over: what was being written is all there is of it,
+    /// sent as whole (a stopped turn's message never completes).
+    fn end_writing(&mut self, out: &Out) -> Result<()> {
+        let Some(writing) = self.writing.take() else {
+            return Ok(());
+        };
+        if writing.text.trim().is_empty() {
+            return Ok(());
+        }
+        let (id, text) = (writing.id, head(&writing.text, TEXT_KEPT));
+        self.last_item = Some(id.clone());
+        out.send(&Ev::item(if writing.thinking { Item::Thinking { id, text } } else { Item::Text { id, text } }))?;
+        Ok(())
+    }
+
     fn send_writing(&mut self, out: &Out) -> Result<()> {
         let Some(writing) = &mut self.writing else {
             return Ok(());
@@ -378,12 +439,8 @@ impl Chat {
         if writing.text.trim().is_empty() {
             return Ok(());
         }
-        out.send(&Ev::Item {
-            item: Item::Text {
-                id: writing.id.clone(),
-                text: head(&writing.text, TEXT_KEPT),
-            },
-        })?;
+        let (id, text) = (writing.id.clone(), head(&writing.text, TEXT_KEPT));
+        out.send(&Ev::partial(if writing.thinking { Item::Thinking { id, text } } else { Item::Text { id, text } }))?;
         Ok(())
     }
 
@@ -402,12 +459,14 @@ impl Chat {
             name: name.to_string(),
             description: description.to_string(),
             args: args.map(str::to_string),
+            kind: Some(CommandKind::Command),
         });
         let skills = self.skills.iter().map(|skill| CommandInfo {
             name: format!("${}", skill.name),
             description: skill.description.clone(),
             // What the skill is for follows it.
             args: Some(String::new()),
+            kind: Some(CommandKind::Skill),
         });
         Ev::Commands {
             commands: own.chain(skills).collect(),
@@ -467,6 +526,10 @@ impl Chat {
         })?;
         for ev in worked {
             out.send(ev)?;
+        }
+        let times: Vec<(String, u64)> = self.times.iter().filter(|(id, _)| ids.contains(id.as_str())).cloned().collect();
+        if !times.is_empty() {
+            out.send(&Ev::Times { times })?;
         }
         Ok(())
     }
@@ -559,6 +622,7 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> R
         writing: None,
         rollout: Rollout::new(found.path.clone()),
         worked: Vec::new(),
+        times: Vec::new(),
         last_item: None,
     };
     // A thread whose first turn has not run has nothing on disk yet and
@@ -586,11 +650,13 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> R
             older: None,
             running: None,
             worked: Vec::new(),
+            times: Vec::new(),
         }
     };
     chat.older = turns.older;
     chat.turn = turns.running;
     chat.worked = turns.worked;
+    chat.times = turns.times;
     chat.send_page(&out, turns.items, true)?;
     out.send(&Ev::State {
         state: chat.state,
@@ -648,6 +714,8 @@ struct Turns {
     /// How long each turn that ended worked (`Ev::Worked`), after its
     /// last item.
     worked: Vec<Ev>,
+    /// When each item came about, as its turn tells (`Ev::Times`).
+    times: Vec<(String, u64)>,
 }
 
 fn turns_to_items(listed: &Value) -> Turns {
@@ -661,10 +729,18 @@ fn turns_to_items(listed: &Value) -> Turns {
     turns.reverse();
     let mut items = Vec::new();
     let mut worked = Vec::new();
+    let mut times = Vec::new();
     for turn in turns {
         let first = items.len();
+        // Codex keeps no time of each item, only its turn's: what was said
+        // when it began, what came of it when it ended.
+        let (began, ended) = (turn["startedAt"].as_u64(), turn["completedAt"].as_u64());
         for item in turn["items"].as_array().into_iter().flatten() {
             if let Some(item) = to_item(item) {
+                let at = if matches!(item, Item::User { .. }) { began } else { ended.or(began) };
+                if let Some(at) = at {
+                    times.push((item.id().to_string(), at));
+                }
                 items.push(item);
             }
         }
@@ -685,6 +761,7 @@ fn turns_to_items(listed: &Value) -> Turns {
         older,
         running,
         worked,
+        times,
     }
 }
 
@@ -823,6 +900,7 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                     let turns = turns_to_items(&message["result"]);
                     chat.older = turns.older;
                     chat.worked.extend(turns.worked);
+                    chat.times.extend(turns.times);
                     chat.send_page(out, turns.items, false)?;
                 }
                 (Pending::Older(cursor), Some(err)) => {
@@ -842,6 +920,7 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                         chat.turn = turns.running;
                     }
                     chat.worked = turns.worked;
+                    chat.times = turns.times;
                     chat.send_page(out, turns.items, true)?;
                     chat.ask_again(out)?;
                 }
@@ -920,6 +999,13 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                         chat.wrote(out, id, delta)?;
                     }
                 }
+                "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                    let summary = method == "item/reasoning/summaryTextDelta";
+                    if let (Some(id), Some(delta)) = (params["itemId"].as_str(), params["delta"].as_str()) {
+                        let part = params[if summary { "summaryIndex" } else { "contentIndex" }].as_u64();
+                        chat.thought(out, id, delta, summary, part)?;
+                    }
+                }
                 "item/started" | "item/completed" => {
                     let item = &params["item"];
                     // Written whole: the words as they came are done with.
@@ -939,7 +1025,7 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                     }
                     if let Some(item) = to_item(item) {
                         chat.last_item = Some(item.id().to_string());
-                        out.send(&Ev::Item { item })?;
+                        out.send(&Ev::item(item))?;
                     }
                 }
                 "turn/started" => {
@@ -957,10 +1043,11 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                 }
                 "turn/completed" => {
                     chat.turn = None;
+                    chat.end_writing(out)?;
                     chat.send_context(out)?;
                     if let Some(note) = turn_note(&params["turn"]) {
                         chat.last_item = Some(note.id().to_string());
-                        out.send(&Ev::Item { item: note })?;
+                        out.send(&Ev::item(note))?;
                     }
                     if let (Some(after), Some((id, seconds))) = (chat.last_item.clone(), worked_of(&params["turn"])) {
                         out.send(&Ev::Worked { id, after, seconds })?;
@@ -968,6 +1055,9 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                 }
                 "thread/status/changed" => {
                     let state = state_of(&params["status"]);
+                    if state != AgentState::Working {
+                        chat.end_writing(out)?;
+                    }
                     set_state(chat, out, state)?;
                     if !chat.joined && state != AgentState::Idle {
                         let id = daemon.request("thread/resume", json!({ "threadId": chat.thread, "excludeTurns": true }))?;
@@ -1374,13 +1464,7 @@ fn user_input(text: &str, attachments: &[Attachment], skills: &[Skill]) -> Value
 /// Whether `text` names the skill as a word of its own: `$name`, not
 /// followed by more of a name.
 fn names_skill(text: &str, name: &str) -> bool {
-    let mention = format!("${name}");
-    text.match_indices(&mention).any(|(at, _)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + mention.len()..].chars().next();
-        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
-            && !after.is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':')
-    })
+    super::names_with(text, '$', name)
 }
 
 /// The model a thread talks to and how hard it thinks, as Codex reports
@@ -1541,7 +1625,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .filter_map(|line| match serde_json::from_str::<Ev>(line).unwrap() {
-                    Ev::Item { item: Item::Text { text, .. } } => Some(text),
+                    Ev::Item { item: Item::Text { text, .. }, .. } => Some(text),
                     _ => None,
                 })
                 .collect()
@@ -1571,6 +1655,7 @@ mod tests {
             writing: None,
             rollout: Rollout::new(None),
             worked: Vec::new(),
+            times: Vec::new(),
             last_item: None,
         };
         // The first words go at once; those right after wait their turn.
@@ -1651,6 +1736,7 @@ mod tests {
             writing: None,
             rollout: Rollout::new(None),
             worked: Vec::new(),
+            times: Vec::new(),
             last_item: None,
         };
         let big = |n: usize| Item::Text {
@@ -1698,6 +1784,7 @@ mod tests {
             writing: None,
             rollout: Rollout::new(None),
             worked: Vec::new(),
+            times: Vec::new(),
             last_item: None,
         };
         settings_of(&mut chat, &json!({ "model": "gpt-5.5", "reasoningEffort": "high" }));

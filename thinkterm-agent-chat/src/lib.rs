@@ -111,7 +111,12 @@ pub enum Ev {
     },
     /// An item new or changed: it replaces the one with its id, or goes
     /// after all the others.
-    Item { item: Item },
+    Item {
+        item: Item,
+        /// Still being written: more of it comes, until it is sent without.
+        #[serde(default, skip_serializing_if = "is_false")]
+        partial: bool,
+    },
     /// What the agent is doing, since when (unix seconds).
     State {
         state: AgentState,
@@ -165,6 +170,22 @@ pub enum Ev {
     /// not an item: a client that does not know it lets it go, where an
     /// item it did not know would cost it the whole history it came in.
     Worked { id: String, after: String, seconds: u64 },
+    /// When things said and done came about (unix seconds), by item id:
+    /// said after history, for what it holds. A line of its own, as
+    /// [`Ev::Worked`] is.
+    Times { times: Vec<(String, u64)> },
+}
+
+impl Ev {
+    /// An item, whole.
+    pub fn item(item: Item) -> Self {
+        Ev::Item { item, partial: false }
+    }
+
+    /// An item as far as it is written: more of it comes.
+    pub fn partial(item: Item) -> Self {
+        Ev::Item { item, partial: true }
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -340,6 +361,24 @@ pub struct CommandInfo {
     /// What follows it ("<name>"); none for one that runs as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,
+    /// What it is; none from a bridge that does not say, when its name
+    /// tells (`$skill`, `/skill:name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CommandKind>,
+}
+
+/// What a command is, as the field groups them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    /// Something the agent does: its own, or an extension's.
+    Command,
+    /// Instructions it takes up for what follows.
+    Skill,
+    /// Words written ahead, sent in the command's place.
+    Prompt,
+    #[serde(other)]
+    Other,
 }
 
 /// A model the agent can be switched to.
@@ -497,16 +536,14 @@ mod tests {
 
     #[test]
     fn lines_round_trip() {
-        let ev = Ev::Item {
-            item: Item::Command {
-                id: "c1".into(),
-                command: "cargo test".into(),
-                status: Status::Done,
-                output: "ok".into(),
-                exit: Some(0),
-                looks: vec![],
-            },
-        };
+        let ev = Ev::item(Item::Command {
+            id: "c1".into(),
+            command: "cargo test".into(),
+            status: Status::Done,
+            output: "ok".into(),
+            exit: Some(0),
+            looks: vec![],
+        });
         let line = serde_json::to_string(&ev).unwrap();
         assert!(line.contains(r#""ev":"item""#) && line.contains(r#""kind":"command""#));
         assert_eq!(serde_json::from_str::<Ev>(&line).unwrap(), ev);

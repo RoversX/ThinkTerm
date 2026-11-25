@@ -14,7 +14,7 @@
 use super::http::{self, Endpoint};
 use super::{head, now, read_ops, tail, Input, Out, PaneControl, PaneProc, Target};
 use crate::{
-    AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, ContextInfo, ContextPart, Ev, FileEdit, Item, Look, LookKind,
+    AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, CommandKind, ContextInfo, ContextPart, Ev, FileEdit, Item, Look, LookKind,
     ModelChoice, Need, NoteKind, Op, PartKind, Status, Usage,
 };
 use anyhow::{anyhow, Context, Result};
@@ -852,6 +852,8 @@ struct Chat {
     windows: HashMap<String, u64>,
     /// OpenCode's commands where the pane is.
     commands: Vec<CommandInfo>,
+    /// Its skills there, by name, with the ids a prompt names them by.
+    skills: Vec<(String, String)>,
     /// What the agent is writing now, as far as it has come.
     writing: Option<Writing>,
     /// What the last step took of the context, and the session's totals.
@@ -864,6 +866,9 @@ struct Chat {
     /// How long the turns read worked (`Ev::Worked`): each said after the
     /// page holding what it follows.
     worked: Vec<Ev>,
+    /// When the items read came about (`Ev::Times`), said after the page
+    /// holding them.
+    times: Vec<(String, u64)>,
     /// The last item sent, which a turn that ends is said to have worked
     /// after.
     last_item: Option<String>,
@@ -913,6 +918,7 @@ impl Chat {
             models: Vec::new(),
             windows: HashMap::new(),
             commands: Vec::new(),
+            skills: Vec::new(),
             writing: None,
             used: None,
             totals: Usage::default(),
@@ -920,6 +926,7 @@ impl Chat {
             follow_at: Instant::now() + FOLLOW_EVERY,
             cwd,
             worked: Vec::new(),
+            times: Vec::new(),
             last_item: None,
             unresolved: false,
             joined: None,
@@ -966,6 +973,7 @@ impl Chat {
             name: name.to_string(),
             description: description.to_string(),
             args: args.map(str::to_string),
+            kind: Some(CommandKind::Command),
         });
         Ev::Commands {
             commands: own.chain(self.commands.iter().cloned()).collect(),
@@ -1034,13 +1042,15 @@ impl Chat {
         } else {
             Item::Text { id, text }
         };
-        self.send_item(out, item)
+        self.last_item = Some(item.id().to_string());
+        out.send(&Ev::partial(item))?;
+        Ok(())
     }
 
     /// An item new or changed, which the turn's time is then said after.
     fn send_item(&mut self, out: &Out, item: Item) -> Result<()> {
         self.last_item = Some(item.id().to_string());
-        out.send(&Ev::Item { item })?;
+        out.send(&Ev::item(item))?;
         Ok(())
     }
 
@@ -1072,6 +1082,10 @@ impl Chat {
         })?;
         for ev in worked {
             out.send(ev)?;
+        }
+        let times: Vec<(String, u64)> = self.times.iter().filter(|(id, _)| ids.contains(id.as_str())).cloned().collect();
+        if !times.is_empty() {
+            out.send(&Ev::Times { times })?;
         }
         Ok(())
     }
@@ -1301,6 +1315,7 @@ fn open(api: &Api, chat: &mut Chat, out: &Out) -> Result<()> {
     }
     remember_tools(chat, &listed.tools);
     chat.worked = listed.worked;
+    chat.times = listed.times;
     chat.open_end = listed.open_end.clone();
     chat.last_item = listed.items.last().map(|item| item.id().to_string());
     chat.send_page(out, listed.items, true)?;
@@ -1357,6 +1372,7 @@ fn list_commands(api: &Api, chat: &mut Chat) {
                         ),
                         // What it is about follows it, if anything.
                         args: Some(String::new()),
+                        kind: Some(CommandKind::Command),
                     })
                 })
                 .filter(|command| !OWN_COMMANDS.iter().any(|(own, _, _)| *own == command.name))
@@ -1364,6 +1380,44 @@ fn list_commands(api: &Api, chat: &mut Chat) {
         }
         Err(err) => log::info!("agent chat: no OpenCode commands: {err:#}"),
     }
+    // Skills, as its terminal offers them: `@name`, taken up with what
+    // is said. Listed anew each time, the commands kept when they could
+    // not be read again.
+    chat.commands.retain(|command| command.kind != Some(CommandKind::Skill));
+    chat.skills.clear();
+    match api.get(&format!("/api/skill?{}", api.location())) {
+        Ok(listed) => {
+            for skill in listed["data"].as_array().into_iter().flatten() {
+                let (Some(id), Some(name)) = (skill["id"].as_str(), skill["name"].as_str()) else {
+                    continue;
+                };
+                if chat.skills.iter().any(|(known, _)| known == name) {
+                    continue;
+                }
+                chat.skills.push((name.to_string(), id.to_string()));
+                chat.commands.push(CommandInfo {
+                    name: format!("@{name}"),
+                    description: head(
+                        &skill["description"].as_str().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" "),
+                        DETAIL_KEPT,
+                    ),
+                    args: Some(String::new()),
+                    kind: Some(CommandKind::Skill),
+                });
+            }
+        }
+        Err(err) => log::info!("agent chat: no OpenCode skills: {err:#}"),
+    }
+}
+
+/// The skills `text` names (`@name`, a word of its own), as a prompt
+/// takes them in.
+fn skills_named(text: &str, skills: &[(String, String)]) -> Vec<Value> {
+    skills
+        .iter()
+        .filter(|(name, _)| super::names_with(text, '@', name))
+        .map(|(_, id)| json!({ "id": id }))
+        .collect()
 }
 
 /// Sub-agents' sessions asked about at most, the newest.
@@ -1549,6 +1603,8 @@ struct Messages {
     turn_started: Option<u64>,
     /// How long each turn that ended worked, after its last item.
     worked: Vec<Ev>,
+    /// When each item came about: its message's making (unix seconds).
+    times: Vec<(String, u64)>,
     /// The newest step's message.
     last_assistant: Option<String>,
     /// The first turn's end, when its start is on an older page.
@@ -1570,8 +1626,10 @@ fn messages_to_items(messages: &[Value], older: Option<String>, cwd: Option<&str
     let mut last_assistant = None;
     let mut open_end = None;
     let mut said = false;
+    let mut times = Vec::new();
     for message in messages {
         let created = message["time"]["created"].as_u64();
+        let before = items.len();
         match message["type"].as_str() {
             Some("user") => {
                 // What is added to a running turn does not start another.
@@ -1643,6 +1701,10 @@ fn messages_to_items(messages: &[Value], older: Option<String>, cwd: Option<&str
             // told on the way: nothing said.
             _ => {}
         }
+        // Each item made of a message came about when it was made.
+        if let Some(created) = created {
+            times.extend(items[before..].iter().map(|item| (item.id().to_string(), created / 1000)));
+        }
     }
     Messages {
         items,
@@ -1651,6 +1713,7 @@ fn messages_to_items(messages: &[Value], older: Option<String>, cwd: Option<&str
         tools,
         turn_started,
         worked,
+        times,
         last_assistant,
         open_end,
     }
@@ -2328,6 +2391,10 @@ fn handle_op(api: &Api, chat: &mut Chat, out: &Out, op: Op) -> Result<()> {
             if !files.is_empty() {
                 body["files"] = Value::Array(files);
             }
+            let skills = skills_named(&text, &chat.skills);
+            if !skills.is_empty() {
+                body["skills"] = Value::Array(skills);
+            }
             if let Err(err) = api.post(&format!("/api/session/{session}/prompt"), &body) {
                 out.refused(format!("{err:#}"))?;
             }
@@ -2376,6 +2443,7 @@ fn handle_op(api: &Api, chat: &mut Chat, out: &Out, op: Op) -> Result<()> {
                     chat.older = listed.older;
                     remember_tools(chat, &listed.tools);
                     chat.worked.extend(listed.worked);
+                    chat.times.extend(listed.times);
                     // A turn that ended on the newer page and began on this
                     // one: said now, after what it ended with.
                     let mut across = None;

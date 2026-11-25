@@ -711,7 +711,14 @@ impl State {
                 return;
             }
             ChatCmd::Send { text, attachments } => {
-                self.chat_op_or_end(ChatOp::Send { text, attachments });
+                // A command only the agent's terminal takes is said so here,
+                // rather than reach the model as words. Words sent with a
+                // picture or a file are for the model, whatever they begin
+                // with.
+                let refused = attachments.is_empty() && self.chat.as_mut().is_some_and(|chat| !chat.model.may_send(&text));
+                if !refused {
+                    self.chat_op_or_end(ChatOp::Send { text, attachments });
+                }
             }
             ChatCmd::SetModel { model, effort } => {
                 self.chat_op_or_end(ChatOp::SetModel { model, effort });
@@ -741,7 +748,12 @@ impl State {
                     }
                 }
             }
-            ChatCmd::Load => self.chat_op_or_end(ChatOp::Reload),
+            ChatCmd::Load => {
+                if let Some(chat) = self.chat.as_mut() {
+                    chat.model.reload_sent();
+                }
+                self.chat_op_or_end(ChatOp::Reload);
+            }
             ChatCmd::Install => {
                 self.chat_op(ChatOp::Install);
             }

@@ -429,6 +429,19 @@ pub(crate) fn tail(text: &str, max: usize) -> String {
     }
 }
 
+/// Whether `text` names `name` after `sign` as a word of its own
+/// (`$review`, `@review`): not inside a word, nor followed by more of a
+/// name.
+pub(crate) fn names_with(text: &str, sign: char, name: &str) -> bool {
+    let mention = format!("{sign}{name}");
+    text.match_indices(&mention).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + mention.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':')
+    })
+}
+
 /// The head of `text`: at most `max` bytes, on a character boundary.
 pub(crate) fn head(text: &str, max: usize) -> String {
     if text.len() <= max {

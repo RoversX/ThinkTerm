@@ -75,7 +75,7 @@ fn fill_within(line: &str, mut room: usize) -> String {
     };
     let items: &mut [Item] = match &mut ev {
         Ev::History { items, .. } => items,
-        Ev::Item { item } => std::slice::from_mut(item),
+        Ev::Item { item, .. } => std::slice::from_mut(item),
         _ => return line.to_string(),
     };
     'items: for item in items.iter_mut().rev() {
@@ -121,6 +121,7 @@ mod tests {
         let filled: Ev = serde_json::from_str(&fill_line(&line)).unwrap();
         let Ev::Item {
             item: Item::User { attachments, .. },
+            ..
         } = filled
         else {
             panic!("not a user item");

@@ -19,7 +19,7 @@ import * as path from "node:path";
 
 /// Raised with every change: ThinkTerm puts a newer one in place of an
 /// older one when a chat opens.
-const EXTENSION_VERSION = 10;
+const EXTENSION_VERSION = 11;
 /// 2: what is said may carry files and pictures; the model can be changed.
 /// 3: the commands the session takes are listed (`commands`), and how full
 /// its context is said (`context`).
@@ -352,7 +352,7 @@ export default function (pi: ExtensionAPI) {
   function sendCommands(to?: net.Socket) {
     // `/new` and `/reload` only where the command they go through is
     // there to run them.
-    const commands: object[] = OWN_COMMANDS.filter((c) => runs() || (c.name !== "/new" && c.name !== "/reload"));
+    const commands: object[] = OWN_COMMANDS.filter((c) => runs() || (c.name !== "/new" && c.name !== "/reload")).map((c) => ({ ...c, kind: "command" }));
     let listed: any[] = [];
     try {
       listed = typeof pi.getCommands === "function" ? pi.getCommands() : [];
@@ -364,7 +364,8 @@ export default function (pi: ExtensionAPI) {
       seen.add(name);
       const description = String(command?.description ?? "").replace(/\s+/g, " ").trim();
       // What these take is not said: each is given room to be followed.
-      commands.push({ name, description: description.slice(0, DESCRIPTION_KEPT), args: "" });
+      const kind = command?.source === "skill" ? "skill" : command?.source === "prompt" ? "prompt" : "command";
+      commands.push({ name, description: description.slice(0, DESCRIPTION_KEPT), args: "", kind });
     }
     send({ ev: "commands", commands }, to);
   }
@@ -642,6 +643,9 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // When each item of the history read came about, in unix seconds, by id.
+  const itemTimes = new Map<string, number>();
+
   // The conversation so far, as chat items: the branch shown, its tool
   // calls met with their results.
   function allItems(): any[] {
@@ -670,8 +674,13 @@ export default function (pi: ExtensionAPI) {
       if (turn?.after && turn.to > turn.from)
         worked.push({ ev: "worked", id: `w-${turn.id}`, after: turn.after, seconds: Math.round((turn.to - turn.from) / 1000) });
     };
+    itemTimes.clear();
     for (const entry of entries) {
-      if (entry?.type === "compaction") items.push(compacted(entry.id));
+      if (entry?.type === "compaction") {
+        items.push(compacted(entry.id));
+        const at = timeOf(entry);
+        if (at !== undefined) itemTimes.set(entry.id, Math.round(at / 1000));
+      }
       if (entry?.type !== "message") continue;
       const role = entry.message?.role;
       const at = timeOf(entry);
@@ -686,6 +695,7 @@ export default function (pi: ExtensionAPI) {
       else if (role === "toolResult") midRun = true;
       const made = fromMessage(entry.message, entry.id, results) as any[];
       items.push(...made);
+      if (at !== undefined) for (const item of made) itemTimes.set(item.id, Math.round(at / 1000));
       if (turn && made.length && (role === "assistant" || role === "toolResult")) turn.after = made[made.length - 1].id;
     }
     // The turn on its way has not ended.
@@ -693,11 +703,14 @@ export default function (pi: ExtensionAPI) {
     return { items, worked };
   }
 
-  // A page of history, then how long its turns worked.
+  // A page of history, then how long its turns worked and when its items
+  // came about.
   function sendPage(client: net.Socket, items: any[], more: boolean, reset: boolean, worked: any[]) {
     send({ ev: "history", items, more, reset }, client);
     const ids = new Set(items.map((item) => item.id));
     for (const ev of worked) if (ids.has(ev.after)) send(ev, client);
+    const times = items.filter((item) => itemTimes.has(item.id)).map((item) => [item.id, itemTimes.get(item.id)]);
+    if (times.length) send({ ev: "times", times }, client);
   }
 
   // When an entry was written, in milliseconds.
@@ -1204,7 +1217,8 @@ export default function (pi: ExtensionAPI) {
       if (!now) return;
       try {
         for (const item of fromMessage(now.message, now.id) as any[]) {
-          if (item.kind === "text" || item.kind === "thinking") send({ ev: "item", item });
+          // More of it comes: the item sent whole at its end.
+          if (item.kind === "text" || item.kind === "thinking") send({ ev: "item", item, partial: true });
         }
       } catch {}
     }, WRITING_EVERY);

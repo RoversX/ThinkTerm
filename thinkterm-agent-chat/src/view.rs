@@ -5,7 +5,7 @@
 
 use crate::markdown::{blocks, Block};
 use crate::{
-    diff, AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, ContextInfo, Done, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need,
+    diff, AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, CommandKind, ContextInfo, Done, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need,
     NoteKind, PartKind, Status,
 };
 use serde::Serialize;
@@ -35,7 +35,8 @@ pub struct Chat {
     since: Option<u64>,
     asks: Vec<Ask>,
     problem: Option<(Option<Need>, String)>,
-    notice: Option<(u64, String)>,
+    /// The notice on show, and the words it gives back to the field.
+    notice: Option<(u64, String, Option<String>)>,
     /// Folds the person opened, by row id.
     open: HashSet<String>,
     /// Items held at most: [`ITEMS_KEPT`], and as many more as the person
@@ -59,6 +60,17 @@ pub struct Chat {
     can_load: bool,
     /// The agent runs an older extension than the one in its folder.
     outdated: bool,
+    /// Its reload command was sent: the greeting of the extension taken
+    /// in anew is told as done.
+    reloading: bool,
+    /// When each item came about (unix seconds): as the bridge says for
+    /// history, else when it first came here.
+    times: HashMap<String, u64>,
+    /// The items still being written (`Ev::Item::partial`).
+    writing: HashSet<String>,
+    /// What was last refused as a command only the terminal takes: sent
+    /// again as it is, it goes, as words (`/tmp is full` is no command).
+    refused: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +116,11 @@ pub struct ChatView {
     /// folder: said over the field, with the button that loads the new
     /// one (`load`).
     pub outdated: Option<OutdatedView>,
+    /// When each row came about (unix seconds), by its id, where known.
+    pub times: HashMap<String, u64>,
+    /// The rows of what the agent is still writing, by id: shown as they
+    /// grow, or held back until whole, as the app is set to.
+    pub writing: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +186,10 @@ pub struct CommandView {
     pub args: Option<String>,
     /// Done by the client rather than sent: `model` opens the model menu.
     pub here: Option<&'static str>,
+    /// `skill`, `command` or `prompt`: its icon, and the group it is in.
+    pub kind: &'static str,
+    /// Over the group it begins: "Skills". The commands come by group.
+    pub group: String,
 }
 
 /// The model button and its menu: the models, each opening on how hard it
@@ -225,7 +246,14 @@ pub enum Row {
         /// Pictures and files sent with it.
         attachments: Vec<AttachmentView>,
     },
-    Text { id: String, blocks: Vec<Block> },
+    Text {
+        id: String,
+        blocks: Vec<Block>,
+        /// The words as written, for the last reply of a turn: what a
+        /// copy of the answer takes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        copy: Option<String>,
+    },
     Fold {
         id: String,
         /// `think`, `look`, `run`, `edit`, `tool`.
@@ -337,6 +365,9 @@ pub struct ActionView {
 pub struct NoticeView {
     pub seq: u64,
     pub text: String,
+    /// What was typed and not sent: back in the field, to be put right.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
 }
 
 impl Chat {
@@ -382,6 +413,11 @@ impl Chat {
                 self.guessed |= guessed;
                 self.problem = None;
                 self.state.get_or_insert(AgentState::Idle);
+                if std::mem::take(&mut self.reloading) {
+                    let mut args = FluentArgs::new();
+                    args.set("agent", display_name(&self.agent));
+                    self.notify(tr_args("chat-reloaded", &args));
+                }
             }
             Ev::History { mut items, more, reset } => {
                 for item in &mut items {
@@ -390,6 +426,7 @@ impl Chat {
                 if reset {
                     self.items = items;
                     self.limit = ITEMS_KEPT;
+                    self.writing.clear();
                     // The conversation from the start: what it still asks is
                     // said again after it (an agent restarted asks nothing
                     // of before).
@@ -405,8 +442,18 @@ impl Chat {
                 self.loading_older = false;
                 self.trim();
             }
-            Ev::Item { mut item } => {
+            Ev::Item { mut item, partial } => {
                 self.keep_pictures(&mut item);
+                let id = item.id().to_string();
+                // Only a turn under way writes: one sent after it ended (a
+                // last flush after a stop) is all there is of it.
+                if partial && self.state == Some(AgentState::Working) {
+                    self.writing.insert(id.clone());
+                } else {
+                    self.writing.remove(&id);
+                }
+                // As it comes: the bridge says when only for history.
+                self.times.entry(id).or_insert_with(now);
                 match self.items.iter_mut().rev().find(|held| held.id() == item.id()) {
                     Some(held) => *held = item,
                     None => self.items.push(item),
@@ -418,6 +465,11 @@ impl Chat {
                     self.since = since;
                 }
                 self.state = Some(state);
+                // At rest, nothing is still being written: what was is all
+                // there will be of it (a turn stopped mid-sentence).
+                if state != AgentState::Working {
+                    self.writing.clear();
+                }
             }
             Ev::Models { current, effort, models } => self.models = Some((current, effort, models)),
             Ev::Commands { commands } => self.commands = commands,
@@ -435,8 +487,10 @@ impl Chat {
                 self.problem = Some((Some(Need::PiRestart), String::new()));
             }
             Ev::Refused { message } => {
-                // What was refused may be the older history asked for.
+                // What was refused may be the older history asked for, or
+                // the reload sent.
                 self.loading_older = false;
+                self.reloading = false;
                 let mut args = FluentArgs::new();
                 args.set("why", message);
                 self.notify(tr_args("chat-refused", &args));
@@ -444,8 +498,10 @@ impl Chat {
             Ev::Error { need, message, can_load } => {
                 self.problem = Some((need, message));
                 self.can_load = can_load;
+                self.writing.clear();
             }
             Ev::Outdated => self.outdated = true,
+            Ev::Times { times } => self.times.extend(times),
             // Put after what it follows; with that not held, let go.
             Ev::Worked { id, after, seconds } => {
                 self.items.retain(|item| item.id() != id);
@@ -472,6 +528,8 @@ impl Chat {
             self.problem = Some((None, reason.to_string()));
         }
         self.asks.clear();
+        // What came of a reply is all there will be on this channel.
+        self.writing.clear();
     }
 
     /// A new channel is on its way: what was held stays on show until
@@ -487,6 +545,8 @@ impl Chat {
         self.context = None;
         self.can_load = false;
         self.outdated = false;
+        self.reloading = false;
+        self.writing.clear();
     }
 
     /// The small pictures in `item`, kept by key and taken out of it.
@@ -594,8 +654,12 @@ impl Chat {
     }
 
     fn notify(&mut self, text: String) {
-        let seq = self.notice.as_ref().map_or(1, |(seq, _)| seq + 1);
-        self.notice = Some((seq, text));
+        self.notify_keeping(text, None);
+    }
+
+    fn notify_keeping(&mut self, text: String, kept: Option<String>) {
+        let seq = self.notice.as_ref().map_or(1, |(seq, _, _)| seq + 1);
+        self.notice = Some((seq, text, kept));
     }
 
     /// What does not fit goes, oldest first. The bridge is not asked for it
@@ -605,7 +669,9 @@ impl Chat {
     fn trim(&mut self) {
         if self.items.len() > self.limit {
             let extra = self.items.len() - self.limit;
-            self.items.drain(..extra);
+            for item in self.items.drain(..extra) {
+                self.times.remove(item.id());
+            }
             self.more = false;
         }
     }
@@ -621,6 +687,22 @@ impl Chat {
         };
         let resting = !matches!(self.state, Some(AgentState::Working) | Some(AgentState::Blocked));
         let rows = self.rows(resting);
+        // A group's time is its first item's.
+        let times = rows
+            .iter()
+            .filter_map(|row| {
+                let id = row_id(row);
+                let first = id.strip_prefix("group:").unwrap_or(id);
+                self.times.get(first).map(|at| (id.to_string(), *at))
+            })
+            .collect();
+        let writing = rows
+            .iter()
+            .filter(|row| matches!(row, Row::Text { .. }))
+            .map(row_id)
+            .filter(|id| self.writing.contains(*id))
+            .map(str::to_string)
+            .collect();
         let busy = (state == "working").then(|| match self.items.last() {
             Some(Item::Command {
                 command,
@@ -657,9 +739,10 @@ impl Chat {
                 .problem
                 .as_ref()
                 .map(|(need, detail)| problem_view(*need, detail, &self.agent, self.can_load)),
-            notice: self.notice.as_ref().map(|(seq, text)| NoticeView {
+            notice: self.notice.as_ref().map(|(seq, text, kept)| NoticeView {
                 seq: *seq,
                 text: text.clone(),
+                kept: kept.clone(),
             }),
             placeholder: tr_args("chat-placeholder", &args),
             pane: self.pane,
@@ -681,6 +764,8 @@ impl Chat {
             }),
             model: self.model_view(),
             agent,
+            times,
+            writing,
         }
     }
 
@@ -701,7 +786,32 @@ impl Chat {
             }
             i += 1;
         }
+        self.mark_answers(&mut rows, resting);
         rows
+    }
+
+    /// The last reply of each turn finished -- one the person spoke after,
+    /// or the last of all once the agent rests -- carries its words to be
+    /// copied whole.
+    fn mark_answers(&self, rows: &mut [Row], resting: bool) {
+        let mut ends = Vec::new();
+        for (at, row) in rows.iter().enumerate() {
+            if !matches!(row, Row::Text { .. }) {
+                continue;
+            }
+            let next = rows[at + 1..].iter().find(|row| !matches!(row, Row::Note { .. }));
+            if matches!(next, Some(Row::User { .. })) || (next.is_none() && resting) {
+                ends.push(at);
+            }
+        }
+        for at in ends {
+            if let Row::Text { id, copy, .. } = &mut rows[at] {
+                *copy = self.items.iter().rev().find_map(|item| match item {
+                    Item::Text { id: held, text } if held == id => Some(text.clone()),
+                    _ => None,
+                });
+            }
+        }
     }
 
     /// The ring and its sheet, once the agent has said how full it is.
@@ -786,30 +896,92 @@ impl Chat {
         })
     }
 
-    /// What the field offers on `/`: the model menu, when there is one, and
-    /// the agent's commands, in its own order.
+    /// What the field offers on `/`, by group: the skills, the commands
+    /// (the model menu first, when there is one), then the prompts --
+    /// each group in the agent's own order.
     fn command_views(&self) -> Vec<CommandView> {
-        let mut views = Vec::new();
+        let view = |command: &CommandInfo, kind: &'static str| CommandView {
+            name: command.name.clone(),
+            description: command.description.clone(),
+            args: command.args.clone(),
+            here: None,
+            kind,
+            group: String::new(),
+        };
+        let mut skills = Vec::new();
+        let mut commands = Vec::new();
+        let mut prompts = Vec::new();
         if self.models.as_ref().is_some_and(|(current, _, _)| current.is_some()) {
-            views.push(CommandView {
+            commands.push(CommandView {
                 name: "/model".into(),
                 description: tr("chat-command-model"),
                 args: None,
                 here: Some("model"),
+                kind: "command",
+                group: String::new(),
             });
         }
-        views.extend(
-            self.commands
-                .iter()
-                .filter(|command| command.name != "/model")
-                .map(|command| CommandView {
-                    name: command.name.clone(),
-                    description: command.description.clone(),
-                    args: command.args.clone(),
-                    here: None,
-                }),
-        );
+        // Each name once: the lists key their rows by it.
+        let mut seen = HashSet::new();
+        for command in self.commands.iter().filter(|command| command.name != "/model" && seen.insert(command.name.as_str())) {
+            match command_kind(command) {
+                CommandKind::Skill => skills.push(view(command, "skill")),
+                CommandKind::Prompt => prompts.push(view(command, "prompt")),
+                CommandKind::Command | CommandKind::Other => commands.push(view(command, "command")),
+            }
+        }
+        let mut views = Vec::new();
+        for (mut group, key) in [(skills, "chat-commands-skills"), (commands, "chat-commands-commands"), (prompts, "chat-commands-prompts")] {
+            let heading = tr(key);
+            for view in &mut group {
+                view.group = heading.clone();
+            }
+            views.append(&mut group);
+        }
         views
+    }
+
+    /// Whether `text` may go to the agent. A command it does not take
+    /// (`/goal`, which only its terminal knows) would reach the model as
+    /// words: it is refused here, said why, given back to the field, and
+    /// false. Sent again as it is, it goes, as words. Its reload command
+    /// is kept in mind, to tell when the agent has taken it.
+    pub fn may_send(&mut self, text: &str) -> bool {
+        let again = self.refused.take().is_some_and(|refused| refused == text);
+        let Some(name) = command_typed(text) else {
+            return true;
+        };
+        // The agent has not said what it takes (an older bridge).
+        if !again && !self.commands.is_empty() && !self.takes(name) {
+            let mut args = FluentArgs::new();
+            args.set("command", name.to_string());
+            args.set("agent", display_name(&self.agent));
+            self.notify_keeping(tr_args("chat-command-terminal", &args), Some(text.to_string()));
+            self.refused = Some(text.to_string());
+            return false;
+        }
+        if name == crate::reload_command(&self.agent) {
+            self.reload_sent();
+        }
+        true
+    }
+
+    /// Whether the agent's bridge runs the command `name`: one it listed,
+    /// or one it takes as typed without listing it. As they match them:
+    /// in the case they are listed in.
+    fn takes(&self, name: &str) -> bool {
+        let unlisted: &[&str] = match self.agent.as_str() {
+            "pi" | "omp" => &["/model", "/thinking"],
+            "opencode" => &["/model", "/summarize"],
+            _ => &["/model"],
+        };
+        self.commands.iter().any(|command| command.name == name) || unlisted.contains(&name)
+    }
+
+    /// The agent was asked to take its extension in anew: its next greeting
+    /// is told as that done.
+    pub fn reload_sent(&mut self) {
+        self.reloading = true;
     }
 
     /// The model button and what it opens on, once the agent has said.
@@ -990,6 +1162,7 @@ impl Chat {
             Item::Text { id, text } => Row::Text {
                 id: id.clone(),
                 blocks: blocks(text),
+                copy: None,
             },
             Item::Thinking { id, text } => self.fold(
                 id,
@@ -1048,12 +1221,23 @@ impl Chat {
                     [one] => {
                         let mut args = FluentArgs::new();
                         args.set("file", file_name(&one.path));
-                        tr_args(if going { "chat-editing" } else { "chat-edited" }, &args)
+                        let key = match status {
+                            _ if going => "chat-editing",
+                            // It did not come about: not "edited".
+                            Status::Failed => "chat-edit-failed",
+                            _ => "chat-edited",
+                        };
+                        tr_args(key, &args)
                     }
                     many => {
                         let mut args = FluentArgs::new();
                         args.set("count", many.len() as i64);
-                        tr_args(if going { "chat-editing-files" } else { "chat-edited-files" }, &args)
+                        let key = match status {
+                            _ if going => "chat-editing-files",
+                            Status::Failed => "chat-edit-failed-files",
+                            _ => "chat-edited-files",
+                        };
+                        tr_args(key, &args)
                     }
                 };
                 let badge = (*status == Status::Declined).then(|| tr("chat-declined"));
@@ -1401,6 +1585,12 @@ fn problem_view(need: Option<Need>, detail: &str, agent_id: &str, can_load: bool
             label: tr("chat-retry"),
         })
     };
+    let terminal = || {
+        Some(ActionView {
+            id: "terminal",
+            label: tr("chat-open-terminal"),
+        })
+    };
     let (key, action) = match need {
         Some(Need::PiExtension) => (
             "chat-need-pi-extension",
@@ -1427,9 +1617,10 @@ fn problem_view(need: Option<Need>, detail: &str, agent_id: &str, can_load: bool
         Some(Need::OpenCodeService) => ("chat-need-opencode-service", retry()),
         Some(Need::OpenCodeSession) => ("chat-need-opencode-session", retry()),
         Some(Need::OpenCodeUpgrade) => ("chat-need-opencode-upgrade", retry()),
-        Some(Need::NotHere) => ("chat-need-not-here", None),
-        Some(Need::Unsupported) => ("chat-need-unsupported", None),
-        Some(Need::Bridge) => ("chat-need-bridge", None),
+        // Nothing to do here: the terminal is where the agent is.
+        Some(Need::NotHere) => ("chat-need-not-here", terminal()),
+        Some(Need::Unsupported) => ("chat-need-unsupported", terminal()),
+        Some(Need::Bridge) => ("chat-need-bridge", terminal()),
         None => ("chat-ended", retry()),
     };
     ProblemView {
@@ -1442,6 +1633,39 @@ fn problem_view(need: Option<Need>, detail: &str, agent_id: &str, can_load: bool
         detail: detail.to_string(),
         action,
     }
+}
+
+/// A row's id.
+fn row_id(row: &Row) -> &str {
+    match row {
+        Row::User { id, .. } | Row::Text { id, .. } | Row::Fold { id, .. } | Row::Note { id, .. } | Row::Group { id, .. } => id,
+    }
+}
+
+/// Now, in unix seconds.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// What a command is: as its bridge says, else as its name tells.
+fn command_kind(command: &CommandInfo) -> CommandKind {
+    match command.kind {
+        Some(kind) => kind,
+        None if command.name.starts_with('$') || command.name.starts_with("/skill:") => CommandKind::Skill,
+        None => CommandKind::Command,
+    }
+}
+
+/// The command `text` begins with, when it begins with one: `/name`, a
+/// word of its own (not a path such as `/usr/bin`).
+fn command_typed(text: &str) -> Option<&str> {
+    let word = text.split_whitespace().next()?;
+    let name = word.strip_prefix('/')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    (first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))).then_some(word)
 }
 
 pub fn display_name(agent: &str) -> String {
@@ -1691,9 +1915,7 @@ mod tests {
             more: true,
             reset: true,
         });
-        chat.apply(Ev::Item {
-            item: command("c", "make", Status::Done, vec![]),
-        });
+        chat.apply(Ev::item(command("c", "make", Status::Done, vec![])));
         chat.apply(Ev::History {
             items: vec![Item::User {
                 id: "old".into(),
@@ -1724,6 +1946,7 @@ mod tests {
                     exit: None,
                     looks: vec![],
                 },
+                partial: false,
             });
             match &chat.view().rows[0] {
                 Row::Fold { label, .. } => label.clone(),
@@ -1785,7 +2008,8 @@ mod tests {
         let view = chat.view();
         assert_eq!(view.state, "problem");
         assert!(!view.can_send);
-        assert!(view.problem.unwrap().action.is_none());
+        // Nothing to do here but go to the terminal.
+        assert_eq!(view.problem.unwrap().action.map(|a| a.id), Some("terminal"));
     }
 
     #[test]
@@ -1850,7 +2074,7 @@ mod tests {
         });
         assert!(chat.view().more);
         for n in 1..=ITEMS_KEPT {
-            chat.apply(Ev::Item { item: said(n) });
+            chat.apply(Ev::item(said(n)));
         }
         // What the bridge would send next is from before c0, which went.
         let view = chat.view();
@@ -1990,6 +2214,7 @@ mod tests {
                 id: "t".into(),
                 text: "x".into(),
             },
+            partial: false,
         });
         assert!(matches!(chat.view().rows[..], [Row::Fold { .. }]));
     }
@@ -2063,6 +2288,7 @@ mod tests {
                     thumb: Some("AAAA".into()),
                 }],
             },
+            partial: false,
         });
         let view = chat.view();
         let Row::User { text, attachments, .. } = &view.rows[0] else {
@@ -2135,11 +2361,26 @@ mod tests {
                     name: "/compact".into(),
                     description: "Compact the context".into(),
                     args: None,
+                    kind: None,
                 },
                 CommandInfo {
                     name: "/name".into(),
                     description: "Name the session".into(),
                     args: Some("<name>".into()),
+                    kind: Some(CommandKind::Command),
+                },
+                CommandInfo {
+                    name: "/fix-tests".into(),
+                    description: "Fix what fails".into(),
+                    args: Some(String::new()),
+                    kind: Some(CommandKind::Prompt),
+                },
+                // An older extension says no kind: its name tells.
+                CommandInfo {
+                    name: "/skill:review".into(),
+                    description: "Review".into(),
+                    args: Some(String::new()),
+                    kind: None,
                 },
             ],
         });
@@ -2148,15 +2389,152 @@ mod tests {
             effort: None,
             models: vec![],
         });
-        let names: Vec<_> = chat.view().commands.iter().map(|c| (c.name.clone(), c.here, c.args.is_some())).collect();
+        let names: Vec<_> = chat.view().commands.iter().map(|c| (c.name.clone(), c.here, c.args.is_some(), c.kind)).collect();
         assert_eq!(
             names,
             [
-                ("/model".to_string(), Some("model"), false),
-                ("/compact".to_string(), None, false),
-                ("/name".to_string(), None, true)
+                ("/skill:review".to_string(), None, true, "skill"),
+                ("/model".to_string(), Some("model"), false, "command"),
+                ("/compact".to_string(), None, false, "command"),
+                ("/name".to_string(), None, true, "command"),
+                ("/fix-tests".to_string(), None, true, "prompt"),
             ]
         );
+        let groups: Vec<_> = chat.view().commands.iter().map(|c| c.group.clone()).collect();
+        assert!(groups[0] != groups[1] && groups[1] == groups[3] && groups[3] != groups[4], "{groups:?}");
+    }
+
+    #[test]
+    fn a_command_only_the_terminal_takes_is_refused_here() {
+        let mut chat = Chat::new(1, "codex");
+        // Nothing said of what it takes: everything goes.
+        assert!(chat.may_send("/goal ship it"));
+        chat.apply(Ev::Commands {
+            commands: vec![CommandInfo {
+                name: "/compact".into(),
+                description: String::new(),
+                args: None,
+                kind: Some(CommandKind::Command),
+            }],
+        });
+        assert!(chat.may_send("/compact"));
+        assert!(chat.may_send("/model"));
+        assert!(chat.may_send("please look at /usr/bin/env"));
+        assert!(chat.may_send("/usr/bin/env is missing"));
+        assert!(chat.may_send("$review this"));
+        assert!(chat.view().notice.is_none());
+        // Codex's own take only `/thinking`'s Pi.
+        assert!(!chat.may_send("/thinking high"));
+        // Matched as the bridge matches: `/COMPACT` would reach the model.
+        assert!(!chat.may_send("/COMPACT"));
+        assert!(!chat.may_send("/goal ship it"));
+        let notice = chat.view().notice.unwrap();
+        assert!(notice.text.contains("/goal"));
+        assert_eq!(notice.kept.as_deref(), Some("/goal ship it"), "given back to the field");
+        // Sent again as it is: words (`/tmp is full` is no command).
+        assert!(!chat.may_send("/tmp is full"));
+        assert!(chat.may_send("/tmp is full"));
+        // Only right after: refused once more.
+        assert!(!chat.may_send("/tmp is full"));
+    }
+
+    #[test]
+    fn opencode_takes_summarize_and_pi_thinking_unlisted() {
+        let compact = CommandInfo {
+            name: "/compact".into(),
+            description: String::new(),
+            args: None,
+            kind: Some(CommandKind::Command),
+        };
+        let mut opencode = Chat::new(1, "opencode");
+        opencode.apply(Ev::Commands {
+            commands: vec![compact.clone()],
+        });
+        assert!(opencode.may_send("/summarize"));
+        let mut pi = Chat::new(2, "pi");
+        pi.apply(Ev::Commands { commands: vec![compact] });
+        assert!(pi.may_send("/thinking high"));
+    }
+
+    #[test]
+    fn a_reload_refused_is_not_told_as_done() {
+        let mut chat = Chat::new(1, "pi");
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi"}"#);
+        chat.reload_sent();
+        chat.line(r#"{"ev":"refused","message":"/reload waits until Pi is done (or stopped)"}"#);
+        let refused = chat.view().notice.unwrap().seq;
+        // A rename's greeting, later.
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi","title":"x"}"#);
+        assert_eq!(chat.view().notice.unwrap().seq, refused, "no reload told");
+    }
+
+    #[test]
+    fn a_reply_still_written_shows_once_the_channel_ends() {
+        let mut chat = Chat::new(1, "pi");
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi"}"#);
+        chat.line(r#"{"ev":"state","state":"working"}"#);
+        chat.line(r#"{"ev":"item","item":{"kind":"text","id":"t1","text":"half"},"partial":true}"#);
+        assert_eq!(chat.view().writing, vec!["t1".to_string()]);
+        chat.ended(false, "gone");
+        assert!(chat.view().writing.is_empty());
+        // A last flush after the turn ended is the reply whole.
+        let mut late = Chat::new(1, "codex");
+        late.line(r#"{"ev":"hello","protocol":3,"agent":"codex"}"#);
+        late.line(r#"{"ev":"state","state":"idle"}"#);
+        late.line(r#"{"ev":"item","item":{"kind":"text","id":"t2","text":"cut"},"partial":true}"#);
+        assert!(late.view().writing.is_empty());
+    }
+
+    #[test]
+    fn a_reload_sent_is_told_once_the_agent_greets_again() {
+        let mut chat = Chat::new(1, "pi");
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi"}"#);
+        chat.apply(Ev::Commands {
+            commands: vec![CommandInfo {
+                name: "/reload".into(),
+                description: String::new(),
+                args: None,
+                kind: Some(CommandKind::Command),
+            }],
+        });
+        assert!(chat.may_send("/reload"));
+        assert!(chat.view().notice.is_none());
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi"}"#);
+        let told = chat.view().notice.unwrap();
+        // Once.
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi"}"#);
+        assert_eq!(chat.view().notice.unwrap().seq, told.seq);
+    }
+
+    #[test]
+    fn the_last_reply_of_a_turn_can_be_copied_whole() {
+        let mut chat = Chat::new(1, "pi");
+        chat.line(r#"{"ev":"hello","protocol":3,"agent":"pi"}"#);
+        chat.apply(Ev::History {
+            items: vec![
+                Item::User { id: "u1".into(), text: "hi".into(), attachments: vec![] },
+                Item::Text { id: "t1".into(), text: "first **part**".into() },
+                Item::Text { id: "t2".into(), text: "the answer".into() },
+                Item::User { id: "u2".into(), text: "more".into(), attachments: vec![] },
+                Item::Text { id: "t3".into(), text: "still going".into() },
+            ],
+            more: false,
+            reset: true,
+        });
+        chat.apply(Ev::State { state: AgentState::Working, since: None });
+        let copies = |chat: &Chat| -> Vec<Option<String>> {
+            chat.view()
+                .rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    Row::Text { copy, .. } => Some(copy),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(copies(&chat), [None, Some("the answer".to_string()), None]);
+        chat.apply(Ev::State { state: AgentState::Idle, since: None });
+        assert_eq!(copies(&chat), [None, Some("the answer".to_string()), Some("still going".to_string())]);
     }
 
     #[test]
@@ -2189,6 +2567,7 @@ mod tests {
                 name: "/compact".into(),
                 description: String::new(),
                 args: None,
+                kind: None,
             }],
         });
         chat.apply(Ev::Context {
@@ -2236,6 +2615,7 @@ mod tests {
                 exit: Some(0),
                 looks: vec![],
             },
+            partial: false,
         });
         let closed = |chat: &Chat| match &chat.view().rows[0] {
             Row::Fold { can_open, body, open, .. } => (*can_open, body.is_some(), *open),
