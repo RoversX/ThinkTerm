@@ -1,5 +1,7 @@
 mod font_picker;
+mod font_presets;
 use font_picker::{FontCatalog, FontPicker, FontSlot, FontTarget, SampleFaces};
+use font_presets::CjkLanguage;
 use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
@@ -2480,12 +2482,16 @@ enum SettingsAction {
     AddFontFallback(FontTarget),
     /// Open the picker to replace the fallback font at this place.
     EditFontFallback(FontTarget, u8),
+    /// Open the picker on the recommended sets of fallback fonts.
+    RecommendFontFallbacks(FontTarget),
     /// Move the fallback font at this place one up (`true`) or down.
     MoveFontFallback(FontTarget, u8, bool),
     RemoveFontFallback(FontTarget, u8),
     FontPickerSearch,
     FontPickerDefault,
     FontPickerChoose(u16, u64),
+    /// Choose the recommended set for this language.
+    FontPickerPreset(CjkLanguage),
     FontPickerPage(i8),
     FontPickerApply,
     FontPickerCancel,
@@ -4534,6 +4540,10 @@ impl SettingsWindow {
                 "terminal-font" => Some((FontTarget::Terminal, FontSlot::Main)),
                 "interface-font-add" => Some((FontTarget::Interface, FontSlot::Add)),
                 "terminal-font-add" => Some((FontTarget::Terminal, FontSlot::Add)),
+                "interface-font-recommended" => {
+                    Some((FontTarget::Interface, FontSlot::Recommended))
+                }
+                "terminal-font-recommended" => Some((FontTarget::Terminal, FontSlot::Recommended)),
                 _ => None,
             };
             if let (Some((target, slot)), Some(settings)) =
@@ -6818,6 +6828,9 @@ impl SettingsWindow {
         match action {
             SettingsAction::OpenFontPicker(target) => self.open_font_picker(target, FontSlot::Main),
             SettingsAction::AddFontFallback(target) => self.open_font_picker(target, FontSlot::Add),
+            SettingsAction::RecommendFontFallbacks(target) => {
+                self.open_font_picker(target, FontSlot::Recommended)
+            }
             SettingsAction::EditFontFallback(target, index) => {
                 self.open_font_picker(target, FontSlot::Fallback(index))
             }
@@ -6828,6 +6841,7 @@ impl SettingsWindow {
                 self.remove_font_fallback(target, usize::from(index))
             }
             SettingsAction::FontPickerDefault => self.choose_font(None),
+            SettingsAction::FontPickerPreset(language) => self.choose_font_preset(language),
             SettingsAction::FontPickerChoose(index, generation) => {
                 self.choose_font(Some((index, generation)))
             }

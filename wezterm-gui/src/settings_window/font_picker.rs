@@ -1,3 +1,4 @@
+use super::font_presets::{font_presets, with_set, CjkLanguage, FontPreset};
 use super::*;
 use crate::native_settings::{FontStack, MAX_FONT_FALLBACKS};
 
@@ -81,6 +82,8 @@ pub(super) enum FontSlot {
     Add,
     /// The fallback font at this place.
     Fallback(u8),
+    /// All the fallback fonts at once, from a recommended set.
+    Recommended,
 }
 
 /// What one loaded font is made of: the names of the faces it loaded, the
@@ -219,6 +222,8 @@ struct FontEdit {
     draft: Option<String>,
     /// For a fallback's place, the family the picker opened on.
     replacing: Option<String>,
+    /// For the recommended sets, the fallbacks of the one chosen.
+    set: Option<Vec<String>>,
 }
 
 impl FontEdit {
@@ -226,6 +231,13 @@ impl FontEdit {
         match self.slot {
             FontSlot::Main => stack.primary.clone_from(&self.draft),
             FontSlot::Add => stack.fallbacks.extend(self.draft.clone()),
+            // Ahead of the list's other fonts, whatever it has now: the
+            // main font stays, and so do symbols and emoji fonts.
+            FontSlot::Recommended => {
+                if let Some(set) = &self.set {
+                    stack.fallbacks = with_set(set, &stack.fallbacks);
+                }
+            }
             FontSlot::Fallback(_) => {
                 let Some(draft) = &self.draft else {
                     return;
@@ -249,7 +261,7 @@ impl FontEdit {
     /// The family this edit puts in the list, which must be there after.
     fn adds(&self) -> Option<&str> {
         match self.slot {
-            FontSlot::Main => None,
+            FontSlot::Main | FontSlot::Recommended => None,
             FontSlot::Add | FontSlot::Fallback(_) => self.draft.as_deref(),
         }
     }
@@ -318,6 +330,15 @@ pub(super) struct FontPicker {
     default_main_generation: Option<usize>,
     /// For a fallback's place, the family it opened on.
     replacing: Option<String>,
+    /// For the recommended sets, the ones installed here, and the
+    /// catalogue they are from: its generation and length.
+    presets: Vec<FontPreset>,
+    presets_from: Option<(u64, usize)>,
+    /// The set shown and applied.
+    preset: Option<FontPreset>,
+    /// The language of the set chosen by hand; until then `preset` is the
+    /// first set, which a new catalogue may change.
+    chosen: Option<CjkLanguage>,
     preview: Option<Rc<LoadedFont>>,
     preview_key: Option<PreviewKey>,
     filtered: Vec<usize>,
@@ -334,11 +355,11 @@ impl FontPicker {
     ) -> Self {
         let replacing = match slot {
             FontSlot::Fallback(index) => base.fallbacks.get(usize::from(index)).cloned(),
-            FontSlot::Main | FontSlot::Add => None,
+            FontSlot::Main | FontSlot::Add | FontSlot::Recommended => None,
         };
         let draft = match slot {
             FontSlot::Main => base.primary.clone(),
-            FontSlot::Add => None,
+            FontSlot::Add | FontSlot::Recommended => None,
             FontSlot::Fallback(_) => replacing.clone(),
         };
         Self {
@@ -351,6 +372,10 @@ impl FontPicker {
             default_main,
             default_main_generation: None,
             replacing,
+            presets: Vec::new(),
+            presets_from: None,
+            preset: None,
+            chosen: None,
             preview: None,
             preview_key: None,
             filtered: Vec::new(),
@@ -369,6 +394,7 @@ impl FontPicker {
             slot: self.slot,
             draft: self.draft.clone(),
             replacing: self.replacing.clone(),
+            set: self.preset.as_ref().map(|preset| preset.families.clone()),
         }
     }
 
@@ -385,7 +411,7 @@ impl FontPicker {
     /// not have yet, nor the main font. Any family may become the main font.
     fn excluded(&self) -> Vec<String> {
         let keep = match self.slot {
-            FontSlot::Main => return Vec::new(),
+            FontSlot::Main | FontSlot::Recommended => return Vec::new(),
             FontSlot::Add => None,
             FontSlot::Fallback(index) => Some(usize::from(index)),
         };
@@ -408,7 +434,59 @@ impl FontPicker {
 
     /// Whether Apply has something to save.
     fn can_apply(&self) -> bool {
-        self.preview.is_some() && (self.slot == FontSlot::Main || self.draft.is_some())
+        self.preview.is_some()
+            && match self.slot {
+                FontSlot::Main => true,
+                FontSlot::Recommended => self.preset.is_some(),
+                FontSlot::Add | FontSlot::Fallback(_) => self.draft.is_some(),
+            }
+    }
+
+    /// The recommended sets for the catalogue as `names` (`None` while it
+    /// loads) and `generation` have it, worked out again when it changes.
+    /// The set shown is the one chosen, with the fonts installed now, and
+    /// until one is, the first: the system's language's.
+    fn refresh_presets(&mut self, names: Option<&[String]>, generation: u64) {
+        if self.slot != FontSlot::Recommended {
+            return;
+        }
+        let Some(names) = names else {
+            // Loading again: fonts listed may have gone, so there is
+            // nothing to show or apply until the new list is in.
+            if self.presets_from.take().is_some() {
+                self.presets.clear();
+                if self.preset.take().is_some() {
+                    self.clear_preview();
+                }
+            }
+            return;
+        };
+        let from = (generation, names.len());
+        if self.presets_from == Some(from) {
+            return;
+        }
+        // The system's languages first: the interface's has only the
+        // languages there are translations for, Simplified Chinese among
+        // them but not Traditional.
+        let locales: Vec<String> = crate::i18n::system_locales()
+            .into_iter()
+            .chain(std::iter::once(crate::i18n::current_locale().to_string()))
+            .collect();
+        self.presets = font_presets(self.target, names, &locales);
+        self.presets_from = Some(from);
+        let shown = self
+            .chosen
+            .and_then(|language| {
+                self.presets
+                    .iter()
+                    .find(|preset| preset.language == language)
+            })
+            .or(self.presets.first())
+            .cloned();
+        if shown != self.preset {
+            self.preset = shown;
+            self.clear_preview();
+        }
     }
 
     fn load_preview(&mut self, fonts: &FontConfiguration, config: &config::ConfigHandle) {
@@ -508,7 +586,11 @@ impl SettingsWindow {
         let mut picker = FontPicker::new(target, slot, stack, default_main);
         picker.default_main_generation = Some(config.generation());
         self.ui.font_picker = Some(picker);
-        self.set_focused_input(Some(SettingsAction::FontPickerSearch));
+        // The sets have no search field to type in, nor does anything
+        // under them: a field focused before would take the keys.
+        self.set_focused_input(
+            (slot != FontSlot::Recommended).then_some(SettingsAction::FontPickerSearch),
+        );
         self.load_font_catalog();
     }
 
@@ -585,6 +667,28 @@ impl SettingsWindow {
         };
         if let Some(picker) = &mut self.ui.font_picker {
             picker.draft = family;
+            picker.clear_preview();
+        }
+        self.invalidate_shaped_text();
+        self.ui.stale_glyphs = true;
+    }
+
+    /// Choose the recommended set for `language`, as the sets are now.
+    pub(super) fn choose_font_preset(&mut self, language: CjkLanguage) {
+        let Some(picker) = &mut self.ui.font_picker else {
+            return;
+        };
+        let Some(preset) = picker
+            .presets
+            .iter()
+            .find(|preset| preset.language == language)
+            .cloned()
+        else {
+            return;
+        };
+        picker.chosen = Some(language);
+        if picker.preset.as_ref() != Some(&preset) {
+            picker.preset = Some(preset);
             picker.clear_preview();
         }
         self.invalidate_shaped_text();
@@ -1078,6 +1182,50 @@ impl SettingsWindow {
         if count > 0 {
             self.paint_separator(layers, label_x, row_y, x + width - label_x - lead)?;
         }
+        // The recommended sets, at the end of the row to add a font: the
+        // list full or not, a set takes its place.
+        let recommend_label = crate::i18n::tr("settings-font-recommended");
+        let recommend_glyph = self.ui_px(26.0);
+        let recommend_gap = self.ui_px(10.0);
+        let recommend_width = (self.measure_text_width(&ui_font, &recommend_label)
+            + recommend_glyph
+            + recommend_gap
+            + lead * 2.0)
+            .min(width * 0.5);
+        let recommend = rect(
+            x + width - recommend_width,
+            row_y,
+            recommend_width,
+            row_height,
+        );
+        let recommend_action = SettingsAction::RecommendFontFallbacks(target);
+        self.ui_context
+            .push(recommend, WidgetKind::Button, recommend_action);
+        self.paint_font_list_row_ground(
+            layers,
+            recommend,
+            fill,
+            recommend_action,
+            editing == Some(FontSlot::Recommended),
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::Globe,
+            recommend.min_x() + lead,
+            row_y + (row_height - recommend_glyph) / 2.0,
+            recommend_glyph,
+            accent,
+        )?;
+        let recommend_text_x = recommend.min_x() + lead + recommend_glyph + recommend_gap;
+        self.draw_text(
+            layers,
+            &ui_font,
+            recommend_text_x,
+            self.control_text_y(row_y, row_height),
+            &recommend_label,
+            accent,
+            (recommend.max_x() - lead - recommend_text_x).max(0.0),
+        )?;
         let (label, color) = if count >= MAX_FONT_FALLBACKS {
             (
                 settings_tr(
@@ -1087,7 +1235,7 @@ impl SettingsWindow {
                 palette.muted_text,
             )
         } else {
-            let row = rect(x, row_y, width, row_height);
+            let row = rect(x, row_y, width - recommend_width, row_height);
             let action = SettingsAction::AddFontFallback(target);
             self.ui_context.push(row, WidgetKind::Button, action);
             self.paint_font_list_row_ground(
@@ -1115,7 +1263,7 @@ impl SettingsWindow {
             self.control_text_y(row_y, row_height),
             &label,
             color,
-            x + width - label_x - lead,
+            (recommend.min_x() - label_x - lead).max(0.0),
         )?;
         y += group_height;
 
@@ -1174,6 +1322,11 @@ impl SettingsWindow {
         let Some(picker) = self.ui.font_picker.as_mut() else {
             return Ok(None);
         };
+        // Before the preview, which shows the set chosen.
+        picker.refresh_presets(
+            self.ui.font_catalog.names.as_deref(),
+            self.ui.font_catalog.generation,
+        );
         picker.load_preview(&self.fonts, &config);
         Ok(Some(picker.preview.clone()))
     }
@@ -1330,53 +1483,133 @@ impl SettingsWindow {
         Ok(y + height)
     }
 
-    fn paint_font_picker(
+    /// The recommended sets, each its name over the fonts it puts in the
+    /// list, under a word on what choosing one does. Returns where it ends.
+    fn paint_font_preset_list(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         x: f32,
         top: f32,
         width: f32,
     ) -> anyhow::Result<f32> {
-        let config = configuration();
-        if self.fonts.config().generation() != config.generation() {
-            self.reload_configured_fonts(&config)?;
-        }
-        // The configuration's main font, not to offer as a fallback, as it
-        // is now: the configuration may have been reloaded since.
-        let picker = self.ui.font_picker.as_mut().unwrap();
-        if picker.default_main_generation != Some(config.generation()) {
-            picker.default_main = picker
-                .base
-                .primary
-                .is_none()
-                .then(|| Self::default_main_family(picker.target, &config))
-                .flatten();
-            picker.default_main_generation = Some(config.generation());
-            picker.filter_query = None;
-        }
+        let palette = self.palette();
+        let card = self.floating_card_palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let padding = self.ui_px(16.0);
         let picker = self.ui.font_picker.as_ref().unwrap();
-        let query = picker.search.text().to_string();
+        let presets = picker.presets.clone();
+        let chosen = picker.preset.as_ref().map(|preset| preset.language);
+
+        // Where the search field is for a single font.
+        let note = crate::i18n::tr("settings-font-presets-note");
+        let mut y = top + self.ui_px(4.0);
+        y += self.draw_row_note_in_lines(layers, x, y, &note, width, 4)?
+            + self.description_line_step()
+            + self.ui_px(12.0);
+
+        let label_height = self.dropdown_row_height();
+        let row_height = label_height + self.description_line_step();
+        let list_height = row_height * presets.len().max(1) as f32 + padding * 2.0;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            x,
+            y,
+            width,
+            list_height,
+            card.control_bg,
+            card.control_border,
+            self.ui_px(DROPDOWN_RADIUS),
+        )?;
+        let inset = self.dropdown_label_inset();
+        let room = (width - inset - padding).max(0.0);
+        for (index, preset) in presets.iter().enumerate() {
+            let row = rect(
+                x,
+                y + padding + index as f32 * row_height,
+                width,
+                row_height,
+            );
+            let selected = chosen == Some(preset.language);
+            if selected {
+                self.draw_rounded_rect(
+                    layers,
+                    0,
+                    row.min_x() + self.ui_px(8.0),
+                    row.min_y() + self.ui_px(2.0),
+                    row.size.width - self.ui_px(16.0),
+                    row.size.height - self.ui_px(4.0),
+                    crate::ui::color::mix(card.control_bg, card.text, 0.10),
+                    self.ui_px(DROPDOWN_ROW_RADIUS),
+                )?;
+            }
+            // The name and the fonts under it, centred together in the row.
+            let label_y =
+                self.control_text_y(row.min_y(), row_height - self.description_line_step());
+            let action = SettingsAction::FontPickerPreset(preset.language);
+            let color =
+                self.paint_dropdown_row_on_layer(layers, &card, row, label_y, action, selected, 0)?;
+            let label = crate::i18n::tr(preset.language.label_key());
+            let label = self.text_with_ellipsis(&ui_font, &label, room);
+            self.draw_text(layers, &ui_font, x + inset, label_y, &label, color, room)?;
+            let families = self.text_with_ellipsis(&body_font, &preset.families.join(" · "), room);
+            self.draw_text(
+                layers,
+                &body_font,
+                x + inset,
+                label_y + self.description_line_step(),
+                &families,
+                card.muted_text,
+                room,
+            )?;
+        }
+        if presets.is_empty() {
+            self.draw_text(
+                layers,
+                &ui_font,
+                x + padding,
+                y + padding + self.ui_px(20.0),
+                &crate::i18n::tr(if self.ui.font_catalog.loading {
+                    "settings-font-loading"
+                } else if self.ui.font_catalog.names.is_none() {
+                    "settings-font-list-error"
+                } else {
+                    "settings-font-presets-none"
+                }),
+                palette.muted_text,
+                width - padding * 2.0,
+            )?;
+        }
+        Ok(y + list_height)
+    }
+
+    /// The search field over the installed families, a page of them to
+    /// choose from and the arrows to page. Returns where it ends.
+    fn paint_font_catalog_list(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        top: f32,
+        list_width: f32,
+        query: &str,
+        excluded: &[String],
+    ) -> anyhow::Result<f32> {
+        let picker = self.ui.font_picker.as_ref().unwrap();
         let target = picker.target;
         let slot = picker.slot;
         let draft = picker.draft.clone();
-        let excluded = picker.excluded();
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
         let row_height = self.dropdown_row_height();
         let gap = self.ui_px(20.0);
         let padding = self.ui_px(16.0);
-        let side_by_side = width >= self.ui_px(800.0);
-        let list_width = if side_by_side {
-            (width * 0.44).min(self.ui_px(520.0))
-        } else {
-            width
-        };
         let search_rect = rect(x, top, list_width, self.ui_px(CONTROL_HEIGHT));
         self.paint_text_input(
             layers,
             0,
             TextInputSpec {
-                text: &query,
+                text: query,
                 placeholder: &crate::i18n::tr("settings-font-search"),
                 rect: search_rect,
                 focused: self.ui.interaction.focused == Some(SettingsAction::FontPickerSearch),
@@ -1411,12 +1644,10 @@ impl SettingsWindow {
         )?;
         let picker = self.ui.font_picker.as_mut().unwrap();
         let names = self.ui.font_catalog.names.as_deref().unwrap_or(&[]);
-        if picker.filter_query.as_deref() != Some(query.as_str())
-            || picker.catalog_len != names.len()
-        {
+        if picker.filter_query.as_deref() != Some(query) || picker.catalog_len != names.len() {
             let prefer_mono = target == FontTarget::Terminal && slot == FontSlot::Main;
-            picker.filtered = ranked_indices(names, &query, prefer_mono, &excluded);
-            picker.filter_query = Some(query.clone());
+            picker.filtered = ranked_indices(names, query, prefer_mono, excluded);
+            picker.filter_query = Some(query.to_string());
             picker.catalog_len = names.len();
         }
         let result_count = picker.filtered.len();
@@ -1523,7 +1754,54 @@ impl SettingsWindow {
             palette.muted_text,
             list_width - small * 2.0 - padding * 2.0,
         )?;
-        let list_bottom = pagination_y + small;
+        Ok(pagination_y + small)
+    }
+
+    fn paint_font_picker(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        top: f32,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        let config = configuration();
+        if self.fonts.config().generation() != config.generation() {
+            self.reload_configured_fonts(&config)?;
+        }
+        // The configuration's main font, not to offer as a fallback, as it
+        // is now: the configuration may have been reloaded since.
+        let picker = self.ui.font_picker.as_mut().unwrap();
+        if picker.default_main_generation != Some(config.generation()) {
+            picker.default_main = picker
+                .base
+                .primary
+                .is_none()
+                .then(|| Self::default_main_family(picker.target, &config))
+                .flatten();
+            picker.default_main_generation = Some(config.generation());
+            picker.filter_query = None;
+        }
+        let picker = self.ui.font_picker.as_ref().unwrap();
+        let query = picker.search.text().to_string();
+        let target = picker.target;
+        let slot = picker.slot;
+        let draft = picker.draft.clone();
+        let excluded = picker.excluded();
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let gap = self.ui_px(20.0);
+        let padding = self.ui_px(16.0);
+        let side_by_side = width >= self.ui_px(800.0);
+        let list_width = if side_by_side {
+            (width * 0.44).min(self.ui_px(520.0))
+        } else {
+            width
+        };
+        let list_bottom = if slot == FontSlot::Recommended {
+            self.paint_font_preset_list(layers, x, top, list_width)?
+        } else {
+            self.paint_font_catalog_list(layers, x, top, list_width, &query, &excluded)?
+        };
         let preview_x = if side_by_side {
             x + list_width + gap
         } else {
@@ -1560,7 +1838,19 @@ impl SettingsWindow {
         let step = preview
             .as_ref()
             .map(|font| (font.metrics().cell_height.get() as f32).max(self.ui_px(34.0)));
-        let content_height = self.ui_px(120.0)
+        // A set's fonts in full under its name, which its row may have cut.
+        let set_lines = match (
+            slot,
+            self.ui.font_picker.as_ref().and_then(|p| p.preset.as_ref()),
+        ) {
+            (FontSlot::Recommended, Some(preset)) => {
+                let body_font = Rc::clone(&self.body_font);
+                self.capped_lines(&body_font, &preset.families.join(" → "), inner_width, 3)
+            }
+            _ => Vec::new(),
+        };
+        let samples_top = self.ui_px(120.0) + self.description_line_step() * set_lines.len() as f32;
+        let content_height = samples_top
             + padding
             + step.map_or(self.ui_px(40.0), |step| step * samples.len() as f32);
         let preview_height = if side_by_side {
@@ -1588,9 +1878,16 @@ impl SettingsWindow {
             palette.muted_text,
             inner_width,
         )?;
+        let preset = self
+            .ui
+            .font_picker
+            .as_ref()
+            .and_then(|picker| picker.preset.as_ref())
+            .map(|preset| crate::i18n::tr(preset.language.label_key()));
         let heading = match (&draft, slot) {
             (Some(family), _) => Some(family.clone()),
             (None, FontSlot::Main) => Some(crate::i18n::tr("settings-font-default")),
+            (None, FontSlot::Recommended) => preset,
             (None, _) => None,
         };
         if let Some(heading) = heading {
@@ -1604,7 +1901,23 @@ impl SettingsWindow {
                 inner_width,
             )?;
         }
-        let mut y = preview_y + self.ui_px(120.0);
+        if !set_lines.is_empty() {
+            let body_font = Rc::clone(&self.body_font);
+            self.draw_text_lines(
+                layers,
+                &body_font,
+                preview_x + padding,
+                preview_y
+                    + padding
+                    + self.ui_px(38.0)
+                    + self.description_line_step()
+                    + self.ui_px(6.0),
+                &set_lines,
+                palette.muted_text,
+                inner_width,
+            )?;
+        }
+        let mut y = preview_y + samples_top;
         if let (Some(font), Some(step)) = (preview, step) {
             for text in samples {
                 self.draw_text(
@@ -1752,8 +2065,8 @@ mod tests {
         let with_family = |family: &str| {
             configs.get().adjusted(|cfg| {
                 cfg.font_locator = config::FontLocatorSelection::ConfigDirsOnly;
-                cfg.font_dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../assets/fonts")];
+                cfg.font_dirs =
+                    vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/fonts")];
                 cfg.font.set_primary_family(family);
             })
         };
@@ -1913,6 +2226,104 @@ mod tests {
             Some("JetBrains Mono".to_string()),
         );
         assert!(picker.excluded().is_empty());
+    }
+
+    #[test]
+    fn a_recommended_set_goes_ahead_of_the_fallbacks() {
+        let list =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        let base = FontStack::new(Some("Main"), &list(&["First", "Second"]));
+        let mut picker = FontPicker::new(
+            FontTarget::Terminal,
+            FontSlot::Recommended,
+            base.clone(),
+            None,
+        );
+        assert_eq!(picker.draft, None);
+        assert!(picker.excluded().is_empty());
+        assert_eq!(picker.draft_stack(), base, "no set chosen yet");
+        assert!(!picker.can_apply());
+        let set = |families: &[&str]| FontPreset {
+            language: CjkLanguage::Japanese,
+            families: list(families),
+        };
+        // The main font in the set is the main font still, not a fallback;
+        // the list's own fallbacks come after the set.
+        picker.preset = Some(set(&["JP Font", "Main", "SC Font"]));
+        assert_eq!(
+            picker.draft_stack(),
+            FontStack::new(
+                Some("Main"),
+                &list(&["JP Font", "SC Font", "First", "Second"])
+            )
+        );
+        // Applied to the list as it is by then.
+        let mut now = FontStack::new(Some("Other"), &list(&["Added Meanwhile", "sc font"]));
+        picker.edit().apply(&mut now);
+        assert_eq!(now.primary.as_deref(), Some("Other"));
+        assert_eq!(
+            now.fallbacks,
+            ["JP Font", "Main", "SC Font", "Added Meanwhile"]
+        );
+        assert_eq!(picker.edit().adds(), None);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_sets_follow_the_catalogue_and_keep_the_language_chosen() {
+        let names = |families: &[&str]| -> Vec<String> {
+            families.iter().map(|family| family.to_string()).collect()
+        };
+        let mut picker = FontPicker::new(
+            FontTarget::Terminal,
+            FontSlot::Recommended,
+            FontStack::default(),
+            None,
+        );
+        picker.refresh_presets(None, 0);
+        assert!(picker.presets.is_empty(), "nothing before the catalogue");
+        let catalogue = names(&["Noto Sans Mono CJK JP", "Noto Sans Mono CJK KR"]);
+        picker.refresh_presets(Some(&catalogue), 0);
+        assert_eq!(picker.presets.len(), 2);
+        assert_eq!(
+            picker.preset.as_ref(),
+            picker.presets.first(),
+            "the first set"
+        );
+        // Not chosen by hand, the first set follows a new catalogue.
+        let more = names(&[
+            "Noto Sans Mono CJK JP",
+            "Noto Sans Mono CJK KR",
+            "Noto Sans Mono CJK SC",
+            "Noto Sans Mono CJK TC",
+        ]);
+        picker.refresh_presets(Some(&more), 1);
+        assert_eq!(picker.presets.len(), 4);
+        assert_eq!(picker.preset.as_ref(), picker.presets.first());
+        // While the catalogue loads again, nothing to show or apply.
+        picker.refresh_presets(None, 2);
+        assert!(picker.presets.is_empty());
+        assert_eq!(picker.preset, None);
+
+        picker.chosen = Some(CjkLanguage::Korean);
+        let catalogue = names(&[
+            "Noto Sans Mono CJK JP",
+            "Noto Sans Mono CJK KR",
+            "Noto Sans Mono CJK SC",
+        ]);
+        picker.refresh_presets(Some(&catalogue), 3);
+        assert_eq!(picker.presets.len(), 3);
+        let shown = picker.preset.as_ref().unwrap();
+        assert_eq!(shown.language, CjkLanguage::Korean);
+        assert_eq!(
+            shown.families,
+            [
+                "Noto Sans Mono CJK KR",
+                "Noto Sans Mono CJK SC",
+                "Noto Sans Mono CJK JP"
+            ],
+            "the set chosen, as installed now"
+        );
     }
 
     #[test]

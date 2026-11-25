@@ -26,7 +26,7 @@ pub(crate) fn configured_preference(settings: &ThinkTermNativeSettings) -> &str 
         .unwrap_or_else(|| legacy_preference(settings.onboarding.language))
 }
 
-fn system_locales() -> Vec<String> {
+pub(crate) fn system_locales() -> Vec<String> {
     sys_locale::get_locales().collect()
 }
 
