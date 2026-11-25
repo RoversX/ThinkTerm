@@ -50,12 +50,16 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -67,6 +71,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -84,10 +89,12 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 /// large title under a glass back button, and iOS's own switches, segments
 /// and steppers. From the iOS app's Form pages.
 
-/// The colours of the grouped pages, in the system's lightness.
+/// The colours of the grouped pages, in the system's lightness. The
+/// ground is the threads list's (`listBackdrop`), so going from there to
+/// a page keeps the colour behind it; the cards stay a step lighter.
 @Immutable
 class GroupedColors(val dark: Boolean) {
-    val ground = if (dark) Color.Black else Color(0xFFF2F2F7)
+    val ground = listBackdrop(dark)
     val card = if (dark) Color(0xFF1C1C1E) else Color.White
     val hairline = if (dark) Color(0xFF38383A) else Color(0xFFC6C6C8)
     val primary = if (dark) Color.White else Color.Black
@@ -539,6 +546,37 @@ fun DialogField(value: String, onChange: (String) -> Unit, placeholder: String, 
                 autoCorrectEnabled = false,
             ),
             modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+/// A dialog's field for one line to edit, as `DialogField` draws it, with
+/// the keys on it as it shows: what `value` selects stays selected, so a
+/// name given to start from is replaced by the first key typed.
+@Composable
+fun DialogField(value: TextFieldValue, onChange: (TextFieldValue) -> Unit, placeholder: String) {
+    val colors = groupedColors()
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(colors.fill)
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        if (value.text.isEmpty()) Text(placeholder, color = colors.tertiary, fontSize = 15.sp, maxLines = 1)
+        BasicTextField(
+            value = value,
+            onValueChange = onChange,
+            singleLine = true,
+            textStyle = TextStyle(color = colors.primary, fontSize = 15.sp),
+            cursorBrush = SolidColor(colors.accent),
+            keyboardOptions = KeyboardOptions(
+                capitalization = androidx.compose.ui.text.input.KeyboardCapitalization.None,
+                autoCorrectEnabled = false,
+            ),
+            modifier = Modifier.fillMaxWidth().focusRequester(focus),
         )
     }
 }

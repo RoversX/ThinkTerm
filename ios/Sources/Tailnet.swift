@@ -365,6 +365,7 @@ struct TailnetSettingsView: View {
                 }
             }
         }
+        .onPageBackdrop()
         .navigationTitle("Tailscale")
         .navigationBarTitleDisplayMode(.inline)
         // The login stays in the app: the system's own browser sheet, which
@@ -387,7 +388,7 @@ struct TailnetSettingsView: View {
                         Circle()
                             .fill(tailnet.color)
                             .frame(width: 16, height: 16)
-                            .overlay(Circle().stroke(Color(.systemGroupedBackground), lineWidth: 3))
+                            .overlay(Circle().stroke(Color.pageBackdrop, lineWidth: 3))
                             .offset(x: 4, y: 4)
                     }
                 }
@@ -514,6 +515,7 @@ private struct TailnetAdvancedView: View {
                     .onSubmit { tailnet.apply() }
             }
         }
+        .onPageBackdrop()
         .navigationTitle(tr("f.advanced"))
         .navigationBarTitleDisplayMode(.inline)
         // What was typed and left is kept, as a field's return keeps it.

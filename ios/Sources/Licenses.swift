@@ -27,6 +27,7 @@ struct LicensesView: View {
             section("assets", title: tr("licenses.assets"), in: shown)
             section("rust", title: tr("licenses.rust"), in: shown)
         }
+        .onPageBackdrop()
         .searchable(text: $query, prompt: tr("licenses.search"))
         .navigationTitle(tr("licenses"))
         .navigationBarTitleDisplayMode(.inline)

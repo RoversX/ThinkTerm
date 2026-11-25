@@ -12,7 +12,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SidebarView {
     pub rows: Vec<Row>,
-    pub editing: Editing,
+    pub editing: EditingView,
     /// The Space on show, for the page to remember.
     pub space: Option<String>,
     /// Why the last "add workspace" path was refused, shown next to the
@@ -24,6 +24,19 @@ pub struct SidebarView {
     pub reveal: Reveal,
     pub footer: Vec<FooterAction>,
     pub footer_label_min_width: f64,
+}
+
+/// What the panel's field is open for (`Editing`, its `kind` and `id`),
+/// with the name it starts from: a rename's field holds the current name,
+/// for a phone's dialog to show selected so typing replaces it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EditingView {
+    #[serde(flatten)]
+    pub what: Editing,
+    /// The thread's, project's or Space's name now; none for a new
+    /// project, and for one the tree no longer has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -342,7 +355,7 @@ mod tests {
         ];
         let v = to_value(SidebarView {
             rows,
-            editing: Editing::Thread("thread-1".into()),
+            editing: EditingView { what: Editing::Thread("thread-1".into()), name: Some("main".into()) },
             space: Some("space-1".into()),
             new_project_error: None,
             reveal: crate::sidebar::REVEAL,
@@ -360,8 +373,11 @@ mod tests {
         assert_eq!(t["dot"], "Active");
         assert_eq!(t["unread"], true);
         assert_eq!(v["rows"][3], json!({"kind": "window", "id": 3, "title": "Terminal", "selected": false}));
-        assert_eq!(v["editing"], json!({"kind": "thread", "id": "thread-1"}));
+        assert_eq!(v["editing"], json!({"kind": "thread", "id": "thread-1", "name": "main"}));
         assert_eq!(to_value(Editing::None).unwrap(), json!({"kind": "none"}));
+        // A new project has no name to start from: none is written.
+        let adding = EditingView { what: Editing::NewProject, name: None };
+        assert_eq!(to_value(adding).unwrap(), json!({"kind": "new-project"}));
         // The rules the display layer reads rather than decides.
         assert_eq!(v["reveal"], json!({"edge": 6.0, "dwell_ms": 150, "retreat_ms": 250}));
         assert_eq!(v["footer_label_min_width"], 168.0);

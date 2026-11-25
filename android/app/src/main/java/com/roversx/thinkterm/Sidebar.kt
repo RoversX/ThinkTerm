@@ -54,8 +54,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -354,10 +356,6 @@ private fun Tree(
             }
         }
         TailRows(model, done)
-        val error = model.sidebar?.newProjectError
-        if (!error.isNullOrEmpty()) {
-            Text(error, fontSize = 13.sp, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
-        }
     }
 }
 
@@ -538,24 +536,51 @@ private fun SearchResults(model: TerminalModel, query: String, dark: Boolean, do
 
 /// The App asks for a name -- a new project's, or a rename -- through the
 /// sidebar's field: here a dialog, wherever the host's threads are listed.
+/// A rename starts from the current name, selected. A new project is a
+/// folder on the host, ~/dir or /dir: its dialog stays up until the App
+/// takes the path, saying inside it why one was refused.
 @Composable
 internal fun NameAsk(model: TerminalModel) {
     val editing = model.sidebar?.editing
+    val refused = model.sidebar?.newProjectError
     var asking by remember { mutableStateOf<String?>(null) }
-    var text by remember { mutableStateOf("") }
-    LaunchedEffect(editing) {
+    var text by remember { mutableStateOf(TextFieldValue("")) }
+    LaunchedEffect(editing, refused) {
+        if (editing == null || editing.kind == "none") {
+            // The path was taken: the project is being made.
+            if (asking == "new-project") asking = null
+            return@LaunchedEffect
+        }
+        if (asking != null) return@LaunchedEffect
         // A new project has no id yet: the same field, asking for the
-        // name of what is about to exist.
-        if (editing == null || editing.kind == "none" || asking != null) return@LaunchedEffect
-        text = ""
+        // path of what is about to exist. One refused after the dialog
+        // went comes back as it was typed, to be corrected.
+        if (editing.kind != "new-project" || refused == null) {
+            val name = editing.name ?: ""
+            text = TextFieldValue(name, selection = TextRange(0, name.length))
+        }
         asking = editing.kind
     }
     val kind = asking ?: return
+    val adding = kind == "new-project"
     AlertDialog(
         onDismissRequest = { model.sideKey("Escape", ""); asking = null },
-        title = { Text(tr(if (kind == "new-project") "project.new" else "rename")) },
-        text = { DialogField(text, { text = it }, tr("f.name")) },
-        confirmButton = { TextButton(onClick = { model.sideKey("Enter", text); asking = null }) { Text(tr("save")) } },
+        title = { Text(tr(if (adding) "project.new" else "rename")) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                DialogField(text, { text = it }, if (adding) "~/" else tr("f.name"))
+                if (adding && !refused.isNullOrEmpty()) {
+                    Text(refused, fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                model.sideKey("Enter", text.text)
+                // A path waits for the App's answer; a name is done.
+                if (!adding) asking = null
+            }) { Text(tr("save")) }
+        },
         dismissButton = { TextButton(onClick = { model.sideKey("Escape", ""); asking = null }) { Text(tr("cancel")) } },
     )
 }

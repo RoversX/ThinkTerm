@@ -671,11 +671,35 @@ extension Color {
     static let chromeBackdrop = Color(UIColor { traits in
         traits.userInterfaceStyle == .dark ? UIColor(white: 0.07, alpha: 1) : UIColor(white: 0.95, alpha: 1)
     })
-    /// The ground of the pages pushed over them: black in the dark, as it
-    /// was, and the system's grouped ground in the light.
+    /// The ground of the pages pushed over them: the lists' own in the
+    /// dark, so going from the threads to Settings or the hosts keeps the
+    /// colour behind them, and the system's grouped ground in the light,
+    /// all but the same as theirs.
     static let pageBackdrop = Color(UIColor { traits in
-        traits.userInterfaceStyle == .dark ? .black : .systemGroupedBackground
+        traits.userInterfaceStyle == .dark ? UIColor(white: 0.07, alpha: 1) : .systemGroupedBackground
     })
+}
+
+extension View {
+    /// A page's list on `pageBackdrop` rather than the system's ground.
+    func onPageBackdrop() -> some View {
+        scrollContentBackground(.hidden)
+            .background(Color.pageBackdrop.ignoresSafeArea())
+    }
+
+    /// A field an alert opens with `name` in it has all of it selected as
+    /// the keyboard comes up, so the first key typed replaces it: a
+    /// rename's field, which starts from the current name. None, or an
+    /// empty name, selects nothing.
+    func selectsOnEditing(_ name: String?) -> some View {
+        onReceive(NotificationCenter.default.publisher(for: UITextField.textDidBeginEditingNotification)) { note in
+            guard let name, !name.isEmpty, let field = note.object as? UITextField, field.text == name else { return }
+            // Once the field has put its caret at the end.
+            DispatchQueue.main.async {
+                field.selectedTextRange = field.textRange(from: field.beginningOfDocument, to: field.endOfDocument)
+            }
+        }
+    }
 }
 
 extension View {

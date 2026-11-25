@@ -337,9 +337,12 @@ struct ThreadChat: Decodable, Hashable {
     var agent: String
 }
 
+/// What the sidebar's field is open for, and `name`, the current name a
+/// rename starts from (none for a new project).
 struct Editing: Decodable, Hashable {
     var kind: String
     var id: String?
+    var name: String?
 }
 
 struct SidebarView: Decodable, Hashable {

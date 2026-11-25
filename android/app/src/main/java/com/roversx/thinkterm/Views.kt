@@ -208,7 +208,9 @@ data class ThreadRow(
 /// its detection names it ("codex", "pi").
 data class ThreadChat(val pane: Int, val agent: String)
 
-data class Editing(val kind: String, val id: String?)
+/// What the sidebar's field is open for, and `name`, the current name a
+/// rename starts from (none for a new project).
+data class Editing(val kind: String, val id: String?, val name: String? = null)
 
 data class SidebarView(
     val rows: List<SideRow>,
@@ -478,7 +480,11 @@ object Views {
         val e = root.optJSONObject("editing")
         return SidebarView(
             rows = rows,
-            editing = Editing(e?.optString("kind") ?: "none", e?.takeIf { it.has("id") && !it.isNull("id") }?.optString("id")),
+            editing = Editing(
+                e?.optString("kind") ?: "none",
+                e?.takeIf { it.has("id") && !it.isNull("id") }?.optString("id"),
+                e?.takeIf { it.has("name") && !it.isNull("name") }?.optString("name"),
+            ),
             space = root.takeIf { it.has("space") && !it.isNull("space") }?.optString("space"),
             newProjectError = root.takeIf { it.has("new_project_error") && !it.isNull("new_project_error") }?.optString("new_project_error"),
         )

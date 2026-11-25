@@ -34,6 +34,7 @@ struct SettingsView: View {
                 row(.about)
             }
         }
+        .onPageBackdrop()
         .navigationTitle(tr("settings"))
     }
 
@@ -174,6 +175,7 @@ struct SettingsPageView: View {
 
     var body: some View {
         List { content }
+            .onPageBackdrop()
             .navigationTitle(page.title)
             .navigationBarTitleDisplayMode(.inline)
     }
@@ -560,6 +562,7 @@ struct OptionPicker: View {
                 }
             }
         }
+        .onPageBackdrop()
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -580,6 +583,7 @@ struct KeyBarKeys: View {
                 Text(tr("k.keybar.foot"))
             }
         }
+        .onPageBackdrop()
         .navigationTitle(tr("k.keybar"))
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -607,6 +611,7 @@ struct ThemePicker: View {
                 row(name, label: name, color: Schemes.background(of: name))
             }
         }
+        .onPageBackdrop()
         .searchable(text: $query, prompt: tr("theme.search"))
         .navigationTitle(tr("theme"))
         .navigationBarTitleDisplayMode(.inline)

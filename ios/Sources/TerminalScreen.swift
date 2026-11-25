@@ -627,7 +627,8 @@ struct TerminalScreen: View {
             // name of what is about to exist.
             guard let editing, editing.kind != "none" else { return }
             if renaming == nil {
-                renameText = ""
+                // A rename starts from the current name, selected.
+                renameText = editing.name ?? ""
                 renaming = (editing.kind, editing.id ?? "")
             }
         }
@@ -663,6 +664,7 @@ struct TerminalScreen: View {
                 Text(error)
             }
         }
+        .selectsOnEditing(renaming == nil || renaming?.kind == "new-project" ? nil : renameText)
         .confirmationDialog(
             tr("thread.delete.title", threadName(model.confirming?.split(separator: ":", maxSplits: 1).last.map(String.init) ?? "")),
             isPresented: Binding(get: { model.confirming != nil }, set: { if !$0 { model.confirming = nil } }),

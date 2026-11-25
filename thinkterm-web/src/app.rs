@@ -1267,7 +1267,7 @@ impl<P: Platform, L: Link> App<P, L> {
         let inner = self.inner.borrow();
         crate::views::SidebarView {
             rows: Self::side_rows(&inner),
-            editing: inner.editing.clone(),
+            editing: crate::views::EditingView { what: inner.editing.clone(), name: Self::editing_name(&inner) },
             space: inner.tree.current_space().map(|s| s.id.clone()),
             new_project_error: inner.new_project_error.clone(),
             reveal: crate::sidebar::REVEAL,
@@ -3821,6 +3821,23 @@ impl<P: Platform, L: Link> App<P, L> {
                     members: Self::capsules(&inner, place),
                 })
                 .collect(),
+        }
+    }
+
+    /// The name now of what the sidebar's field renames, for the field to
+    /// start from: a thread's, a project's (an archived one's is only in
+    /// the tree) or a Space's.
+    fn editing_name(inner: &Inner<P, L>) -> Option<String> {
+        use crate::sidebar::Editing;
+        let session = inner.tree.session.as_ref();
+        match &inner.editing {
+            Editing::Thread(id) => inner.tree.thread(id).map(|t| t.name.clone()),
+            Editing::Project(id) => session
+                .and_then(|s| s.projects.iter().find(|p| &p.id == id))
+                .map(|p| p.name.clone())
+                .or_else(|| inner.tree.tree.as_ref()?.projects.iter().find(|p| &p.id == id).map(|p| p.name.clone())),
+            Editing::Space(id) => session.and_then(|s| s.spaces.iter().find(|s| &s.id == id)).map(|s| s.name.clone()),
+            Editing::NewProject | Editing::None => None,
         }
     }
 

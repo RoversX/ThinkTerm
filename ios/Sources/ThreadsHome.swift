@@ -366,7 +366,8 @@ private struct HomeAsks: ViewModifier {
         content
             .onChange(of: model.sidebar?.editing) { _, editing in
                 guard let editing, editing.kind != "none", !model.isOnScreen, renaming == nil else { return }
-                renameText = ""
+                // A rename starts from the current name, selected.
+                renameText = editing.name ?? ""
                 renaming = editing.kind
             }
             .alert(
@@ -385,6 +386,7 @@ private struct HomeAsks: ViewModifier {
                     renaming = nil
                 }
             }
+            .selectsOnEditing(renaming == nil || renaming == "new-project" ? nil : renameText)
             .confirmationDialog(
                 tr("thread.delete.title", threadName(model.confirming?.split(separator: ":", maxSplits: 1).last.map(String.init) ?? "")),
                 isPresented: Binding(get: { deleting }, set: { if !$0 { model.confirming = nil } }),
