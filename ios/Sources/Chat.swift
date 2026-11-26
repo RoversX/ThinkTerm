@@ -470,6 +470,9 @@ struct ChatPage: View {
     @State private var follow = false
     /// A picture sent, shown big.
     @State private var shownPicture: ChatSent?
+    /// Gliding to the end for the button: once there, the end is read,
+    /// even if more came in on the way.
+    @State private var jumping = false
     /// The rows on show already: one not among them comes in as it is
     /// added, the first ones as they are.
     @State private var known: Set<String> = []
@@ -634,12 +637,17 @@ struct ChatPage: View {
             // field.
             .scrollEdgeEffectStyle(.soft, for: .all)
             .defaultScrollAnchor(.bottom)
-            .safeAreaBar(edge: .top, spacing: 0) { header(chat) }
-            .safeAreaBar(edge: .bottom, spacing: 0) {
-                foot(chat).overlay(alignment: .top) {
-                    // Scrolled up to read: a way back down to what comes now.
+            // Scrolled up to read: a way back down to what comes now. Over
+            // the list, inside the bars, where a tap reaches it -- pushed
+            // out of the foot's bar, it was drawn but not tapped.
+            .overlay(alignment: .bottom) {
+                ZStack {
                     if !atEnd && chat?.rows.isEmpty == false {
                         Button {
+                            // Read at the end from now on: what comes while it
+                            // glides there is followed too.
+                            atEnd = true
+                            jumping = true
                             withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo("end", anchor: .bottom) }
                         } label: {
                             Image(systemName: "arrow.down")
@@ -652,12 +660,14 @@ struct ChatPage: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(tr("chat.latest"))
-                        .offset(y: -50)
+                        .padding(.bottom, 4)
                         .transition(.scale(scale: 0.8).combined(with: .opacity))
                     }
                 }
                 .animation(.snappy(duration: 0.16), value: atEnd)
             }
+            .safeAreaBar(edge: .top, spacing: 0) { header(chat) }
+            .safeAreaBar(edge: .bottom, spacing: 0) { foot(chat) }
             // Whether the person reads the end: as their last scroll (or
             // the last one made here) left the list, once it came to rest.
             // What comes in below does not change it: rows that came in a
@@ -668,6 +678,13 @@ struct ChatPage: View {
                 // comes in meanwhile does not pull the list back.
                 case .interacting:
                     atEnd = false
+                    jumping = false
+                // The button's glide came to rest: at the end, wherever
+                // what came in meanwhile left it.
+                case .idle where jumping:
+                    jumping = false
+                    atEnd = true
+                    proxy.scrollTo("end", anchor: .bottom)
                 case .idle:
                     let geometry = context.geometry
                     atEnd = geometry.visibleRect.maxY >= geometry.contentSize.height - 120

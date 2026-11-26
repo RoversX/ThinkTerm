@@ -729,9 +729,12 @@ fun ChatPage(model: TerminalModel, onSidebar: () -> Unit, onTerminal: () -> Unit
     // one made here) left the list. What comes in below does not change
     // it: rows that came in a burst once read as a scroll away from it.
     var reading by remember(target.pane) { mutableStateOf(true) }
+    // Gliding to the end for the button: once there, the end is read, even
+    // if more came in on the way and it stopped short of it.
+    var jumping by remember(target.pane) { mutableStateOf(false) }
     LaunchedEffect(list, target.pane) {
         snapshotFlow { list.isScrollInProgress }.collect { scrolling ->
-            if (!scrolling) reading = !list.canScrollForward
+            if (!scrolling && !jumping) reading = !list.canScrollForward
         }
     }
     // Also when what is under the list grows (a question, the keyboard):
@@ -1025,7 +1028,9 @@ fun ChatPage(model: TerminalModel, onSidebar: () -> Unit, onTerminal: () -> Unit
         ) {
             val down = tr("chat.latest")
             AnimatedVisibility(
-                visible = rows.isNotEmpty() && list.canScrollForward,
+                // Not while the end is read: a reply growing there would
+                // have it come and go as the list catches up.
+                visible = rows.isNotEmpty() && !reading && list.canScrollForward,
                 enter = fadeIn(tween(160)) + scaleIn(tween(160), initialScale = 0.8f),
                 exit = fadeOut(tween(120)) + scaleOut(tween(120), targetScale = 0.8f),
             ) {
@@ -1034,7 +1039,17 @@ fun ChatPage(model: TerminalModel, onSidebar: () -> Unit, onTerminal: () -> Unit
                         .size(40.dp)
                         .glass(backdrop, dark, CircleShape)
                         .clickable(role = Role.Button) {
-                            scope.launch { list.animateScrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END) }
+                            scope.launch {
+                                jumping = true
+                                try {
+                                    list.animateScrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END)
+                                    // What came in on the way: there too, at once.
+                                    list.scrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END)
+                                    reading = true
+                                } finally {
+                                    jumping = false
+                                }
+                            }
                         }
                         .semantics { contentDescription = down },
                     contentAlignment = Alignment.Center,
