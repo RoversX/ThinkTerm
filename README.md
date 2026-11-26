@@ -10,7 +10,7 @@
 
 **Your machines fuse into one.**
 
-A superfast terminal with a built-in multiplexer.
+A superfast terminal multiplexer built on top of WezTerm.
 
 **Platforms:** macOS · Linux · Windows · Web · TUI · iOS · Android
 

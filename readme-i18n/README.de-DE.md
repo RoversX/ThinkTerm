@@ -10,7 +10,7 @@
 
 **Deine Rechner werden zu einer gemeinsamen Arbeitsumgebung.**
 
-Ein superschnelles Terminal mit integriertem Multiplexer.
+Ein superschneller Terminal-Multiplexer auf Basis von WezTerm.
 
 **Plattformen:** macOS · Linux · Windows · Web · TUI · iOS · Android
 

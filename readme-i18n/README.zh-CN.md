@@ -10,7 +10,7 @@
 
 **让你的多台机器融为一体。**
 
-一款内置终端复用器的超高速终端。
+一款基于 WezTerm 构建的超高速终端复用器。
 
 **平台支持：** macOS · Linux · Windows · Web · TUI · iOS · Android
 

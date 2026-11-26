@@ -10,7 +10,7 @@
 
 **Vos machines réunies dans un même espace de travail.**
 
-Un terminal ultrarapide avec multiplexeur intégré.
+Un multiplexeur de terminal ultrarapide basé sur WezTerm.
 
 **Plateformes :** macOS · Linux · Windows · Web · TUI · iOS · Android
 
