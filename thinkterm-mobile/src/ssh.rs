@@ -81,12 +81,14 @@ pub enum Out {
     /// keep-alives have gone unanswered long enough.
     Probe,
     /// Open the chat with the agent in `pane`, on a channel of its own
-    /// running the host's bridge (`thinkterm cli agent chat`); one open
-    /// before is closed.
+    /// running the host's bridge (`thinkterm cli agent chat`), as opening
+    /// `generation`. Ones open before stay open: a chat left is kept a
+    /// while, its channel with it, until it is closed (`ChatClose`).
     ChatOpen { pane: u32, generation: u64 },
-    /// A line for the chat's bridge.
-    ChatLine(String),
-    ChatClose,
+    /// A line for the bridge of opening `generation`.
+    ChatLine { generation: u64, line: String },
+    /// Close the channel of opening `generation`.
+    ChatClose(u64),
     Close,
 }
 
@@ -174,8 +176,8 @@ fn shell_quote(word: &str) -> String {
 /// What the network thread is asked of the chat (`Out::Chat*`).
 enum ChatAsk {
     Open { pane: u32, generation: u64 },
-    Line(String),
-    Close,
+    Line { generation: u64, line: String },
+    Close(u64),
 }
 
 /// The chat's channel: the host's bridge between the phone's chat and the
@@ -325,17 +327,22 @@ fn chat_by_login_shell(pane: u32) -> String {
     format!("exec \"${{SHELL:-/bin/sh}}\" -lc '{find}'")
 }
 
-/// The chat's next message, or never while none is open.
-async fn chat_wait(chat: &mut Option<Chat>) -> Option<ChannelMsg> {
-    match chat {
-        Some(chat) => chat.reader.wait().await,
-        None => std::future::pending().await,
+/// The next message of any open chat, and which one it is; never while
+/// none is open.
+async fn chat_wait(chats: &mut [Chat]) -> (usize, Option<ChannelMsg>) {
+    if chats.is_empty() {
+        return std::future::pending().await;
     }
+    let waits = chats.iter_mut().map(|chat| Box::pin(chat.reader.wait()));
+    let (msg, at, _) = futures::future::select_all(waits).await;
+    (at, msg)
 }
 
-/// The chat's channel, run beside the protocol's and polled with it: its
-/// opening, its writes and its close wait here, never in the loop that
-/// reads the protocol, whose reading must not stop (`run`).
+/// The chats' channels, run beside the protocol's and polled with it:
+/// their openings, writes and closes wait here, never in the loop that
+/// reads the protocol, whose reading must not stop (`run`). Several may be
+/// open: the one on show, and ones left a while ago, kept to show again
+/// at once.
 async fn run_chat(
     session: &client::Handle<HostKeyCheck>,
     cli: Option<String>,
@@ -343,47 +350,42 @@ async fn run_chat(
     mut asks: UnboundedReceiver<ChatAsk>,
     deliver: &dyn Fn(Net),
 ) {
-    let mut chat: Option<Chat> = None;
+    let mut chats: Vec<Chat> = Vec::new();
     loop {
         tokio::select! {
             ask = asks.recv() => match ask {
                 None => break,
                 Some(ChatAsk::Open { pane, generation }) => {
-                    if let Some(old) = chat.take() {
-                        old.close().await;
-                    }
                     let command = chat_command(cli.as_deref(), &remote_command, pane);
                     match Chat::open(session, command, generation).await {
-                        Ok(opened) => chat = Some(opened),
+                        Ok(opened) => chats.push(opened),
                         Err(err) => deliver(Net::ChatEnded { generation, missing: false, reason: format!("{err:#}") }),
                     }
                 }
-                Some(ChatAsk::Line(line)) => {
-                    if let Some(open) = chat.as_mut() {
-                        if let Err(err) = open.send(&line).await {
-                            let generation = open.generation;
-                            chat = None;
+                Some(ChatAsk::Line { generation, line }) => {
+                    if let Some(at) = chats.iter().position(|chat| chat.generation == generation) {
+                        if let Err(err) = chats[at].send(&line).await {
+                            chats.remove(at);
                             deliver(Net::ChatEnded { generation, missing: false, reason: format!("{err:#}") });
                         }
                     }
                 }
-                Some(ChatAsk::Close) => {
-                    if let Some(old) = chat.take() {
-                        old.close().await;
+                Some(ChatAsk::Close(generation)) => {
+                    if let Some(at) = chats.iter().position(|chat| chat.generation == generation) {
+                        chats.remove(at).close().await;
                     }
                 }
             },
-            msg = chat_wait(&mut chat) => {
-                let open = chat.as_mut().expect("waited on an open chat");
-                if let Some(ended) = open.take(msg, deliver) {
-                    chat = None;
+            (at, msg) = chat_wait(&mut chats) => {
+                if let Some(ended) = chats[at].take(msg, deliver) {
+                    chats.remove(at);
                     deliver(ended);
                 }
             }
         }
     }
-    if let Some(old) = chat.take() {
-        old.close().await;
+    for chat in chats {
+        chat.close().await;
     }
 }
 
@@ -900,8 +902,8 @@ async fn run(
                 | Out::CancelUpload(_)
                 | Out::Probe
                 | Out::ChatOpen { .. }
-                | Out::ChatLine(_)
-                | Out::ChatClose) => {
+                | Out::ChatLine { .. }
+                | Out::ChatClose(_)) => {
                     let _ = upload_tx.send(beside);
                 }
                 Out::Close => break,
@@ -1013,11 +1015,11 @@ async fn run(
                 Out::ChatOpen { pane, generation } => {
                     let _ = chat_tx.send(ChatAsk::Open { pane, generation });
                 }
-                Out::ChatLine(line) => {
-                    let _ = chat_tx.send(ChatAsk::Line(line));
+                Out::ChatLine { generation, line } => {
+                    let _ = chat_tx.send(ChatAsk::Line { generation, line });
                 }
-                Out::ChatClose => {
-                    let _ = chat_tx.send(ChatAsk::Close);
+                Out::ChatClose(generation) => {
+                    let _ = chat_tx.send(ChatAsk::Close(generation));
                 }
                 _ => {}
             },
