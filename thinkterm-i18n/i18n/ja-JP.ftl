@@ -1926,6 +1926,10 @@ settings-reverse-connect-first = まずサーバーに接続してください�
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = 接続中…
 chat-reconnecting = 再接続中…
+chat-loading = { $agent } に ThinkTerm を読み込ませています…
+chat-loading-after-turn = { $agent } のターンが終わったら接続します
+chat-loading-after-field = { $agent } の入力欄が空になったら接続します（入力中の文字はそのままです）
+chat-loading-after-screen = { $agent } が入力欄に戻ったら接続します
 chat-writing = 書いています
 chat-thought = 思考
 chat-looked = { $files } 個のファイルを確認

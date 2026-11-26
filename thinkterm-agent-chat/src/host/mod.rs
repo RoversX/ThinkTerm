@@ -19,6 +19,34 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
+/// Puts ThinkTerm's chat mod into the Claude Code whose folder is `claude`
+/// (`CLAUDE_CONFIG_DIR`, or `~/.claude`), or brings ours there up to date:
+/// a Claude started from then on runs it from its start, so a phone's chat
+/// with it connects without having it reload its plugins. Whether that
+/// changed anything.
+pub fn install_claude_mod(claude: &std::path::Path) -> anyhow::Result<bool> {
+    claude::install_into(claude)
+}
+
+/// [`install_claude_mod`], only where ours is in place already: brought up
+/// to date as ThinkTerm is, never put in where it is not -- a phone's first
+/// chat with Claude, or `thinkterm skill setup`, puts it in.
+pub fn refresh_claude_mod(claude: &std::path::Path) -> anyhow::Result<bool> {
+    claude::refresh_in(claude)
+}
+
+/// How ThinkTerm's chat mod in the Claude Code whose folder is `claude`
+/// is: "current", "outdated", "missing" or "someone else's".
+pub fn claude_mod_state(claude: &std::path::Path) -> &'static str {
+    claude::state_in(claude)
+}
+
+/// Takes ThinkTerm's chat mod out of the Claude Code whose folder is
+/// `claude`; whether it was there.
+pub fn remove_claude_mod(claude: &std::path::Path) -> anyhow::Result<bool> {
+    claude::remove_from(claude)
+}
+
 /// The pane the client asked about, as the mux that owns it sees it.
 #[derive(Clone, Debug, Default)]
 pub struct Target {

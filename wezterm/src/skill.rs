@@ -40,7 +40,8 @@ pub struct SkillCommand {
 #[derive(Debug, Parser, Clone)]
 enum SkillSubCommand {
     /// Install or update the skill and the session-start hook in the coding
-    /// agents found on this machine. Safe to run again.
+    /// agents found on this machine, and in Claude Code the plugin the
+    /// phone's chat talks to it through. Safe to run again.
     #[command(name = "setup")]
     Setup(SetupArgs),
 
@@ -48,13 +49,20 @@ enum SkillSubCommand {
     #[command(name = "status")]
     Status(AgentArgs),
 
-    /// Take ThinkTerm's skill and hook out of the agents
+    /// Take ThinkTerm's skill, hook and phone chat plugin out of the agents
     #[command(name = "remove")]
     Remove(AgentArgs),
 
     /// Print the skill, for an agent `setup` does not know
     #[command(name = "show")]
     Show,
+
+    /// Bring the phone chat's plugin in Claude Code up to date where it is
+    /// in place, and nothing else: what the session server does as it
+    /// starts. None is put where there is none: a phone's first chat with
+    /// Claude, or `setup`, puts it in.
+    #[command(name = "chat-mod", hide = true)]
+    ChatMod,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -161,6 +169,16 @@ impl SkillCommand {
             SkillSubCommand::Setup(args) => setup(&args.agents.agents(), args.dry_run),
             SkillSubCommand::Status(args) => status(&args.agents()),
             SkillSubCommand::Remove(args) => remove(&args.agents()),
+            SkillSubCommand::ChatMod => {
+                // Quietly: a machine without it has nothing to do.
+                #[cfg(unix)]
+                {
+                    if let Err(err) = thinkterm_agent_chat::host::refresh_claude_mod(&Agent::Claude.home()) {
+                        log::debug!("bringing the chat plugin in Claude Code up to date: {err:#}");
+                    }
+                }
+                Ok(())
+            }
             SkillSubCommand::Show => {
                 let out = std::io::stdout();
                 let mut out = out.lock();
@@ -221,6 +239,24 @@ fn setup(agents: &[Agent], dry_run: bool) -> Result<()> {
             }
         };
         println!("  hook   {line}  {}", shown(&hooks));
+
+        // The phone chat's plugin, in place before any chat: a Claude
+        // started from now on runs it, with no reload to have it take it in.
+        #[cfg(unix)]
+        {
+            if agent == Agent::Claude {
+                let line = if dry_run {
+                    "would be brought up to date".to_string()
+                } else {
+                    match thinkterm_agent_chat::host::install_claude_mod(&agent.home()) {
+                        Ok(true) => "written".to_string(),
+                        Ok(false) => "up to date".to_string(),
+                        Err(err) => format!("left alone: {err:#}"),
+                    }
+                };
+                println!("  chat   {line}  {}", shown(&agent.home().join("skills").join("thinkterm-chat")));
+            }
+        }
     }
     if !dry_run {
         println!();
@@ -249,6 +285,13 @@ fn status(agents: &[Agent]) -> Result<()> {
             hook_state(&hooks).label()
         };
         println!("  hook   {state}  {}", shown(&hooks));
+        #[cfg(unix)]
+        {
+            if agent == Agent::Claude {
+                let state = thinkterm_agent_chat::host::claude_mod_state(&agent.home());
+                println!("  chat   {state}  {}", shown(&agent.home().join("skills").join("thinkterm-chat")));
+            }
+        }
     }
     Ok(())
 }
@@ -300,6 +343,19 @@ fn remove(agents: &[Agent]) -> Result<()> {
             }
         };
         println!("  hook   {line}  {}", shown(&hooks));
+
+        // The phone chat's plugin, which `setup` puts in.
+        #[cfg(unix)]
+        {
+            if agent == Agent::Claude {
+                let line = match thinkterm_agent_chat::host::remove_claude_mod(&agent.home()) {
+                    Ok(true) => "removed".to_string(),
+                    Ok(false) => "not there".to_string(),
+                    Err(err) => format!("left alone: {err:#}"),
+                };
+                println!("  chat   {line}  {}", shown(&agent.home().join("skills").join("thinkterm-chat")));
+            }
+        }
     }
     Ok(())
 }

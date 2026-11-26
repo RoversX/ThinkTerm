@@ -1981,6 +1981,10 @@ settings-reverse-connect-first = Verbinden Sie zuerst einen Server. Berechtigung
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = Verbinde…
 chat-reconnecting = Verbinde erneut…
+chat-loading = ThinkTerm wird in { $agent } geladen…
+chat-loading-after-turn = Verbindet, sobald { $agent } seinen Zug beendet hat
+chat-loading-after-field = Verbindet, sobald das Eingabefeld von { $agent } leer ist – was dort steht, bleibt unberührt
+chat-loading-after-screen = Verbindet, sobald { $agent } wieder an seiner Eingabe ist
 chat-writing = Schreibt
 chat-thought = Denkt nach
 chat-looked = { $files ->

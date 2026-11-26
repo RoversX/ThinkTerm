@@ -1926,6 +1926,10 @@ settings-reverse-connect-first = 请先连接服务器。每条连接分别设�
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = 正在连接…
 chat-reconnecting = 正在重新连接…
+chat-loading = 正在让 { $agent } 加载 ThinkTerm…
+chat-loading-after-turn = 等 { $agent } 这一轮做完就连上
+chat-loading-after-field = 等 { $agent } 的输入框空了就连上（里面打的字不会动）
+chat-loading-after-screen = 等 { $agent } 回到输入框就连上
 chat-writing = 正在写
 chat-thought = 思考过程
 chat-looked = 看了 { $files } 个文件

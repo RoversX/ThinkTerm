@@ -5,8 +5,8 @@
 
 use crate::markdown::{blocks, Block};
 use crate::{
-    diff, AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, CommandKind, ContextInfo, Done, Ev, FileEdit, FileShown, Item, Look, LookKind,
-    ModelChoice, Need, NoteKind, PartKind, Status,
+    diff, AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, CommandKind, ContextInfo, Done, Ev, FileEdit, FileShown, Item, LoadWait, Look,
+    LookKind, ModelChoice, Need, NoteKind, PartKind, Status,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +62,9 @@ pub struct Chat {
     context: Option<ContextInfo>,
     /// The bridge can have the agent take its extension in (`Op::Reload`).
     can_load: bool,
+    /// The bridge is having the agent take its extension in by itself, and
+    /// waits for this (`Ev::Loading`): said while the chat connects.
+    loading: Option<LoadWait>,
     /// The agent runs an older extension than the one in its folder.
     outdated: bool,
     /// Its reload command was sent: the greeting of the extension taken
@@ -504,6 +507,7 @@ impl Chat {
                 // among several stays so until a new channel.
                 self.guessed |= guessed;
                 self.problem = None;
+                self.loading = None;
                 self.again = false;
                 // Said again after the greeting when known: one from before
                 // (the agent started again in the pane) is not taken as it.
@@ -595,9 +599,18 @@ impl Chat {
             Ev::Error { need, message, can_load } => {
                 self.problem = Some((need, message));
                 self.can_load = can_load;
+                self.loading = None;
                 self.writing.clear();
             }
             Ev::Outdated => self.outdated = true,
+            // Nothing to put right: it connects once the agent takes it.
+            Ev::Loading { wait } => {
+                self.loading = Some(wait);
+                self.problem = None;
+                self.can_load = false;
+                // A bridge saying so is a channel that is back.
+                self.again = false;
+            }
             Ev::Times { times } => self.times.extend(times),
             Ev::Mode { mode } => self.mode = Some(mode),
             Ev::File { file } => self.files.push(file_view(file)),
@@ -678,6 +691,7 @@ impl Chat {
         self.commands.clear();
         self.context = None;
         self.can_load = false;
+        self.loading = None;
         self.outdated = false;
         self.reloading = false;
         self.writing.clear();
@@ -867,6 +881,19 @@ impl Chat {
         let (state, state_label) = match (&self.problem, self.state) {
             (Some(_), _) => ("problem", String::new()),
             (None, None) if self.again => ("connecting", tr("chat-reconnecting")),
+            // Why it is not connected yet, when the bridge is having the
+            // agent take its extension in.
+            (None, None) if self.loading.is_some() => {
+                let key = match self.loading {
+                    Some(LoadWait::Turn) => "chat-loading-after-turn",
+                    Some(LoadWait::Field) => "chat-loading-after-field",
+                    Some(LoadWait::Screen) => "chat-loading-after-screen",
+                    _ => "chat-loading",
+                };
+                let mut args = FluentArgs::new();
+                args.set("agent", agent.clone());
+                ("connecting", tr_args(key, &args))
+            }
             (None, None) => ("connecting", tr("chat-connecting")),
             (None, Some(AgentState::Working)) => ("working", tr("right-agents-state-working")),
             (None, Some(AgentState::Blocked)) => ("blocked", tr("right-agents-state-blocked")),
@@ -2701,6 +2728,41 @@ mod tests {
             })
             .collect();
         assert_eq!(notes, vec![(true, Some(1169)), (true, Some(2010))]);
+    }
+
+    #[test]
+    fn a_load_the_bridge_makes_by_itself_says_what_it_waits_for_not_a_problem() {
+        let mut chat = Chat::new(1, "claude");
+        // An older bridge's card first, then the new one loading by itself.
+        chat.line(r#"{"ev":"error","need":"pi_restart","message":"not running","can_load":true}"#);
+        assert!(chat.view().problem.is_some());
+        chat.line(r#"{"ev":"loading","wait":"turn"}"#);
+        let view = chat.view();
+        assert!(view.problem.is_none(), "waiting is no problem");
+        assert_eq!(view.state, "connecting");
+        let mut args = FluentArgs::new();
+        args.set("agent", "Claude");
+        assert_eq!(view.state_label, tr_args("chat-loading-after-turn", &args));
+        chat.line(r#"{"ev":"loading","wait":"field"}"#);
+        assert_eq!(chat.view().state_label, tr_args("chat-loading-after-field", &args));
+        chat.line(r#"{"ev":"loading","wait":"typed"}"#);
+        assert_eq!(chat.view().state_label, tr_args("chat-loading", &args));
+        // A reason from a newer bridge is said as loading.
+        chat.line(r#"{"ev":"loading","wait":"elsewhere"}"#);
+        assert_eq!(chat.view().state_label, tr_args("chat-loading", &args));
+        // Loaded: the chat as ever.
+        chat.apply(Ev::Hello {
+            protocol: 2,
+            agent: "claude".into(),
+            title: None,
+            guessed: false,
+        });
+        assert_eq!(chat.view().state, "idle");
+        // Given up: the card again, for the person.
+        let mut chat = Chat::new(1, "claude");
+        chat.line(r#"{"ev":"loading","wait":"typed"}"#);
+        chat.line(r#"{"ev":"error","need":"pi_restart","message":"not running","can_load":true}"#);
+        assert_eq!(chat.view().state, "problem");
     }
 
     #[test]

@@ -498,6 +498,7 @@ async fn async_run(
     mux::foreground_program::initialize_mux(&mux);
     update_mux_domains_for_server(&config)?;
     mux::spawn_idle_image_sweeper();
+    put_chat_plugin_in_place();
 
     if let Some(mut takeover) = takeover {
         // The pid file outlives the takeover handle: it stays open, locked,
@@ -748,6 +749,43 @@ fn adopt_pid_file(fd: std::os::unix::io::OwnedFd) {
         .and_then(|_| writeln!(file, "{}", std::process::id()))
     {
         log::warn!("rewriting the pid file after the takeover: {err:#}");
+    }
+}
+
+/// The phone chat's plugin in Claude Code brought up to date, as this
+/// server -- installed, upgraded, or just started -- begins, where a phone's
+/// chat or `thinkterm skill setup` put it: Claude takes the edited mod in by
+/// itself, with no reload. None is put where there is none, or where the
+/// person took it out. By the `thinkterm` beside this program, in the
+/// background; nothing to do where there is no Claude Code.
+fn put_chat_plugin_in_place() {
+    // Not from a build under test or in development, which may run with
+    // the developer's own home: their Claude Code keeps the mod it has.
+    if cfg!(debug_assertions) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let Some(cli) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("thinkterm")))
+            .filter(|cli| cli.is_file())
+        else {
+            return;
+        };
+        let spawned = std::process::Command::new(cli)
+            .args(["skill", "chat-mod"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            // Waited for off this thread, so it leaves no zombie.
+            Ok(mut child) => {
+                thread::spawn(move || child.wait());
+            }
+            Err(err) => log::debug!("bringing the chat plugin in Claude Code up to date: {err:#}"),
+        }
     }
 }
 

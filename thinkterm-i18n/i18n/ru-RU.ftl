@@ -1891,6 +1891,10 @@ settings-reverse-connect-first = Сначала подключитесь к се
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = Подключение…
 chat-reconnecting = Переподключение…
+chat-loading = { $agent } загружает ThinkTerm…
+chat-loading-after-turn = Подключится, когда { $agent } закончит ход
+chat-loading-after-field = Подключится, когда поле ввода { $agent } опустеет — набранное там останется как есть
+chat-loading-after-screen = Подключится, когда { $agent } вернётся к вводу
 chat-writing = Пишет
 chat-thought = Размышления
 chat-looked = Просмотрено файлов: { $files }

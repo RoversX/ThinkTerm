@@ -889,8 +889,17 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             }
             if (chat == null || (rows.isEmpty() && chat.state == "connecting")) {
                 item(key = "tt:connecting") {
-                    Box(Modifier.fillMaxWidth().padding(top = 80.dp), contentAlignment = Alignment.Center) {
+                    // And what it waits for, when the agent is being had to
+                    // take ThinkTerm in.
+                    Column(
+                        Modifier.fillMaxWidth().padding(top = 80.dp, start = 32.dp, end = 32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
                         CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = secondary)
+                        chat?.stateLabel?.takeIf { it.isNotEmpty() }?.let { label ->
+                            Text(label, fontSize = 13.sp, color = secondary, textAlign = TextAlign.Center)
+                        }
                     }
                 }
             }

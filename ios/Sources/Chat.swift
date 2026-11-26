@@ -526,9 +526,20 @@ struct ChatPage: View {
                             .frame(maxWidth: .infinity)
                     }
                     if chat == nil || (chat?.rows.isEmpty == true && chat?.state == "connecting") {
-                        ProgressView()
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 80)
+                        // And what it waits for, when the agent is being had
+                        // to take ThinkTerm in.
+                        VStack(spacing: 12) {
+                            ProgressView()
+                            if let label = chat?.state_label, !label.isEmpty {
+                                Text(label)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.center)
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 80)
+                        .padding(.horizontal, 32)
                     }
                     // Nothing said yet: whom the chat is with, where the words
                     // will be.
