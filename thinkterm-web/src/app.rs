@@ -2372,8 +2372,9 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             KeyCode::Char('v') | KeyCode::Char('V') if cmd || ctrl_shift => return false,
             // Ctrl+Shift+Enter splits to the right, Ctrl+Shift+\ below,
-            // Ctrl+Shift+Z zooms; the same as the strip's buttons.
-            KeyCode::Enter if ctrl_shift => {
+            // Ctrl+Shift+Z zooms; the same as the strip's buttons. Enter is
+            // a named key: its Shift is in `mods` (`keymap::map_key`).
+            KeyCode::Enter if mods == Modifiers::CTRL | Modifiers::SHIFT || ctrl_shift => {
                 drop(inner);
                 self.split(None, thinkterm_proto::SplitDirection::Horizontal);
                 return true;
