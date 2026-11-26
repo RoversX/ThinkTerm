@@ -10671,9 +10671,9 @@ impl TermWindow {
     }
 
     /// `color` as a tab bar paints it: as the chrome does, or as solid as
-    /// the shade Settings asks of it.
+    /// the shade Settings asks of the terminal, which the tab bars share.
     pub(crate) fn tab_bar_surface(&self, color: LinearRgba) -> LinearRgba {
-        self.area_surface(color, self.area_shades.map(|shades| shades.tab_bar))
+        self.area_surface(color, self.area_shades.map(|shades| shades.terminal))
     }
 
     /// A collapsed pane stack's bar: the pane nav bars' fellow, so shaded as

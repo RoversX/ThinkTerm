@@ -572,10 +572,8 @@ pub(crate) struct NativeAppearanceSettings {
     /// The sidebars' shade.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) sidebar_shade: NativeSidebarShade,
-    /// The tab bars' shade.
-    #[serde(deserialize_with = "choice_or_default")]
-    pub(crate) tab_bar_shade: NativeShade,
-    /// The terminal's shade.
+    /// The terminal's shade, which the tab bars take too. A
+    /// `tab_bar_shade` an older build saved is ignored.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) terminal_shade: NativeShade,
     /// How a sidebar thread row draws the programs its panes run.
@@ -679,13 +677,14 @@ impl NativeMacGlass {
 
 /// The shade of one of the window's areas in a see-through window: dark is
 /// the sidebars' colour as designed, light the terminal's ground, mid
-/// halfway -- and as solid as `shade_opacity` says.
+/// halfway -- and as solid as `shade_opacity` says. The terminal, and the
+/// tab bars with it, are dark unless asked otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeShade {
+    #[default]
     Dark,
     Mid,
-    #[default]
     Light,
 }
 
@@ -693,13 +692,15 @@ impl NativeShade {
     pub(crate) const ALL: [Self; 3] = [Self::Dark, Self::Mid, Self::Light];
 }
 
-/// `NativeShade`, for the sidebars, which are dark unless asked otherwise.
+/// `NativeShade`, for the sidebars, which are light unless asked otherwise:
+/// in a see-through window they stand lighter than the tab bars and the
+/// terminal beside them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeSidebarShade {
-    #[default]
     Dark,
     Mid,
+    #[default]
     Light,
 }
 
@@ -726,8 +727,8 @@ impl NativeSidebarShade {
 /// an area look dark or light: a dark ground let through less shows darker
 /// over whatever is behind, a light one lighter. So a darker shade is more
 /// solid in a dark interface, and less in a light one. Light is the
-/// window's own opacity either way: the terminal, left light, is as solid
-/// as the slider says.
+/// window's own opacity either way: a terminal set light is as solid as
+/// the slider says.
 pub(crate) fn shade_opacity(shade: NativeShade, dark_interface: bool, window: f32) -> f32 {
     let window = window.clamp(0.0, 1.0);
     let step = match shade {
@@ -742,18 +743,22 @@ pub(crate) fn shade_opacity(shade: NativeShade, dark_interface: bool, window: f3
     }
 }
 
-/// The shades Settings asks of a see-through window's areas.
+/// The shades Settings asks of a see-through window's areas. The tab bars
+/// have none of their own: they take the terminal's, so that the two read
+/// as one surface -- its colour where the terminal takes one, and its
+/// solidity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AreaShades {
     pub(crate) sidebar: NativeShade,
-    pub(crate) tab_bar: NativeShade,
     pub(crate) terminal: NativeShade,
 }
 
-/// `palette` with the sidebars and the tab bars shaded as Settings asks,
-/// and the terminal's ground when it is not the light one it has anyway --
-/// unless the terminal's scheme is on the other side of the interface:
-/// the interface's greys under that scheme's text would not be read.
+/// `palette` with the sidebars shaded as Settings asks, and the terminal's
+/// ground when it is not the light one it has anyway -- unless the
+/// terminal's scheme is on the other side of the interface: the interface's
+/// greys under that scheme's text would not be read. The tab bars take the
+/// terminal's ground where it takes one, and stay as designed where it
+/// keeps its own.
 pub(crate) fn apply_area_shades(
     settings: &ThinkTermNativeSettings,
     mut palette: crate::ui::UiPalette,
@@ -776,9 +781,11 @@ pub(crate) fn apply_area_shades(
     };
     let appearance = &settings.appearance;
     palette.workspace_sidebar_bg = pick(appearance.sidebar_shade.shade());
-    palette.header_bg = pick(appearance.tab_bar_shade);
     let terminal = (appearance.terminal_shade != NativeShade::Light && scheme_on_interface_side)
         .then(|| pick(appearance.terminal_shade));
+    // Light is the tab bars' own colour, so this is pick(terminal_shade)
+    // wherever the terminal is shaded.
+    palette.header_bg = terminal.unwrap_or(palette.header_bg);
     (palette, terminal)
 }
 
@@ -812,7 +819,6 @@ pub(crate) fn window_chrome_palette(
     let (palette, terminal) = apply_area_shades(&settings, palette, scheme_on_interface_side);
     let shades = AreaShades {
         sidebar: settings.appearance.sidebar_shade.shade(),
-        tab_bar: settings.appearance.tab_bar_shade,
         terminal: settings.appearance.terminal_shade,
     };
     (palette, terminal, Some(shades))
@@ -2802,7 +2808,6 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.window_opacity != after.appearance.window_opacity
         || before.appearance.mac_glass != after.appearance.mac_glass
         || before.appearance.sidebar_shade != after.appearance.sidebar_shade
-        || before.appearance.tab_bar_shade != after.appearance.tab_bar_shade
         || before.appearance.terminal_shade != after.appearance.terminal_shade
         || before.appearance.sidebar_thread_icons != after.appearance.sidebar_thread_icons
         || before.appearance.sidebar_thread_status != after.appearance.sidebar_thread_status
@@ -4213,20 +4218,32 @@ mod tests {
         let palette = crate::ui::UiPalette::for_appearance(Appearance::Dark);
         let (dark, light) = (palette.workspace_sidebar_bg, palette.header_bg);
         let mut settings = ThinkTermNativeSettings::default();
-        // As designed unless asked otherwise.
-        assert_eq!(apply_area_shades(&settings, palette, true), (palette, None));
-        settings.appearance.sidebar_shade = NativeSidebarShade::Light;
-        settings.appearance.tab_bar_shade = NativeShade::Dark;
-        settings.appearance.terminal_shade = NativeShade::Mid;
+        // Unless asked otherwise, the sidebars are light, and the tab bars
+        // and the terminal dark.
         let (shaded, terminal) = apply_area_shades(&settings, palette, true);
         assert_eq!(shaded.workspace_sidebar_bg, light);
         assert_eq!(shaded.header_bg, dark);
+        assert_eq!(terminal, Some(dark));
+        // As designed when asked for.
+        settings.appearance.sidebar_shade = NativeSidebarShade::Dark;
+        settings.appearance.terminal_shade = NativeShade::Light;
+        assert_eq!(apply_area_shades(&settings, palette, true), (palette, None));
+        // The tab bars take the terminal's shade, whichever it is.
+        settings.appearance.sidebar_shade = NativeSidebarShade::Light;
+        settings.appearance.terminal_shade = NativeShade::Mid;
+        let (shaded, terminal) = apply_area_shades(&settings, palette, true);
+        assert_eq!(shaded.workspace_sidebar_bg, light);
         let mid = terminal.expect("a mid terminal is asked for");
         assert!(mid != dark && mid != light);
+        assert_eq!(shaded.header_bg, mid);
         // The terminal's own ground is left to its override, not the
-        // palette's sidebar colour, and none on the scheme's other side.
+        // palette's sidebar colour, and none on the scheme's other side,
+        // where the terminal keeps its own ground and the tab bars stay as
+        // designed with it.
         assert_eq!(shaded.sidebar_bg, palette.sidebar_bg);
-        assert_eq!(apply_area_shades(&settings, palette, false).1, None);
+        let (other_side, terminal) = apply_area_shades(&settings, palette, false);
+        assert_eq!(terminal, None);
+        assert_eq!(other_side.header_bg, light);
         // Light is the window's own opacity in either interface.
         assert_eq!(shade_opacity(NativeShade::Light, false, 0.3), 0.3);
         assert_eq!(shade_opacity(NativeShade::Light, false, 0.0), 0.0);
@@ -4239,11 +4256,14 @@ mod tests {
         for shade in NativeShade::ALL {
             assert_eq!(shade_opacity(shade, true, 1.0), 1.0);
         }
-        let text = r#"{"appearance":{"sidebar_shade":"something_new","terminal_shade":"dark"}}"#;
+        // An unknown choice falls back to the default, and the tab bars'
+        // own shade an older build saved is ignored.
+        let text = r#"{"appearance":{"sidebar_shade":"something_new","tab_bar_shade":"dark","terminal_shade":"light"}}"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(text).unwrap();
-        assert_eq!(settings.appearance.sidebar_shade, NativeSidebarShade::Dark);
-        assert_eq!(settings.appearance.tab_bar_shade, NativeShade::Light);
-        assert_eq!(settings.appearance.terminal_shade, NativeShade::Dark);
+        assert_eq!(settings.appearance.sidebar_shade, NativeSidebarShade::Light);
+        assert_eq!(settings.appearance.terminal_shade, NativeShade::Light);
+        let (shaded, _) = apply_area_shades(&settings, palette, true);
+        assert_eq!(shaded.header_bg, light);
     }
 
     #[test]

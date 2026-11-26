@@ -2383,7 +2383,6 @@ enum SettingsAction {
     ToggleMacGlassMenu,
     SetMacGlass(crate::native_settings::NativeMacGlass),
     SetSidebarShade(crate::native_settings::NativeShade),
-    SetTabBarShade(crate::native_settings::NativeShade),
     SetWindowTabs(crate::native_settings::NativeWindowTabs),
     SetServerPlacement(crate::native_settings::NativeServerPlacement),
     SetServerTerminals(crate::native_settings::NativeServerTerminals),
@@ -7248,11 +7247,6 @@ impl SettingsWindow {
                     appearance.sidebar_shade = crate::native_settings::NativeSidebarShade::of(shade)
                 },
             ),
-            SettingsAction::SetTabBarShade(shade) => self.apply_window_areas(
-                "settings-tab-bar-shade",
-                localized_shade_label(shade),
-                |appearance| appearance.tab_bar_shade = shade,
-            ),
             SettingsAction::SetWindowTabs(mode) => self.apply_window_tabs(mode),
             SettingsAction::SetServerPlacement(placement) => {
                 self.apply_server_placement(placement)
@@ -10009,11 +10003,6 @@ impl SettingsWindow {
                         "settings-sidebar-shade",
                         appearance.sidebar_shade.shade(),
                         SettingsAction::SetSidebarShade as fn(_) -> SettingsAction,
-                    ),
-                    (
-                        "settings-tab-bar-shade",
-                        appearance.tab_bar_shade,
-                        SettingsAction::SetTabBarShade as fn(_) -> SettingsAction,
                     ),
                     (
                         "settings-terminal-shade",
