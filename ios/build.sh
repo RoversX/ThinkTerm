@@ -15,6 +15,9 @@
 #                           TestFlight. Signing is Xcode's own: the account
 #                           signed in to Xcode, or an App Store Connect API
 #                           key in ASC_KEY_PATH, ASC_KEY_ID and ASC_ISSUER_ID.
+#   ios/build.sh organizer VERSION
+#                           open this version's archive in Xcode for manual
+#                           upload, building it first if it does not exist.
 #
 # A signing team for the phone goes in ios/Local.xcconfig (not tracked):
 #   DEVELOPMENT_TEAM = ABCDE12345
@@ -35,12 +38,25 @@ BUNDLE=com.roversx.thinkterm.ios
 # a last two for a fix to the app alone), so a fix sorts after its release
 # and before the next. App Store Connect takes three numbers as the
 # version, so a fix keeps its release's and only the build number moves.
-if [ "$MODE" = archive ]; then
-  VERSION=${2:?usage: ios/build.sh archive VERSION}
+if [ "$MODE" = archive ] || [ "$MODE" = organizer ]; then
+  VERSION=${2:?usage: ios/build.sh $MODE VERSION}
   echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]{1,2})?$' \
     || { echo "VERSION is major.minor.patch, or .fix after it: $VERSION" >&2; exit 1; }
   MARKETING=$(echo "$VERSION" | cut -d. -f1-3)
   BUILD=$(echo "$VERSION" | awk -F. '{ print $1 * 1000000 + $2 * 10000 + $3 * 100 + ($4 == "" ? 0 : $4) }')
+  ARCHIVE=$DERIVED/ThinkTerm-$VERSION.xcarchive
+  archive_action=$MODE
+  if [ "$MODE" = organizer ] && [ -e "$ARCHIVE" ]; then
+    info=$ARCHIVE/Info.plist
+    if [ "$(plutil -extract ApplicationProperties.CFBundleShortVersionString raw "$info")" != "$MARKETING" ] ||
+       [ "$(plutil -extract ApplicationProperties.CFBundleVersion raw "$info")" != "$BUILD" ]; then
+      echo "Expected version $MARKETING (build $BUILD) in $ARCHIVE" >&2
+      exit 1
+    fi
+    exec open -a Xcode "$ARCHIVE"
+  fi
+  # Both modes use the same device build and archive settings.
+  MODE=archive
 fi
 
 # Only the static library: the crate's cdylib is for Android, and its
@@ -150,9 +166,9 @@ fi
 
 if [ "$MODE" = archive ]; then
   echo "== archive ($MARKETING, build $BUILD)"
-  ARCHIVE=$DERIVED/ThinkTerm-$VERSION.xcarchive
-  EXPORT=$DERIVED/export-$VERSION
-  rm -rf "$ARCHIVE" "$EXPORT"
+  if [ "$archive_action" = archive ]; then
+    rm -rf "$ARCHIVE"
+  fi
   set --
   if [ -n "${ASC_KEY_PATH:-}" ]; then
     set -- -authenticationKeyPath "$ASC_KEY_PATH" \
@@ -165,10 +181,15 @@ if [ "$MODE" = archive ]; then
     -allowProvisioningUpdates "$@" \
     MARKETING_VERSION="$MARKETING" CURRENT_PROJECT_VERSION="$BUILD" \
     archive -quiet
+  if [ "$archive_action" = organizer ]; then
+    exec open -a Xcode "$ARCHIVE"
+  fi
   # App Store Connect's distribution, signed by Xcode; the build number is
   # the one above, not one Xcode picks.
   destination=export
   [ "${UPLOAD:-}" = 1 ] && destination=upload
+  EXPORT=$DERIVED/export-$VERSION
+  rm -rf "$EXPORT"
   options=$DERIVED/ExportOptions.plist
   cat > "$options" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
