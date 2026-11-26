@@ -107,6 +107,13 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(spaceHost, forKey: "spaces.host") }
     }
 
+    /// What Threads home shows: a Space (""), or every computer's projects
+    /// by the git repository they are in ("repos"), while those are asked
+    /// for (`byRepo`).
+    @Published var homeView: String {
+        didSet { defaults.set(homeView, forKey: "home.view") }
+    }
+
     /// Threads lists only the threads the Status panel has something in
     /// (the eye in its bar), kept from one launch to the next.
     @Published var agentsOnly: Bool {
@@ -213,6 +220,7 @@ final class AppSettings: ObservableObject {
         chatReveal = d.string(forKey: "chat.reveal") ?? "stream"
         spaces = d.string(forKey: "ui.spaces") ?? "list"
         spaceHost = d.string(forKey: "spaces.host") ?? ""
+        homeView = d.string(forKey: "home.view") ?? ""
         agentsOnly = d.object(forKey: "home.agents") as? Bool ?? false
         byRepo = d.object(forKey: "home.repos") as? Bool ?? false
         repoHost = d.object(forKey: "home.repos.host") as? Bool ?? false

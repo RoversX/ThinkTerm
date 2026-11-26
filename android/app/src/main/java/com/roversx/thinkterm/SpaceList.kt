@@ -17,7 +17,20 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -179,6 +192,9 @@ fun SpaceList(
     val bars = WindowInsets.statusBars.asPaddingValues()
     val foot = WindowInsets.navigationBars.asPaddingValues()
     val byRepo = settings.byRepo && !searching
+    // Threads home's view of every computer's projects by repository, in
+    // place of a Space; a sidebar shows its Space, as ever.
+    val reposView = place == ListPlace.HOME && byRepo && settings.homeView == "repos"
     // Folded projects, by id, the list over.
     val folded = remember { mutableStateListOf<String>() }
 
@@ -187,6 +203,8 @@ fun SpaceList(
     // others' only while it looks at them (a search, the menu, the repos),
     // the terminal on show reading its own.
     var menuOpen by remember { mutableStateOf(false) }
+    // Threads home's view picked at its head (`HomeViewSheet`).
+    var picking by remember { mutableStateOf(false) }
     val readAll = place == ListPlace.HOME || searching || menuOpen || byRepo
     for (listed in entries.mapNotNull { Sessions.existing(it.id) }) key(listed) {
         if (listed !== inFront && (readAll || listed === model)) {
@@ -238,11 +256,13 @@ fun SpaceList(
         val extra = if (place == ListPlace.HOME) ((maxWidth - READABLE_WIDTH) / 2).coerceAtLeast(0.dp) else 0.dp
         Box(Modifier.matchParentSize().layerBackdrop(groundGlass).background(ground))
 
-        // Swiped sideways, the list goes to the Space before or after the
-        // one on show, as the desktop's sidebar does: decided as the touch
-        // sets off, plainly sideways, so a scroll stays a scroll.
+        // Swiped sideways, a sidebar's list goes to the Space before or
+        // after the one on show, as the desktop's sidebar does: decided as
+        // the touch sets off, plainly sideways, so a scroll stays a scroll.
+        // Threads home stays put: its Spaces are picked from the menu at
+        // its head.
         val spaceId = model?.shownSpace()?.id
-        val shownKey = (host?.id ?: "") + "/" + (spaceId ?: "")
+        val shownKey = if (reposView) REPOS_KEY else (host?.id ?: "") + "/" + (spaceId ?: "")
         val order = swipeOrder(entries)
         val at = order.indexOfFirst { it.first.id == host?.id && it.second == spaceId }
         val scope = rememberCoroutineScope()
@@ -300,10 +320,11 @@ fun SpaceList(
                 (slideInHorizontally(spec) { if (forward) it / 3 else -it / 3 } + fadeIn(tween(240))) togetherWith
                     (slideOutHorizontally(spec) { if (forward) -it / 3 else it / 3 } + fadeOut(tween(200)))
             },
-            modifier = Modifier.fillMaxSize().then(if (searching) Modifier else swipe).graphicsLayer { translationX = drag },
+            modifier = Modifier.fillMaxSize().then(if (searching || place == ListPlace.HOME) Modifier else swipe).graphicsLayer { translationX = drag },
             label = "space",
         ) { key ->
-            val (keyHost, keySpace) = key.split("/", limit = 2).let { it[0] to it.getOrElse(1) { "" } }
+            val repos = key == REPOS_KEY
+            val (keyHost, keySpace) = if (repos) "" to "" else key.split("/", limit = 2).let { it[0] to it.getOrElse(1) { "" } }
             val listHost = entries.firstOrNull { it.id == keyHost }
             val listModel = listHost?.let { Sessions.existing(it.id) }
             LazyColumn(
@@ -317,7 +338,15 @@ fun SpaceList(
             ) {
                 item(key = "head") {
                     Column {
-                        if (listHost != null) {
+                        if (repos && entries.isNotEmpty()) {
+                            HomeTitle(tr("home.view.repos"), tr("home.view.repos.all"), null) { picking = true }
+                        } else if (listHost != null && place == ListPlace.HOME) {
+                            HomeTitle(
+                                listModel?.tree?.spaces?.firstOrNull { it.id == keySpace }?.name ?: listHost.display,
+                                listHost.display,
+                                listModel,
+                            ) { picking = true }
+                        } else if (listHost != null) {
                             SpaceTitle(
                                 place = place,
                                 entries = entries,
@@ -341,15 +370,24 @@ fun SpaceList(
                         Column {
                             when {
                                 searching -> Found(entries, query, dark, ::openRow)
+                                // Every computer's projects by repository, then
+                                // the rest, computer by computer.
+                                repos && entries.isNotEmpty() -> {
+                                    RepoGroups(entries, dark, ::toTerminal, ::openRow)
+                                    OtherProjects(entries, dark, folded, onOpen = ::toTerminal, onRow = ::openRow, connect = { pick(it, null) })
+                                }
                                 listHost != null -> {
-                                    if (byRepo) RepoGroups(entries, dark, ::toTerminal, ::openRow)
+                                    // A sidebar's repositories are above its Space;
+                                    // Threads home has a view of them of its own.
+                                    val grouped = byRepo && place == ListPlace.PANEL
+                                    if (grouped) RepoGroups(entries, dark, ::toTerminal, ::openRow)
                                     SpaceRows(
                                         host = listHost,
                                         model = listModel,
                                         spaceId = keySpace,
                                         dark = dark,
                                         folded = folded,
-                                        skipGrouped = byRepo,
+                                        skipGrouped = grouped,
                                         overview = overview,
                                         onOpen = { done(); toTerminal(listHost) },
                                         onRow = ::openRow,
@@ -415,8 +453,9 @@ fun SpaceList(
                     ),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // A thread of its own in the Space on show.
-                if (host != null && model?.listReady() == true) {
+                // A thread of its own in the Space on show (none in the view
+                // of every computer's repositories: each group has its +).
+                if (host != null && model?.listReady() == true && !reposView) {
                     Row(
                         Modifier
                             .height(50.dp)
@@ -444,6 +483,321 @@ fun SpaceList(
                 ListCircle("settings", tr("settings"), backdrop, dark, size = 50) { done(); onSettings() }
             }
         }
+    }
+
+    if (picking) {
+        HomeViewSheet(
+            entries = entries,
+            shown = host,
+            reposShown = reposView,
+            byRepo = byRepo,
+            dark = dark,
+            onRepos = { settings.homeView = "repos" },
+            onPick = { to, space ->
+                settings.homeView = ""
+                pick(to, space)
+            },
+            onOpen = ::toTerminal,
+        ) { picking = false }
+    }
+}
+
+/// The key of Threads home's view of every computer's repositories, in
+/// place of a host's Space.
+private const val REPOS_KEY = "\u0000repos"
+
+/// Threads home's head: what it shows, large -- a Space, or every
+/// computer's projects by repository -- and under it where (the computer,
+/// its dot saying how its connection is). A tap picks another
+/// (`HomeViewSheet`).
+@Composable
+private fun HomeTitle(title: String, under: String, model: TerminalModel?, onClick: () -> Unit) {
+    val primary = MaterialTheme.colorScheme.onSurface
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
+    Box(Modifier.padding(start = 6.dp, end = 4.dp, top = 4.dp, bottom = 8.dp)) {
+        Column(Modifier.clip(MaterialTheme.shapes.medium).clickable(onClick = onClick).padding(horizontal = 6.dp, vertical = 4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    title,
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Spacer(Modifier.width(6.dp))
+                DesktopIcon("chevrons-up-down", size = 16.dp, tint = secondary)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (model != null) {
+                    if (model.onItsWay()) {
+                        CircularProgressIndicator(Modifier.size(10.dp), strokeWidth = 1.5.dp, color = Color(0xFFFF9F0A))
+                    } else {
+                        Box(Modifier.size(8.dp).clip(CircleShape).background(hostDot(model)))
+                    }
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(under, fontSize = 14.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+    }
+}
+
+/// What Threads home shows, picked from the bottom: every computer's
+/// projects by repository (while those are asked for), then each computer
+/// with its Spaces -- the one on show ticked, a long press to rename or
+/// delete one, and a new one at the end. A computer not connected says how
+/// its connection stands, and a tap connects it; its connection's own
+/// actions are behind the dots at its name.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HomeViewSheet(
+    entries: List<Host>,
+    shown: Host?,
+    reposShown: Boolean,
+    byRepo: Boolean,
+    dark: Boolean,
+    onRepos: () -> Unit,
+    onPick: (Host, String?) -> Unit,
+    /// A host's terminal, for its key to be trusted there.
+    onOpen: (Host) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val ink = MaterialTheme.colorScheme.onSurface
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
+    val card = if (dark) Color(0xFF2C2C2E) else Color.White
+    val scope = rememberCoroutineScope()
+    val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // Gone first, then what was picked: the list changes under no sheet.
+    val then = { act: () -> Unit -> scope.launch { state.hide() }.invokeOnCompletion { onDismiss(); act() } }
+    // A Space to be deleted, asked about first: its threads' tabs close.
+    var deleting by remember { mutableStateOf<Pair<TerminalModel, TreeSpace>?>(null) }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = state,
+        containerColor = if (dark) Color(0xFF1C1C1E) else Color(0xFFF2F2F7),
+        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+    ) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 28.dp)) {
+            Text(
+                tr("home.view.pick"),
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = ink,
+                modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 12.dp).semantics { heading() },
+            )
+            if (byRepo) {
+                ViewCard(card) {
+                    ViewRow("git-branch", tr("home.view.repos"), tr("home.view.repos.all"), reposShown, ink, secondary) { then(onRepos) }
+                }
+            }
+            for (entry in entries) key(entry.id) {
+                val session = Sessions.existing(entry.id)
+                val ready = session?.listReady() == true
+                var menu by remember { mutableStateOf(false) }
+                // The computer: its dot and name, how its connection stands,
+                // and that connection's own actions.
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 28.dp, end = 16.dp, top = 18.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(Modifier.size(8.dp).clip(CircleShape).background(hostDot(session)))
+                    Spacer(Modifier.width(8.dp))
+                    Text(entry.display, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    if (session != null) {
+                        Box {
+                            Box(
+                                Modifier.size(32.dp).clip(CircleShape).clickable(role = Role.Button) { menu = true },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                DesktopIcon("ellipsis", size = 18.dp, tint = secondary)
+                            }
+                            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                val up = session.isConnected && !(session.reconnecting && !session.autoReconnect)
+                                DropdownMenuItem(
+                                    text = { Text(tr(if (up) "disconnect" else "reconnect")) },
+                                    leadingIcon = { DesktopIcon(if (up) "power" else "rotate-ccw", size = 18.dp, tint = secondary) },
+                                    onClick = {
+                                        menu = false
+                                        if (up) session.disconnect() else session.connect()
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+                ViewCard(card) {
+                    val spaces = session?.takeIf { ready }?.tree?.spaces
+                    if (session?.pendingHostKey != null) {
+                        // Its key waits to be trusted, on its terminal's screen.
+                        ViewRow("key-round", tr("hostkey.approve.title"), null, false, ink, secondary) { then { onOpen(entry) } }
+                    } else if (spaces == null) {
+                        val word = when {
+                            session?.onItsWay() == true -> tr("connecting")
+                            session?.connection?.startsWith("failed") == true -> tr("reconnect")
+                            else -> tr("connect")
+                        }
+                        ViewRow("link-2", word, null, false, ink, secondary) { then { onPick(entry, null) } }
+                    } else {
+                        for (space in spaces) key(space.id) {
+                            var actions by remember { mutableStateOf(false) }
+                            Box {
+                                ViewRow(
+                                    "layers",
+                                    space.name,
+                                    null,
+                                    !reposShown && entry.id == shown?.id && space.current,
+                                    ink,
+                                    secondary,
+                                    onLongClick = { actions = true },
+                                ) { then { onPick(entry, space.id) } }
+                                DropdownMenu(expanded = actions, onDismissRequest = { actions = false }) {
+                                    DropdownMenuItem(
+                                        text = { Text(tr("rename")) },
+                                        leadingIcon = { DesktopIcon("pencil", size = 18.dp, tint = secondary) },
+                                        onClick = {
+                                            actions = false
+                                            session.menuAction("rename-space:" + space.id)
+                                        },
+                                    )
+                                    if (spaces.size > 1) {
+                                        DropdownMenuItem(
+                                            text = { Text(tr("delete"), color = Color(0xFFFF453A)) },
+                                            leadingIcon = { DesktopIcon("trash-2", size = 18.dp, tint = Color(0xFFFF453A)) },
+                                            onClick = {
+                                                actions = false
+                                                deleting = session to space
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        ViewRow("plus", tr("space.new"), null, false, ink, secondary) {
+                            then {
+                                session.menuAction("new-space")
+                                onPick(entry, null)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    deleting?.let { (session, space) ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text(tr("thread.delete.title", space.name)) },
+            text = { Text(tr("space.delete.body")) },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleting = null
+                    session.menuAction("delete-space:" + space.id)
+                }) { Text(tr("delete"), color = Color(0xFFFF453A)) }
+            },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text(tr("cancel")) } },
+        )
+    }
+}
+
+/// A group of rows on the sheet, as a card.
+@Composable
+private fun ViewCard(card: Color, content: @Composable () -> Unit) {
+    Column(Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(card)) { content() }
+}
+
+/// A row of the sheet: its icon, its name and what it holds, a tick on the
+/// one on show.
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ViewRow(
+    icon: String,
+    title: String,
+    under: String?,
+    on: Boolean,
+    ink: Color,
+    secondary: Color,
+    onLongClick: (() -> Unit)? = null,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .semantics { selected = on }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        DesktopIcon(icon, size = 18.dp, tint = secondary)
+        Column(Modifier.weight(1f)) {
+            Text(title, fontSize = 16.sp, color = ink, fontWeight = if (on) FontWeight.SemiBold else null, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (under != null) Text(under, fontSize = 13.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+            if (on) DesktopIcon("check", size = 18.dp, tint = LeadBlue)
+        }
+    }
+}
+
+/// Under every computer's repositories on Threads home: each connected
+/// computer's projects in none (or in one with no remote), wherever its
+/// Space, as their projects list them; a computer not connected, a tap
+/// away from connecting.
+@Composable
+private fun OtherProjects(
+    entries: List<Host>,
+    dark: Boolean,
+    folded: MutableList<String>,
+    onOpen: (Host) -> Unit,
+    onRow: (Host, TerminalModel, TreeSpace, TreeProject, ThreadRow) -> Unit,
+    connect: (Host) -> Unit,
+) {
+    val agentsOnly = AppSettings.shared.agentsOnly
+    for (host in entries) key("others:" + host.id) {
+        val model = Sessions.existing(host.id)
+        val rest = model?.takeIf { it.listReady() }?.tree?.spaces.orEmpty().flatMap { space ->
+            space.projects.filter { it.repo?.remote == null && listedProject(it, agentsOnly) }.map { space to it }
+        }
+        if (model?.pendingHostKey != null) {
+            // Its key waits to be trusted, on its terminal's screen.
+            HomeRow(icon = "key-round", title = host.display + " · " + tr("hostkey.approve.title"), bold = true) { onOpen(host) }
+        } else if (model == null || !model.listReady()) {
+            HomeRow(
+                icon = "link-2",
+                title = host.display + " · " + tr(if (model?.onItsWay() == true) "connecting" else "host.notconnected"),
+                dim = true,
+            ) { connect(host) }
+        } else if (rest.isNotEmpty()) {
+            OtherProjectsOf(host, model, rest, dark, folded, agentsOnly, onOpen, onRow)
+        }
+    }
+}
+
+/// One computer's projects in no repository with a remote, under its name.
+@Composable
+private fun OtherProjectsOf(
+    host: Host,
+    model: TerminalModel,
+    rest: List<Pair<TreeSpace, TreeProject>>,
+    dark: Boolean,
+    folded: MutableList<String>,
+    agentsOnly: Boolean,
+    onOpen: (Host) -> Unit,
+    onRow: (Host, TerminalModel, TreeSpace, TreeProject, ThreadRow) -> Unit,
+) {
+    Row(
+        Modifier.padding(start = 12.dp, end = 12.dp, top = 18.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(hostDot(model)))
+        Spacer(Modifier.width(7.dp))
+        Text(host.display, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+    }
+    for ((space, project) in rest) key(project.id) {
+        ProjectItem(model, space, project, folded, dark, agentsOnly, { onOpen(host) }) { thread -> onRow(host, model, space, project, thread) }
     }
 }
 
