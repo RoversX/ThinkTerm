@@ -1031,8 +1031,10 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                 .imePadding()
                 .navigationBarsPadding()
                 .onSizeChanged { footPx = it.height }
-                // Clear of a large rounded screen corner, the keyboard down.
-                .padding(start = 10.dp, end = 10.dp, top = 14.dp, bottom = 8.dp + if (keyboardUp) 0.dp else footClearance),
+                // Clear of a large rounded screen corner, the keyboard down,
+                // and a little higher than that so it does not sit on the
+                // screen's edge.
+                .padding(start = 10.dp, end = 10.dp, top = 14.dp, bottom = 8.dp + if (keyboardUp) 0.dp else footClearance + 6.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             // A chat's notices are numbered from one again: the count of
