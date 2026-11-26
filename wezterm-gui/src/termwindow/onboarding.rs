@@ -549,6 +549,12 @@ pub(crate) struct OnboardingView {
     /// How solid the page's ground is: as solid as the terminal's, which is
     /// less than whole in a see-through window (`set_ground_opacity`).
     ground_opacity: f32,
+    /// In a see-through window, the ground Settings has the terminal take
+    /// (`set_terminal_ground`), which the page takes instead of its own, and
+    /// its controls are mixed from: a new user's first look at a
+    /// see-through window then shows the page and the tab bar above it as
+    /// one surface, as the terminal and the tab bar are.
+    terminal_ground: Option<LinearRgba>,
 }
 
 impl OnboardingView {
@@ -587,7 +593,14 @@ impl OnboardingView {
             mark: None,
             shaped: ShapedText::default(),
             ground_opacity: 1.0,
+            terminal_ground: None,
         }
+    }
+
+    /// The page's ground colour, opaque: its own, or the terminal's where
+    /// Settings shades that. It is painted as solid as the terminal.
+    fn page_colour(&self, palette: UiPalette) -> LinearRgba {
+        self.terminal_ground.unwrap_or_else(|| page_ground(palette))
     }
 
     /// Whether the intro still keeps the page from taking input.
@@ -883,7 +896,7 @@ impl OnboardingView {
         caption_font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
         self.widgets.clear();
-        let skin = Skin::new(palette);
+        let skin = Skin::on(palette, self.page_colour(palette));
         // In a see-through window the desktop shows through the page as it
         // does through the terminal. The controls on it stay solid.
         let page = skin.ground.mul_alpha(self.ground_opacity);
@@ -2105,8 +2118,9 @@ struct Skin {
 }
 
 impl Skin {
-    fn new(palette: UiPalette) -> Self {
-        let ground = page_ground(palette);
+    /// The controls for a page whose ground is `ground`: its own
+    /// (`page_ground`), or the terminal's in a see-through window.
+    fn on(palette: UiPalette, ground: LinearRgba) -> Self {
         // Every fill below is opaque — see `mix`. The selected chip in
         // particular sits only a little way from the ground, so the ordinary
         // text colour still reads on it; pushing it towards the text colour
@@ -2232,6 +2246,10 @@ impl ContentView for OnboardingView {
         self.ground_opacity = opacity.clamp(0.0, 1.0);
     }
 
+    fn set_terminal_ground(&mut self, ground: Option<LinearRgba>) {
+        self.terminal_ground = ground;
+    }
+
     fn title(&self) -> String {
         crate::i18n::tr("onboarding-window-title")
     }
@@ -2317,7 +2335,7 @@ impl ContentView for OnboardingView {
                 ctx,
                 layers,
                 area,
-                page_ground(palette),
+                self.page_colour(palette),
                 self.ground_opacity,
                 frame,
                 page_under,
@@ -2702,7 +2720,7 @@ mod tests {
     fn skin_fills_are_opaque_and_keep_their_labels_legible() {
         for appearance in [Appearance::Dark, Appearance::Light] {
             let palette = UiPalette::for_appearance(appearance);
-            let skin = Skin::new(palette);
+            let skin = Skin::on(palette, page_ground(palette));
             let fills = [
                 ("chip_bg", skin.chip_bg),
                 ("chip_hover_bg", skin.chip_hover_bg),
@@ -2758,7 +2776,7 @@ mod tests {
         // And the skin's own greys must stay nearer the ground than the text.
         for appearance in [Appearance::Dark, Appearance::Light] {
             let palette = UiPalette::for_appearance(appearance);
-            let skin = Skin::new(palette);
+            let skin = Skin::on(palette, page_ground(palette));
             let luma =
                 |c: LinearRgba| (srgb_encode(c.0) + srgb_encode(c.1) + srgb_encode(c.2)) / 3.0;
             let to_ground = (luma(skin.menu_bg) - luma(skin.ground)).abs();
