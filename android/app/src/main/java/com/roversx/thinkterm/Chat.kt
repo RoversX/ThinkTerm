@@ -9,7 +9,11 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
@@ -118,6 +122,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -3370,23 +3375,30 @@ private fun ModelChip(menu: ChatModelMenu, model: TerminalModel, dark: Boolean, 
     if (open) ModelSheet(menu, model, dark) { open = false }
 }
 
-/// The models to talk to, risen from the bottom: each with what it is for,
-/// the one in use ticked; under them, how hard the one picked thinks, side
-/// by side. Picking a model that can think more or less keeps the sheet up
-/// for that; picking how hard, or a model that cannot, puts it away.
+/// The pages of the model sheet: its first, with a row for each setting,
+/// and one for each setting's choices.
+private enum class ModelPage { ROOT, MODELS, EFFORTS }
+
+/// The model and how hard it thinks, risen from the bottom: two rows, the
+/// model in use and how hard it thinks, each a tap away from its own page
+/// -- the models with what each is for, the efforts one under another --
+/// whose pick comes back here. What the model chip and `/model` raise.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ModelSheet(menu: ChatModelMenu, model: TerminalModel, dark: Boolean, onPicked: () -> Unit = {}, onDismiss: () -> Unit) {
     val ink = LocalChrome.current.ink
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     val view = LocalView.current
-    val scope = rememberCoroutineScope()
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val card = if (dark) Color(0xFF2C2C2E) else Color.White
     val using = menu.models.firstOrNull { it.current }
-    // The one picked here, before the host says it is in use.
+    // What was picked here, before the host says it is in use.
     var picked by remember { mutableStateOf(using?.id) }
+    var pickedEffort by remember { mutableStateOf<String?>(null) }
     val chosen = menu.models.firstOrNull { it.id == picked } ?: using
+    val efforts = chosen?.efforts.orEmpty()
+    val effort = efforts.firstOrNull { it.id == pickedEffort } ?: efforts.firstOrNull { it.current }
+    var page by remember { mutableStateOf(ModelPage.ROOT) }
     // Something was picked: told as the sheet goes (`/model`'s field is
     // cleared then; cleared at the pick, the sheet would go with it).
     var pickedAny by remember { mutableStateOf(false) }
@@ -3394,102 +3406,154 @@ private fun ModelSheet(menu: ChatModelMenu, model: TerminalModel, dark: Boolean,
         if (pickedAny) onPicked()
         onDismiss()
     }
-    val close = { scope.launch { state.hide() }.invokeOnCompletion { done() } }
+    val tick = { view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK) }
     ModalBottomSheet(
         onDismissRequest = done,
         sheetState = state,
         containerColor = if (dark) Color(0xFF1C1C1E) else Color(0xFFF2F2F7),
         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
     ) {
-        Column(
-            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 28.dp),
-        ) {
-            Text(
-                menu.modelsHeading,
-                fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = ink,
-                modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 12.dp).semantics { heading() },
-            )
-            Column(Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(card)) {
-                for ((n, choice) in menu.models.withIndex()) {
-                    if (n > 0) HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
-                    val on = choice.id == chosen?.id
-                    Row(
+        // Back from a page of choices is the first page, not away.
+        BackHandler(enabled = page != ModelPage.ROOT) { page = ModelPage.ROOT }
+        Column(Modifier.fillMaxWidth().padding(bottom = 28.dp)) {
+            // The page's name in the middle; on a page of choices, the way
+            // back to the first. The sheet itself goes as sheets do (down,
+            // a tap beside it, back).
+            Box(Modifier.fillMaxWidth().height(52.dp).padding(horizontal = 12.dp)) {
+                if (page != ModelPage.ROOT) {
+                    val label = tr("back")
+                    Box(
                         Modifier
-                            .fillMaxWidth()
-                            .clickable(role = Role.RadioButton) {
-                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                picked = choice.id
-                                pickedAny = true
-                                if (!choice.current) {
-                                    // How hard it thinks stays as it was, where it can.
-                                    val effort = using?.efforts?.firstOrNull { it.current }?.id?.takeIf { e -> choice.efforts.any { it.id == e } }
-                                    model.chatSetModel(choice.id, effort)
-                                }
-                                if (choice.efforts.isEmpty()) close()
-                            }
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            .align(Alignment.CenterStart)
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(card)
+                            .clickable(role = Role.Button) { page = ModelPage.ROOT }
+                            .semantics { contentDescription = label },
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text(choice.label, fontSize = 16.sp, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (choice.description.isNotEmpty()) {
-                                Text(choice.description, fontSize = 13.sp, lineHeight = 17.sp, color = secondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            }
-                        }
-                        Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) {
-                            if (on) DesktopIcon("check", size = 18.dp, tint = LeadBlue)
-                        }
+                        DesktopIcon("chevron-left", size = 18.dp, tint = ink)
                     }
                 }
-            }
-            val efforts = chosen?.efforts.orEmpty()
-            if (chosen != null && efforts.isNotEmpty()) {
                 Text(
-                    menu.effortsHeading,
-                    fontSize = 13.sp,
-                    color = secondary,
-                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 8.dp).semantics { heading() },
+                    when (page) {
+                        ModelPage.ROOT -> tr("chat.model.pick")
+                        ModelPage.MODELS -> menu.modelsHeading
+                        ModelPage.EFFORTS -> menu.effortsHeading
+                    },
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = ink,
+                    maxLines = 1,
+                    modifier = Modifier.align(Alignment.Center).semantics { heading() },
                 )
-                Row(
+            }
+            Spacer(Modifier.height(8.dp))
+            AnimatedContent(
+                targetState = page,
+                transitionSpec = {
+                    // A page of choices comes in from the right, and goes back.
+                    val into = targetState != ModelPage.ROOT
+                    (slideInHorizontally(tween(260)) { if (into) it else -it } + fadeIn(tween(200))) togetherWith
+                        (slideOutHorizontally(tween(260)) { if (into) -it else it } + fadeOut(tween(160)))
+                },
+                label = "model page",
+            ) { shown ->
+                // A long list of models scrolls under the bar.
+                Column(
                     Modifier
+                        .verticalScroll(rememberScrollState())
                         .padding(horizontal = 16.dp)
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(card)
-                        .padding(4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(card),
                 ) {
-                    for (effort in efforts) {
-                        val on = effort.current
-                        Box(
-                            Modifier
-                                .weight(1f)
-                                .height(38.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (on) LeadBlue.copy(alpha = if (dark) 0.32f else 0.16f) else Color.Transparent)
-                                .clickable(role = Role.RadioButton) {
-                                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                    if (!(chosen.current && on)) model.chatSetModel(chosen.id, effort.id)
-                                    pickedAny = true
-                                    close()
-                                },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                effort.label,
-                                fontSize = 13.5.sp,
-                                fontWeight = if (on) FontWeight.SemiBold else null,
-                                color = if (on) ink else secondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                    when (shown) {
+                        ModelPage.ROOT -> {
+                            SheetRow(menu.modelsHeading, chosen?.label.orEmpty(), ink, secondary) { page = ModelPage.MODELS }
+                            if (chosen != null && efforts.isNotEmpty()) {
+                                HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
+                                SheetRow(menu.effortsHeading, effort?.label.orEmpty(), ink, secondary) { page = ModelPage.EFFORTS }
+                            }
+                        }
+                        ModelPage.MODELS -> for ((n, choice) in menu.models.withIndex()) {
+                            if (n > 0) HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
+                            ChoiceRow(choice.label, choice.description, choice.id == chosen?.id, ink, secondary) {
+                                tick()
+                                pickedAny = true
+                                // Another than the one picked last (the one in
+                                // use, or one picked here not yet confirmed):
+                                // how hard it thinks stays as it was, where it
+                                // can.
+                                if (choice.id != chosen?.id) {
+                                    val kept = effort?.id?.takeIf { e -> choice.efforts.any { it.id == e } }
+                                    picked = choice.id
+                                    pickedEffort = kept
+                                    model.chatSetModel(choice.id, kept)
+                                }
+                                page = ModelPage.ROOT
+                            }
+                        }
+                        ModelPage.EFFORTS -> for ((n, option) in efforts.withIndex()) {
+                            if (n > 0) HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
+                            ChoiceRow(option.label, "", option.id == effort?.id, ink, secondary) {
+                                tick()
+                                if (chosen != null && option.id != effort?.id) {
+                                    pickedEffort = option.id
+                                    model.chatSetModel(chosen.id, option.id)
+                                }
+                                pickedAny = true
+                                page = ModelPage.ROOT
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// A row of the model sheet's first page: what it sets, what it is set to,
+/// and that a tap opens its choices.
+@Composable
+private fun SheetRow(title: String, value: String, ink: Color, secondary: Color, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(title, fontSize = 16.sp, color = ink, maxLines = 1, modifier = Modifier.weight(1f))
+        Text(value, fontSize = 15.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 200.dp))
+        DesktopIcon("chevron-right", size = 15.dp, tint = secondary)
+    }
+}
+
+/// A choice on one of the model sheet's pages: its name, what it is for,
+/// and a tick on the one picked.
+@Composable
+private fun ChoiceRow(label: String, description: String, on: Boolean, ink: Color, secondary: Color, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+            .clickable(role = Role.RadioButton, onClick = onClick)
+            .semantics { selected = on }
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(label, fontSize = 16.sp, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (description.isNotEmpty()) {
+                Text(description, fontSize = 13.sp, lineHeight = 17.sp, color = secondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+            if (on) DesktopIcon("check", size = 18.dp, tint = LeadBlue)
         }
     }
 }

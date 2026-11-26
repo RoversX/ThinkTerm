@@ -1596,93 +1596,140 @@ private struct ChatComposer: View, Equatable {
     }
 }
 
-/// The models to talk to, risen from the bottom: each with what it is for,
-/// the one in use ticked; under them, how hard the one picked thinks, side
-/// by side. What the model chip and `/model` raise. Picking a model that
-/// can think more or less keeps the sheet up for that; picking how hard,
-/// or a model that cannot, puts it away.
+/// The model and how hard it thinks, risen from the bottom: two rows, the
+/// model in use and how hard it thinks, each a tap away from its own page
+/// -- the models with what each is for, the efforts one under another --
+/// whose pick comes back here. What the model chip and `/model` raise.
 private struct ModelSheet: View {
     let menu: ChatModelMenu
     let set: (String, String?) -> Void
-    @Environment(\.dismiss) private var dismiss
-    /// The one picked here, before the host says it is in use.
+    /// The model picked here, before the host says it is in use.
     @State private var picked: String?
+    /// The effort picked here, likewise.
+    @State private var pickedEffort: String?
+    @State private var path: [Page] = []
+
+    private enum Page: Hashable { case models, efforts }
 
     var body: some View {
         let using = menu.models.first { $0.current }
         let chosen = menu.models.first { $0.id == (picked ?? using?.id) } ?? using
-        NavigationStack {
+        let effort = chosen.flatMap { model in
+            model.efforts.first { $0.id == pickedEffort } ?? model.efforts.first(where: \.current)
+        }
+        NavigationStack(path: $path) {
             List {
                 Section {
-                    ForEach(menu.models) { choice in
-                        Button {
-                            picked = choice.id
-                            if !choice.current {
-                                // How hard it thinks stays as it was, where it can.
-                                let effort = using?.efforts.first(where: \.current)?.id
-                                set(choice.id, choice.efforts.contains { $0.id == effort } ? effort : nil)
-                            }
-                            if choice.efforts.isEmpty { dismiss() }
-                        } label: {
-                            HStack(spacing: 12) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(choice.label)
-                                        .foregroundStyle(.primary)
-                                    if let words = choice.description, !words.isEmpty {
-                                        Text(words)
-                                            .font(.footnote)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(2)
-                                    }
-                                }
-                                Spacer(minLength: 0)
-                                if choice.id == chosen?.id {
-                                    Image(systemName: "checkmark")
-                                        .font(.body.weight(.semibold))
-                                        .foregroundStyle(.tint)
-                                }
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityAddTraits(choice.id == chosen?.id ? .isSelected : [])
+                    NavigationLink(value: Page.models) {
+                        row(menu.models_heading, chosen?.label ?? "")
                     }
-                }
-                if let chosen, !chosen.efforts.isEmpty {
-                    // Side by side; any tap picks and puts the sheet away,
-                    // the one in use too.
-                    Section(menu.efforts_heading) {
-                        HStack(spacing: 4) {
-                            ForEach(chosen.efforts) { effort in
-                                Button {
-                                    if !(chosen.current && effort.current) { set(chosen.id, effort.id) }
-                                    dismiss()
-                                } label: {
-                                    Text(effort.label)
-                                        .font(.system(size: 14, weight: effort.current ? .semibold : .regular))
-                                        .foregroundStyle(effort.current ? .primary : .secondary)
-                                        .lineLimit(1)
-                                        .minimumScaleFactor(0.8)
-                                        .frame(maxWidth: .infinity, minHeight: 34)
-                                        .background(
-                                            effort.current ? Color.accentColor.opacity(0.2) : .clear,
-                                            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                        )
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityAddTraits(effort.current ? .isSelected : [])
-                            }
+                    if let chosen, !chosen.efforts.isEmpty {
+                        NavigationLink(value: Page.efforts) {
+                            row(menu.efforts_heading, effort?.label ?? "")
                         }
                     }
                 }
             }
-            .navigationTitle(menu.models_heading)
+            .navigationTitle(tr("chat.model.pick"))
             .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: Page.self) { page in
+                switch page {
+                case .models: models(chosen: chosen, effort: effort)
+                case .efforts: efforts(chosen: chosen, effort: effort)
+                }
+            }
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
-        .sensoryFeedback(.selection, trigger: picked)
+        .sensoryFeedback(.selection, trigger: (picked ?? "") + (pickedEffort ?? ""))
+    }
+
+    /// A row of the first page: what it sets, and what it is set to.
+    private func row(_ title: String, _ value: String) -> some View {
+        HStack(spacing: 12) {
+            Text(title)
+            Spacer(minLength: 8)
+            Text(value)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    /// The models, each with what it is for, the one picked ticked; a pick
+    /// keeps how hard it thinks where the new one can, and comes back.
+    private func models(chosen: ChatModelChoice?, effort: ChatModelOption?) -> some View {
+        List {
+            ForEach(menu.models) { choice in
+                Button {
+                    // Another than the one picked last (the one in use, or
+                    // one picked here not yet confirmed): how hard it thinks
+                    // stays as it was, where it can.
+                    if choice.id != chosen?.id {
+                        let kept = choice.efforts.contains { $0.id == effort?.id } ? effort?.id : nil
+                        picked = choice.id
+                        pickedEffort = kept
+                        set(choice.id, kept)
+                    }
+                    path.removeAll()
+                } label: {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(choice.label)
+                                .foregroundStyle(.primary)
+                            if let words = choice.description, !words.isEmpty {
+                                Text(words)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        if choice.id == chosen?.id {
+                            Image(systemName: "checkmark")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(choice.id == chosen?.id ? .isSelected : [])
+            }
+        }
+        .navigationTitle(menu.models_heading)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    /// How hard the model picked thinks, one under another, the one in use
+    /// ticked; a pick comes back.
+    private func efforts(chosen: ChatModelChoice?, effort: ChatModelOption?) -> some View {
+        List {
+            ForEach(chosen?.efforts ?? []) { option in
+                Button {
+                    if let chosen, option.id != effort?.id {
+                        pickedEffort = option.id
+                        set(chosen.id, option.id)
+                    }
+                    path.removeAll()
+                } label: {
+                    HStack {
+                        Text(option.label)
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: 0)
+                        if option.id == effort?.id {
+                            Image(systemName: "checkmark")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(option.id == effort?.id ? .isSelected : [])
+            }
+        }
+        .navigationTitle(menu.efforts_heading)
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
