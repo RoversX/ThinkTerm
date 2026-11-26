@@ -723,6 +723,15 @@ pub fn is_event_emission<'lua>(lua: &'lua Lua) -> mlua::Result<bool> {
     lua.named_registry_value(IS_EVENT)
 }
 
+/// Whether `wezterm.on` has registered a handler for the event `name`.
+pub fn has_event_handler(lua: &Lua, name: &str) -> mlua::Result<bool> {
+    let tbl: mlua::Value = lua.named_registry_value(&format!("wezterm-event-{}", name))?;
+    Ok(match tbl {
+        mlua::Value::Table(tbl) => tbl.raw_len() > 0,
+        _ => false,
+    })
+}
+
 /// This implements `wezterm.emit`.
 /// The first parameter to emit is the name of a signal that may or may not
 /// have previously been registered via `wezterm.on`.

@@ -1645,6 +1645,7 @@ fn requires_existing_frontend_access(pdu: &Pdu) -> bool {
             | Pdu::KillPane(_)
             | Pdu::SetPaneZoomed(_)
             | Pdu::SpawnV2(_)
+            | Pdu::OpenFromStart(_)
             | Pdu::SplitPane(_)
             | Pdu::SpawnPaneInStack(_)
             | Pdu::SpawnPage(_)
@@ -2957,6 +2958,18 @@ impl SessionHandler {
             // folders themselves are read on threads of their own.
             Pdu::GetProjectRepos(_) => {
                 send_response(Ok(Pdu::ProjectRepos(crate::project_repos::answer())));
+            }
+
+            // Not on the web or share lists either: only a program on this
+            // machine hands the window something to open.
+            Pdu::OpenFromStart(request) => {
+                spawn_into_main_thread(async move {
+                    send_response(
+                        crate::open_from_start::open(request)
+                            .map(|()| Pdu::UnitResponse(UnitResponse {})),
+                    );
+                })
+                .detach();
             }
 
             Pdu::GetThinkTermSessionState(_) => {

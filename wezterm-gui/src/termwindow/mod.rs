@@ -2264,6 +2264,10 @@ mod scrollback_wheel_lines_tests {
 /// every thread or Space it switches to, and the holder must still match
 /// when that window loses focus or goes away.
 static FOCUSED_WINDOW: parking_lot::Mutex<Option<u64>> = parking_lot::Mutex::new(None);
+/// The window that last had the keyboard focus, by `space_owner_id`: kept
+/// when focus goes to another program, such as a file manager that asks
+/// ThinkTerm to open a folder.
+static LAST_FOCUSED_WINDOW: parking_lot::Mutex<Option<u64>> = parking_lot::Mutex::new(None);
 
 impl TermWindow {
     /// The pane in front of someone has been seen. Whenever the active pane
@@ -2298,6 +2302,12 @@ pub(crate) fn app_has_focus() -> bool {
 /// of its `FrontendRecoverySlot::Window`), if a ThinkTerm window does.
 pub(crate) fn focused_window_owner() -> Option<u64> {
     *FOCUSED_WINDOW.lock()
+}
+
+/// The window that has, or last had, the keyboard focus, by its
+/// `space_owner_id`. It may have closed since.
+pub(crate) fn last_focused_window_owner() -> Option<u64> {
+    FOCUSED_WINDOW.lock().or(*LAST_FOCUSED_WINDOW.lock())
 }
 
 /// The agents a thread row's hover card lists: those in the thread's
@@ -5094,6 +5104,7 @@ impl TermWindow {
             let mut holder = FOCUSED_WINDOW.lock();
             if focused {
                 *holder = Some(self.space_owner_id);
+                *LAST_FOCUSED_WINDOW.lock() = Some(self.space_owner_id);
             } else if *holder == Some(self.space_owner_id) {
                 *holder = None;
             }
@@ -6135,7 +6146,32 @@ impl TermWindow {
             myself.apply_native_terminal_settings();
             myself.apply_workspace_thread_font_scales();
             myself.load_os_parameters();
-            if restore_saved_thread {
+            // What `thinkterm start` named opens in the first window that
+            // restores a thread, in place of that thread when it is in this
+            // window's Space, and after it otherwise.
+            let mut requests = if restore_saved_thread {
+                crate::start_request::take_for_window()
+            } else {
+                Vec::new()
+            };
+            let later = requests.split_off(requests.len().min(1));
+            let started = requests
+                .pop()
+                .and_then(|request| myself.thread_for_start(request));
+            let (opened_here, started_elsewhere) = match started {
+                Some((space_id, thread_id)) if space_id == myself.active_space_id => {
+                    myself.activate_workspace_thread_for_new_window(
+                        thread_id,
+                        &window,
+                        mux_window_id,
+                    );
+                    (true, None)
+                }
+                elsewhere => (false, elsewhere),
+            };
+            if opened_here {
+                // In place of the restore.
+            } else if restore_saved_thread {
                 if let Some(thread_id) =
                     crate::workspace_threads::thread_to_restore_for_space(&myself.active_space_id)
                 {
@@ -6149,6 +6185,13 @@ impl TermWindow {
                 }
             } else {
                 myself.sync_current_workspace_thread();
+            }
+            if let Some((space_id, thread_id)) = started_elsewhere {
+                myself.open_started_thread(space_id, thread_id);
+            }
+            // Handed over while this window was on its way.
+            for request in later {
+                myself.open_from_start(request);
             }
             if myself.dedicated_thread.is_none() {
                 myself.maybe_show_onboarding();
@@ -7248,6 +7291,73 @@ impl TermWindow {
     fn set_inner_size(&mut self, window: &Window, width: usize, height: usize) {
         self.resizes_pending += 1;
         window.set_inner_size(width, height);
+    }
+
+    /// Whether this is the window `space_owner_id` names.
+    pub(crate) fn is_space_owner(&self, space_owner_id: u64) -> bool {
+        self.space_owner_id == space_owner_id
+    }
+
+    /// The thread to open for what `thinkterm start` named, with its
+    /// program set to start there, and the Space it is in: this window's,
+    /// unless that is another machine's, where a folder or program of this
+    /// one has no place; then this computer's first Space.
+    fn thread_for_start(
+        &self,
+        request: crate::start_request::StartRequest,
+    ) -> Option<(String, String)> {
+        let here = crate::workspace_threads::client_domain_for_space(&self.active_space_id);
+        let space_id = if here.is_none() {
+            self.active_space_id.clone()
+        } else {
+            let Some((space_id, _)) = crate::workspace_threads::local_spaces().into_iter().next()
+            else {
+                log::error!("thinkterm start: no Space of this computer to open it in");
+                return None;
+            };
+            space_id
+        };
+        match crate::workspace_threads::thread_for_start(
+            &space_id,
+            request.folder.as_deref(),
+            request.program.is_some(),
+        ) {
+            Ok(thread_id) => {
+                if let Some(program) = request.program {
+                    crate::workspace_threads::run_first_in_thread(&thread_id, program);
+                }
+                Some((space_id, thread_id))
+            }
+            Err(err) => {
+                log::error!("thinkterm start: cannot open what it named: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// Open what `thinkterm start` named in this window, and bring it to
+    /// the front.
+    pub(crate) fn open_from_start(&mut self, request: crate::start_request::StartRequest) {
+        if let Some((space_id, thread_id)) = self.thread_for_start(request) {
+            self.open_started_thread(space_id, thread_id);
+        }
+    }
+
+    /// Open the thread made for what `thinkterm start` named, moving to its
+    /// Space when that is another, and bring the window to the front. A
+    /// Space another window shows is that window's to open it in.
+    pub(crate) fn open_started_thread(&mut self, space_id: String, thread_id: String) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if space_id == self.active_space_id {
+            self.activate_workspace_thread(thread_id, &window);
+        } else if !self.switch_space_to_thread(space_id.clone(), Some(thread_id.clone()), &window)
+        {
+            crate::start_request::hand_thread_to_its_space(space_id, thread_id);
+            return;
+        }
+        window.focus();
     }
 
     /// Re-point THIS GUI window at a different mux window (the mux window of

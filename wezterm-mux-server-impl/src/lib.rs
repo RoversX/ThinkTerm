@@ -14,6 +14,7 @@ pub mod handoff;
 pub mod hold;
 pub mod session_import;
 pub mod local;
+pub mod open_from_start;
 pub mod pki;
 mod plugin_relay;
 pub mod privacy;

@@ -891,6 +891,11 @@ impl GuiFrontEnd {
     /// moments. Once those have passed, a new-window request held during
     /// startup is answered if startup showed nothing, and later requests
     /// are answered as they come.
+    /// Whether the launch has had its time to open its first window.
+    pub(crate) fn startup_has_settled(&self) -> bool {
+        self.startup_settled.get()
+    }
+
     pub(crate) fn startup_settled_soon(&self) {
         promise::spawn::spawn(async move {
             smol::Timer::after(std::time::Duration::from_secs(2)).await;
