@@ -265,6 +265,16 @@ struct SettingsPageView: View {
                 ])
                 Toggle(tr("sky.haptics"), isOn: $settings.skyHaptics)
             }
+            // The Threads home's projects by repository, every host's
+            // together, or host by host.
+            Section {
+                Toggle(tr("i.byrepo"), isOn: $settings.byRepo)
+                if settings.byRepo {
+                    Toggle(tr("i.repohost"), isOn: $settings.repoHost)
+                }
+            } footer: {
+                Text(tr("i.byrepo.note"))
+            }
         case .agents:
             Section {
                 Toggle(tr("chat.first"), isOn: $settings.chatFirst)

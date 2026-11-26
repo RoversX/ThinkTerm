@@ -682,6 +682,19 @@ pub struct Inner<P: Platform, L: Link> {
     /// The timer that hides the passing remark, so a new one restarts it.
     tree: crate::tree::TreeModel,
     session_refresh_pending: bool,
+    /// The page groups projects by git repository, and so asks the server
+    /// for them (`set_wants_repos`). Off, nothing is asked or kept.
+    wants_repos: bool,
+    /// The server answered that ask with an error -- one from before it --
+    /// so it is not asked again on this connection.
+    repos_unsupported: bool,
+    /// An ask is out; one more is wanted once it is answered, as the
+    /// session view changed meanwhile.
+    repos_fetching: bool,
+    repos_again: bool,
+    /// The timer that asks again every `REPOS_EVERY_MS` is set
+    /// (`poll_repos`).
+    repos_polling: bool,
     /// A thread's delete button was pressed once, and when.
     deleting: Option<(String, f64)>,
     editing: crate::sidebar::Editing,
@@ -1015,6 +1028,11 @@ impl<P: Platform, L: Link> App<P, L> {
             summary: RefCell::new(String::new()),
             tree: crate::tree::TreeModel::default(),
             session_refresh_pending: false,
+            wants_repos: false,
+            repos_unsupported: false,
+            repos_fetching: false,
+            repos_again: false,
+            repos_polling: false,
             deleting: None,
             editing: crate::sidebar::Editing::None,
             new_project_error: None,
@@ -1945,6 +1963,12 @@ impl<P: Platform, L: Link> App<P, L> {
                 if changed {
                     Self::notify(&self.inner.borrow());
                 }
+                // Pushed as a project's repository changes too, which the
+                // view does not carry: asked anew.
+                if self.inner.borrow().wants_repos {
+                    let app = Rc::clone(self);
+                    self.spawn(async move { app.fetch_repos().await });
+                }
             }
             Pdu::AgentStatusChanged(codec::AgentStatusChanged { pane_id, status }) => {
                 drop(inner);
@@ -2260,6 +2284,11 @@ impl<P: Platform, L: Link> App<P, L> {
             // connection has proved it can carry a frame.
             inner.connected_since = Some(inner.platform.monotonic_ms());
             inner.session_refresh_pending = false;
+            // The server may be another, or a newer one, by now; an ask
+            // out on the old socket is not waited for.
+            inner.repos_unsupported = false;
+            inner.repos_fetching = false;
+            inner.repos_again = false;
             inner.images.lock().clear();
             inner.host.image_versions.borrow_mut().reset();
             {
@@ -3969,6 +3998,138 @@ impl<P: Platform, L: Link> App<P, L> {
                 Self::notify(&self.inner.borrow());
             }
             Err(err) => log::warn!("fetching the session view: {err:#}"),
+        }
+        self.fetch_repos().await;
+    }
+
+    /// Whether the page groups projects by git repository, and so asks the
+    /// server which one each is in. Turned off, the ones known are
+    /// forgotten at once and the server is not asked again.
+    pub fn set_wants_repos(self: &Rc<Self>, on: bool) {
+        let forgot = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.wants_repos == on {
+                return;
+            }
+            inner.wants_repos = on;
+            !on && inner.tree.clear_repos()
+        };
+        if forgot {
+            Self::notify(&self.inner.borrow());
+        }
+        if on {
+            let app = Rc::clone(self);
+            self.spawn(async move { app.fetch_repos().await });
+            self.poll_repos();
+        }
+    }
+
+    /// While the page wants repositories they are asked for on a timer as
+    /// well, sooner than a server stops reading unasked (a minute): so it
+    /// keeps reading -- a branch switched in a terminal shows -- and does
+    /// not forget them in a quiet spell between two changes of the session.
+    /// Not while the socket is down; the timer stops once they are not
+    /// wanted.
+    fn poll_repos(self: &Rc<Self>) {
+        const REPOS_EVERY_MS: f64 = 30_000.0;
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.repos_polling || !inner.wants_repos {
+                return;
+            }
+            inner.repos_polling = true;
+        }
+        let weak = Rc::downgrade(self);
+        self.platform.set_timeout(
+            REPOS_EVERY_MS,
+            Box::new(move || {
+                let Some(app) = weak.upgrade() else { return };
+                let (wanted, connected) = {
+                    let mut inner = app.inner.borrow_mut();
+                    inner.repos_polling = false;
+                    (inner.wants_repos, inner.disconnected.is_none())
+                };
+                if !wanted {
+                    return;
+                }
+                if connected {
+                    let asking = Rc::clone(&app);
+                    app.spawn(async move { asking.fetch_repos().await });
+                }
+                app.poll_repos();
+            }),
+        );
+    }
+
+    /// Each project's git repository, asked for after every session view
+    /// while the page wants them -- not sent with the view, so a server
+    /// reads the folders only for a client that groups by them. A server
+    /// that does not know the request answers with an error; it is not
+    /// asked again on this connection, and nothing is grouped there. One
+    /// ask at a time: one wanted while another is out is made after it.
+    async fn fetch_repos(self: &Rc<Self>) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.wants_repos || inner.repos_unsupported {
+                return;
+            }
+            if inner.repos_fetching {
+                inner.repos_again = true;
+                return;
+            }
+            inner.repos_fetching = true;
+        }
+        loop {
+            use thinkterm_session::host::PduLink as _;
+            let (link, generation) = {
+                let mut inner = self.inner.borrow_mut();
+                inner.repos_again = false;
+                if !inner.wants_repos || inner.repos_unsupported {
+                    inner.repos_fetching = false;
+                    return;
+                }
+                (inner.link.clone(), inner.link.connection_generation())
+            };
+            let answer = link.request(Pdu::GetProjectRepos(codec::GetProjectRepos {})).await;
+            let (changed, again) = {
+                let mut inner = self.inner.borrow_mut();
+                if inner.link.connection_generation() != generation {
+                    // The socket was replaced meanwhile: this answer is the
+                    // old one's, and `reconnected` let the ask go.
+                    return;
+                }
+                // Turned off while the answer was on its way: nothing is
+                // kept (`set_wants_repos` forgot what there was).
+                let changed = inner.wants_repos
+                    && match answer {
+                        Ok(Pdu::ProjectRepos(answer)) => inner.tree.apply_repos(answer.repos, answer.reading),
+                        Ok(Pdu::ErrorResponse(_)) => {
+                            log::info!("the server does not say which repository a project is in; not grouping its projects");
+                            inner.repos_unsupported = true;
+                            inner.tree.clear_repos()
+                        }
+                        // Named, not printed: the answer is the folders' remotes.
+                        Ok(other) => {
+                            log::warn!("asking for the projects' repositories: unexpected {}", other.pdu_name());
+                            false
+                        }
+                        Err(err) => {
+                            log::warn!("asking for the projects' repositories: {:#}", anyhow::Error::from(err));
+                            false
+                        }
+                    };
+                let again = inner.repos_again && inner.wants_repos && !inner.repos_unsupported;
+                if !again {
+                    inner.repos_fetching = false;
+                }
+                (changed, again)
+            };
+            if changed {
+                Self::notify(&self.inner.borrow());
+            }
+            if !again {
+                return;
+            }
         }
     }
 

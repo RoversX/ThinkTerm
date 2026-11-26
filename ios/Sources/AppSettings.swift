@@ -105,6 +105,18 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(agentsOnly, forKey: "home.agents") }
     }
 
+    /// Threads home lists the projects of every host by the git repository
+    /// they are in, rather than host by host.
+    @Published var byRepo: Bool {
+        didSet { defaults.set(byRepo, forKey: "home.repos") }
+    }
+
+    /// A repository's group says the host its remote is on, not only the
+    /// owner: `github.com/owner/repo`.
+    @Published var repoHost: Bool {
+        didSet { defaults.set(repoHost, forKey: "home.repos.host") }
+    }
+
     /// The starry sky is felt as well as seen: at launch, and as a
     /// connection's sky rushes off (`SkyHaptics`).
     @Published var skyHaptics: Bool {
@@ -193,6 +205,8 @@ final class AppSettings: ObservableObject {
         chatReveal = d.string(forKey: "chat.reveal") ?? "stream"
         spaces = d.string(forKey: "ui.spaces") ?? "list"
         agentsOnly = d.object(forKey: "home.agents") as? Bool ?? false
+        byRepo = d.object(forKey: "home.repos") as? Bool ?? false
+        repoHost = d.object(forKey: "home.repos.host") as? Bool ?? false
         skyHaptics = d.object(forKey: "sky.haptics") as? Bool ?? true
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
         leftOptionAlt = d.object(forKey: "key.leftoptionalt") as? Bool ?? true

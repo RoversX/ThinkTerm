@@ -182,6 +182,15 @@ struct TreeProject: Decodable, Hashable, Identifiable {
     var name: String
     var path: String
     var threads: [ThreadRow]
+    var repo: ProjectRepo?
+}
+
+/// The git repository a project's folder is in, as its server read it:
+/// `codec::ThinkTermProjectRepo`. `remote` is `github.com/owner/repo`.
+struct ProjectRepo: Decodable, Hashable {
+    var remote: String?
+    var branch: String?
+    var worktree: String?
 }
 
 /// A tab as it is split, for a picture of it: each pane's screen where it

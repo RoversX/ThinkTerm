@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
@@ -48,6 +49,8 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import com.roversx.thinkterm.core.RepoProject
+import com.roversx.thinkterm.core.repoGroups
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -119,6 +122,13 @@ fun ThreadsHome(
     val entries = store.hosts + listOfNotNull(probe?.copy(name = tr("thismac")))
 
     fun model(host: Host) = Sessions.get(context, store, host)
+    // Every host's projects by the repository they are in, above the hosts;
+    // a search looks host by host as ever.
+    val byRepo = AppSettings.get(context).byRepo && !searching
+    val listState = rememberLazyListState()
+    // Switched, the list starts again at its top: the groups come and go
+    // there, and would otherwise be scrolled past under the bar.
+    LaunchedEffect(byRepo) { listState.scrollToItem(0) }
 
     // Populate threads on arrival for known hosts that allow automatic connections.
     LaunchedEffect(Unit) {
@@ -139,6 +149,7 @@ fun ThreadsHome(
         val extra = ((maxWidth - READABLE_WIDTH) / 2).coerceAtLeast(0.dp)
         LazyColumn(
             Modifier.fillMaxSize().layerBackdrop(backdrop).background(ground),
+            state = listState,
             contentPadding = PaddingValues(
                 start = 10.dp + extra,
                 end = 10.dp + extra,
@@ -149,11 +160,15 @@ fun ThreadsHome(
             if (entries.isEmpty()) {
                 item { Box(Modifier.padding(top = 40.dp)) { HostsEmptyState(onHosts) } }
             }
+            if (byRepo) {
+                item(key = "repos") { RepoGroups(entries, dark, onOpen) }
+            }
             for (host in entries) {
                 hostThreads(
                     host = host,
                     model = Sessions.existing(host.id),
                     query = if (searching) query else "",
+                    byRepo = byRepo,
                     dark = dark,
                     connect = { model(host).connect() },
                     open = { onOpen(host) },
@@ -343,6 +358,7 @@ private fun LazyListScope.hostThreads(
     host: Host,
     model: TerminalModel?,
     query: String,
+    byRepo: Boolean,
     dark: Boolean,
     connect: () -> Unit,
     open: () -> Unit,
@@ -360,7 +376,7 @@ private fun LazyListScope.hostThreads(
         return
     }
     item(key = "host:" + host.id) {
-        ConnectedHost(host.display, model, query, dark, connect, open, connected)
+        ConnectedHost(host.display, model, query, byRepo, dark, connect, open, connected)
     }
 }
 
@@ -398,6 +414,7 @@ private fun ConnectedHost(
     name: String,
     model: TerminalModel,
     query: String,
+    byRepo: Boolean,
     dark: Boolean,
     connect: () -> Unit,
     open: () -> Unit,
@@ -421,21 +438,7 @@ private fun ConnectedHost(
     // A rename asked from a row's menu here asks for the name here, not
     // later in the sidebar.
     NameAsk(model)
-    LaunchedEffect(model) {
-        // The views are kept while the list shows them, and read as the
-        // core says they changed (`TerminalModel.setViewsListed`).
-        model.setViewsListed(true)
-        try {
-            while (true) {
-                delay(1000)
-                // The terminal's own surface went with its screen, or the
-                // last lend was refused: the list's is lent again.
-                if (model.generation == 0uL && model.isInFront) model.setViewsListed(true)
-            }
-        } finally {
-            model.setViewsListed(false)
-        }
-    }
+    LaunchedEffect(model) { keepViewsListed(model) }
 
     Column {
         if (query.isNotEmpty()) {
@@ -463,7 +466,7 @@ private fun ConnectedHost(
             model.pendingHostKey != null -> HomeRow(icon = "key-round", title = tr("hostkey.approve.title"), bold = true, onClick = open)
             !ready && connecting -> HomeRow(icon = "link-2", title = tr("connecting"), dim = true, onClick = {})
             !ready -> HomeRow(icon = "rotate-ccw", title = tr("reconnect"), dim = true, onClick = connect)
-            else -> HostTree(model, dark, open)
+            else -> HostTree(model, dark, open, skipGrouped = byRepo)
         }
     }
 }
@@ -490,23 +493,27 @@ private fun listedProject(project: TreeProject, agentsOnly: Boolean) =
 /// The host's Spaces, projects and threads; a lone Space has no row of its
 /// own, as in the sidebar. Windows no thread claims come last.
 @Composable
-private fun HostTree(model: TerminalModel, dark: Boolean, open: () -> Unit) {
+private fun HostTree(model: TerminalModel, dark: Boolean, open: () -> Unit, skipGrouped: Boolean = false) {
     val spaces = model.tree?.spaces ?: emptyList()
     val folded = remember { mutableStateListOf<String>() }
     val windows = (model.sidebar?.rows ?: emptyList()).filterIsInstance<SideRow.Window>()
     val agentsOnly = AppSettings.shared.agentsOnly
+    // With projects by repository, the ones in a repository are listed in
+    // theirs, above, and only the rest here.
+    fun listedHere(project: TreeProject, agentsOnly: Boolean) =
+        listedProject(project, agentsOnly) && !(skipGrouped && project.repo?.remote != null)
     // Each row's showing is its own, kept by its id: a row added or gone
     // elsewhere in the list does not play another's fold.
     if (spaces.size == 1) {
         for (project in spaces[0].projects) key(project.id) {
-            Shown(listedProject(project, agentsOnly)) { ProjectRows(model, spaces[0], project, 0, folded, dark, agentsOnly, open) }
+            Shown(listedHere(project, agentsOnly)) { ProjectRows(model, spaces[0], project, 0, folded, dark, agentsOnly, open) }
         }
     } else {
         for (space in spaces) key(space.id) {
-            Shown(!agentsOnly || space.projects.any { listedProject(it, agentsOnly) }) {
+            Shown((!agentsOnly && !skipGrouped) || space.projects.any { listedHere(it, agentsOnly) }) {
                 HomeRow(icon = "layers", title = space.name, bold = space.current, dim = true, onClick = {})
                 for (project in space.projects) key(project.id) {
-                    Shown(listedProject(project, agentsOnly)) { ProjectRows(model, space, project, 1, folded, dark, agentsOnly, open) }
+                    Shown(listedHere(project, agentsOnly)) { ProjectRows(model, space, project, 1, folded, dark, agentsOnly, open) }
                 }
             }
         }
@@ -523,16 +530,172 @@ private fun HostTree(model: TerminalModel, dark: Boolean, open: () -> Unit) {
     val none = when {
         // Said, not left blank: a host with nothing under it reads as one
         // whose connection broke.
-        agentsOnly -> spaces.none { space -> space.projects.any { listedProject(it, true) } } && windows.none { it.agent }
-        else -> spaces.all { it.projects.isEmpty() } && windows.isEmpty()
+        agentsOnly -> spaces.none { space -> space.projects.any { listedHere(it, true) } } && windows.none { it.agent }
+        else -> spaces.none { space -> space.projects.any { listedHere(it, false) } } && windows.isEmpty()
     }
+    // Only when the groups do list one of them: with the eye on, a
+    // repository's projects without agents are in neither place.
+    val above = skipGrouped && spaces.any { space -> space.projects.any { it.repo?.remote != null && listedProject(it, agentsOnly) } }
     if (none) {
         Text(
-            tr(if (agentsOnly) "home.agents.none" else "overview.none"),
+            tr(if (above) "home.repos.above" else if (agentsOnly) "home.agents.none" else "overview.none"),
             fontSize = 14.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
         )
+    }
+}
+
+/// How many parts of the list read a host's views now -- its own rows, and
+/// the repository groups showing its projects -- so that one going does
+/// not stop the views another still shows. Main thread only.
+private val listHolds = HashMap<TerminalModel, Int>()
+
+/// Keep `model`'s views read while this part of the list shows them, and
+/// read as the core says they changed (`TerminalModel.setViewsListed`):
+/// from the first part that reads them to the last.
+private suspend fun keepViewsListed(model: TerminalModel) {
+    listHolds[model] = (listHolds[model] ?: 0) + 1
+    model.setViewsListed(true)
+    try {
+        while (true) {
+            delay(1000)
+            // The terminal's own surface went with its screen, or the
+            // last lend was refused: the list's is lent again.
+            if (model.generation == 0uL && model.isInFront) model.setViewsListed(true)
+        }
+    } finally {
+        val left = (listHolds[model] ?: 1) - 1
+        if (left > 0) {
+            listHolds[model] = left
+        } else {
+            listHolds.remove(model)
+            model.setViewsListed(false)
+        }
+    }
+}
+
+/// Whether a host's tree is the one its server has now: its connection is
+/// up, as `ConnectedHost` reads it.
+private fun TerminalModel.listReady() = connection.startsWith("pane ") && !(reconnecting && !autoReconnect)
+
+/// A project of one host in a repository's group: that host's copy.
+private data class RepoCopy(
+    val host: Host,
+    val model: TerminalModel,
+    val space: TreeSpace,
+    val project: TreeProject,
+    val branch: String?,
+)
+
+/// Every connected host's projects that are in a repository with a remote,
+/// put together by repository: its name, then the threads of all its
+/// copies. The group is the project, so which computer a thread is on is not
+/// said -- unless that computer's connection is down -- and its branch only
+/// when the group's threads are on more than one. A host not connected yet
+/// has its projects here once it is.
+@Composable
+private fun RepoGroups(entries: List<Host>, dark: Boolean, onOpen: (Host) -> Unit) {
+    val agentsOnly = AppSettings.shared.agentsOnly
+    // Every host's views are read for the groups, its own rows on the
+    // screen or not: a list's rows off it are not composed, and a host's
+    // projects would show in neither place.
+    for (model in entries.mapNotNull { Sessions.existing(it.id) }) key(model) {
+        LaunchedEffect(model) { keepViewsListed(model) }
+    }
+    val hosts = entries.mapNotNull { host -> Sessions.existing(host.id)?.takeIf { it.listReady() }?.let { host to it } }
+    val projects = hosts.flatMap { (host, model) ->
+        (model.tree?.spaces ?: emptyList()).flatMap { space ->
+            space.projects.mapNotNull { project ->
+                val repo = project.repo ?: return@mapNotNull null
+                val remote = repo.remote ?: return@mapNotNull null
+                RepoProject(host.id, space.id, project.id, remote, repo.branch, repo.worktree)
+            }
+        }
+    }
+    val groups = remember(projects) { repoGroups(projects) }
+    for (group in groups) key("repo:" + group.remote.lowercase()) {
+        val copies = group.projects.mapNotNull { at ->
+            val (host, model) = hosts.firstOrNull { it.first.id == at.host } ?: return@mapNotNull null
+            val space = model.tree?.spaces?.firstOrNull { it.id == at.space } ?: return@mapNotNull null
+            val project = space.projects.firstOrNull { it.id == at.project } ?: return@mapNotNull null
+            RepoCopy(host, model, space, project, at.branch)
+        }
+        val sayBranch = copies
+            .filter { copy -> copy.project.threads.any { shownThread(it, agentsOnly) } }
+            .mapTo(HashSet()) { it.branch }
+            .size > 1
+        // Its owner, not where it is hosted, unless asked for or the
+        // host is what tells it from another.
+        val under = if (AppSettings.shared.repoHost || group.hostNeeded) group.remote else group.owner.ifEmpty { null }
+        Shown(copies.any { listedProject(it.project, agentsOnly) }) {
+            RepoTitle(group.name, under, copies, onOpen)
+            for (copy in copies) for (thread in copy.project.threads) key(copy.host.id + "/" + thread.id) {
+                val subtitle = listOfNotNull(
+                    if (copy.model.reconnecting) copy.host.display + " " + tr("offline") else null,
+                    copy.branch.takeIf { sayBranch },
+                ).joinToString(" \u00b7 ").ifEmpty { null }
+                Shown(shownThread(thread, agentsOnly)) {
+                    ThreadRowItem(copy.model, thread, copy.space, copy.project, 0, dark, subtitle) { onOpen(copy.host) }
+                }
+            }
+        }
+    }
+}
+
+/// A repository's name, the group's root, with whose it is under it, and
+/// the + that starts a thread in it: in its one copy, or in the one picked
+/// from a menu -- the only place a computer is named.
+@Composable
+private fun RepoTitle(name: String, under: String?, copies: List<RepoCopy>, onOpen: (Host) -> Unit) {
+    var menu by remember { mutableStateOf(false) }
+    fun start(copy: RepoCopy) {
+        copy.model.setSpace(copy.space.id)
+        copy.model.sideClick("new-thread", copy.project.id)
+        onOpen(copy.host)
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 18.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                name,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (under != null) {
+                Text(
+                    under,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Box {
+            Box(
+                Modifier.size(32.dp).clip(CircleShape).clickable {
+                    if (copies.size == 1) start(copies[0]) else menu = true
+                },
+                contentAlignment = Alignment.Center,
+            ) {
+                DesktopIcon("circle-plus", size = 18.dp, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                for (copy in copies) DropdownMenuItem(
+                    text = { Text(listOfNotNull(copy.host.display, copy.branch).joinToString(" \u00b7 ")) },
+                    onClick = {
+                        menu = false
+                        start(copy)
+                    },
+                )
+            }
+        }
     }
 }
 

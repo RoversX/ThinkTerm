@@ -21,6 +21,7 @@ mod link;
 pub mod painter;
 mod platform;
 mod qr;
+mod repos;
 mod ssh;
 mod tailnet;
 
@@ -784,6 +785,14 @@ impl Core {
     /// are kept current for it, which `set_shown(false)` alone stops.
     pub fn set_views_listed(&self, listed: bool) {
         let _ = self.tx.send(core::Cmd::ListViews(listed));
+    }
+
+    /// Whether the shell groups projects by git repository. Only then is
+    /// the server asked which one each project's folder is in, and the
+    /// "tree" view says it (`TreeProject::repo`); turned off, what was
+    /// known is forgotten.
+    pub fn set_wants_repos(&self, wanted: bool) {
+        let _ = self.tx.send(core::Cmd::WantRepos(wanted));
     }
 
     /// One of the App's views as JSON: "tabs", "threads", "tree",

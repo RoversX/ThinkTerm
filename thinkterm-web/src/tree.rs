@@ -144,6 +144,11 @@ pub struct TreeProject {
     pub name: String,
     pub path: String,
     pub threads: Vec<ThreadRow>,
+    /// The git repository its folder is in, as the server read it, for the
+    /// phone to put the projects of several machines together; only while
+    /// it asks for them (`TreeModel::apply_repos`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<codec::ThinkTermProjectRepo>,
 }
 
 /// A Space as the Space menu lists it.
@@ -174,6 +179,9 @@ pub struct TreeModel {
     windows: Vec<(WindowId, String, String)>,
     /// The panes in each of those windows, every tab's.
     window_panes: HashMap<WindowId, Vec<PaneId>>,
+    /// The git repository of each project the server has read one for, by
+    /// project id; empty unless the client asks (`GetProjectRepos`).
+    repos: HashMap<String, codec::ThinkTermProjectRepo>,
 }
 
 impl TreeModel {
@@ -192,6 +200,32 @@ impl TreeModel {
 
     pub fn apply_tree(&mut self, tree: ThinkTermTree) {
         self.tree = Some(tree);
+    }
+
+    /// The projects' repositories as the server last answered; whether
+    /// that changed them. While it is still `reading` some folders, the
+    /// ones it does not list keep what they had: not read yet is not "in
+    /// no repository", and the groups do not empty and fill again.
+    pub fn apply_repos(&mut self, repos: Vec<codec::ProjectRepoEntry>, reading: bool) -> bool {
+        let mut repos: HashMap<_, _> = repos.into_iter().map(|e| (e.project_id, e.repo)).collect();
+        if reading {
+            for (project, repo) in &self.repos {
+                repos.entry(project.clone()).or_insert_with(|| repo.clone());
+            }
+        }
+        if repos == self.repos {
+            return false;
+        }
+        self.repos = repos;
+        true
+    }
+
+    /// Forget the projects' repositories, as the client stops asking for
+    /// them; whether there were any.
+    pub fn clear_repos(&mut self) -> bool {
+        let had = !self.repos.is_empty();
+        self.repos.clear();
+        had
     }
 
     /// Every pane an agent runs in: pane, agent id, state, reported title.
@@ -457,6 +491,7 @@ impl TreeModel {
                         name: p.name.clone(),
                         path: p.path.clone(),
                         threads: p.threads.iter().map(|t| self.thread_row(t, &p.id, selected, deleting)).collect(),
+                        repo: self.repos.get(&p.id).cloned(),
                     })
                     .collect(),
             })
@@ -1054,6 +1089,34 @@ mod tests {
         assert_eq!((b.dot, b.live, b.pinned), (Dot::Pinned, false, true));
         // Selection by workspace when the tab is not listed.
         assert_eq!(m.selected_thread(99, "ws-b"), Some("b"));
+    }
+
+    #[test]
+    fn a_project_says_its_repository_only_while_they_are_asked_for() {
+        let mut m = TreeModel::default();
+        m.apply_session(session(vec![thread("a", Some("ws-a"), vec![])]));
+        let repo_of = |m: &TreeModel| m.tree(0, "", None).spaces[0].projects[0].repo.clone();
+        assert_eq!(repo_of(&m), None);
+        let repo = codec::ThinkTermProjectRepo {
+            remote: Some("github.com/owner/repo".into()),
+            branch: Some("main".into()),
+            worktree: None,
+        };
+        let entry = codec::ProjectRepoEntry { project_id: "p1".into(), repo: repo.clone() };
+        assert!(m.apply_repos(vec![entry.clone()], false));
+        assert!(!m.apply_repos(vec![entry], false), "the same answer changes nothing");
+        assert_eq!(repo_of(&m), Some(repo.clone()));
+        // A server that has just begun reading again keeps what was known.
+        assert!(!m.apply_repos(Vec::new(), true));
+        assert_eq!(repo_of(&m), Some(repo.clone()));
+        // Once it has read them all, a project in none is in none.
+        assert!(m.apply_repos(Vec::new(), false));
+        assert_eq!(repo_of(&m), None);
+        let entry = codec::ProjectRepoEntry { project_id: "p1".into(), repo: repo.clone() };
+        assert!(m.apply_repos(vec![entry], false));
+        assert!(m.clear_repos());
+        assert_eq!(repo_of(&m), None);
+        assert!(!m.clear_repos());
     }
 
     #[test]

@@ -125,7 +125,11 @@ data class TreeView(val spaces: List<TreeSpace>)
 
 data class TreeSpace(val id: String, val name: String, val current: Boolean, val projects: List<TreeProject>)
 
-data class TreeProject(val id: String, val name: String, val path: String, val threads: List<ThreadRow>)
+data class TreeProject(val id: String, val name: String, val path: String, val threads: List<ThreadRow>, val repo: ProjectRepo? = null)
+
+/// The git repository a project's folder is in, as its server read it:
+/// `codec::ThinkTermProjectRepo`. `remote` is `github.com/owner/repo`.
+data class ProjectRepo(val remote: String?, val branch: String?, val worktree: String?)
 
 /// A thumbnail row: `App::PreviewRow`.
 data class PreviewRow(val runs: List<PreviewRun>)
@@ -343,6 +347,10 @@ object Views {
                             name = pr.optString("name"),
                             path = pr.optString("path"),
                             threads = pr.optJSONArray("threads").map { threadRow(it) },
+                            repo = pr.optJSONObject("repo")?.let { r ->
+                                fun text(key: String) = if (r.isNull(key)) null else r.optString(key).ifEmpty { null }
+                                ProjectRepo(text("remote"), text("branch"), text("worktree"))
+                            },
                         )
                     },
                 )

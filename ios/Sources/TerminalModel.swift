@@ -298,6 +298,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         settings.$autoReconnect.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
         settings.$paneBars.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
         settings.$language.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        // The server is asked which git repository each project is in only
+        // while Threads home groups by them; off, what was known is
+        // forgotten. The value as it is now, then as it changes.
+        settings.$byRepo.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] on in self?.core.setWantsRepos(wanted: on) }.store(in: &subscriptions)
         // A face is shaped at connect time: the connection is made again.
         settings.$fontFamily.dropFirst().removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
             guard let self, self.host?.autoConnect != false, self.connection.hasPrefix("pane ") else { return }

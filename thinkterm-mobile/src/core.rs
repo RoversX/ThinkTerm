@@ -235,6 +235,9 @@ pub enum Cmd {
     /// The shell shows the views though the terminal is off screen: a list
     /// of this host's threads among other hosts'.
     ListViews(bool),
+    /// The shell groups projects by git repository: the App asks the
+    /// server for them (`App::set_wants_repos`).
+    WantRepos(bool),
     TextBetween {
         anchor: (usize, usize),
         head: (usize, usize),
@@ -419,6 +422,9 @@ struct State {
     /// The views are on show without the terminal (`Cmd::ListViews`): they
     /// are made off screen too.
     views_listed: bool,
+    /// The shell groups projects by repository (`Cmd::WantRepos`); every
+    /// App of this connection is told.
+    repos_wanted: bool,
     /// The tab icon cards on show, shared with the shell's thread, which
     /// draws them: the built-in ones, then the host's (`Net::TabIcons`).
     icons: Arc<icons::Shown>,
@@ -534,6 +540,7 @@ impl State {
             agents_dirty: Rc::new(Cell::new(false)),
             screen_wanted: false,
             views_listed: false,
+            repos_wanted: false,
             icons,
             icons_host: None,
             screen_dirty: false,
@@ -1326,6 +1333,12 @@ impl State {
                 }
             }
             Cmd::ViewsRead => self.views_dirty.set(true),
+            Cmd::WantRepos(wanted) => {
+                self.repos_wanted = wanted;
+                if let Some(app) = self.app.clone() {
+                    app.set_wants_repos(wanted);
+                }
+            }
             Cmd::ListViews(listed) => {
                 self.views_listed = listed;
                 // What changed while nobody looked is made now.
@@ -2080,6 +2093,7 @@ impl State {
         if let Some((_, zoomed)) = self.one_pane_zoomed.take().filter(|(server, _)| *server == attached.server_id) {
             app.keep_one_pane_zoomed(zoomed);
         }
+        app.set_wants_repos(self.repos_wanted);
         app.fetch_tree();
         app.hide_status();
         app.refresh_layout();

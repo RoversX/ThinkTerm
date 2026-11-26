@@ -74,6 +74,12 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     /// Threads lists only the threads the Status panel has something in
     /// (the eye in its bar), kept from one launch to the next.
     var agentsOnly by pref("home.agents", false)
+    /// Threads home lists the projects of every host by the git repository
+    /// they are in, rather than host by host.
+    var byRepo by pref("home.repos", false)
+    /// A repository's group says the host its remote is on, not only the
+    /// owner: `github.com/owner/repo`.
+    var repoHost by pref("home.repos.host", false)
     /// The starry sky is felt as well as seen: at launch, and as a
     /// connection's sky rushes off (`SkyHaptics`).
     var skyHaptics by pref("sky.haptics", true)

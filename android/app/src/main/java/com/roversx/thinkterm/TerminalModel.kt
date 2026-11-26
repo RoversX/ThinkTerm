@@ -86,6 +86,12 @@ class TerminalModel(
     internal fun applyAutoReconnect() {
         core.setSetting("auto-reconnect", autoReconnect.toString())
     }
+
+    /// The server is asked which git repository each project is in only
+    /// while Threads home groups by them; off, what was known is forgotten.
+    internal fun applyByRepo() {
+        core.setWantsRepos(settings.byRepo)
+    }
     /// A key to approve: the host's own, or (`jump`) that of the jump host
     /// it is reached through, which `endpoint` is then.
     data class HostKeyChallenge(val requestId: String, val endpoint: Host, val fingerprint: String, val jump: Boolean = false)
@@ -352,6 +358,7 @@ class TerminalModel(
         applyTerminalPrefs()
         applyFontSize()
         applyAutoReconnect()
+        applyByRepo()
         appliedFamily = settings.fontFamily
         appliedSettings = followedSettings()
     }

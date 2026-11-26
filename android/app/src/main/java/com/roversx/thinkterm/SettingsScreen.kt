@@ -397,14 +397,29 @@ private fun SettingsSection(
                 SwitchRow(tr("bell"), settings.bell) { settings.bell = it }
                 PushRow(tr("resize.mode"), label(resizes(), settings.resizeMode)) { onPush("resize.mode") }
             }
-            "interface" -> Group {
-                SwitchRow(tr("i.panebars"), settings.paneBars) { settings.paneBars = it }
-                SegmentRow(
-                    tr("i.spaces"),
-                    listOf(tr("i.spaces.list"), tr("i.spaces.menu")),
-                    if (settings.spaces == "menu") 1 else 0,
-                ) { settings.spaces = if (it == 1) "menu" else "list" }
-                SwitchRow(tr("sky.haptics"), settings.skyHaptics) { settings.skyHaptics = it }
+            "interface" -> {
+                Group {
+                    SwitchRow(tr("i.panebars"), settings.paneBars) { settings.paneBars = it }
+                    SegmentRow(
+                        tr("i.spaces"),
+                        listOf(tr("i.spaces.list"), tr("i.spaces.menu")),
+                        if (settings.spaces == "menu") 1 else 0,
+                    ) { settings.spaces = if (it == 1) "menu" else "list" }
+                    SwitchRow(tr("sky.haptics"), settings.skyHaptics) { settings.skyHaptics = it }
+                }
+                // The Threads home's projects by repository, every host's
+                // together, or host by host.
+                Group(footer = tr("i.byrepo.note")) {
+                    SwitchRow(tr("i.byrepo"), settings.byRepo) {
+                        settings.byRepo = it
+                        // Every host's session asks, or stops asking and
+                        // forgets, now.
+                        Sessions.all.forEach { model -> model.applyByRepo() }
+                    }
+                    if (settings.byRepo) {
+                        SwitchRow(tr("i.repohost"), settings.repoHost) { settings.repoHost = it }
+                    }
+                }
             }
             "agents" -> Group(footer = tr("chat.first.note")) {
                 SwitchRow(tr("chat.first"), settings.chatFirst) { settings.chatFirst = it }

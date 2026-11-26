@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// Where the app opens: every host's threads on one screen, each host as
@@ -108,6 +109,8 @@ struct ThreadsHome: View {
         }
     }
 
+    private var byRepo: Bool { settings.byRepo && !searching }
+
     private var list: some View {
         ScrollView {
             // Not lazy: a host's whole tree is one view in it, which grows
@@ -120,11 +123,22 @@ struct ThreadsHome: View {
                     HostsEmptyState { adding = true }
                         .padding(.top, 40)
                 } else {
+                    // Every host's projects by the repository they are in,
+                    // above the hosts; a search looks host by host as ever.
+                    if byRepo {
+                        RepoGroups(
+                            hosts: entries.compactMap { entry in
+                                sessions.existing(entry.id).map { RepoGroups.Host(id: entry.id, name: entry.name, model: $0) }
+                            },
+                            open: { id in path.append(Route.terminal(id)) }
+                        )
+                    }
                     ForEach(entries) { entry in
                         HostThreads(
                             name: entry.name,
                             model: sessions.existing(entry.id),
                             query: searching ? query : "",
+                            byRepo: byRepo,
                             connect: { model(entry.id).connect() },
                             open: { path.append(Route.terminal(entry.id)) },
                             connected: { up in
@@ -312,13 +326,14 @@ private struct HostThreads: View {
     var name: String
     var model: TerminalModel?
     var query: String
+    var byRepo = false
     var connect: () -> Void
     var open: () -> Void
     var connected: (Bool) -> Void
 
     var body: some View {
         if let model {
-            Connected(name: name, model: model, query: query, connect: connect, open: open, connected: connected)
+            Connected(name: name, model: model, query: query, byRepo: byRepo, connect: connect, open: open, connected: connected)
         } else if query.isEmpty {
             HostTitle(name: name, color: Color.primary.opacity(0.25))
             SidebarRow(icon: "link-2", title: tr("connect"), dim: true, action: connect)
@@ -422,6 +437,9 @@ private struct Connected: View {
     @ObservedObject var model: TerminalModel
     @ObservedObject private var settings = AppSettings.shared
     var query: String
+    /// The projects in a repository are listed in theirs, above, and only
+    /// the rest here.
+    var byRepo = false
     var connect: () -> Void
     var open: () -> Void
     var connected: (Bool) -> Void
@@ -509,9 +527,10 @@ private struct Connected: View {
         agentsOnly ? project.threads.filter { $0.agent == true } : project.threads
     }
 
-    /// A project has its row unless agents only are shown and it has none.
+    /// A project has its row unless agents only are shown and it has none,
+    /// or it is listed in its repository's group.
     private func listed(_ project: TreeProject) -> Bool {
-        !agentsOnly || !shown(project).isEmpty
+        (!agentsOnly || !shown(project).isEmpty) && !(byRepo && project.repo?.remote != nil)
     }
 
     /// The host's Spaces, projects and threads; a lone Space has no row
@@ -521,7 +540,7 @@ private struct Connected: View {
         if spaces.count == 1, let space = spaces.first {
             ForEach(space.projects.filter { listed($0) }) { project in projectRows(space, project, depth: 0) }
         } else {
-            ForEach(spaces.filter { space in !agentsOnly || space.projects.contains { listed($0) } }) { space in
+            ForEach(spaces.filter { space in (!agentsOnly && !byRepo) || space.projects.contains { listed($0) } }) { space in
                 SidebarRow(icon: "layers", title: space.name, bold: space.current, dim: true) {}
                 ForEach(space.projects.filter { listed($0) }) { project in projectRows(space, project, depth: 1) }
             }
@@ -533,12 +552,13 @@ private struct Connected: View {
                 open()
             }
         }
-        if agentsOnly && !spaces.contains(where: { $0.projects.contains { listed($0) } }) && !windows.contains(where: \.agent) {
+        if !spaces.contains(where: { $0.projects.contains { listed($0) } }) && !windows.contains(where: { !agentsOnly || $0.agent }) {
             // Said, not left blank: a host with nothing under it reads as
             // one whose connection broke.
-            emptyLine(tr("home.agents.none"))
-        } else if !agentsOnly && spaces.allSatisfy({ $0.projects.isEmpty }) && windows.isEmpty {
-            emptyLine(tr("overview.none"))
+            // Only when the groups do list one of them: with the eye on, a
+            // repository's projects without agents are in neither place.
+            let above = byRepo && spaces.contains { $0.projects.contains { $0.repo?.remote != nil && (!agentsOnly || !shown($0).isEmpty) } }
+            emptyLine(tr(above ? "home.repos.above" : agentsOnly ? "home.agents.none" : "overview.none"))
         }
     }
 
@@ -597,6 +617,43 @@ private struct Connected: View {
     }
 
     private func threadRow(_ thread: ThreadRow, space: TreeSpace, project: TreeProject, depth: Int, subtitle: String? = nil) -> some View {
+        HomeThreadRow(model: model, thread: thread, space: space, project: project, depth: depth, subtitle: subtitle, open: open)
+    }
+
+    /// The threads whose names hold the query, under the host's name, each
+    /// with the project it is in; a host with none says nothing.
+    @ViewBuilder
+    private var found: some View {
+        let needle = query.lowercased()
+        let hits = spaces.flatMap { space in
+            space.projects.flatMap { project in
+                project.threads
+                    .filter { $0.name.lowercased().contains(needle) }
+                    .map { (space: space, project: project, thread: $0) }
+            }
+        }
+        if !hits.isEmpty {
+            HostTitle(name: name, color: dot)
+            ForEach(hits, id: \.thread.id) { hit in
+                threadRow(hit.thread, space: hit.space, project: hit.project, depth: 0, subtitle: hit.project.name)
+            }
+        }
+    }
+}
+
+/// A thread's row: its cards, its name and its mark; a tap opens it, or
+/// its agent's chat when chats come first.
+private struct HomeThreadRow: View {
+    @ObservedObject var model: TerminalModel
+    @ObservedObject private var settings = AppSettings.shared
+    var thread: ThreadRow
+    var space: TreeSpace
+    var project: TreeProject
+    var depth: Int
+    var subtitle: String? = nil
+    var open: () -> Void
+
+    var body: some View {
         SidebarRow(
             lead: AnyView(ThreadCards(core: model.core, icons: thread.icons ?? [], revision: model.iconsRevision)),
             mark: AnyView(ThreadMark(status: thread.markStatus, dot: thread.dot, live: thread.live, size: 9)),
@@ -619,24 +676,211 @@ private struct Connected: View {
         }
         .contextMenu { AppMenuItems(model: model, kind: "thread", id: thread.id) }
     }
+}
 
-    /// The threads whose names hold the query, under the host's name, each
-    /// with the project it is in; a host with none says nothing.
-    @ViewBuilder
-    private var found: some View {
-        let needle = query.lowercased()
-        let hits = spaces.flatMap { space in
-            space.projects.flatMap { project in
-                project.threads
-                    .filter { $0.name.lowercased().contains(needle) }
-                    .map { (space: space, project: project, thread: $0) }
+/// Every connected host's projects that are in a repository with a remote,
+/// put together by repository: its name, then the threads of all its
+/// copies. The group is the project, so which computer a thread is on is not
+/// said -- unless that computer's connection is down -- and its branch only
+/// when the group's threads are on more than one. A host not connected yet
+/// has its projects here once it is.
+private struct RepoGroups: View {
+    struct Host {
+        let id: UUID
+        let name: String
+        let model: TerminalModel
+    }
+
+    /// A project of one host in a repository's group: that host's copy.
+    struct Copy: Identifiable {
+        let id: String
+        let host: Host
+        let space: TreeSpace
+        let project: TreeProject
+        let branch: String?
+    }
+
+    var hosts: [Host]
+    var open: (UUID) -> Void
+    @ObservedObject private var settings = AppSettings.shared
+    /// Moves on as any host's tree or connection changes, which this view
+    /// does not observe one by one: their trees are read again.
+    @StateObject private var watch = RepoWatch()
+
+    private struct Repo: Identifiable {
+        let id: String
+        let name: String
+        /// Under its name: its owner, not where it is hosted, unless asked
+        /// for or the host is what tells it from another.
+        let under: String?
+        let copies: [Copy]
+    }
+
+    /// A thread of one of a repository's copies, as the group lists it.
+    private struct Line: Identifiable {
+        let id: String
+        let copy: Copy
+        let thread: ThreadRow
+    }
+
+    /// Attached to its server, as `Connected` reads it: its tree is the
+    /// one the server has now.
+    private func ready(_ model: TerminalModel) -> Bool {
+        model.connection.hasPrefix("pane ") && !(model.reconnecting && !model.autoReconnect)
+    }
+
+    private var groups: [Repo] {
+        watch.watch(hosts.map(\.model))
+        _ = watch.tick
+        let live = hosts.filter { ready($0.model) }
+        var projects: [RepoProject] = []
+        for host in live {
+            for space in host.model.tree?.spaces ?? [] {
+                for project in space.projects {
+                    guard let repo = project.repo, let remote = repo.remote else { continue }
+                    projects.append(RepoProject(
+                        host: host.id.uuidString, space: space.id, project: project.id,
+                        remote: remote, branch: repo.branch, worktree: repo.worktree
+                    ))
+                }
             }
         }
-        if !hits.isEmpty {
-            HostTitle(name: name, color: dot)
-            ForEach(hits, id: \.thread.id) { hit in
-                threadRow(hit.thread, space: hit.space, project: hit.project, depth: 0, subtitle: hit.project.name)
+        return repoGroups(projects: projects).map { group in
+            let copies: [Copy] = group.projects.compactMap { at in
+                guard let host = live.first(where: { $0.id.uuidString == at.host }),
+                      let space = host.model.tree?.spaces.first(where: { $0.id == at.space }),
+                      let project = space.projects.first(where: { $0.id == at.project })
+                else { return nil }
+                return Copy(id: at.host + "/" + at.project, host: host, space: space, project: project, branch: at.branch)
+            }
+            let under = settings.repoHost || group.hostNeeded ? group.remote : (group.owner.isEmpty ? nil : group.owner)
+            return Repo(id: group.remote.lowercased(), name: group.name, under: under, copies: copies)
+        }
+    }
+
+    /// A project's threads as the list shows them: with the eye on, only
+    /// the ones the Status panel has something in.
+    private func shown(_ project: TreeProject) -> [ThreadRow] {
+        settings.agentsOnly ? project.threads.filter { $0.agent == true } : project.threads
+    }
+
+    /// The line under a thread: its computer only while that one's
+    /// connection is down, its branch only when the group's threads are on
+    /// more than one.
+    private func subtitle(_ copy: Copy, sayBranch: Bool) -> String? {
+        let parts = [
+            copy.host.model.reconnecting ? copy.host.name + " " + tr("offline") : nil,
+            sayBranch ? copy.branch : nil,
+        ].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(groups) { group in
+                let lines = group.copies.flatMap { copy in
+                    shown(copy.project).map { Line(id: copy.host.id.uuidString + "/" + $0.id, copy: copy, thread: $0) }
+                }
+                if !settings.agentsOnly || !lines.isEmpty {
+                    let sayBranch = Set(group.copies.filter { !shown($0.project).isEmpty }.map { $0.branch }).count > 1
+                    RepoTitle(name: group.name, under: group.under, copies: group.copies, open: open)
+                    ForEach(lines) { line in
+                        // Under the repository's name, not stepped in: the
+                        // desktop's rows all start at one edge.
+                        HomeThreadRow(
+                            model: line.copy.host.model,
+                            thread: line.thread,
+                            space: line.copy.space,
+                            project: line.copy.project,
+                            depth: 0,
+                            subtitle: subtitle(line.copy, sayBranch: sayBranch),
+                            open: { open(line.copy.host.id) }
+                        )
+                    }
+                }
             }
         }
+    }
+}
+
+/// What `RepoGroups` is made of, watched: the hosts' trees and connections,
+/// and only as they change -- a model publishes much else, its screen's
+/// every change among it. Subscribed once for a set of hosts, not as the
+/// view is drawn, so no change falls between two subscriptions.
+private final class RepoWatch: ObservableObject {
+    @Published private(set) var tick = 0
+    private var watched: [ObjectIdentifier] = []
+    private var subscription: AnyCancellable?
+
+    func watch(_ models: [TerminalModel]) {
+        let ids = models.map(ObjectIdentifier.init)
+        guard ids != watched else { return }
+        watched = ids
+        // A `@Published` sends what it holds as it is subscribed to: that
+        // is what was just drawn, not a change.
+        subscription = Publishers.MergeMany(models.flatMap { model -> [AnyPublisher<Void, Never>] in
+            [
+                model.$tree.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                model.$connection.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                model.$reconnecting.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            ]
+        })
+        .receive(on: RunLoop.main)
+        .sink { [weak self] in self?.tick &+= 1 }
+    }
+}
+
+/// A repository's name, the group's root, with whose it is under it, and
+/// the + that starts a thread in it: in its one copy, or in the one picked
+/// from a menu -- the only place a computer is named.
+private struct RepoTitle: View {
+    var name: String
+    var under: String?
+    var copies: [RepoGroups.Copy]
+    var open: (UUID) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name)
+                    .font(.title3.weight(.bold))
+                    .lineLimit(1)
+                if let under {
+                    Text(under)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if copies.count == 1, let copy = copies.first {
+                Button { start(copy) } label: { plus }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(tr("thread.new"))
+            } else {
+                Menu {
+                    ForEach(copies) { copy in
+                        Button([copy.host.name, copy.branch].compactMap { $0 }.joined(separator: " · ")) { start(copy) }
+                    }
+                } label: { plus }
+                    .accessibilityLabel(tr("thread.new"))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 18)
+        .padding(.bottom, 4)
+    }
+
+    private var plus: some View {
+        DesktopIcon(name: "circle-plus", size: 18)
+            .foregroundColor(.secondary)
+            .frame(width: 32, height: 32)
+            .contentShape(Rectangle())
+    }
+
+    private func start(_ copy: RepoGroups.Copy) {
+        copy.host.model.setSpace(copy.space.id)
+        copy.host.model.sideClick("new-thread", id: copy.project.id)
+        open(copy.host.id)
     }
 }
