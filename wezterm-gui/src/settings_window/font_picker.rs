@@ -719,6 +719,9 @@ impl SettingsWindow {
         if !picker.can_apply() {
             return false;
         }
+        if picker.slot == FontSlot::Recommended {
+            return self.font_preset_fits();
+        }
         let edit = picker.edit();
         let Some(adds) = edit.adds() else {
             return true;
@@ -726,6 +729,24 @@ impl SettingsWindow {
         let mut stack = self.font_stack(picker.target);
         edit.apply(&mut stack);
         FontStack::new(stack.primary.as_deref(), &stack.fallbacks).has_fallback(adds)
+    }
+
+    /// Whether the set the open picker shows finds a place in the list as
+    /// this window has it now: none does when the list's own fonts fill it.
+    fn font_preset_fits(&self) -> bool {
+        let Some(picker) = &self.ui.font_picker else {
+            return false;
+        };
+        let Some(preset) = &picker.preset else {
+            return false;
+        };
+        let mut stack = self.font_stack(picker.target);
+        picker.edit().apply(&mut stack);
+        let stack = FontStack::new(stack.primary.as_deref(), &stack.fallbacks);
+        preset
+            .families
+            .iter()
+            .any(|family| stack.has_fallback(family))
     }
 
     /// The family `target`'s main font is when Settings leaves it to
@@ -1501,8 +1522,16 @@ impl SettingsWindow {
         let presets = picker.presets.clone();
         let chosen = picker.preset.as_ref().map(|preset| preset.language);
 
-        // Where the search field is for a single font.
-        let note = crate::i18n::tr("settings-font-presets-note");
+        // Where the search field is for a single font; when the list's own
+        // fonts leave no place for a set, that instead of what Apply does.
+        let note = if picker.preset.is_some() && !self.font_preset_fits() {
+            settings_tr(
+                "settings-font-fallbacks-full",
+                &[("count", MAX_FONT_FALLBACKS.to_string())],
+            )
+        } else {
+            crate::i18n::tr("settings-font-presets-note")
+        };
         let mut y = top + self.ui_px(4.0);
         y += self.draw_row_note_in_lines(layers, x, y, &note, width, 4)?
             + self.description_line_step()
@@ -1838,16 +1867,31 @@ impl SettingsWindow {
         let step = preview
             .as_ref()
             .map(|font| (font.metrics().cell_height.get() as f32).max(self.ui_px(34.0)));
-        // A set's fonts in full under its name, which its row may have cut.
-        let set_lines = match (
-            slot,
-            self.ui.font_picker.as_ref().and_then(|p| p.preset.as_ref()),
-        ) {
-            (FontSlot::Recommended, Some(preset)) => {
+        // The set's fonts that go in the list, in full under its name: its
+        // row may have cut them, and a nearly full list takes fewer.
+        let placed = match (slot, self.ui.font_picker.as_ref()) {
+            (FontSlot::Recommended, Some(picker)) => picker.preset.as_ref().map(|preset| {
+                picker
+                    .draft_stack()
+                    .fallbacks
+                    .into_iter()
+                    .filter(|family| {
+                        preset
+                            .families
+                            .iter()
+                            .any(|ours| ours.eq_ignore_ascii_case(family))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            }),
+            _ => None,
+        };
+        let set_lines = match placed.filter(|placed| !placed.is_empty()) {
+            Some(placed) => {
                 let body_font = Rc::clone(&self.body_font);
-                self.capped_lines(&body_font, &preset.families.join(" → "), inner_width, 3)
+                self.capped_lines(&body_font, &placed, inner_width, 3)
             }
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         let samples_top = self.ui_px(120.0) + self.description_line_step() * set_lines.len() as f32;
         let content_height = samples_top

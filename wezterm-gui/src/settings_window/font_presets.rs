@@ -9,6 +9,7 @@
 //! for the characters it lacks: kana, Hangul, forms only one language has.
 
 use super::font_picker::FontTarget;
+use crate::native_settings::MAX_FONT_FALLBACKS;
 
 /// A language a set gives the shared Han characters the forms of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -214,21 +215,25 @@ fn recommended_on(system: System, family: &str) -> bool {
 /// The fallbacks a list has once the set `set` is applied to `fallbacks`:
 /// the set's families first, then the list's other fonts as they were,
 /// symbols, emoji or any other language's, without the ones a set takes.
+/// Those other fonts are the list's owner's and all stay: where they leave
+/// no room for the whole set, it gives up its last families, and where
+/// they leave none at all, the list is as it was.
 pub(super) fn with_set(set: &[String], fallbacks: &[String]) -> Vec<String> {
-    with_set_on(SYSTEM, set, fallbacks)
+    with_set_on(SYSTEM, set, fallbacks, MAX_FONT_FALLBACKS)
 }
 
-fn with_set_on(system: System, set: &[String], fallbacks: &[String]) -> Vec<String> {
+fn with_set_on(system: System, set: &[String], fallbacks: &[String], most: usize) -> Vec<String> {
     let in_set = |family: &String| set.iter().any(|ours| ours.eq_ignore_ascii_case(family));
-    set.iter()
+    let kept: Vec<String> = fallbacks
+        .iter()
+        .filter(|family| !in_set(family) && !recommended_on(system, family))
         .cloned()
-        .chain(
-            fallbacks
-                .iter()
-                .filter(|family| !in_set(family) && !recommended_on(system, family))
-                .cloned(),
-        )
-        .collect()
+        .collect();
+    let room = most.saturating_sub(kept.len());
+    if room == 0 {
+        return fallbacks.to_vec();
+    }
+    set.iter().take(room).cloned().chain(kept).collect()
 }
 
 /// The sets for `target` of the families in `installed` (the catalogue),
@@ -445,7 +450,7 @@ mod tests {
             "Noto Color Emoji",
         ]);
         assert_eq!(
-            with_set_on(System::Unix, &set, &fallbacks),
+            with_set_on(System::Unix, &set, &fallbacks, 8),
             [
                 "Noto Sans Mono CJK JP",
                 "Noto Sans Mono CJK SC",
@@ -457,7 +462,7 @@ mod tests {
         );
         // What a set may take differs by system.
         assert_eq!(
-            with_set_on(System::Mac, &installed(&["PingFang SC"]), &fallbacks),
+            with_set_on(System::Mac, &installed(&["PingFang SC"]), &fallbacks, 8),
             [
                 "PingFang SC",
                 "Noto Sans CJK SC",
@@ -467,6 +472,28 @@ mod tests {
                 "Noto Color Emoji",
             ]
         );
+    }
+
+    #[test]
+    fn a_full_list_keeps_its_own_fonts_and_trims_the_set() {
+        let set = installed(&["JP", "SC", "TC", "KR"]);
+        let own = installed(&["A", "B", "C", "D", "E", "Symbols", "Emoji"]);
+        // One place left: the set's first family only.
+        assert_eq!(
+            with_set_on(System::Unix, &set, &own, 8),
+            installed(&["JP", "A", "B", "C", "D", "E", "Symbols", "Emoji"])
+        );
+        // A font a set takes frees its place for the set.
+        let mut with_cjk = own.clone();
+        with_cjk.insert(0, "Noto Sans CJK SC".to_string());
+        assert_eq!(
+            with_set_on(System::Unix, &set, &with_cjk, 8),
+            installed(&["JP", "A", "B", "C", "D", "E", "Symbols", "Emoji"])
+        );
+        // No place at all: the list stays as it was.
+        let mut full = own.clone();
+        full.push("F".to_string());
+        assert_eq!(with_set_on(System::Unix, &set, &full, 8), full);
     }
 
     #[test]
