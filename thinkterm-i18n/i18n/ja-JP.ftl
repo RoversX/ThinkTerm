@@ -1925,6 +1925,7 @@ settings-reverse-connect-first = まずサーバーに接続してください�
 
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = 接続中…
+chat-reconnecting = 再接続中…
 chat-writing = 書いています
 chat-thought = 思考
 chat-looked = { $files } 個のファイルを確認
@@ -2000,9 +2001,9 @@ chat-exit = 終了コード { $code }
 chat-declined = 拒否
 chat-note-compacted = 以前の会話を要約しました
 chat-note-worked = { $time } 作業しました
-chat-time-s = { $s } 秒
-chat-time-ms = { $m } 分 { $s } 秒
-chat-time-hm = { $h } 時間 { $m } 分
+chat-time-s = { $s }秒
+chat-time-ms = { $m }分{ $s }秒
+chat-time-hm = { $h }時間{ $m }分
 chat-note-interrupted = 停止しました
 chat-note-failed = 失敗：{ $why }
 chat-ask-command = このコマンドを実行しますか？

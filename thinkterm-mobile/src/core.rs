@@ -56,6 +56,22 @@ const REDIAL_TRIES: u32 = 20;
 /// the lines of a chat opening one.
 const CHAT_EVERY: Duration = Duration::from_millis(60);
 
+/// A chat's channel that ended by itself (its connection still up) is
+/// opened again: first after this long, the wait doubling to the most, for
+/// so many tries (a few minutes); then the chat says it was cut off, and a
+/// tap opens it again.
+const CHAT_REDIAL_FIRST: Duration = Duration::from_secs(1);
+const CHAT_REDIAL_MOST: Duration = Duration::from_secs(15);
+const CHAT_REDIAL_TRIES: u32 = 12;
+/// A channel that was open this long had worked: its end starts the waits
+/// over.
+const CHAT_STEADY: Duration = Duration::from_secs(30);
+
+/// Chats left are kept this long, and so many at most: one opened again
+/// shows what it held at once, until its bridge has sent it anew.
+const CHAT_KEPT_FOR: Duration = Duration::from_secs(30 * 60);
+const CHATS_KEPT: usize = 4;
+
 pub struct ConnectParams {
     pub ssh: SshParams,
     pub font_paths: Vec<String>,
@@ -284,7 +300,23 @@ pub enum ChatCmd {
 /// whose lines count, and what its bridge said.
 struct ChatSession {
     pane: u32,
+    /// The agent as the shell named it at the opening.
+    agent: String,
     generation: u64,
+    /// When its channel was last opened.
+    since: Instant,
+    model: ChatModel,
+}
+
+/// A chat left, kept a while (`CHAT_KEPT_FOR`): opened again, what it held
+/// is on show at once.
+struct KeptChat {
+    pane: u32,
+    agent: String,
+    /// The server it is of (`App::server_id`): a pane of the same number
+    /// on another (or on one started anew) is another agent.
+    server: Option<String>,
+    left: Instant,
     model: ChatModel,
 }
 
@@ -393,6 +425,13 @@ struct State {
     /// Openings of a chat's channel so far: each is numbered, and only the
     /// latest one's lines count.
     chat_openings: u64,
+    /// Chats left a while ago, newest last.
+    chats_kept: Vec<KeptChat>,
+    /// The chat's channel ended by itself: when it is opened again, how
+    /// long the wait after that, and how many tries were made.
+    chat_redial_at: Option<Instant>,
+    chat_redial_wait: Duration,
+    chat_redial_tries: u32,
     /// Where the last connect went, for a failed dial to be made again.
     ssh: Option<SshParams>,
     /// A failed dial is made again by itself: from a connect until a
@@ -467,6 +506,7 @@ pub fn run(
         state.report_agents();
         state.publish_chat_owed();
         state.redial_if_due();
+        state.chat_redial_if_due();
         state.publish_views();
     }
     state.disconnect();
@@ -527,6 +567,10 @@ impl State {
             views_dirty: Rc::new(Cell::new(true)),
             chat: None,
             chat_openings: 0,
+            chats_kept: Vec::new(),
+            chat_redial_at: None,
+            chat_redial_wait: CHAT_REDIAL_FIRST,
+            chat_redial_tries: 0,
             chat_owed: false,
             chat_made: Instant::now(),
             ssh: None,
@@ -564,6 +608,9 @@ impl State {
             wait = wait.min((self.chat_made + CHAT_EVERY).saturating_duration_since(now));
         }
         if let Some(at) = self.redial_at {
+            wait = wait.min(at.saturating_duration_since(now));
+        }
+        if let Some(at) = self.chat_redial_at {
             wait = wait.min(at.saturating_duration_since(now));
         }
         let owed = self.views_dirty.get() || (self.screen_dirty && self.screen_wanted);
@@ -704,25 +751,34 @@ impl State {
     fn chat_cmd(&mut self, cmd: ChatCmd) {
         match cmd {
             ChatCmd::Open { pane, agent } => {
-                if let Some(link) = &self.link {
-                    if self.chat.is_some() {
+                if let Some(chat) = self.chat.take() {
+                    if let Some(link) = &self.link {
                         link.chat_close();
                     }
+                    self.keep_chat(chat);
                 }
+                // One left a while ago shows what it held at once; its
+                // bridge sends it anew as the channel opens.
+                let model = self.kept_chat(pane, &agent).unwrap_or_else(|| ChatModel::new(pane, &agent));
                 self.chat = Some(ChatSession {
                     pane,
+                    agent,
                     generation: 0,
-                    model: ChatModel::new(pane, &agent),
+                    since: Instant::now(),
+                    model,
                 });
+                self.chat_redial_reset();
                 self.chat_connect();
                 self.probe_for_chat();
             }
             ChatCmd::Close => {
-                if self.chat.take().is_some() {
+                if let Some(chat) = self.chat.take() {
                     if let Some(link) = &self.link {
                         link.chat_close();
                     }
+                    self.keep_chat(chat);
                 }
+                self.chat_redial_at = None;
                 return;
             }
             ChatCmd::Send { text, attachments } => {
@@ -773,6 +829,7 @@ impl State {
                 self.chat_op(ChatOp::Install);
             }
             ChatCmd::Retry => {
+                self.chat_redial_reset();
                 self.chat_connect();
                 self.probe_for_chat();
             }
@@ -791,16 +848,142 @@ impl State {
     /// Open the chat's channel on the connection, for the chat on show:
     /// an opening of its own, which lines of any before do not count in.
     fn chat_connect(&mut self) {
+        let back = self.coming_back();
         let Some(chat) = self.chat.as_mut() else {
             return;
         };
         self.chat_openings += 1;
         chat.generation = self.chat_openings;
+        chat.since = Instant::now();
         chat.model.reconnecting();
         let opened = self.link.as_ref().is_some_and(|link| link.chat_open(chat.pane, chat.generation));
         if !opened {
-            chat.model.ended(false, "not connected");
+            // The connection's return opens it (`Net::Connected`).
+            if back {
+                chat.model.lost();
+            } else {
+                chat.model.ended(false, "not connected");
+            }
         }
+    }
+
+    /// Whether a connection that is down comes back by itself, where the
+    /// person lets it: the App's own redial, a dial made again after a
+    /// wait, or one on its way.
+    fn coming_back(&self) -> bool {
+        self.auto_reconnect()
+            && (self.app.is_some() || self.redial_at.is_some() || matches!(self.conn, Conn::Connecting | Conn::Attaching))
+    }
+
+    /// The chat's channel ended by itself (`missing`: the host's ThinkTerm
+    /// has no bridge). It is opened again after a wait, said as
+    /// reconnecting meanwhile -- unless its bridge said what is wrong,
+    /// which a new channel would only say again, or it was tried enough.
+    fn chat_ended(&mut self, missing: bool, reason: &str) {
+        let Some(chat) = self.chat.as_mut() else {
+            return;
+        };
+        if chat.since.elapsed() >= CHAT_STEADY {
+            self.chat_redial_wait = CHAT_REDIAL_FIRST;
+            self.chat_redial_tries = 0;
+        }
+        if missing || chat.model.has_problem() || self.chat_redial_tries >= CHAT_REDIAL_TRIES {
+            chat.model.ended(missing, reason);
+            self.chat_redial_at = None;
+            return;
+        }
+        chat.model.lost();
+        self.chat_redial_tries += 1;
+        self.chat_redial_at = Some(Instant::now() + self.chat_redial_wait);
+        self.notify
+            .on_log(format!("chat: opening again in {} s: {reason}", self.chat_redial_wait.as_secs()));
+        self.chat_redial_wait = (self.chat_redial_wait * 2).min(CHAT_REDIAL_MOST);
+    }
+
+    /// The connection the chat's channel went over went: said as
+    /// reconnecting while the connection comes back by itself; the chat
+    /// opens again with it (`Net::Connected`).
+    fn chat_cut(&mut self, reason: &str) {
+        self.chat_redial_at = None;
+        let back = self.auto_reconnect() && !self.redial_lasting;
+        if let Some(chat) = self.chat.as_mut() {
+            if back && !chat.model.has_problem() {
+                chat.model.lost();
+            } else {
+                chat.model.ended(false, reason);
+            }
+        }
+    }
+
+    /// The connection is not coming back by itself after all (the dial
+    /// failed for good, or was tried enough): a chat said as reconnecting
+    /// says it was cut off, and a tap tries again.
+    fn chat_off(&mut self, reason: &str) {
+        self.chat_redial_at = None;
+        if let Some(chat) = self.chat.as_mut() {
+            chat.model.ended(false, reason);
+            self.publish_chat();
+        }
+    }
+
+    /// The chat's channel opened again once its wait is over: on the
+    /// connection if it is up, else with its return.
+    fn chat_redial_if_due(&mut self) {
+        if self.chat_redial_at.is_none_or(|at| Instant::now() < at) {
+            return;
+        }
+        self.chat_redial_at = None;
+        if self.chat.is_none() {
+            return;
+        }
+        self.chat_connect();
+        self.probe_for_chat();
+        self.publish_chat();
+    }
+
+    /// The waits start over: a chat opened anew, or a tap.
+    fn chat_redial_reset(&mut self) {
+        self.chat_redial_at = None;
+        self.chat_redial_wait = CHAT_REDIAL_FIRST;
+        self.chat_redial_tries = 0;
+    }
+
+    /// The server the chats are of: the App's, or with it gone (the
+    /// connection down) the one last heard from.
+    fn chat_server(&self) -> Option<String> {
+        self.app.as_ref().and_then(|app| app.server_id()).or_else(|| self.agents_server.clone())
+    }
+
+    /// Keep a chat left, for a while, in place of one kept for its pane.
+    fn keep_chat(&mut self, chat: ChatSession) {
+        let now = Instant::now();
+        self.chats_kept
+            .retain(|kept| now.duration_since(kept.left) < CHAT_KEPT_FOR && kept.pane != chat.pane);
+        self.chats_kept.push(KeptChat {
+            pane: chat.pane,
+            agent: chat.agent,
+            server: self.chat_server(),
+            left: now,
+            model: chat.model,
+        });
+        if self.chats_kept.len() > CHATS_KEPT {
+            self.chats_kept.remove(0);
+        }
+    }
+
+    /// The chat of `pane` and `agent` on this server, kept since it was
+    /// left, if not too long ago.
+    fn kept_chat(&mut self, pane: u32, agent: &str) -> Option<ChatModel> {
+        let now = Instant::now();
+        self.chats_kept.retain(|kept| now.duration_since(kept.left) < CHAT_KEPT_FOR);
+        let server = self.chat_server();
+        let at = self
+            .chats_kept
+            .iter()
+            .position(|kept| kept.pane == pane && kept.agent == agent && kept.server == server)?;
+        let mut model = self.chats_kept.remove(at).model;
+        model.shown_again();
+        Some(model)
     }
 
     /// See whether the connection a chat opens on still carries: after the
@@ -930,6 +1113,7 @@ impl State {
                     self.fail(format!("connect: {err:#}"));
                     self.conn = Conn::Disconnected(format!("{err:#}"));
                     self.set_status(&format!("failed: {err:#}"));
+                    self.chat_off(&format!("{err:#}"));
                 }
             }
             Cmd::Disconnect => {
@@ -1276,6 +1460,14 @@ impl State {
                         self.redial_at = Some(Instant::now());
                     }
                 }
+                // Turned off, a connection that is down no longer comes back
+                // by itself: a chat waiting on it says it was cut off.
+                if key == "auto-reconnect" && !self.auto_reconnect() && self.chat.as_ref().is_some_and(|chat| chat.model.reconnects()) {
+                    let down = self.app.as_ref().is_none_or(|app| !app.connected()) || self.link.is_none();
+                    if down {
+                        self.chat_off("disconnected");
+                    }
+                }
                 if let Some(app) = self.app.clone() {
                     if let Err(err) = app.set_setting(&key, &value) {
                         self.notify.on_log(format!("setting {key}: {err}"));
@@ -1487,6 +1679,8 @@ impl State {
         if self.icons_host.as_ref() != Some(&host) {
             self.show_icons(icons::catalog());
             self.icons_host = Some(host);
+            // Another host's panes are other agents.
+            self.chats_kept.clear();
         }
         self.device_id = params.device_id.clone();
         let mut faces = Vec::new();
@@ -1509,6 +1703,11 @@ impl State {
         self.redial_lasting = false;
         self.redial_wait = REDIAL_FIRST;
         self.redial_tries = 0;
+        // A chat on show opens again once this is up: it says so meanwhile.
+        if let Some(chat) = self.chat.as_mut() {
+            chat.model.lost();
+            self.publish_chat();
+        }
         self.dial(params.ssh)
     }
 
@@ -1548,6 +1747,7 @@ impl State {
         self.end_unfinished_uploads("disconnected");
         // A chat on show has no channel without it: it says so, rather than
         // take words it cannot send. The next connection opens it again.
+        self.chat_redial_at = None;
         if let Some(chat) = self.chat.as_mut() {
             chat.model.ended(false, "disconnected");
             self.publish_chat();
@@ -1727,6 +1927,7 @@ impl State {
                 self.link = None;
                 if !self.dial_failed(&err) {
                     self.set_status(&format!("failed: {err}"));
+                    self.chat_off(&err);
                 }
             }
         }
@@ -1766,6 +1967,7 @@ impl State {
                 }
                 // A chat on show lost its channel with the last connection.
                 if self.chat.is_some() {
+                    self.chat_redial_at = None;
                     self.chat_connect();
                     self.publish_chat();
                 }
@@ -1784,8 +1986,8 @@ impl State {
                 missing,
                 reason,
             } => {
-                if let Some(chat) = self.chat.as_mut().filter(|chat| chat.generation == generation) {
-                    chat.model.ended(missing, &reason);
+                if self.chat.as_ref().is_some_and(|chat| chat.generation == generation) {
+                    self.chat_ended(missing, &reason);
                     self.publish_chat();
                     // A channel that never opened is most often a connection
                     // gone quiet: looked at, and dialled again if it is.
@@ -1823,8 +2025,8 @@ impl State {
             Net::Closed(reason) => {
                 // What was on its way went with the connection.
                 self.end_unfinished_uploads(&reason);
-                if let Some(chat) = self.chat.as_mut() {
-                    chat.model.ended(false, &reason);
+                if self.chat.is_some() {
+                    self.chat_cut(&reason);
                     self.publish_chat();
                 }
                 if self.app.is_none() {
@@ -1833,6 +2035,7 @@ impl State {
                     // again: this dial is made again here.
                     if !self.dial_failed(&reason) {
                         self.set_status(&format!("disconnected: {reason}"));
+                        self.chat_off(&reason);
                     }
                 }
                 // With an App up, its close handler takes it from here:
@@ -1951,6 +2154,7 @@ impl State {
                 }
                 if !self.dial_failed(&reason) {
                     self.set_status(&format!("failed: {reason}"));
+                    self.chat_off(&reason);
                 }
                 return;
             }
@@ -2511,6 +2715,84 @@ mod tests {
         state.views_made = Instant::now() - VIEWS_EVERY;
         state.publish_views();
         assert_eq!(state.published.lock().unwrap().views.revision, 1, "and wait again once the list is gone");
+    }
+
+    #[test]
+    fn a_chat_cut_off_opens_again_by_itself_and_one_left_is_kept() {
+        use thinkterm_agent_chat::{Ev, Item, Need};
+        let mut state = state();
+        let view = |state: &State| state.chat.as_ref().unwrap().model.view();
+        // With no connection that comes back by itself: cut off, a tap away.
+        state.chat_cmd(ChatCmd::Open {
+            pane: 3,
+            agent: "pi".into(),
+        });
+        assert_eq!(view(&state).state, "problem");
+        let model = &mut state.chat.as_mut().unwrap().model;
+        model.apply(Ev::Hello {
+            protocol: 2,
+            agent: "pi".into(),
+            title: None,
+            guessed: false,
+        });
+        model.apply(Ev::History {
+            items: vec![Item::Text {
+                id: "a".into(),
+                text: "hi".into(),
+            }],
+            more: false,
+            reset: true,
+        });
+
+        // The channel ended by itself: reconnecting, and opened again after
+        // a wait that grows.
+        state.chat_ended(false, "the channel closed");
+        assert_eq!((view(&state).state, view(&state).rows.len()), ("connecting", 1));
+        assert!(view(&state).problem.is_none());
+        assert!(state.chat_redial_at.is_some());
+        assert_eq!((state.chat_redial_tries, state.chat_redial_wait), (1, CHAT_REDIAL_FIRST * 2));
+        // Tried enough: said so, with a way to try again.
+        state.chat_redial_tries = CHAT_REDIAL_TRIES;
+        state.chat_ended(false, "the channel closed");
+        assert_eq!(view(&state).state, "problem");
+        assert!(state.chat_redial_at.is_none());
+        // What its bridge said is wrong is not tried again.
+        state.chat_redial_reset();
+        state.chat.as_mut().unwrap().model.apply(Ev::Error {
+            need: Some(Need::NotHere),
+            message: String::new(),
+            can_load: false,
+        });
+        state.chat_ended(false, "the channel closed");
+        assert!(state.chat_redial_at.is_none());
+
+        // Left and opened again: what it held is on show at once.
+        state.chat_cmd(ChatCmd::Close);
+        assert_eq!(state.chats_kept.len(), 1);
+        state.chat_cmd(ChatCmd::Open {
+            pane: 3,
+            agent: "pi".into(),
+        });
+        assert_eq!(view(&state).rows.len(), 1);
+        assert!(state.chats_kept.is_empty());
+        // Not another agent in the same pane, nor one left too long ago.
+        state.chat_cmd(ChatCmd::Close);
+        state.chat_cmd(ChatCmd::Open {
+            pane: 3,
+            agent: "codex".into(),
+        });
+        assert!(view(&state).rows.is_empty());
+        state.chat_cmd(ChatCmd::Close);
+        assert_eq!(state.chats_kept.len(), 1, "one kept for a pane: the latest");
+        // (A clock that started less than that ago has no such instant.)
+        if let Some(long_ago) = state.chats_kept[0].left.checked_sub(CHAT_KEPT_FOR) {
+            state.chats_kept[0].left = long_ago;
+            state.chat_cmd(ChatCmd::Open {
+                pane: 3,
+                agent: "codex".into(),
+            });
+            assert!(state.chats_kept.is_empty());
+        }
     }
 
     #[test]

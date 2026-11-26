@@ -1980,6 +1980,7 @@ settings-reverse-connect-first = Connect to a server first. Each connection has 
 
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = Connecting…
+chat-reconnecting = Reconnecting…
 chat-writing = Writing
 chat-thought = Thinking
 chat-looked = { $files ->
@@ -2082,9 +2083,9 @@ chat-exit = exit { $code }
 chat-declined = declined
 chat-note-compacted = Earlier messages were summarized
 chat-note-worked = Worked for { $time }
-chat-time-s = { $s } s
-chat-time-ms = { $m } min { $s } s
-chat-time-hm = { $h } h { $m } min
+chat-time-s = { $s }s
+chat-time-ms = { $m }m { $s }s
+chat-time-hm = { $h }h { $m }m
 chat-note-interrupted = Stopped
 chat-note-failed = Failed: { $why }
 chat-ask-command = Run this command?

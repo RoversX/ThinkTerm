@@ -156,20 +156,22 @@ enum ChatRow: Decodable, Identifiable {
     /// `copy`: the words as written, for the last reply of a turn.
     case text(id: String, blocks: [MdBlock], copy: String?)
     case fold(ChatFold)
-    case note(id: String, text: String)
+    /// `aside`: said at the side, small, as the end of a turn is; `done`:
+    /// when that turn was done (unix seconds), where known.
+    case note(id: String, text: String, aside: Bool, done: Int64?)
     case group(ChatGroup)
 
     var id: String {
         switch self {
         case let .user(id, _, _): return id
         case let .text(id, _, _): return id
-        case let .note(id, _): return id
+        case let .note(id, _, _, _): return id
         case let .fold(fold): return fold.id
         case let .group(group): return group.id
         }
     }
 
-    private enum Key: String, CodingKey { case kind, id, text, blocks, attachments, copy }
+    private enum Key: String, CodingKey { case kind, id, text, blocks, attachments, copy, aside, done }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Key.self)
@@ -184,7 +186,13 @@ enum ChatRow: Decodable, Identifiable {
         case "text": self = .text(id: id, blocks: try c.decode([MdBlock].self, forKey: .blocks), copy: try? c.decode(String.self, forKey: .copy))
         case "fold": self = .fold(try ChatFold(from: decoder))
         case "group": self = .group(try ChatGroup(from: decoder))
-        default: self = .note(id: id, text: (try? c.decode(String.self, forKey: .text)) ?? "")
+        default:
+            self = .note(
+                id: id,
+                text: (try? c.decode(String.self, forKey: .text)) ?? "",
+                aside: (try? c.decode(Bool.self, forKey: .aside)) ?? false,
+                done: try? c.decode(Int64.self, forKey: .done)
+            )
         }
     }
 }
@@ -467,7 +475,7 @@ struct ChatPage: View {
     @StateObject private var reveal = ChatReveal()
     /// Swiped left: the rows move aside for when each came about, and back
     /// once let go (or the touch is taken for something else).
-    @GestureState(resetTransaction: Transaction(animation: .snappy(duration: 0.28))) private var swipe: CGFloat = 0
+    @GestureState(resetTransaction: Transaction(animation: .snappy(duration: 0.28))) private var swipe = TimeSwipe()
     @State private var codeScroll = CodeScroll()
 
     var body: some View {
@@ -548,19 +556,19 @@ struct ChatPage: View {
                             // The full width: its time sits at the right edge
                             // however short the row.
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .offset(x: swipe)
+                            .offset(x: swipe.x)
                             .overlay(alignment: .topTrailing) {
                                 // When it came about, out of sight to its right until
                                 // the rows are swiped aside.
-                                if swipe < 0, let at = chat?.times?[row.id] {
+                                if swipe.x < 0, let at = chat?.times?[row.id] {
                                     Text(chatTimeWords(at))
                                         .font(.system(size: 11))
                                         .foregroundStyle(.secondary)
                                         .multilineTextAlignment(.trailing)
                                         .frame(width: timeGutter - 8, alignment: .trailing)
                                         .padding(.top, 2)
-                                        .offset(x: swipe + timeGutter)
-                                        .opacity(Double(min(1, -swipe / timeGutter)))
+                                        .offset(x: swipe.x + timeGutter)
+                                        .opacity(Double(min(1, -swipe.x / timeGutter)))
                                         .allowsHitTesting(false)
                                 }
                             }
@@ -581,15 +589,22 @@ struct ChatPage: View {
             }
             // A swipe to the left over the rows moves them aside for their
             // times; not one that scrolls a code block, nor one from the
-            // left edge, which goes back.
+            // left edge, which goes back. Which it is, is settled once, as
+            // it sets off: a scroll that wanders sideways, or a touch that
+            // sets off to the right, leaves the rows where they are.
             .simultaneousGesture(
                 DragGesture(minimumDistance: 20, coordinateSpace: .global)
                     .updating($swipe) { drag, state, _ in
-                        guard drag.startLocation.x >= 28, !codeScroll.active,
-                              abs(drag.translation.width) > abs(drag.translation.height) else { return }
-                        let dx = min(0, drag.translation.width)
+                        let w = drag.translation.width, h = drag.translation.height
+                        if state.forTimes == nil {
+                            state.forTimes = drag.startLocation.x >= 28 && !codeScroll.active
+                                && w < 0 && -w >= abs(h) * timeSwipeSlant
+                            state.from = w
+                        }
+                        guard state.forTimes == true, !codeScroll.active else { return }
+                        let dx = min(0, w - state.from)
                         // Past the times, it gives less and less.
-                        state = dx < -timeGutter ? -timeGutter + (dx + timeGutter) / 3 : dx
+                        state.x = dx < -timeGutter ? -timeGutter + (dx + timeGutter) / 3 : dx
                     }
             )
             .environment(\.codeScroll, codeScroll)
@@ -665,7 +680,13 @@ struct ChatPage: View {
                 }
                 reveal.rest()
             }
-            .onChange(of: chat?.rows.last?.id) {
+            .onChange(of: chat?.rows.last?.id) { before, _ in
+                // The first rows (the chat opening): at the end at once, not
+                // a glide down from the top.
+                if before == nil {
+                    proxy.scrollTo("end", anchor: .bottom)
+                    return
+                }
                 guard atEnd || follow else { return }
                 follow = false
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
@@ -866,12 +887,21 @@ struct ChatPage: View {
                 toggle: { model.chatToggle(group.id) },
                 toggleFold: { model.chatToggle($0) }
             )
-        case let .note(_, text):
-            Text(text)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
+        case let .note(_, text, aside, done):
+            if aside {
+                // The end of a turn, small at the side: how long it worked,
+                // and when it was done.
+                Text(done.map { "\(text) · " + tr("chat.note.done", chatTimeWords($0).replacingOccurrences(of: "\n", with: " ")) } ?? text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text(text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
         }
     }
 
@@ -1743,6 +1773,19 @@ private struct CommandRow: View {
 
 /// How far a left swipe moves the rows aside, for their times.
 private let timeGutter: CGFloat = 64
+/// A swipe for the times goes at least this many times as far sideways as
+/// up or down, as it sets off: anything steeper is a scroll.
+private let timeSwipeSlant: CGFloat = 2
+
+/// A touch over the chat's rows, while it lasts.
+struct TimeSwipe {
+    /// How far the rows are moved aside, for their times.
+    var x: CGFloat = 0
+    /// Settled as it sets off: whether it is a swipe for the times.
+    var forTimes: Bool?
+    /// How far it had gone sideways then; the rows move from there.
+    var from: CGFloat = 0
+}
 
 /// When something came about, as the app's language words it: the time,
 /// and the day above it when not today.

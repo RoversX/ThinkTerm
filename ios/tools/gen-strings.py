@@ -28,6 +28,8 @@ EXTRA = {
     "chat.file.loading": ["Opening…", "正在打开…", "開いています…", "Ouverture…", "Wird geöffnet…"],
     "chat.file.failed": ["Couldn't open this file", "打不开这个文件", "このファイルを開けません", "Impossible d’ouvrir ce fichier", "Datei kann nicht geöffnet werden"],
     "chat.file.copy_path": ["Copy path", "复制路径", "パスをコピー", "Copier le chemin", "Pfad kopieren"],
+    # The end of a turn: "Worked for 2m 49s · done 2:50 PM"
+    "chat.note.done": ["done %@", "%@ 完成", "%@ 完了", "terminé à %@", "fertig um %@"],
     # common
     "ok": ["OK", "好", "OK", "OK", "OK"],
     "copy": ["Copy", "复制", "コピー", "Copier", "Kopieren"],

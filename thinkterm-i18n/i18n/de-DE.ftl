@@ -1980,6 +1980,7 @@ settings-reverse-connect-first = Verbinden Sie zuerst einen Server. Berechtigung
 
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = Verbinde…
+chat-reconnecting = Verbinde erneut…
 chat-writing = Schreibt
 chat-thought = Denkt nach
 chat-looked = { $files ->

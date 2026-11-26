@@ -152,7 +152,12 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
+import kotlinx.coroutines.Job
+import kotlin.math.abs
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -319,7 +324,9 @@ sealed class ChatRow {
         /// Its folds' pictures, under its line while it is closed.
         val pictures: List<ChatSent> = emptyList(),
     ) : ChatRow()
-    data class Note(override val id: String, val text: String) : ChatRow()
+    /// `aside`: said at the side, small, as the end of a turn is; `done`:
+    /// when that turn was done (unix seconds), where known.
+    data class Note(override val id: String, val text: String, val aside: Boolean = false, val done: Long? = null) : ChatRow()
 }
 
 sealed class FoldBody {
@@ -517,7 +524,7 @@ object ChatViews {
                 body = r.optJSONObject("body")?.let(::body),
                 pictures = sent(r.optJSONArray("pictures")),
             )
-            "note" -> ChatRow.Note(id, r.optString("text"))
+            "note" -> ChatRow.Note(id, r.optString("text"), r.optBoolean("aside"), r.optLongOrNull("done"))
             "group" -> ChatRow.Group(
                 id = id,
                 icon = r.optString("icon"),
@@ -731,12 +738,18 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
         // A scroll on its way (a fling up from the end) is the person's: what
         // comes in meanwhile does not pull the list back.
         val atEnd = !opened || follow || (reading && !list.isScrollInProgress)
-        opened = true
-        if (atEnd && last != null) {
-            follow = false
-            // To the end of the last row, however much taller than the
-            // screen it is: the list stops where its content does.
-            list.scrollToItem(before + rows.size - 1 + (if (chat?.busy != null) 1 else 0), TO_THE_END)
+        try {
+            if (atEnd && last != null) {
+                follow = false
+                // To the end of the last row, however much taller than the
+                // screen it is: the list stops where its content does.
+                list.scrollToItem(before + rows.size - 1 + (if (chat?.busy != null) 1 else 0), TO_THE_END)
+            }
+        } finally {
+            // Shown from here on: it opens at its end, not at its start for
+            // a frame before going there -- and shown all the same when a
+            // finger on the list took the scroll from this one.
+            opened = true
         }
     }
     // The rows on show when the chat opened come as they are; later ones
@@ -798,17 +811,42 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             state = list,
             modifier = Modifier
                 .fillMaxSize()
+                .graphicsLayer { alpha = if (opened || rows.isEmpty()) 1f else 0f }
                 .layerBackdrop(backdrop)
                 .background(ground)
                 .pointerInput(target.pane) {
-                    detectHorizontalDragGestures(
-                        onDragEnd = { scope.launch { animate(swipe, 0f, animationSpec = spring(dampingRatio = 0.8f, stiffness = 500f)) { at, _ -> swipe = at } } },
-                        onDragCancel = { swipe = 0f },
-                    ) { change, dx ->
-                        change.consume()
-                        // Past the times, it gives less and less.
-                        val next = swipe + dx
-                        swipe = if (next < -gutterPx) -gutterPx + (next + gutterPx) / 3 else next.coerceAtMost(0f)
+                    // Only a touch that sets off to the left, and plainly
+                    // sideways, is a swipe for the times. One that wanders
+                    // sideways as it scrolls, or sets off to the right, stays
+                    // the list's, and so does one the list (or a code block
+                    // scrolling sideways) has taken.
+                    var settle: Job? = null
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val decideAt = viewConfiguration.touchSlop * 2
+                        var moved = Offset.Zero
+                        while (true) {
+                            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
+                            if (!change.pressed || change.isConsumed) return@awaitEachGesture
+                            moved += change.positionChange()
+                            if (moved.getDistance() >= decideAt) {
+                                if (moved.x >= 0f || -moved.x < abs(moved.y) * TIME_SWIPE_SLANT) return@awaitEachGesture
+                                change.consume()
+                                break
+                            }
+                        }
+                        settle?.cancel()
+                        // Followed to its end by hand: the drag helpers give
+                        // up on a pointer whose first move was taken here.
+                        while (true) {
+                            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) break
+                            change.consume()
+                            // Past the times, it gives less and less.
+                            val next = swipe + change.positionChangeIgnoreConsumed().x
+                            swipe = if (next < -gutterPx) -gutterPx + (next + gutterPx) / 3 else next.coerceAtMost(0f)
+                        }
+                        settle = scope.launch { animate(swipe, 0f, animationSpec = spring(dampingRatio = 0.8f, stiffness = 500f)) { at, _ -> swipe = at } }
                     }
                 },
             contentPadding = PaddingValues(
@@ -1051,13 +1089,29 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean, revea
         }
         is ChatRow.Fold -> FoldView(row, model, dark, secondary)
         is ChatRow.Group -> GroupView(row, model, dark, secondary)
-        is ChatRow.Note -> Text(
-            row.text,
-            fontSize = 12.5.sp,
-            color = secondary,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth(),
-        )
+        is ChatRow.Note -> if (row.aside) {
+            // The end of a turn, small at the side: how long it worked,
+            // and when it was done.
+            val done = row.done?.let { at ->
+                // Said again in another language, and on another day (a
+                // time today becomes a date).
+                remember(at, AppLanguage.tag, java.time.LocalDate.now()) { tr("chat.note.done", timeWords(at).replace('\n', ' ')) }
+            }
+            Text(
+                if (done != null) "${row.text} · $done" else row.text,
+                fontSize = 12.sp,
+                color = secondary.copy(alpha = 0.85f),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else {
+            Text(
+                row.text,
+                fontSize = 12.5.sp,
+                color = secondary,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 
@@ -1489,6 +1543,9 @@ private fun monoFamily(): FontFamily {
 /// While it works: what it is doing, and how long it has been at it.
 /// How far a left swipe moves the rows aside, for their times.
 private val TIME_GUTTER = 64.dp
+/// A swipe for the times goes at least this many times as far sideways as
+/// up or down, at its start: anything steeper is a scroll.
+private const val TIME_SWIPE_SLANT = 2f
 /// The slowest a reply comes in, in lines a second; and, faster, all it is
 /// behind over this many seconds, again each frame: a burst comes in
 /// quickly at first and eases as it catches up.

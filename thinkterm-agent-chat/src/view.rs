@@ -78,6 +78,9 @@ pub struct Chat {
     /// What was last refused as a command only the terminal takes: sent
     /// again as it is, it goes, as words (`/tmp is full` is no command).
     refused: Option<String>,
+    /// Cut off, and being opened again by itself (`lost`): said as
+    /// reconnecting, not as a chat that ended, until the bridge greets.
+    again: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -285,7 +288,18 @@ pub enum Row {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pictures: Vec<AttachmentView>,
     },
-    Note { id: String, text: String },
+    Note {
+        id: String,
+        text: String,
+        /// Said at the side, small, as the end of a turn is ("Worked for
+        /// 2m 49s"), rather than across the chat.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        aside: bool,
+        /// When the turn it ends was done (unix seconds), where known: the
+        /// client says it in its own words for a time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        done: Option<u64>,
+    },
     /// What the agent did between two things said, two things or more of
     /// it, as one line ("Ran 3 commands, edited a file") that opens on
     /// them, each a fold of its own.
@@ -490,6 +504,7 @@ impl Chat {
                 // among several stays so until a new channel.
                 self.guessed |= guessed;
                 self.problem = None;
+                self.again = false;
                 // Said again after the greeting when known: one from before
                 // (the agent started again in the pane) is not taken as it.
                 self.mode = None;
@@ -611,9 +626,44 @@ impl Chat {
         } else if self.problem.is_none() {
             self.problem = Some((None, reason.to_string()));
         }
+        self.again = false;
         self.asks.clear();
         // What came of a reply is all there will be on this channel.
         self.writing.clear();
+    }
+
+    /// The channel to the bridge went, and is being opened again by itself
+    /// (the connection redials, or the channel is opened anew after a
+    /// wait): said as reconnecting, what was held still on show, nothing
+    /// asked of the person.
+    pub fn lost(&mut self) {
+        self.problem = None;
+        self.state = None;
+        self.asks.clear();
+        self.writing.clear();
+        self.loading_older = false;
+        self.again = true;
+    }
+
+    /// Cut off and said as reconnecting (`lost`), not yet greeted again.
+    pub fn reconnects(&self) -> bool {
+        self.again && self.problem.is_none()
+    }
+
+    /// The bridge (or the channel's end) said what is wrong: a channel
+    /// opened again would only say it again.
+    pub fn has_problem(&self) -> bool {
+        self.problem.is_some()
+    }
+
+    /// Shown again after the chat was left a while (kept, not made anew):
+    /// what it hands a client once (small pictures, files, a notice) is
+    /// handed the new one again, or not at all.
+    pub fn shown_again(&mut self) {
+        self.given.clear();
+        self.files.clear();
+        self.notice = None;
+        self.refused = None;
     }
 
     /// A new channel is on its way: what was held stays on show until
@@ -816,6 +866,7 @@ impl Chat {
         let agent = display_name(&self.agent);
         let (state, state_label) = match (&self.problem, self.state) {
             (Some(_), _) => ("problem", String::new()),
+            (None, None) if self.again => ("connecting", tr("chat-reconnecting")),
             (None, None) => ("connecting", tr("chat-connecting")),
             (None, Some(AgentState::Working)) => ("working", tr("right-agents-state-working")),
             (None, Some(AgentState::Blocked)) => ("blocked", tr("right-agents-state-blocked")),
@@ -1438,27 +1489,62 @@ impl Chat {
                 }
                 row
             }
-            Item::Note { id, note, text } => Row::Note {
-                id: id.clone(),
-                text: match note {
-                    NoteKind::Compacted => tr("chat-note-compacted"),
-                    NoteKind::Interrupted => tr("chat-note-interrupted"),
+            Item::Note { id, note, text } => {
+                let across = |text: String| Row::Note {
+                    id: id.clone(),
+                    text,
+                    aside: false,
+                    done: None,
+                };
+                match note {
+                    NoteKind::Compacted => across(tr("chat-note-compacted")),
+                    NoteKind::Interrupted => across(tr("chat-note-interrupted")),
                     NoteKind::Failed => {
                         let mut args = FluentArgs::new();
                         args.set("why", text.clone());
-                        tr_args("chat-note-failed", &args)
+                        across(tr_args("chat-note-failed", &args))
                     }
                     NoteKind::Worked => {
                         // A turn quicker than this is not worth a line.
                         let seconds = text.trim().parse::<u64>().ok().filter(|&s| s >= WORKED_SAID)?;
                         let mut args = FluentArgs::new();
                         args.set("time", duration_words(seconds));
-                        tr_args("chat-note-worked", &args)
+                        Row::Note {
+                            id: id.clone(),
+                            text: tr_args("chat-note-worked", &args),
+                            aside: true,
+                            done: self.done_at(id, seconds),
+                        }
                     }
                     NoteKind::Other => return None,
-                },
-            },
+                }
+            }
         })
+    }
+
+    /// When the turn whose note is `id`, `seconds` long, was done: from
+    /// when it was asked (the person's words before it), as long as that
+    /// falls between its last reply and what came next; else when its
+    /// last reply came (words sent while it worked would put it late).
+    fn done_at(&self, id: &str, seconds: u64) -> Option<u64> {
+        let at = self.items.iter().position(|item| item.id() == id)?;
+        let last = at.checked_sub(1).and_then(|before| self.times.get(self.items[before].id())).copied();
+        let next = self.items[at + 1..]
+            .iter()
+            .find_map(|item| self.times.get(item.id()))
+            .copied()
+            .unwrap_or_else(now);
+        let asked = self.items[..at]
+            .iter()
+            .rev()
+            .find(|item| matches!(item, Item::User { .. }))
+            .and_then(|item| self.times.get(item.id()));
+        let reckoned = asked.and_then(|asked| asked.checked_add(seconds));
+        match (reckoned, last) {
+            (Some(done), Some(last)) if done >= last && done <= next => Some(done),
+            (Some(done), None) if done <= next => Some(done),
+            (_, last) => last,
+        }
     }
 
     /// Runs that only looked at things, as one line: "Looked at 3 files".
@@ -2565,6 +2651,96 @@ mod tests {
         assert!(said[0].contains("12"), "{said:?}");
         assert!(said[1].contains('1') && said[1].contains('5'), "{said:?}");
         assert!(said[2].contains('1') && said[2].contains('2'), "{said:?}");
+    }
+
+    #[test]
+    fn a_worked_note_is_said_aside_with_when_it_was_done() {
+        let asked = |id: &str| Item::User {
+            id: id.into(),
+            text: "go".into(),
+            attachments: Vec::new(),
+        };
+        let said = |id: &str| Item::Text {
+            id: id.into(),
+            text: "done".into(),
+        };
+        let mut chat = Chat::new(1, "codex");
+        chat.apply(Ev::History {
+            items: vec![asked("u1"), said("a"), asked("u2"), said("b"), asked("u3")],
+            more: false,
+            reset: true,
+        });
+        chat.apply(Ev::Times {
+            times: vec![
+                ("u1".into(), 1000),
+                ("a".into(), 1150),
+                ("u2".into(), 2000),
+                ("b".into(), 2010),
+                ("u3".into(), 2100),
+            ],
+        });
+        // From when it was asked; and, where that would put it past what
+        // came next (words sent while it worked), when its reply came.
+        chat.apply(Ev::Worked {
+            id: "w1".into(),
+            after: "a".into(),
+            seconds: 169,
+        });
+        chat.apply(Ev::Worked {
+            id: "w2".into(),
+            after: "b".into(),
+            seconds: 500,
+        });
+        let notes: Vec<(bool, Option<u64>)> = chat
+            .view()
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Note { aside, done, .. } => Some((*aside, *done)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, vec![(true, Some(1169)), (true, Some(2010))]);
+    }
+
+    #[test]
+    fn a_chat_cut_off_says_it_reconnects_and_keeps_what_it_held() {
+        let mut chat = Chat::new(1, "pi");
+        chat.apply(Ev::Hello {
+            protocol: 2,
+            agent: "pi".into(),
+            title: None,
+            guessed: false,
+        });
+        chat.apply(Ev::History {
+            items: vec![Item::Text {
+                id: "a".into(),
+                text: "hi".into(),
+            }],
+            more: false,
+            reset: true,
+        });
+        chat.lost();
+        assert!(chat.reconnects());
+        let view = chat.view();
+        assert_eq!(view.state, "connecting");
+        assert_eq!(view.state_label, tr("chat-reconnecting"));
+        assert!(view.problem.is_none() && !view.can_send);
+        assert_eq!(view.rows.len(), 1, "what it held stays on show");
+        // A channel opened anew still says so, until its bridge greets.
+        chat.reconnecting();
+        assert_eq!(chat.view().state_label, tr("chat-reconnecting"));
+        chat.apply(Ev::Hello {
+            protocol: 2,
+            agent: "pi".into(),
+            title: None,
+            guessed: false,
+        });
+        assert_eq!(chat.view().state, "idle");
+        assert!(!chat.reconnects());
+        // Cut off for good: said so, with a way to try again.
+        chat.ended(false, "gone");
+        assert_eq!(chat.view().problem.and_then(|p| p.action).map(|a| a.id), Some("retry"));
     }
 
     #[test]

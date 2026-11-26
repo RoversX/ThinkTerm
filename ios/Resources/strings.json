@@ -356,7 +356,8 @@
     "i.repohost": "Domain des Repositorys zeigen",
     "k.optionalt": "Linke Wahltaste als Alt",
     "k.optionalt.note": "Für eine Hardwaretastatur: Die linke Wahltaste sendet Alt, wie im Terminal üblich (Alt+B springt ein Wort zurück); die rechte tippt die Zeichen der Tastatur. Aus, tippen beide sie, wie manche Layouts es für @ oder [ brauchen.",
-    "lock.reason.off": "Bestätigen Sie Ihre Identität, um die Sperre auszuschalten"
+    "lock.reason.off": "Bestätigen Sie Ihre Identität, um die Sperre auszuschalten",
+    "chat.note.done": "fertig um %@"
   },
   "en-US": {
     "about.build": "Build",
@@ -715,7 +716,8 @@
     "i.repohost": "Show Repository Domain",
     "k.optionalt": "Left Option as Alt",
     "k.optionalt.note": "For a hardware keyboard: the left Option key sends Alt, as terminals use it (Alt+B goes back a word); the right one types the keyboard’s own characters. Off, both type them, as some layouts need for @ or [.",
-    "lock.reason.off": "Confirm it’s you to turn off the lock"
+    "lock.reason.off": "Confirm it’s you to turn off the lock",
+    "chat.note.done": "done %@"
   },
   "fr-FR": {
     "about.build": "Compilation",
@@ -1074,7 +1076,8 @@
     "i.repohost": "Afficher le domaine du dépôt",
     "k.optionalt": "Option gauche comme Alt",
     "k.optionalt.note": "Pour un clavier physique : la touche Option de gauche envoie Alt, comme dans un terminal (Alt+B recule d’un mot) ; celle de droite tape les caractères du clavier. Désactivé, les deux les tapent, comme @ ou [ sur certaines dispositions.",
-    "lock.reason.off": "Confirmez votre identité pour désactiver le verrouillage"
+    "lock.reason.off": "Confirmez votre identité pour désactiver le verrouillage",
+    "chat.note.done": "terminé à %@"
   },
   "ja-JP": {
     "about.build": "ビルド",
@@ -1433,7 +1436,8 @@
     "i.repohost": "リポジトリのドメインを表示",
     "k.optionalt": "左 Option キーを Alt として使う",
     "k.optionalt.note": "ハードウェアキーボード用：左の Option キーを Alt として送ります（Alt+B で 1 語戻るなど）。右の Option はキーボードの文字を入力します。オフにすると両方とも文字を入力します（配列によっては @ や [ に必要です）。",
-    "lock.reason.off": "本人確認してロックをオフにします"
+    "lock.reason.off": "本人確認してロックをオフにします",
+    "chat.note.done": "%@ 完了"
   },
   "zh-CN": {
     "about.build": "构建",
@@ -1792,6 +1796,7 @@
     "i.repohost": "显示仓库域名",
     "k.optionalt": "左 Option 键作 Alt",
     "k.optionalt.note": "外接键盘用：左 Option 键当 Alt 发送，终端里常用（比如 Alt+B 后退一个词）；右 Option 照常打出键盘上的字符。关掉后两边都打字符，有些键盘布局要靠它打 @ 或 [。",
-    "lock.reason.off": "验证身份以关闭锁定"
+    "lock.reason.off": "验证身份以关闭锁定",
+    "chat.note.done": "%@ 完成"
   }
 }

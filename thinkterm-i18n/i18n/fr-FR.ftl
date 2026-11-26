@@ -1974,6 +1974,7 @@ settings-reverse-connect-first = Connectez d’abord un serveur. Chaque connexio
 
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = Connexion…
+chat-reconnecting = Reconnexion…
 chat-writing = Écrit
 chat-thought = Réflexion
 chat-looked = { $files ->

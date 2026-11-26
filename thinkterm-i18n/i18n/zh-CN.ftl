@@ -1925,6 +1925,7 @@ settings-reverse-connect-first = 请先连接服务器。每条连接分别设�
 
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = 正在连接…
+chat-reconnecting = 正在重新连接…
 chat-writing = 正在写
 chat-thought = 思考过程
 chat-looked = 看了 { $files } 个文件
@@ -2000,9 +2001,9 @@ chat-exit = 退出码 { $code }
 chat-declined = 被拒绝
 chat-note-compacted = 前面的对话被压缩了
 chat-note-worked = 工作了 { $time }
-chat-time-s = { $s } 秒
-chat-time-ms = { $m } 分 { $s } 秒
-chat-time-hm = { $h } 小时 { $m } 分
+chat-time-s = { $s }秒
+chat-time-ms = { $m }分{ $s }秒
+chat-time-hm = { $h }小时{ $m }分
 chat-note-interrupted = 已停止
 chat-note-failed = 出错了：{ $why }
 chat-ask-command = 运行这条命令吗？

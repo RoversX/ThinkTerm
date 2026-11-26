@@ -1890,6 +1890,7 @@ settings-reverse-connect-first = Сначала подключитесь к се
 
 ## Agent chat: an agent's conversation shown as a chat (the phone app).
 chat-connecting = Подключение…
+chat-reconnecting = Переподключение…
 chat-writing = Пишет
 chat-thought = Размышления
 chat-looked = Просмотрено файлов: { $files }
