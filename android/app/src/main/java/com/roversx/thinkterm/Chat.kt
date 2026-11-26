@@ -683,11 +683,13 @@ private val Added = Color(0xFF30D158)
 private val Removed = Color(0xFFFF6961)
 
 /// The chat with the agent of a pane, over that pane's terminal: what it
-/// said and did, what it asks, and a field to say something. Going back
-/// is going to its terminal.
+/// said and did, what it asks, and a field to say something. It is the
+/// thread's view as its terminal is: the button at its top left brings out
+/// the sidebar over it (`onSidebar`), as the terminal's does, and the one
+/// at its right shows the terminal (`onTerminal`).
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
+fun ChatPage(model: TerminalModel, onSidebar: () -> Unit, onTerminal: () -> Unit) {
     val target = model.chatWith ?: return
     val chat = model.chat
     val chrome = LocalChrome.current
@@ -705,7 +707,6 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     // The context's sheet, risen from the bottom.
     var showContext by remember(target.pane) { mutableStateOf(false) }
-    BackHandler { onBack() }
 
     // A reply on its way shows as it is written, a whole line at a time,
     // each fading in as the reply grows to hold it; or, set to blocks, only
@@ -974,16 +975,16 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                val back = tr("back")
+                val sidebar = tr("sidebar")
                 Box(
                     Modifier
                         .size(40.dp)
                         .glass(backdrop, dark, CircleShape)
-                        .clickable(role = Role.Button, onClick = onBack)
-                        .semantics { contentDescription = back },
+                        .clickable(role = Role.Button, onClick = onSidebar)
+                        .semantics { contentDescription = sidebar },
                     contentAlignment = Alignment.Center,
                 ) {
-                    DesktopIcon("chevron-left", size = 20.dp, tint = chrome.ink)
+                    DesktopIcon("panel-left", size = 20.dp, tint = chrome.ink)
                 }
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
                     Text(target.place, fontSize = 16.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold, color = chrome.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1000,6 +1001,17 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                     }
                 }
                 chat?.context?.let { context -> ContextRing(context, backdrop, dark) { showContext = true } }
+                val terminal = tr("chat.terminal")
+                Box(
+                    Modifier
+                        .size(40.dp)
+                        .glass(backdrop, dark, CircleShape)
+                        .clickable(role = Role.Button, onClick = onTerminal)
+                        .semantics { contentDescription = terminal },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    DesktopIcon("square-terminal", size = 19.dp, tint = chrome.ink)
+                }
             }
         }
 
@@ -1067,7 +1079,7 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             // said while they go.
             Appearing(target.pane, chat?.problem) { ProblemCard(it, model, backdrop, dark) }
             Appearing(target.pane, chat?.outdated) { OutdatedCard(it, model, backdrop, dark) }
-            Appearing(target.pane, chat?.ask) { AskCard(it, model, backdrop, dark, onTerminal = { model.closeChat(toTerminal = true) }) }
+            Appearing(target.pane, chat?.ask) { AskCard(it, model, backdrop, dark, onTerminal = { model.closeChat() }) }
             ChatField(chat, target, model, backdrop, dark, onSend = { follow = true })
         }
     }
@@ -2200,7 +2212,7 @@ private fun ProblemCard(problem: ChatProblem, model: TerminalModel, backdrop: Ba
                     .background(LeadBlue)
                     .clickable(role = Role.Button) {
                         // The terminal is the app's to show; the rest the core's.
-                        if (action.id == "terminal") model.closeChat(toTerminal = true) else model.chatAction(action.id)
+                        if (action.id == "terminal") model.closeChat() else model.chatAction(action.id)
                     },
                 contentAlignment = Alignment.Center,
             ) {

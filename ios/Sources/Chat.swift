@@ -455,6 +455,11 @@ struct ChatPage: View {
     /// What is asked of the chat goes here; what is shown comes from `feed`.
     let model: TerminalModel
     @ObservedObject var feed: TerminalModel.ChatFeed
+    /// The sidebar, out over the chat as over the terminal (or, beside it,
+    /// shown and hidden): the chat is the thread's view as its terminal is.
+    var onSidebar: () -> Void = {}
+    /// A swipe in from the left edge: the sidebar shown, never hidden.
+    var onSwipeIn: () -> Void = {}
     @State private var notice: ChatNotice?
     @State private var noticeSeen: Int64 = 0
     /// The end of the list is in view: what comes next is shown as it
@@ -742,12 +747,13 @@ struct ChatPage: View {
                 withAnimation { if notice == new { notice = nil } }
             }
         }
-        // A swipe in from the left edge goes back, as a pushed page's does.
+        // A swipe in from the left edge brings out the sidebar, as over
+        // the terminal.
         .simultaneousGesture(
             DragGesture(minimumDistance: 20, coordinateSpace: .global)
                 .onEnded { drag in
                     if drag.startLocation.x < 28 && drag.translation.width > 80 && abs(drag.translation.height) < 80 {
-                        model.closeChat()
+                        onSwipeIn()
                     }
                 }
         )
@@ -765,11 +771,12 @@ struct ChatPage: View {
         let who = (chat?.agent).flatMap { $0.isEmpty ? nil : $0 } ?? target?.agent ?? ""
         let said = [who, chat?.state_label ?? "", chat?.title ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
         return HStack(spacing: 8) {
-            // Drawn small; a finger's room around it all the same.
+            // Drawn small; a finger's room around it all the same. The
+            // sidebar's, as the terminal's bar has it.
             Button {
-                model.closeChat()
+                onSidebar()
             } label: {
-                Image(systemName: "chevron.left")
+                Image(systemName: "sidebar.left")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(.primary)
                     .frame(width: 40, height: 40)
@@ -778,7 +785,7 @@ struct ChatPage: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(tr("back"))
+            .accessibilityLabel(tr("sidebar"))
             VStack(alignment: .leading, spacing: 1) {
                 Text(target?.place ?? "")
                     .font(.system(size: 16, weight: .semibold))
@@ -795,6 +802,20 @@ struct ChatPage: View {
             if let context = chat?.context {
                 contextRing(context)
             }
+            // The terminal under the chat.
+            Button {
+                model.closeChat()
+            } label: {
+                Image(systemName: "apple.terminal")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 40, height: 40)
+                    .glassEffect(.regular.interactive(), in: .circle)
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(tr("chat.terminal"))
         }
         .padding(.horizontal, 8)
         .padding(.bottom, 6)
@@ -1027,7 +1048,7 @@ struct ChatPage: View {
             // Answered only in the agent's terminal, which is under the chat.
             if let terminal = ask.terminal {
                 Button {
-                    model.closeChat(toTerminal: true)
+                    model.closeChat()
                 } label: {
                     Text(terminal)
                         .font(.body.weight(.semibold))
@@ -1115,7 +1136,7 @@ struct ChatPage: View {
                 Button {
                     // The terminal is the app's to show; the rest the core's.
                     if action.id == "terminal" {
-                        model.closeChat(toTerminal: true)
+                        model.closeChat()
                     } else {
                         model.chatAction(action.id)
                     }

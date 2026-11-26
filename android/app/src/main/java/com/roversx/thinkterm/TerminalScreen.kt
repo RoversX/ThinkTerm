@@ -227,13 +227,11 @@ fun TerminalScreen(
     DisposableEffect(model) {
         onDispose {
             model.leaveScreen()
-            // A chat opened on Threads ends with the screen it was over.
-            if (model.chatFromThreads) model.closeChat(toTerminal = true)
+            // A chat ends with the screen it was over: kept a while by the
+            // core, it comes back at once when opened again.
+            model.closeChat()
         }
     }
-    // Back from a chat opened on Threads: to Threads, the chat going with
-    // the screen. A change while it is up, not the count it came up with.
-    LaunchedEffect(model) { snapshotFlow { model.backToThreads }.drop(1).collect { onBack() } }
 
     // The open terminal follows the preferences as they change.
     LaunchedEffect(model) {
@@ -304,10 +302,24 @@ fun TerminalScreen(
             // the settings and the host's editor.
             showSettings -> showSettings = false
             editingHost != null -> editingHost = null
+            // Brought out over a chat, back goes on up from the sidebar to
+            // Threads: chat, sidebar, Threads, as the chat's back leads.
+            showTree && model.chatWith != null -> onBack()
             showTree -> showTree = false
             showRight -> showRight = false
             showPanes -> showPanes = false
             overviewShown -> closeOverview()
+            // The chat is the thread's view as the terminal is: back from it
+            // is its sidebar, from which Threads is a tap away. Wide, the
+            // sidebar is a column: brought back, or, there already, Threads.
+            model.chatWith != null -> {
+                model.onHideKeyboard?.invoke()
+                when {
+                    !wide -> showTree = true
+                    settings.sidebarPinned -> onBack()
+                    else -> settings.sidebarPinned = true
+                }
+            }
             // The session stays, as the bar's back button leaves it: the
             // threads list shows its threads.
             else -> onBack()
@@ -341,7 +353,8 @@ fun TerminalScreen(
                         // stack pushes a page over the drawer it came from.
                         onEditHost = { editingHost = model.host },
                         onSettings = { showSettings = true },
-                        onOverview = { showTree = false; if (overviewShown) closeOverview() else openOverview() },
+                        // Under no chat: the overview is the terminal's.
+                        onOverview = { showTree = false; model.closeChat(); if (overviewShown) closeOverview() else openOverview() },
                         // The whole page goes, the sidebar with it: one move.
                         onLeave = { onBack() },
                         onHost = onHost,
@@ -381,7 +394,7 @@ fun TerminalScreen(
                                 done = {},
                                 onEditHost = { editingHost = model.host },
                                 onSettings = { showSettings = true },
-                                onOverview = { if (overviewShown) closeOverview() else openOverview() },
+                                onOverview = { model.closeChat(); if (overviewShown) closeOverview() else openOverview() },
                                 onLeave = { onBack() },
                                 onHost = onHost,
                                 overviewOn = overviewShown,
@@ -632,8 +645,21 @@ fun TerminalScreen(
                 }
                 if (model.chatWith != null) {
                     // The chat with an agent, over the whole screen and its
-                    // pane's terminal, which going back shows.
-                    ChatPage(model) { model.closeChat() }
+                    // pane's terminal: the sidebar comes out over it as over
+                    // the terminal, and the terminal is a tap away.
+                    // Beside the sidebar's column on a wide screen, as the
+                    // terminal is; the button shows and hides it, as the
+                    // terminal's does.
+                    Box(Modifier.fillMaxSize().padding(start = if (pinned) SIDEBAR_COLUMN + 1.dp else 0.dp)) {
+                        ChatPage(
+                            model,
+                            onSidebar = {
+                                model.onHideKeyboard?.invoke()
+                                if (wide) settings.sidebarPinned = !settings.sidebarPinned else showTree = true
+                            },
+                            onTerminal = { model.closeChat() },
+                        )
+                    }
                 }
                 if (moved) {
                     // What shows of the screen takes it back; fainter on a

@@ -276,7 +276,7 @@ struct SpaceList: View {
                             overview: overview,
                             openHost: {
                                 done()
-                                onOpen(shown.id, false)
+                                toTerminal(shown.id)
                             },
                             openRow: openRow
                         )
@@ -358,13 +358,15 @@ struct SpaceList: View {
     /// chats come first, else the thread; then its host's terminal.
     private func openRow(_ on: UUID, _ model: TerminalModel, _ space: TreeSpace, _ project: TreeProject, _ thread: ThreadRow) {
         if settings.chatFirst, let chat = thread.chat {
-            // Its agent's chat, over the terminal of the agent's pane. From
-            // Threads home, back from it is back there. The thread is read
-            // and recent all the same, as an opened one is.
+            // Its agent's chat, over the terminal of the agent's pane; the
+            // sidebar comes out over it as over the terminal. The thread is
+            // read and recent all the same, as an opened one is.
             if !space.current { model.setSpace(space.id) }
             model.sideClick("touch-thread", id: thread.id)
-            model.openChat(pane: chat.pane, agent: chat.agent, place: project.name + " · " + thread.name, fromThreads: place == .home)
+            model.openChat(pane: chat.pane, agent: chat.agent, place: project.name + " · " + thread.name)
         } else {
+            // Its terminal, in front: a chat over it goes.
+            model.closeChat()
             model.openThread(thread.id, space: space.id)
         }
         settings.spaceHost = on.uuidString
@@ -381,6 +383,13 @@ struct SpaceList: View {
     private func started(on id: UUID) {
         settings.spaceHost = id.uuidString
         done()
+        toTerminal(id)
+    }
+
+    /// A terminal comes to the front (a new thread, a window, one in a
+    /// repository's group): a chat over it goes.
+    private func toTerminal(_ id: UUID) {
+        sessions.existing(id)?.closeChat()
         onOpen(id, false)
     }
 
@@ -505,7 +514,7 @@ struct SpaceList: View {
                     model.sideClick("new-thread")
                     settings.spaceHost = shown.id.uuidString
                     done()
-                    onOpen(shown.id, false)
+                    toTerminal(shown.id)
                 } label: {
                     HStack(spacing: 8) {
                         DesktopIcon(name: "square-pen")

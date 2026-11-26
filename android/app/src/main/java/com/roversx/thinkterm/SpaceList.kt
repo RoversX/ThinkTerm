@@ -206,16 +206,25 @@ fun SpaceList(
         if (place == ListPlace.PANEL && to.id != host?.id) onSwitch?.invoke(to)
     }
 
+    // A terminal comes to the front (a new thread, a window, one in a
+    // repository's group): a chat over it goes.
+    fun toTerminal(on: Host) {
+        Sessions.existing(on.id)?.closeChat()
+        onOpen(on)
+    }
+
     fun openRow(on: Host, session: TerminalModel, space: TreeSpace, project: TreeProject, thread: ThreadRow) {
         val chat = thread.chat
         if (settings.chatFirst && chat != null) {
-            // Its agent's chat, over the terminal of the agent's pane. From
-            // Threads home, back from it is back there. The thread is read
-            // and recent all the same, as an opened one is.
+            // Its agent's chat, over the terminal of the agent's pane; back
+            // from it brings out the sidebar, as from the terminal. The
+            // thread is read and recent all the same, as an opened one is.
             if (!space.current) session.setSpace(space.id)
             session.sideClick("touch-thread", thread.id)
-            session.openChat(chat.pane, chat.agent, project.name + " · " + thread.name, fromThreads = place == ListPlace.HOME)
+            session.openChat(chat.pane, chat.agent, project.name + " · " + thread.name)
         } else {
+            // Its terminal, in front: a chat over it goes.
+            session.closeChat()
             session.openThread(thread.id, space.id)
         }
         settings.spaceHost = on.id
@@ -333,7 +342,7 @@ fun SpaceList(
                             when {
                                 searching -> Found(entries, query, dark, ::openRow)
                                 listHost != null -> {
-                                    if (byRepo) RepoGroups(entries, dark, onOpen, ::openRow)
+                                    if (byRepo) RepoGroups(entries, dark, ::toTerminal, ::openRow)
                                     SpaceRows(
                                         host = listHost,
                                         model = listModel,
@@ -342,7 +351,7 @@ fun SpaceList(
                                         folded = folded,
                                         skipGrouped = byRepo,
                                         overview = overview,
-                                        onOpen = { done(); onOpen(listHost) },
+                                        onOpen = { done(); toTerminal(listHost) },
                                         onRow = ::openRow,
                                         connect = { pick(listHost, null) },
                                     )
@@ -416,7 +425,7 @@ fun SpaceList(
                                 model.sideClick("new-thread")
                                 settings.spaceHost = host.id
                                 done()
-                                onOpen(host)
+                                toTerminal(host)
                             }
                             .padding(horizontal = 18.dp),
                         verticalAlignment = Alignment.CenterVertically,

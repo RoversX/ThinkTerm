@@ -19,8 +19,9 @@ struct TerminalScreen: View {
     @State private var wide = false
     @AppStorage("sidebar.pinned") private var sidebarPinned = true
     @State private var showLog = false
-    /// Going back to Threads from a chat opened there: the chat closes
-    /// once the screen is gone.
+    /// Going back to Threads with a chat over the terminal: the chat
+    /// closes once the screen is gone (kept a while by the core, it comes
+    /// back at once when opened again).
     @State private var leavingToThreads = false
     /// The connection page's sky (`skyFollows`): when it came up, and when
     /// it rushes off, in seconds after that.
@@ -171,11 +172,36 @@ struct TerminalScreen: View {
                         : min(edgePull, drawerWidth) - min(rightPull, drawerWidth)
                 )
                 if model.chatWith != nil {
-                    // The chat with an agent, over the whole screen and its
-                    // pane's terminal, which going back shows.
-                    // Its own state for each chat: a notice count, a draft.
-                    ChatPage(model: model, feed: model.chatFeed)
+                    // The chat with an agent, over its pane's terminal: the
+                    // thread's view as the terminal is. Its sidebar comes out
+                    // from under it as from under the terminal, the chat
+                    // sliding off it with the screen; a column stays beside
+                    // it. Its own state for each chat: a notice count, a
+                    // draft.
+                    ChatPage(model: model, feed: model.chatFeed, onSidebar: { toggleSidebar() }, onSwipeIn: { showSidebar() })
                         .id(model.chatWith?.pane)
+                        .mask {
+                            RoundedRectangle(cornerRadius: pulled || rightPulled ? 28 : 0, style: .continuous)
+                                .ignoresSafeArea()
+                        }
+                        .overlay {
+                            if drawerOpen || showRight {
+                                // What shows of it takes it back, as of the screen.
+                                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                                    .fill(Color.black.opacity(scheme == .dark ? 0.35 : 0.08))
+                                    .ignoresSafeArea()
+                                    .onTapGesture {
+                                        showTree = false
+                                        showRight = false
+                                    }
+                            }
+                        }
+                        .padding(.leading, wide && sidebarPinned ? Self.columnWidth + 1 : 0)
+                        .offset(
+                            x: drawerOpen ? drawerWidth
+                                : showRight ? -drawerWidth
+                                : min(edgePull, drawerWidth) - min(rightPull, drawerWidth)
+                        )
                         .transition(.move(edge: .trailing))
                         .zIndex(10)
                 }
@@ -350,6 +376,7 @@ struct TerminalScreen: View {
     /// screen is gone only once it has slid away.
     private func leave() {
         moves.waiting = false
+        leavingToThreads = model.chatWith != nil
         dismiss()
     }
 
@@ -368,9 +395,20 @@ struct TerminalScreen: View {
             done: { if !wide { showTree = false } },
             onEditHost: { showTree = false; editingHost = model.host },
             onSettings: { showSettings = true },
-            onOverview: { openOverview() },
+            // Under no chat: the overview is the terminal's.
+            onOverview: {
+                model.closeChat()
+                openOverview()
+            },
             onLeave: { leave() },
-            onHost: onHost,
+            // Another host's terminal in this one's place: this one's chat
+            // ends with its screen, as on the way back to Threads.
+            onHost: onHost.map { go -> (UUID, Bool) -> Void in
+                { id, keepPanel in
+                    leavingToThreads = model.chatWith != nil
+                    go(id, keepPanel)
+                }
+            },
             overviewOn: overviewOpen,
             live: live
         )
@@ -632,12 +670,6 @@ struct TerminalScreen: View {
             }
         }
         .onChange(of: showLog) { _, on in model.logShown = on }
-        // Back from a chat opened on Threads: to Threads, the chat going
-        // with the screen once it is gone.
-        .onChange(of: model.backToThreads) { _, _ in
-            leavingToThreads = true
-            leave()
-        }
         .onChange(of: model.sidebar?.editing) { _, editing in
             // A new project has no id yet: the same field, asking for the
             // name of what is about to exist.
@@ -774,7 +806,7 @@ struct TerminalScreen: View {
             // from the chat takes the screen out of sight too.
             if leavingToThreads {
                 leavingToThreads = false
-                model.closeChat(toTerminal: true)
+                model.closeChat()
             }
         }
     }
