@@ -9332,6 +9332,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thinkterm-i18n",
+ "thinkterm-syntax",
 ]
 
 [[package]]

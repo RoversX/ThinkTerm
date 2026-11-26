@@ -144,7 +144,7 @@ impl Daemon {
     }
 }
 
-fn connect(target: &Target, input: impl BufRead + Send + 'static) -> Result<Daemon> {
+fn connect(target: &Target, input: impl BufRead + Send + 'static, out: &Out) -> Result<Daemon> {
     let path = socket_path(target);
     let (mut reader, writer) =
         ws::connect(&path).with_context(|| format!("connecting to the Codex daemon at {}", path.display()))?;
@@ -177,7 +177,7 @@ fn connect(target: &Target, input: impl BufRead + Send + 'static) -> Result<Daem
             }
         });
     }
-    read_ops(input, tx);
+    read_ops(input, tx, out.clone(), super::Place::new(target.cwd.clone()));
     let mut daemon = Daemon {
         writer,
         rx,
@@ -571,7 +571,7 @@ enum Pending {
 }
 
 pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out) -> Result<()> {
-    let mut daemon = match connect(target, input) {
+    let mut daemon = match connect(target, input, &out) {
         Ok(daemon) => daemon,
         Err(err) => {
             out.error(Some(Need::CodexDaemon), format!("{err:#}"))?;
@@ -832,7 +832,7 @@ fn handle_op(daemon: &mut Daemon, chat: &mut Chat, out: &Out, op: Op) -> Result<
             }
             None => out.refused("nothing is running")?,
         },
-        Op::Answer { ask, choice } => match chat.asks.remove(&ask) {
+        Op::Answer { ask, choice, .. } => match chat.asks.remove(&ask) {
             Some((request, _)) => {
                 let decision = match choice {
                     Choice::Accept => "accept",
@@ -873,6 +873,8 @@ fn handle_op(daemon: &mut Daemon, chat: &mut Chat, out: &Out, op: Op) -> Result<
         },
         Op::Install => out.refused("Codex needs nothing installed")?,
         Op::Reload => out.refused("Codex has no extension to load")?,
+        // Answered where ops are read (`read_ops`).
+        Op::Open { .. } => {}
     }
     Ok(())
 }
@@ -960,6 +962,7 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                     reason: params["reason"].as_str().map(str::to_string),
                     cwd: params["cwd"].as_str().map(str::to_string),
                     choices: vec![Choice::Accept, Choice::AcceptForSession, Choice::Decline],
+                    questions: Vec::new(),
                 }),
                 "item/fileChange/requestApproval" => {
                     let item = params["itemId"].as_str().unwrap_or_default();
@@ -971,6 +974,7 @@ fn handle_message(daemon: &mut Daemon, chat: &mut Chat, out: &Out, message: Valu
                         reason: params["reason"].as_str().map(str::to_string),
                         cwd: None,
                         choices: vec![Choice::Accept, Choice::AcceptForSession, Choice::Decline],
+                        questions: Vec::new(),
                     })
                 }
                 // Other questions (input, permissions, MCP) are answered in
@@ -1206,6 +1210,7 @@ fn to_item(item: &Value) -> Option<Item> {
                 output: tail(item["aggregatedOutput"].as_str().unwrap_or_default(), OUTPUT_KEPT),
                 exit,
                 looks,
+                pictures: Vec::new(),
             }
         }
         "fileChange" => {
@@ -1242,25 +1247,33 @@ fn to_item(item: &Value) -> Option<Item> {
             ),
             detail: String::new(),
             status: status_of(item["status"].as_str()),
+            // What it gave back: a screenshot, a picture it made.
+            pictures: super::thumb::pictures_in(&item["result"]),
         },
         "dynamicToolCall" => Item::Tool {
             id,
             name: item["tool"].as_str().unwrap_or_default().to_string(),
             detail: String::new(),
             status: status_of(item["status"].as_str()),
+            pictures: super::thumb::pictures_in(&item["contentItems"]),
         },
         "webSearch" => Item::Tool {
             id,
             name: "web_search".into(),
             detail: item["query"].as_str().unwrap_or_default().to_string(),
             status: Status::Done,
+            pictures: Vec::new(),
         },
-        "imageView" => Item::Tool {
-            id,
-            name: "view_image".into(),
-            detail: item["path"].as_str().unwrap_or_default().to_string(),
-            status: Status::Done,
-        },
+        "imageView" => {
+            let path = item["path"].as_str().unwrap_or_default().to_string();
+            Item::Tool {
+                id,
+                name: "view_image".into(),
+                pictures: if path.is_empty() { Vec::new() } else { vec![super::thumb::picture_file(&path)] },
+                detail: path,
+                status: Status::Done,
+            }
+        }
         "collabAgentToolCall" | "subAgentActivity" => Item::Tool {
             id,
             name: "agent".into(),
@@ -1270,6 +1283,7 @@ fn to_item(item: &Value) -> Option<Item> {
                 .map(|text| head(text, 200))
                 .unwrap_or_default(),
             status: status_of(item["status"].as_str()),
+            pictures: Vec::new(),
         },
         "contextCompaction" => Item::Note {
             id,
@@ -1311,6 +1325,8 @@ fn looks_of(actions: &[Value]) -> Vec<Look> {
                     .or_else(|| action["path"].as_str())
                     .unwrap_or_default()
                     .to_string(),
+                // The name shown is the file's name alone: its path opens it.
+                path: action["path"].as_str().filter(|p| !p.is_empty()).map(str::to_string),
             },
             Some("search") => Look {
                 kind: LookKind::Search,
@@ -1319,10 +1335,12 @@ fn looks_of(actions: &[Value]) -> Vec<Look> {
                     .or_else(|| action["path"].as_str())
                     .unwrap_or_default()
                     .to_string(),
+                path: None,
             },
             Some("listFiles") => Look {
                 kind: LookKind::List,
                 target: action["path"].as_str().unwrap_or(".").to_string(),
+                path: None,
             },
             // A command that does more than look is shown as itself.
             _ => return Vec::new(),
@@ -1493,6 +1511,7 @@ fn models_of(listed: &Value) -> Vec<ModelChoice> {
             let id = model["model"].as_str().or(model["id"].as_str())?.to_string();
             Some(ModelChoice {
                 name: model["displayName"].as_str().unwrap_or(&id).to_string(),
+                description: model["description"].as_str().unwrap_or_default().trim().to_string(),
                 efforts: model["supportedReasoningEfforts"]
                     .as_array()
                     .into_iter()

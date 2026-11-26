@@ -11,12 +11,13 @@ publish = false
 # - "view": what a client draws of them (a phone): rows, folds, the
 #   question being asked, Markdown cut into blocks.
 # - "host": the bridge itself, beside the agents: Codex's app-server
-#   daemon, and the extension ThinkTerm puts into Pi.
+#   daemon, and the extension ThinkTerm puts into Pi; and the files a
+#   client asks to see, read and coloured beside them.
 
 [features]
 default = []
 view = ["dep:pulldown-cmark", "dep:thinkterm-i18n"]
-host = ["dep:libc", "dep:image", "dep:base64"]
+host = ["dep:libc", "dep:image", "dep:base64", "dep:thinkterm-syntax"]
 
 [dependencies]
 anyhow.workspace = true
@@ -27,6 +28,7 @@ pulldown-cmark = { workspace = true, optional = true }
 thinkterm-i18n = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 base64 = { workspace = true, features = ["std"], optional = true }
+thinkterm-syntax = { path = "../thinkterm-syntax", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true, optional = true }

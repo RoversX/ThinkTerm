@@ -1136,9 +1136,9 @@ mod tests {
         };
         // An agent the phone has no chat for is listed all the same, and
         // so is one with nothing to do.
-        agent(20, "claude", AgentState::Idle);
+        agent(20, "aider", AgentState::Idle);
         agent(30, "codex", AgentState::Working);
-        agent(31, "claude", AgentState::Blocked);
+        agent(31, "aider", AgentState::Blocked);
         agent(40, "pi", AgentState::Blocked);
         let tree = m.tree(0, "", None);
         let threads = &tree.spaces[0].projects[0].threads;

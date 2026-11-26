@@ -903,7 +903,38 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
                   let bytes = Data(base64Encoded: picture.data),
                   let image = UIImage(data: bytes) else { return }
             DispatchQueue.main.async {
-                if self.chatWith?.pane == picture.pane { self.chatThumbs[picture.key] = image }
+                if self.chatWith?.pane == picture.pane { self.keepThumb(picture.key, image) }
+            }
+        case "chat_file":
+            // Read, and its picture decoded, here, off the main thread.
+            struct Shown: Decodable {
+                struct File: Decodable {
+                    let path: String
+                    let name: String
+                    let size: String
+                    let kind: String
+                    let lines: [[ChatCodeRun]]?
+                    let blocks: [MdBlock]?
+                    let picture: String?
+                    let note: String?
+                }
+                let pane: Int
+                let file: File
+            }
+            guard let shown = ViewJSON.decode(Shown.self, value) else { return }
+            let f = shown.file
+            let file = ChatShownFile(
+                path: f.path,
+                name: f.name,
+                size: f.size,
+                kind: f.kind,
+                lines: f.lines ?? [],
+                blocks: f.blocks ?? [],
+                image: f.picture.flatMap { Data(base64Encoded: $0) }.flatMap { UIImage(data: $0) },
+                note: f.note
+            )
+            DispatchQueue.main.async {
+                if self.chatWith?.pane == shown.pane { self.keepShown(file) }
             }
         case "chat":
             // Read here, off the main thread: a long chat is a long text.
@@ -1119,6 +1150,21 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         @Published fileprivate(set) var files: [ChatFile] = []
         @Published fileprivate(set) var pictures: [String: URL] = [:]
         @Published fileprivate(set) var thumbs: [String: UIImage] = [:]
+        /// The files the host showed, by the path they were asked by
+        /// ("chat_file"): what the file sheet shows, and a picture shown
+        /// big. The last few only: a picture's is large.
+        @Published fileprivate(set) var shown: [String: ChatShownFile] = [:]
+        /// Files asked for that did not come in time (an older host's
+        /// bridge does not show files).
+        @Published fileprivate(set) var shownLate: Set<String> = []
+        /// The file in the sheet over the chat.
+        @Published var fileOpen: ChatFileOpen?
+    }
+
+    /// The file the sheet over the chat shows, by its path.
+    struct ChatFileOpen: Identifiable, Equatable {
+        let path: String
+        var id: String { path }
     }
 
     let chatFeed = ChatFeed()
@@ -1144,6 +1190,12 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         chromeClick("pane", pane: pane)
         chat = nil
         chatThumbs = [:]
+        chatThumbsKept = []
+        chatFeed.shown = [:]
+        chatFeed.shownLate = []
+        chatFeed.fileOpen = nil
+        chatFileAsked = [:]
+        chatShownKept = []
         chatFromThreads = fromThreads
         chatWith = ChatTarget(pane: pane, agent: agent, place: place)
         core.chatOpen(pane: UInt32(pane), agent: agent)
@@ -1357,10 +1409,63 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func chatCommand(_ text: String) { core.chatSend(text: text, attachments: []) }
     func chatSetModel(_ model: String, effort: String?) { core.chatSetModel(model: model, effort: effort) }
     func chatAnswer(ask: String, choice: String) { core.chatAnswer(ask: ask, choice: choice) }
+    func chatAnswerQuestions(ask: String, answers: [String]) { core.chatAnswerQuestions(ask: ask, answers: answers) }
     func chatInterrupt() { core.chatInterrupt() }
     func chatOlder() { core.chatOlder() }
     func chatAction(_ action: String) { core.chatAction(action: action) }
     func chatToggle(_ row: String) { core.chatToggle(row: row) }
+
+    /// The paths of the files shown, oldest first: past a few, the oldest
+    /// goes.
+    private var chatShownKept: [String] = []
+
+    /// The keys of the small pictures held, oldest first: the newest 160
+    /// only, so that a long chat of screenshots does not hold them all (an
+    /// older one shows as a place for a picture, which still opens it).
+    private var chatThumbsKept: [String] = []
+
+    private func keepThumb(_ key: String, _ image: UIImage) {
+        chatThumbsKept.removeAll { $0 == key }
+        chatThumbsKept.append(key)
+        var thumbs = chatThumbs
+        thumbs[key] = image
+        while chatThumbsKept.count > 160 {
+            thumbs[chatThumbsKept.removeFirst()] = nil
+        }
+        chatThumbs = thumbs
+    }
+
+    /// Show the file at `path`, as the chat named it: in the sheet, or (a
+    /// picture shown big, `sheet` false) only fetched whole. Asked again
+    /// each time, for what it holds now; what came before shows meanwhile.
+    func chatOpenFile(_ path: String, sheet: Bool = true) {
+        if sheet { chatFeed.fileOpen = ChatFileOpen(path: path) }
+        chatFeed.shownLate.remove(path)
+        // Each ask its own wait: one from before (the chat closed and opened
+        // again since) does not cut a later one short.
+        chatFileAsks += 1
+        let asked = chatFileAsks
+        chatFileAsked[path] = asked
+        core.chatOpenFile(path: path)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.chatFileAsked[path] == asked, self.chatFeed.shown[path] == nil else { return }
+            self.chatFeed.shownLate.insert(path)
+        }
+    }
+
+    private var chatFileAsks = 0
+    /// The latest ask for each file shown, by path.
+    private var chatFileAsked: [String: Int] = [:]
+
+    private func keepShown(_ file: ChatShownFile) {
+        chatShownKept.removeAll { $0 == file.path }
+        chatShownKept.append(file.path)
+        chatFeed.shown[file.path] = file
+        chatFeed.shownLate.remove(file.path)
+        while chatShownKept.count > 6 {
+            chatFeed.shown[chatShownKept.removeFirst()] = nil
+        }
+    }
 
     /// The text between two visible cells of the focused pane, for the
     /// clipboard, as the core reads it from the cells; the pane's own

@@ -215,7 +215,7 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out, pane
     let _ = ensure_in(&home(), target);
     let pane = pane.as_deref();
     let (tx, rx) = mpsc::channel::<Input<Piece>>();
-    read_ops(input, tx.clone());
+    read_ops(input, tx.clone(), out.clone(), super::Place::new(target.cwd.clone()));
     let note = match find(&chat_dir(), target) {
         Some(note) => note,
         None => match offer(target, pane, &rx, &out)? {

@@ -4,7 +4,9 @@
 //! crate's lines, reading the client's from stdin and writing its own to
 //! stdout.
 
+mod claude;
 mod codex;
+mod files;
 mod http;
 mod opencode;
 pub mod pi;
@@ -279,7 +281,7 @@ fn tcp_sockets(_pid: u32) -> Vec<TcpSocket> {
 
 /// The same file, however its path is written.
 pub(crate) fn same_path(a: &str, b: &str) -> bool {
-    let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
     a == b || canonical(a) == canonical(b)
 }
 
@@ -298,6 +300,11 @@ impl Out {
 
     pub fn send(&self, ev: &Ev) -> io::Result<()> {
         let line = serde_json::to_string(ev).map_err(io::Error::other)?;
+        // The pictures in what is said and done go with small pictures of
+        // them, made here beside their files.
+        if line.contains("\"pictures\"") || line.contains("\"attachments\"") {
+            return self.raw(&thumb::fill_line(&line));
+        }
         self.raw(&line)
     }
 
@@ -332,15 +339,53 @@ pub(crate) enum Input<T> {
     AgentGone(String),
 }
 
+/// Where the agent works, as its bridge last learnt it (where it was
+/// started, until it says): what a relative path a client asks to see
+/// ([`Op::Open`]) is taken from, as the paths it is shown are made
+/// relative to it.
+#[derive(Clone, Default)]
+pub(crate) struct Place(Arc<Mutex<Option<PathBuf>>>);
+
+impl Place {
+    pub(crate) fn new(at: Option<PathBuf>) -> Self {
+        Place(Arc::new(Mutex::new(at)))
+    }
+
+    pub(crate) fn set(&self, at: &str) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(at.into());
+    }
+
+    fn get(&self) -> Option<PathBuf> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+}
+
 /// Reads the client's lines on a thread of their own. A line that is not
-/// an op is skipped; the end of input ends the chat.
-pub(crate) fn read_ops<T: Send + 'static>(mut reader: impl BufRead + Send + 'static, tx: mpsc::Sender<Input<T>>) {
+/// an op is skipped; the end of input ends the chat. A file asked for
+/// ([`Op::Open`]) is answered here, the same for every agent, from `place`
+/// when its path is relative: one at a time, on a thread of its own, so
+/// that what else is asked does not wait on a large file and several
+/// large ones are not read at once.
+pub(crate) fn read_ops<T: Send + 'static>(mut reader: impl BufRead + Send + 'static, tx: mpsc::Sender<Input<T>>, out: Out, place: Place) {
+    let (opens, asked) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for path in asked {
+            let file = files::open(&path, place.get().as_deref());
+            if let Err(err) = out.send(&Ev::File { file }) {
+                log::debug!("agent chat: a file shown went nowhere: {err}");
+                return;
+            }
+        }
+    });
     std::thread::spawn(move || {
         while let Ok(Some(line)) = read_line(&mut reader) {
             if line.trim().is_empty() {
                 continue;
             }
             match serde_json::from_str::<Op>(&line) {
+                Ok(Op::Open { path }) => {
+                    let _ = opens.send(path);
+                }
                 Ok(op) => {
                     if tx.send(Input::Op(op)).is_err() {
                         return;
@@ -401,6 +446,7 @@ pub fn run(
         // OMP (Oh My Pi) is a fork of Pi: the same extension speaks for it.
         "pi" | "omp" => pi::run(&target, input, out, pane),
         "opencode" => opencode::run(&target, input, out, pane),
+        "claude" => claude::run(&target, input, out, pane),
         other => Ok(out.error(Some(Need::Unsupported), format!("no chat for the agent `{other}`"))?),
     }
 }

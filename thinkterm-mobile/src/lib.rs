@@ -896,7 +896,21 @@ impl Core {
     /// Answer the question on show (its `ask.id`) with one of its
     /// `choices` (a choice's `id`).
     pub fn chat_answer(&self, ask: String, choice: String) {
-        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Answer { ask, choice }));
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Answer {
+            ask,
+            choice,
+            answers: Vec::new(),
+        }));
+    }
+
+    /// Answer the questions on show (an ask with `questions`): what was
+    /// picked for each, in order, several picks of one joined by ", ".
+    pub fn chat_answer_questions(&self, ask: String, answers: Vec<String>) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Answer {
+            ask,
+            choice: "accept".into(),
+            answers,
+        }));
     }
 
     pub fn chat_interrupt(&self) {
@@ -921,6 +935,12 @@ impl Core {
     /// Open or fold the chat's row `row` (a fold's `id`).
     pub fn chat_toggle(&self, row: String) {
         let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Toggle(row)));
+    }
+
+    /// Show the file at `path`, as the chat named it (sent, read, changed,
+    /// a picture looked at): it comes as a "chat_file" publication, once.
+    pub fn chat_open_file(&self, path: String) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::OpenFile(path)));
     }
 
     /// A touch on the terminal, in points: "down", "move" or "up".

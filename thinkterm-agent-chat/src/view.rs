@@ -5,8 +5,8 @@
 
 use crate::markdown::{blocks, Block};
 use crate::{
-    diff, AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, CommandKind, ContextInfo, Done, Ev, FileEdit, Item, Look, LookKind, ModelChoice, Need,
-    NoteKind, PartKind, Status,
+    diff, AgentState, Ask, AskKind, Attachment, Choice, CommandInfo, CommandKind, ContextInfo, Done, Ev, FileEdit, FileShown, Item, Look, LookKind,
+    ModelChoice, Need, NoteKind, PartKind, Status,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +19,8 @@ const OUTPUT_LINES: usize = 80;
 const DIFF_LINES: usize = 400;
 /// Characters of a command in its fold's line.
 const COMMAND_CHARS: usize = 60;
+/// Pictures under one line of what the agent did.
+const PICTURES_SHOWN: usize = 8;
 
 #[derive(Default)]
 pub struct Chat {
@@ -47,6 +49,8 @@ pub struct Chat {
     protocol: u32,
     /// The model the agent talks to, how hard it thinks, and the others.
     models: Option<(Option<String>, Option<String>, Vec<ModelChoice>)>,
+    /// How the agent takes its permission prompts, as its bridge said.
+    mode: Option<String>,
     /// The small pictures the bridge sent, by key (`<item>#<n>`): the rows
     /// name them, and a client is given each once (`new_pictures`), not
     /// with every view.
@@ -66,6 +70,9 @@ pub struct Chat {
     /// When each item came about (unix seconds): as the bridge says for
     /// history, else when it first came here.
     times: HashMap<String, u64>,
+    /// The files the bridge showed ([`Ev::File`]) that no client has taken
+    /// yet (`take_files`): each given once, not with every view.
+    files: Vec<FileView>,
     /// The items still being written (`Ev::Item::partial`).
     writing: HashSet<String>,
     /// What was last refused as a command only the terminal takes: sent
@@ -210,6 +217,9 @@ pub struct ModelOptionView {
     /// What `set_model` takes.
     pub id: String,
     pub label: String,
+    /// What it is for, in the agent's words, when it says.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// The one in use.
     pub current: bool,
     /// How hard it can think; the one in use marked, for the model in
@@ -271,6 +281,9 @@ pub enum Row {
         /// What it shows, while open: what a closed one holds (outputs,
         /// diffs) is not sent again with each change of the chat.
         body: Option<FoldBody>,
+        /// The pictures it looked at, under its line.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pictures: Vec<AttachmentView>,
     },
     Note { id: String, text: String },
     /// What the agent did between two things said, two things or more of
@@ -295,6 +308,10 @@ pub enum Row {
         open: bool,
         /// Its folds, while open.
         rows: Vec<Row>,
+        /// The pictures its folds looked at, under its line while it is
+        /// closed (open, each fold shows its own).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pictures: Vec<AttachmentView>,
     },
 }
 
@@ -303,8 +320,48 @@ pub enum Row {
 pub enum FoldBody {
     Text { blocks: Vec<Block> },
     Output { text: String },
-    List { lines: Vec<String> },
+    /// `paths`, beside `lines`: the file each line opens, empty for one
+    /// that opens none (a search, a folder).
+    List {
+        lines: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+    },
     Diff { files: Vec<DiffFile> },
+}
+
+/// A file the bridge showed ([`Ev::File`]), as a client lays it out.
+#[derive(Debug, Serialize)]
+pub struct FileView {
+    /// As it was asked for: what the client asked for, to match it.
+    pub path: String,
+    /// Its own name, over it.
+    pub name: String,
+    /// How large it is, in words ("12 KB").
+    pub size: String,
+    /// `code` (its lines, coloured), `markdown` (laid out), `picture`, or
+    /// `none` (`note` says why).
+    pub kind: &'static str,
+    /// Code: its lines, each in runs of one colour.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<Vec<CodeRun>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<Block>,
+    /// The picture (JPEG or PNG, base64).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// Why it is not shown, or that only its start is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// A run of code in one colour: `k`, what it is (`keyword`, `string`,
+/// `comment`, ...), none for plain.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct CodeRun {
+    pub t: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -335,6 +392,27 @@ pub struct AskView {
     /// With no choices: the label of the button that shows the terminal,
     /// where the agent takes its answer.
     pub terminal: Option<String>,
+    /// What a question asks: picks are sent with the `accept` choice
+    /// (`answer_questions`), a question's picks joined by ", ". One
+    /// question that takes one pick is answered by tapping it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<QuestionView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QuestionView {
+    pub question: String,
+    /// "Library".
+    pub header: String,
+    /// Several may be picked.
+    pub multi: bool,
+    pub options: Vec<QuestionOptionView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QuestionOptionView {
+    pub label: String,
+    pub description: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -412,6 +490,9 @@ impl Chat {
                 // among several stays so until a new channel.
                 self.guessed |= guessed;
                 self.problem = None;
+                // Said again after the greeting when known: one from before
+                // (the agent started again in the pane) is not taken as it.
+                self.mode = None;
                 self.state.get_or_insert(AgentState::Idle);
                 if std::mem::take(&mut self.reloading) {
                     let mut args = FluentArgs::new();
@@ -426,6 +507,7 @@ impl Chat {
                 if reset {
                     self.items = items;
                     self.limit = ITEMS_KEPT;
+                    self.let_go_of_pictures();
                     self.writing.clear();
                     // The conversation from the start: what it still asks is
                     // said again after it (an agent restarted asks nothing
@@ -502,6 +584,8 @@ impl Chat {
             }
             Ev::Outdated => self.outdated = true,
             Ev::Times { times } => self.times.extend(times),
+            Ev::Mode { mode } => self.mode = Some(mode),
+            Ev::File { file } => self.files.push(file_view(file)),
             // Put after what it follows; with that not held, let go.
             Ev::Worked { id, after, seconds } => {
                 self.items.retain(|item| item.id() != id);
@@ -551,13 +635,64 @@ impl Chat {
 
     /// The small pictures in `item`, kept by key and taken out of it.
     fn keep_pictures(&mut self, item: &mut Item) {
-        if let Item::User { id, attachments, .. } = item {
-            for (n, sent) in attachments.iter_mut().enumerate() {
-                if let Some(thumb) = sent.thumb.take() {
-                    self.pictures.insert(format!("{id}#{n}"), thumb);
-                }
+        let (id, pictures) = match item {
+            Item::User { id, attachments, .. } => (id, attachments),
+            Item::Command { id, pictures, .. } | Item::Tool { id, pictures, .. } => (id, pictures),
+            _ => return,
+        };
+        for (n, sent) in pictures.iter_mut().enumerate() {
+            if let Some(thumb) = sent.thumb.take() {
+                self.pictures.insert(format!("{id}#{n}"), thumb);
             }
         }
+    }
+
+    /// The files the bridge showed since they were last taken, each once: a
+    /// client shows them, and the next view does not carry them again.
+    pub fn take_files(&mut self) -> Vec<FileView> {
+        std::mem::take(&mut self.files)
+    }
+
+    /// The small pictures of items no longer held let go: a long chat of
+    /// screenshots does not keep them all.
+    fn let_go_of_pictures(&mut self) {
+        let held: HashSet<&str> = self.items.iter().map(Item::id).collect();
+        let kept = |key: &String| key.rsplit_once('#').is_some_and(|(id, _)| held.contains(id));
+        self.pictures.retain(|key, _| kept(key));
+        self.given.retain(kept);
+    }
+
+    /// The pictures of item `id`, as a client shows them: each by the key
+    /// of its small picture, when there is one.
+    fn picture_views(&self, id: &str, pictures: &[Attachment]) -> Vec<AttachmentView> {
+        pictures
+            .iter()
+            .enumerate()
+            .map(|(n, picture)| {
+                let key = format!("{id}#{n}");
+                AttachmentView {
+                    name: picture.name.clone(),
+                    image: true,
+                    picture: self.pictures.contains_key(&key).then_some(key),
+                    path: picture.path.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// The pictures `items` looked at, together: the newest
+    /// [`PICTURES_SHOWN`], in order.
+    fn pictures_of(&self, items: &[Item]) -> Vec<AttachmentView> {
+        let mut all = Vec::new();
+        for item in items {
+            if let Item::Command { id, pictures, .. } | Item::Tool { id, pictures, .. } = item {
+                all.extend(self.picture_views(id, pictures));
+            }
+        }
+        if all.len() > PICTURES_SHOWN {
+            all.drain(..all.len() - PICTURES_SHOWN);
+        }
+        all
     }
 
     /// The small pictures no view has been given yet, by key, as `rows`
@@ -672,6 +807,7 @@ impl Chat {
             for item in self.items.drain(..extra) {
                 self.times.remove(item.id());
             }
+            self.let_go_of_pictures();
             self.more = false;
         }
     }
@@ -990,11 +1126,14 @@ impl Chat {
         let current = current.as_deref()?;
         let known = models.iter().find(|model| model.id == current);
         let name = |model: &ModelChoice| if model.name.is_empty() { model.id.clone() } else { model.name.clone() };
-        let label = match (known, effort) {
+        let mut label = match (known, effort) {
             (Some(model), Some(effort)) if !model.efforts.is_empty() => format!("{} · {}", name(model), effort_word(effort)),
             (Some(model), _) => name(model),
             (None, _) => current.to_string(),
         };
+        if let Some(mode) = &self.mode {
+            label = format!("{label} · {}", mode_word(mode));
+        }
         let mut options: Vec<ModelOptionView> = models
             .iter()
             .map(|model| {
@@ -1002,6 +1141,7 @@ impl Chat {
                 ModelOptionView {
                     id: model.id.clone(),
                     label: name(model),
+                    description: model.description.clone(),
                     current: using,
                     efforts: model
                         .efforts
@@ -1021,6 +1161,7 @@ impl Chat {
                 ModelOptionView {
                     id: current.to_string(),
                     label: current.to_string(),
+                    description: String::new(),
                     current: true,
                     efforts: Vec::new(),
                 },
@@ -1115,6 +1256,7 @@ impl Chat {
             removed,
             open,
             rows: if open { folds } else { Vec::new() },
+            pictures: if open { Vec::new() } else { self.pictures_of(items) },
             id,
         });
     }
@@ -1132,6 +1274,7 @@ impl Chat {
             open,
             can_open: more.can_open,
             body: more.body,
+            pictures: Vec::new(),
         }
     }
 
@@ -1178,6 +1321,7 @@ impl Chat {
                 status,
                 output,
                 exit,
+                pictures,
                 ..
             } => {
                 let mut args = FluentArgs::new();
@@ -1210,7 +1354,11 @@ impl Chat {
                         FoldBody::Output { text }
                     })
                 };
-                self.fold(id, "run", label, *status, resting, shown)
+                let mut row = self.fold(id, "run", label, *status, resting, shown);
+                if let Row::Fold { pictures: shown, .. } = &mut row {
+                    *shown = self.picture_views(id, pictures);
+                }
+                row
             }
             Item::Edit { id, status, files } => {
                 // Not yet "edited" while it edits, or waits to be let edit.
@@ -1259,6 +1407,7 @@ impl Chat {
                 name,
                 detail,
                 status,
+                pictures,
             } => {
                 let label = match name.as_str() {
                     "web_search" => {
@@ -1283,7 +1432,11 @@ impl Chat {
                         body: None,
                     }
                 };
-                self.fold(id, "tool", label, *status, resting, shown)
+                let mut row = self.fold(id, "tool", label, *status, resting, shown);
+                if let Row::Fold { pictures: shown, .. } = &mut row {
+                    *shown = self.picture_views(id, pictures);
+                }
+                row
             }
             Item::Note { id, note, text } => Row::Note {
                 id: id.clone(),
@@ -1313,6 +1466,8 @@ impl Chat {
         let mut files: Vec<&str> = Vec::new();
         let mut searches = 0i64;
         let mut lines = Vec::new();
+        // The file each line opens: one read, not a folder or a search.
+        let mut paths = Vec::new();
         let mut status = Status::Done;
         for item in items {
             let Item::Command {
@@ -1324,7 +1479,7 @@ impl Chat {
             if *s == Status::Running {
                 status = Status::Running;
             }
-            for Look { kind, target } in looks {
+            for Look { kind, target, path } in looks {
                 match kind {
                     LookKind::Read | LookKind::List => {
                         if !files.contains(&target.as_str()) {
@@ -1335,10 +1490,12 @@ impl Chat {
                         } else {
                             target.clone()
                         });
+                        paths.push(if *kind == LookKind::Read { path.clone().unwrap_or_else(|| target.clone()) } else { String::new() });
                     }
                     LookKind::Search => {
                         searches += 1;
                         lines.push(format!("“{target}”"));
+                        paths.push(String::new());
                     }
                 }
             }
@@ -1352,7 +1509,14 @@ impl Chat {
             _ => tr_args("chat-looked-searched", &args),
         };
         let id = items.first().map(Item::id).unwrap_or_default();
-        self.fold(id, "look", label, status, resting, self.shown(id, || FoldBody::List { lines }))
+        if paths.iter().all(String::is_empty) {
+            paths.clear();
+        }
+        let mut row = self.fold(id, "look", label, status, resting, self.shown(id, || FoldBody::List { lines, paths }));
+        if let Row::Fold { pictures, .. } = &mut row {
+            *pictures = self.pictures_of(items);
+        }
+        row
     }
 
     /// What a fold shows, made only while it is open.
@@ -1370,6 +1534,19 @@ impl Chat {
 fn effort_word(word: &str) -> String {
     match word {
         "none" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => tr(&format!("chat-effort-{word}")),
+        other => other.to_string(),
+    }
+}
+
+/// A permission mode as the client says it: Claude Code's words for them.
+fn mode_word(mode: &str) -> String {
+    match mode {
+        "default" => tr("chat-mode-default"),
+        "acceptEdits" => tr("chat-mode-accept-edits"),
+        "plan" => tr("chat-mode-plan"),
+        "auto" => tr("chat-mode-auto"),
+        "bypassPermissions" => tr("chat-mode-bypass"),
+        "dontAsk" => tr("chat-mode-dont-ask"),
         other => other.to_string(),
     }
 }
@@ -1542,13 +1719,19 @@ fn ask_view(ask: &Ask) -> AskView {
         args.set("dir", short_dir(dir));
         tr_args("chat-ask-in", &args)
     });
+    let asking = ask.kind == AskKind::Question;
     AskView {
         id: ask.id.clone(),
-        label: tr("agent-kind-permission"),
+        label: tr(if asking { "agent-kind-question" } else { "agent-kind-permission" }),
         question: match ask.kind {
             AskKind::Command => tr("chat-ask-command"),
             AskKind::Edit => tr("chat-ask-edit"),
             AskKind::Tool => tr("chat-ask-tool"),
+            // One question is the card's own; several are listed under it.
+            AskKind::Question => match &ask.questions[..] {
+                [only] => only.question.clone(),
+                _ => tr("chat-ask-questions"),
+            },
         },
         body: ask.body.clone(),
         reason: ask.reason.clone().filter(|r| !r.trim().is_empty()),
@@ -1559,7 +1742,7 @@ fn ask_view(ask: &Ask) -> AskView {
             .map(|choice| match choice {
                 Choice::Accept => ChoiceView {
                     id: "accept",
-                    label: tr("chat-choice-accept"),
+                    label: tr(if asking { "chat-choice-answer" } else { "chat-choice-accept" }),
                     lead: true,
                 },
                 Choice::AcceptForSession => ChoiceView {
@@ -1575,6 +1758,23 @@ fn ask_view(ask: &Ask) -> AskView {
             })
             .collect(),
         terminal: ask.choices.is_empty().then(|| tr("chat-ask-terminal")),
+        questions: ask
+            .questions
+            .iter()
+            .map(|q| QuestionView {
+                question: q.question.clone(),
+                header: q.header.clone(),
+                multi: q.multi,
+                options: q
+                    .options
+                    .iter()
+                    .map(|o| QuestionOptionView {
+                        label: o.label.clone(),
+                        description: o.description.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -1697,6 +1897,106 @@ fn short_command(command: &str) -> String {
 
 fn file_name(path: &str) -> String {
     path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(path).to_string()
+}
+
+/// A file the bridge showed, laid out: code in lines of coloured runs,
+/// Markdown in blocks, a picture as it is, or the words for why not.
+fn file_view(file: FileShown) -> FileView {
+    let mut view = FileView {
+        name: file_name(&file.path),
+        size: size_words(file.size),
+        path: file.path,
+        kind: "none",
+        lines: Vec::new(),
+        blocks: Vec::new(),
+        picture: None,
+        note: None,
+    };
+    if let Some(error) = file.error {
+        view.note = Some(tr(match error.as_str() {
+            "missing" => "chat-file-missing",
+            "folder" => "chat-file-folder",
+            "binary" => "chat-file-binary",
+            "too_big" => "chat-file-too-big",
+            _ => "chat-file-unreadable",
+        }));
+        return view;
+    }
+    if let Some(picture) = file.picture {
+        view.kind = "picture";
+        view.picture = Some(picture);
+        return view;
+    }
+    let text = file.text.unwrap_or_default();
+    if file.cut {
+        let mut args = FluentArgs::new();
+        args.set("size", size_words(text.len() as u64));
+        view.note = Some(tr_args("chat-file-cut", &args));
+    }
+    if file.language.as_deref() == Some("markdown") {
+        view.kind = "markdown";
+        view.blocks = blocks(&text);
+    } else {
+        view.kind = "code";
+        view.lines = code_lines(&text, &file.spans);
+    }
+    view
+}
+
+/// `text` in lines, each in runs of one colour, as `spans` (byte ranges,
+/// in order) colour it: an overlap or a range off a character's edge is
+/// let go.
+fn code_lines(text: &str, spans: &[(u32, u32, String)]) -> Vec<Vec<CodeRun>> {
+    let mut runs: Vec<(usize, usize, Option<&str>)> = Vec::new();
+    let mut at = 0;
+    for (start, end, kind) in spans {
+        let (start, end) = ((*start as usize).max(at), (*end as usize).min(text.len()));
+        if end <= start || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        if start > at {
+            runs.push((at, start, None));
+        }
+        runs.push((start, end, Some(kind.as_str())));
+        at = end;
+    }
+    if at < text.len() {
+        runs.push((at, text.len(), None));
+    }
+    let mut lines = vec![Vec::new()];
+    for (start, end, kind) in runs {
+        for (n, piece) in text[start..end].split('\n').enumerate() {
+            if n > 0 {
+                lines.push(Vec::new());
+            }
+            if !piece.is_empty() {
+                lines.last_mut().expect("a line").push(CodeRun {
+                    t: piece.trim_end_matches('\r').to_string(),
+                    k: kind.map(str::to_string),
+                });
+            }
+        }
+    }
+    // A file that ends its last line has no line after it.
+    if text.ends_with('\n') && lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+/// A file's size as a person reads it: "830 B", "12 KB", "1.4 MB".
+fn size_words(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.0} KB", (b / KB).max(1.0))
+    } else if b < KB * KB * KB {
+        format!("{:.1} MB", b / KB / KB)
+    } else {
+        format!("{:.1} GB", b / KB / KB / KB)
+    }
 }
 
 /// A folder as a person reads it: the home folder as `~`.
@@ -1843,6 +2143,7 @@ mod tests {
             output: String::new(),
             exit: None,
             looks,
+            pictures: Vec::new(),
         }
     }
 
@@ -1850,6 +2151,7 @@ mod tests {
         Look {
             kind: LookKind::Read,
             target: target.into(),
+            path: None,
         }
     }
 
@@ -1945,6 +2247,7 @@ mod tests {
                     output: String::new(),
                     exit: None,
                     looks: vec![],
+                    pictures: Vec::new(),
                 },
                 partial: false,
             });
@@ -1978,6 +2281,7 @@ mod tests {
                 reason: None,
                 cwd: Some("/home/me/project".into()),
                 choices: vec![Choice::Accept, Choice::AcceptForSession, Choice::Decline],
+                questions: Vec::new(),
             },
         });
         let ask = chat.view().ask.unwrap();
@@ -1997,6 +2301,7 @@ mod tests {
                 reason: None,
                 cwd: None,
                 choices: vec![],
+                questions: Vec::new(),
             },
         });
         let ask = chat.view().ask.unwrap();
@@ -2023,6 +2328,7 @@ mod tests {
                 reason: None,
                 cwd: None,
                 choices: vec![],
+                questions: Vec::new(),
             },
         });
         assert!(chat.view().ask.is_some());
@@ -2096,6 +2402,7 @@ mod tests {
             output: String::new(),
             exit: Some(2),
             looks: vec![],
+            pictures: Vec::new(),
         };
         let edit = Item::Edit {
             id: "e".into(),
@@ -2323,16 +2630,33 @@ mod tests {
                     id: "gpt-5.5".into(),
                     name: "GPT-5.5".into(),
                     efforts: vec!["low".into(), "high".into()],
+                    description: String::new(),
                 },
                 ModelChoice {
                     id: "mini".into(),
                     name: String::new(),
                     efforts: vec![],
+                    description: String::new(),
                 },
             ],
         });
         let model = chat.view().model.unwrap();
         assert_eq!(model.label, format!("GPT-5.5 · {}", tr("chat-effort-high")));
+        // An agent with a permission mode says it after them.
+        chat.apply(Ev::Mode { mode: "auto".into() });
+        assert_eq!(
+            chat.view().model.unwrap().label,
+            format!("GPT-5.5 · {} · {}", tr("chat-effort-high"), tr("chat-mode-auto"))
+        );
+        // Greeted again (the agent started again in the pane): its mode is
+        // not known until it says it.
+        chat.apply(Ev::Hello {
+            agent: chat.agent.clone(),
+            title: None,
+            guessed: false,
+            protocol: crate::PROTOCOL,
+        });
+        assert_eq!(chat.view().model.unwrap().label, format!("GPT-5.5 · {}", tr("chat-effort-high")));
         let models: Vec<_> = model.models.iter().map(|m| (m.id.as_str(), m.label.as_str(), m.current)).collect();
         assert_eq!(models, [("gpt-5.5", "GPT-5.5", true), ("mini", "mini", false)]);
         // Each model opens on its own efforts; the one in use is marked.
@@ -2614,6 +2938,7 @@ mod tests {
                 output: "built".into(),
                 exit: Some(0),
                 looks: vec![],
+                pictures: Vec::new(),
             },
             partial: false,
         });
@@ -2668,5 +2993,174 @@ mod tests {
         assert_eq!(short_dir("/home/me/github/x"), "~/github/x");
         assert_eq!(short_dir("/srv/app"), "/srv/app");
         assert_eq!(file_name("src/view.rs"), "view.rs");
+    }
+
+    fn picture(path: &str, thumb: Option<&str>) -> Attachment {
+        Attachment {
+            name: file_name(path),
+            image: true,
+            path: Some(path.into()),
+            thumb: thumb.map(str::to_string),
+        }
+    }
+
+    fn read_item(id: &str, path: &str, pictures: Vec<Attachment>) -> Item {
+        Item::Command {
+            id: id.into(),
+            command: format!("read {path}"),
+            status: Status::Done,
+            output: String::new(),
+            exit: None,
+            looks: vec![Look {
+                kind: LookKind::Read,
+                target: path.into(),
+                path: None,
+            }],
+            pictures,
+        }
+    }
+
+    #[test]
+    fn pictures_a_call_looked_at_show_under_its_line() {
+        let mut chat = Chat::new(1, "claude");
+        chat.apply(Ev::History {
+            items: vec![
+                read_item("r1", "shot.png", vec![picture("/w/shot.png", Some("AAAA"))]),
+                read_item("r2", "src/main.rs", Vec::new()),
+            ],
+            more: false,
+            reset: true,
+        });
+        let view = chat.view();
+        let Row::Fold { icon: "look", pictures, .. } = &view.rows[0] else {
+            panic!("not a look: {:?}", view.rows);
+        };
+        let shown: Vec<_> = pictures.iter().map(|p| (p.picture.clone(), p.path.clone())).collect();
+        assert_eq!(shown, [(Some("r1#0".to_string()), Some("/w/shot.png".to_string()))]);
+        assert_eq!(chat.new_pictures(), [("r1#0".to_string(), "AAAA".to_string())]);
+
+        // Open, its lines say which file each opens: a read one, not a search.
+        chat.toggle("r1");
+        let view = chat.view();
+        let Row::Fold { body: Some(FoldBody::List { lines, paths }), .. } = &view.rows[0] else {
+            panic!("not open: {:?}", view.rows);
+        };
+        assert_eq!(lines, &["shot.png", "src/main.rs"]);
+        assert_eq!(paths, &["shot.png", "src/main.rs"]);
+        chat.toggle("r1");
+
+        // A tool's picture (a screenshot), and a group of several things
+        // done, which shows its folds' pictures while closed.
+        chat.apply(Ev::item(Item::Tool {
+            id: "t1".into(),
+            name: "browser.screenshot".into(),
+            detail: String::new(),
+            status: Status::Done,
+            pictures: vec![picture("/s/a.png", Some("BBBB")), picture("/s/b.png", None)],
+        }));
+        let view = chat.view();
+        let Row::Group { open: false, pictures, .. } = &view.rows[0] else {
+            panic!("not a group: {:?}", view.rows);
+        };
+        let keys: Vec<_> = pictures.iter().map(|p| p.picture.clone()).collect();
+        assert_eq!(keys, [Some("r1#0".to_string()), Some("t1#0".to_string()), None]);
+        assert_eq!(chat.new_pictures(), [("t1#0".to_string(), "BBBB".to_string())]);
+    }
+
+    #[test]
+    fn a_file_shown_is_laid_out_once() {
+        let mut chat = Chat::new(1, "codex");
+        let text = "fn main() {\n    \"hi\"\n}\n";
+        chat.apply(Ev::File {
+            file: FileShown {
+                path: "src/main.rs".into(),
+                size: 2048,
+                text: Some(text.into()),
+                language: Some("rust".into()),
+                spans: vec![(0, 2, "keyword".into()), (3, 7, "function".into()), (16, 20, "string".into())],
+                ..FileShown::default()
+            },
+        });
+        let file = chat.take_files().pop().expect("the file");
+        assert!(chat.take_files().is_empty(), "given once");
+        assert_eq!((file.name.as_str(), file.size.as_str(), file.kind), ("main.rs", "2 KB", "code"));
+        let lines: Vec<Vec<(String, Option<String>)>> =
+            file.lines.into_iter().map(|line| line.into_iter().map(|run| (run.t, run.k)).collect()).collect();
+        let run = |t: &str, k: Option<&str>| (t.to_string(), k.map(str::to_string));
+        assert_eq!(
+            lines,
+            [
+                vec![run("fn", Some("keyword")), run(" ", None), run("main", Some("function")), run("() {", None)],
+                vec![run("    ", None), run("\"hi\"", Some("string"))],
+                vec![run("}", None)],
+            ]
+        );
+        assert_eq!(file.note, None);
+
+        // Markdown is laid out; a long one says only its start is shown.
+        chat.apply(Ev::File {
+            file: FileShown {
+                path: "README.md".into(),
+                size: 900_000,
+                text: Some("# Title\n\nWords.".into()),
+                cut: true,
+                language: Some("markdown".into()),
+                ..FileShown::default()
+            },
+        });
+        let file = chat.take_files().pop().unwrap();
+        assert_eq!(file.kind, "markdown");
+        assert_eq!(file.blocks.len(), 2);
+        assert!(file.note.is_some());
+
+        // A picture as it is; one that could not be read, why not.
+        chat.apply(Ev::File {
+            file: FileShown {
+                path: "/w/shot.png".into(),
+                picture: Some("CCCC".into()),
+                ..FileShown::default()
+            },
+        });
+        let file = chat.take_files().pop().unwrap();
+        assert_eq!((file.kind, file.picture.as_deref()), ("picture", Some("CCCC")));
+        chat.apply(Ev::File {
+            file: FileShown {
+                path: "gone.txt".into(),
+                error: Some("missing".into()),
+                ..FileShown::default()
+            },
+        });
+        let file = chat.take_files().pop().unwrap();
+        assert_eq!((file.kind, file.note), ("none", Some(tr("chat-file-missing"))));
+
+        // Spans that overlap or cut a character are let go, not trusted.
+        let lines = code_lines("é = 1", &[(0, 1, "variable".into()), (0, 2, "keyword".into()), (5, 6, "number".into())]);
+        assert_eq!(
+            lines,
+            [vec![
+                CodeRun { t: "é".into(), k: Some("keyword".into()) },
+                CodeRun { t: " = ".into(), k: None },
+                CodeRun { t: "1".into(), k: Some("number".into()) },
+            ]]
+        );
+        assert_eq!(size_words(830), "830 B");
+        assert_eq!(size_words(3 << 20), "3.0 MB");
+    }
+
+    #[test]
+    fn models_say_what_they_are_for() {
+        let mut chat = Chat::new(1, "codex");
+        chat.apply(Ev::Models {
+            current: Some("gpt-5.5".into()),
+            effort: None,
+            models: vec![ModelChoice {
+                id: "gpt-5.5".into(),
+                name: "GPT-5.5".into(),
+                efforts: Vec::new(),
+                description: "Frontier model for coding".into(),
+            }],
+        });
+        let model = chat.view().model.unwrap();
+        assert_eq!(model.models[0].description, "Frontier model for coding");
     }
 }

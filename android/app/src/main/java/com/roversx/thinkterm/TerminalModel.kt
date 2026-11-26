@@ -49,6 +49,13 @@ private const val IDLE_FRAMES_BEFORE_REST = 30
 /// How long the connection card waits for a dial back from the background
 /// (`TerminalModel.cardHeld`).
 private const val CARD_HOLD_MS = 3_000L
+/// How long a file asked for of the host is waited for before the sheet
+/// says it could not be had.
+private const val CHAT_FILE_WAIT_MS = 20_000L
+/// Files the host showed kept at once (a picture's is large).
+private const val CHAT_FILES_KEPT = 6
+/// Small pictures of the chat kept at once.
+private const val CHAT_THUMBS_KEPT = 160
 
 /// The shell's side of the thread contract. `Notify` calls arrive on the
 /// core thread; nothing here blocks them and nothing here calls back into
@@ -913,6 +920,12 @@ class TerminalModel(
         chromeClick("pane", pane = pane)
         chat = null
         chatThumbs.clear()
+        chatThumbsKept.clear()
+        chatShown.clear()
+        chatShownKept.clear()
+        chatShownLate.clear()
+        chatFileAsked.clear()
+        chatFileOpen = null
         chatFromThreads = fromThreads
         chatWith = ChatTarget(pane, agent, place.ifEmpty { agent })
         core.chatOpen(pane.toUInt(), agent)
@@ -981,8 +994,60 @@ class TerminalModel(
     private val chatCopies = HashMap<ULong, File>()
 
     /// The host's small pictures of what was sent, by the key the chat's
-    /// rows name them by: each comes once ("chat_picture").
+    /// rows name them by: each comes once ("chat_picture"). The newest
+    /// [CHAT_THUMBS_KEPT] only: a long chat of screenshots does not hold
+    /// them all (an older one shows as a place for a picture, which still
+    /// opens it).
     val chatThumbs = mutableStateMapOf<String, ImageBitmap>()
+    private val chatThumbsKept = ArrayDeque<String>()
+
+    private fun keepThumb(key: String, bitmap: ImageBitmap) {
+        chatThumbsKept.remove(key)
+        chatThumbsKept.addLast(key)
+        chatThumbs[key] = bitmap
+        while (chatThumbsKept.size > CHAT_THUMBS_KEPT) chatThumbs.remove(chatThumbsKept.removeFirst())
+    }
+
+    /// The files the host showed, by the path they were asked by
+    /// ("chat_file"): what the file sheet shows, and a picture shown big.
+    /// The last few only: a picture's is large.
+    val chatShown = mutableStateMapOf<String, ChatShownFile>()
+    private val chatShownKept = ArrayDeque<String>()
+
+    /// Files asked for that did not come in time (an older host's bridge
+    /// does not show files).
+    val chatShownLate = mutableStateMapOf<String, Boolean>()
+
+    /// The file in the sheet over the chat, by its path.
+    var chatFileOpen by mutableStateOf<String?>(null)
+
+    /// Show the file at `path`, as the chat named it: in the sheet, or (a
+    /// picture shown big, `sheet` false) only fetched whole. Asked again
+    /// each time, for what it holds now; what came before shows meanwhile.
+    fun chatOpenFile(path: String, sheet: Boolean = true) {
+        if (sheet) chatFileOpen = path
+        chatShownLate.remove(path)
+        // Each ask its own wait: one from before (the chat closed and
+        // opened again since) does not cut a later one short.
+        val asked = ++chatFileAsks
+        chatFileAsked[path] = asked
+        core.chatOpenFile(path)
+        main.postDelayed({
+            if (chatFileAsked[path] == asked && chatShown[path] == null) chatShownLate[path] = true
+        }, CHAT_FILE_WAIT_MS)
+    }
+
+    private var chatFileAsks = 0
+    /// The latest ask for each file shown, by path.
+    private val chatFileAsked = HashMap<String, Int>()
+
+    private fun keepShown(file: ChatShownFile) {
+        chatShownKept.remove(file.path)
+        chatShownKept.addLast(file.path)
+        chatShown[file.path] = file
+        chatShownLate.remove(file.path)
+        while (chatShownKept.size > CHAT_FILES_KEPT) chatShown.remove(chatShownKept.removeFirst())
+    }
 
     /// Put a file the phone has -- a photo, a file, the clipboard's
     /// picture -- in the host's uploads folder, to go with what is said
@@ -1085,6 +1150,7 @@ class TerminalModel(
 
     fun chatSetModel(model: String, effort: String?) = core.chatSetModel(model, effort)
     fun chatAnswer(ask: String, choice: String) = core.chatAnswer(ask, choice)
+    fun chatAnswerQuestions(ask: String, answers: List<String>) = core.chatAnswerQuestions(ask, answers)
     fun chatInterrupt() = core.chatInterrupt()
     fun chatOlder() = core.chatOlder()
     fun chatAction(action: String) = core.chatAction(action)
@@ -1543,8 +1609,13 @@ class TerminalModel(
                     }.getOrNull()
                     if (picture != null) {
                         val (pane, key, bitmap) = picture
-                        if (bitmap != null) main.post { if (chatWith?.pane == pane) chatThumbs[key] = bitmap }
+                        if (bitmap != null) main.post { if (chatWith?.pane == pane) keepThumb(key, bitmap) }
                     }
+                }
+                "chat_file" -> {
+                    // Its picture decoded here, off the screen's thread.
+                    val shown = ChatViews.file(value)
+                    if (shown != null) main.post { if (chatWith?.pane == shown.first) keepShown(shown.second) }
                 }
                 "chat" -> {
                     val parsed = ChatViews.parse(value)

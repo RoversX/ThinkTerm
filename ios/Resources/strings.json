@@ -347,7 +347,10 @@
     "lock.reason.on": "Bestätigen Sie Ihre Identität, um die Sperre einzuschalten",
     "lock.unlock": "Entsperren",
     "sec.security": "Sicherheit",
-    "lock.reason.off": "Bestätigen Sie Ihre Identität, um die Sperre auszuschalten"
+    "lock.reason.off": "Bestätigen Sie Ihre Identität, um die Sperre auszuschalten",
+    "chat.file.copy_path": "Pfad kopieren",
+    "chat.file.failed": "Datei kann nicht geöffnet werden",
+    "chat.file.loading": "Wird geöffnet…"
   },
   "en-US": {
     "about.build": "Build",
@@ -697,7 +700,10 @@
     "lock.reason.on": "Confirm it’s you to turn on the lock",
     "lock.unlock": "Unlock",
     "sec.security": "Security",
-    "lock.reason.off": "Confirm it’s you to turn off the lock"
+    "lock.reason.off": "Confirm it’s you to turn off the lock",
+    "chat.file.copy_path": "Copy path",
+    "chat.file.failed": "Couldn't open this file",
+    "chat.file.loading": "Opening…"
   },
   "fr-FR": {
     "about.build": "Compilation",
@@ -1047,7 +1053,10 @@
     "lock.reason.on": "Confirmez votre identité pour activer le verrouillage",
     "lock.unlock": "Déverrouiller",
     "sec.security": "Sécurité",
-    "lock.reason.off": "Confirmez votre identité pour désactiver le verrouillage"
+    "lock.reason.off": "Confirmez votre identité pour désactiver le verrouillage",
+    "chat.file.copy_path": "Copier le chemin",
+    "chat.file.failed": "Impossible d’ouvrir ce fichier",
+    "chat.file.loading": "Ouverture…"
   },
   "ja-JP": {
     "about.build": "ビルド",
@@ -1397,7 +1406,10 @@
     "lock.reason.on": "本人確認してロックをオンにします",
     "lock.unlock": "ロック解除",
     "sec.security": "セキュリティ",
-    "lock.reason.off": "本人確認してロックをオフにします"
+    "lock.reason.off": "本人確認してロックをオフにします",
+    "chat.file.copy_path": "パスをコピー",
+    "chat.file.failed": "このファイルを開けません",
+    "chat.file.loading": "開いています…"
   },
   "zh-CN": {
     "about.build": "构建",
@@ -1747,6 +1759,9 @@
     "lock.reason.on": "验证身份以开启锁定",
     "lock.unlock": "解锁",
     "sec.security": "安全",
-    "lock.reason.off": "验证身份以关闭锁定"
+    "lock.reason.off": "验证身份以关闭锁定",
+    "chat.file.copy_path": "复制路径",
+    "chat.file.failed": "打不开这个文件",
+    "chat.file.loading": "正在打开…"
   }
 }

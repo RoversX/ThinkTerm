@@ -19,7 +19,7 @@ import * as path from "node:path";
 
 /// Raised with every change: ThinkTerm puts a newer one in place of an
 /// older one when a chat opens.
-const EXTENSION_VERSION = 11;
+const EXTENSION_VERSION = 12;
 /// 2: what is said may carry files and pictures; the model can be changed.
 /// 3: the commands the session takes are listed (`commands`), and how full
 /// its context is said (`context`).
@@ -43,6 +43,10 @@ const PICTURE_KEPT = 20 << 20;
 /// Pictures copied out of sessions for the phone, untouched this long,
 /// are let go (`pictures`).
 const PICTURES_KEPT_MS = 30 * 24 * 3600 * 1000;
+/// The most pictures shown of one tool call's result, and the largest
+/// (base64) of them.
+const TOOL_PICTURES = 4;
+const TOOL_PICTURE_LARGEST = 12 << 20;
 /// How hard a model can think, as Pi words it, least first: Pi's own
 /// rule is asked (`getSupportedThinkingLevels`); this, where it cannot be.
 const LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -503,7 +507,7 @@ export default function (pi: ExtensionAPI) {
         ev: "models",
         current: idOf(current),
         effort,
-        models: models.map((m) => ({ id: idOf(m), name: String(m.name ?? m.id ?? ""), efforts: levelsOf(m) })),
+        models: models.map((m) => ({ id: idOf(m), name: String(m.name ?? m.id ?? ""), efforts: levelsOf(m), description: String(m.provider ?? "") })),
       },
       to,
     );
@@ -798,8 +802,23 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // A tool call, finished when `result` is given, running when not.
+  // A tool call, finished when `result` is given, running when not; with
+  // the pictures it gave back (a picture read, a screenshot), as files: a
+  // few, of a size a phone shows, and only while a phone looks (no copy is
+  // made for no one).
   function toolItem(id: string, name: string, args: any, result?: any, running = false): object {
+    const item: any = toolItemOf(id, name, args, result, running);
+    if (result && clients.size && Array.isArray(result.content) && (item.kind === "command" || item.kind === "tool")) {
+      const shown = result.content
+        .filter((part: any) => part?.type === "image" && typeof part.data === "string" && part.data.length <= TOOL_PICTURE_LARGEST)
+        .slice(0, TOOL_PICTURES);
+      const pictures = picturesIn(shown, id).filter((p: any) => p.path);
+      if (pictures.length) item.pictures = pictures;
+    }
+    return item;
+  }
+
+  function toolItemOf(id: string, name: string, args: any, result?: any, running = false): object {
     const status = running || !result ? "running" : result.isError ? "failed" : "done";
     const output = result ? tail(textOf(result.content), OUTPUT_KEPT) : "";
     args = args ?? {};

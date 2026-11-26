@@ -257,7 +257,12 @@ pub enum ChatCmd {
     },
     /// Talk to another model, or think harder or less.
     SetModel { model: String, effort: Option<String> },
-    Answer { ask: String, choice: String },
+    /// `answers`: a question's picks, one entry each (several joined by ", ").
+    Answer {
+        ask: String,
+        choice: String,
+        answers: Vec<String>,
+    },
     Interrupt,
     Older,
     Install,
@@ -267,6 +272,9 @@ pub enum ChatCmd {
     Retry,
     /// Open or fold a row.
     Toggle(String),
+    /// Show the file at `path`, as the conversation named it: its text or
+    /// picture comes as "chat_file".
+    OpenFile(String),
 }
 
 /// The chat on show: the pane it is with, the opening of its channel
@@ -723,13 +731,13 @@ impl State {
             ChatCmd::SetModel { model, effort } => {
                 self.chat_op_or_end(ChatOp::SetModel { model, effort });
             }
-            ChatCmd::Answer { ask, choice } => {
+            ChatCmd::Answer { ask, choice, answers } => {
                 let choice = match choice.as_str() {
                     "accept" => ChatChoice::Accept,
                     "accept_for_session" => ChatChoice::AcceptForSession,
                     _ => ChatChoice::Decline,
                 };
-                self.chat_op_or_end(ChatOp::Answer { ask, choice });
+                self.chat_op_or_end(ChatOp::Answer { ask, choice, answers });
             }
             ChatCmd::Interrupt => {
                 self.chat_op_or_end(ChatOp::Interrupt);
@@ -765,6 +773,9 @@ impl State {
                 if let Some(chat) = self.chat.as_mut() {
                     chat.model.toggle(&row);
                 }
+            }
+            ChatCmd::OpenFile(path) => {
+                self.chat_op(ChatOp::Open { path });
             }
         }
         self.publish_chat();
@@ -819,7 +830,7 @@ impl State {
 
     /// The chat on show, as the shell draws it: its new small pictures
     /// first ("chat_picture", each once, by the key its rows name them
-    /// by), then the view.
+    /// by), a file it asked to see ("chat_file", once), then the view.
     fn publish_chat(&mut self) {
         self.chat_owed = false;
         self.chat_made = Instant::now();
@@ -827,6 +838,10 @@ impl State {
             for (key, data) in chat.model.new_pictures() {
                 let picture = serde_json::json!({ "pane": chat.pane, "key": key, "data": data });
                 self.notify.on_published("chat_picture".into(), picture.to_string());
+            }
+            for file in chat.model.take_files() {
+                let shown = serde_json::json!({ "pane": chat.pane, "file": file });
+                self.notify.on_published("chat_file".into(), shown.to_string());
             }
             self.notify.on_published("chat".into(), json(&chat.model.view()));
         }

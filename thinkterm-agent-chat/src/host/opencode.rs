@@ -1194,7 +1194,7 @@ pub fn run(target: &Target, input: impl BufRead + Send + 'static, out: Out, pane
         out.error(Some(Need::OpenCodeService), format!("{err:#}"))?;
         return Ok(());
     }
-    read_ops(input, tx.clone());
+    read_ops(input, tx.clone(), out.clone(), super::Place::new(cwd.clone()));
     let mut chat = Chat::new(&found, cwd, pane_title);
     if !reopen(&api, &mut chat, &out)? {
         return Ok(());
@@ -1696,6 +1696,7 @@ fn messages_to_items(messages: &[Value], older: Option<String>, cwd: Option<&str
                 name: "skill".into(),
                 detail: message["name"].as_str().unwrap_or_default().to_string(),
                 status: Status::Done,
+                pictures: Vec::new(),
             }),
             // Switches of agent, model or folder, and what the agent was
             // told on the way: nothing said.
@@ -1738,6 +1739,7 @@ fn synthetic_item(message: &Value) -> Option<Item> {
             Some("running") | Some("pending") => Status::Running,
             _ => Status::Failed,
         },
+        pictures: Vec::new(),
     })
 }
 
@@ -1794,7 +1796,7 @@ fn attachments_of(files: &Value) -> Vec<Attachment> {
 }
 
 /// A `file://` URL's path, its `%xx` read back.
-fn percent_decoded(text: &str) -> String {
+pub(super) fn percent_decoded(text: &str) -> String {
     let bytes = text.as_bytes();
     let hex = |b: u8| (b as char).to_digit(16);
     let mut out = Vec::with_capacity(bytes.len());
@@ -1890,7 +1892,7 @@ fn tool_as_item(id: String, name: &str, input: &Value, state: &Value, cwd: Optio
         let p = path("path");
         shown(if p.is_empty() { path("filePath") } else { p }, cwd)
     };
-    match name {
+    let mut item = match name {
         "shell" | "bash" => Item::Command {
             id,
             command: head(input["command"].as_str().unwrap_or_default(), TEXT_KEPT),
@@ -1898,6 +1900,7 @@ fn tool_as_item(id: String, name: &str, input: &Value, state: &Value, cwd: Optio
             output: tail(&output, OUTPUT_KEPT),
             exit: state["metadata"]["exit"].as_i64().map(fit),
             looks: Vec::new(),
+            pictures: Vec::new(),
         },
         "read" => look(id, format!("read {}", file()), LookKind::Read, file(), status),
         "grep" => {
@@ -1920,6 +1923,7 @@ fn tool_as_item(id: String, name: &str, input: &Value, state: &Value, cwd: Optio
                     name: name.to_string(),
                     detail: String::new(),
                     status,
+                    pictures: Vec::new(),
                 }
             } else {
                 Item::Edit { id, status, files }
@@ -1930,6 +1934,7 @@ fn tool_as_item(id: String, name: &str, input: &Value, state: &Value, cwd: Optio
             name: "web_search".into(),
             detail: input["query"].as_str().unwrap_or_default().to_string(),
             status,
+            pictures: Vec::new(),
         },
         "subagent" | "task" => Item::Tool {
             id,
@@ -1942,30 +1947,52 @@ fn tool_as_item(id: String, name: &str, input: &Value, state: &Value, cwd: Optio
                 DETAIL_KEPT,
             ),
             status,
+            pictures: Vec::new(),
         },
         "question" => Item::Tool {
             id,
             name: "question".into(),
             detail: head(&questions_of(&input["questions"]), DETAIL_KEPT),
             status,
+            pictures: Vec::new(),
         },
         _ => Item::Tool {
             id,
             name: name.to_string(),
             detail: brief(input),
             status,
+            pictures: Vec::new(),
         },
+    };
+    // The pictures it looked at: what it gave back, or the picture file
+    // it read.
+    if let Item::Command { pictures, .. } | Item::Tool { pictures, .. } = &mut item {
+        *pictures = super::thumb::pictures_in(&state["attachments"]);
+        if pictures.is_empty() {
+            *pictures = super::thumb::pictures_in(&state["content"]);
+        }
+        let read = path("path");
+        let read = if read.is_empty() { path("filePath") } else { read };
+        if pictures.is_empty() && name == "read" && status == Status::Done && super::thumb::is_picture_path(&read) {
+            let whole = match cwd {
+                Some(cwd) if !read.starts_with('/') => format!("{}/{read}", cwd.trim_end_matches('/')),
+                _ => read,
+            };
+            pictures.push(super::thumb::picture_file(&whole));
+        }
     }
+    item
 }
 
-fn look(id: String, command: String, kind: LookKind, target: String, status: Status) -> Item {
+pub(super) fn look(id: String, command: String, kind: LookKind, target: String, status: Status) -> Item {
     Item::Command {
         id,
         command,
         status,
         output: String::new(),
         exit: None,
-        looks: vec![Look { kind, target }],
+        looks: vec![Look { kind, target, path: None }],
+        pictures: Vec::new(),
     }
 }
 
@@ -2057,7 +2084,7 @@ fn edited_files(name: &str, input: &Value, metadata: &Value, cwd: Option<&str>) 
 
 /// A path as the chat shows it: from the folder the agent works in, when
 /// it is in it.
-fn shown(path: String, cwd: Option<&str>) -> String {
+pub(super) fn shown(path: String, cwd: Option<&str>) -> String {
     let Some(cwd) = cwd.map(|cwd| cwd.trim_end_matches('/')).filter(|cwd| !cwd.is_empty()) else {
         return path;
     };
@@ -2067,7 +2094,7 @@ fn shown(path: String, cwd: Option<&str>) -> String {
     }
 }
 
-fn file_edit(path: &str, patch: &str) -> FileEdit {
+pub(super) fn file_edit(path: &str, patch: &str) -> FileEdit {
     // From the first hunk on: the file's header names it already.
     let diff = match patch.find("\n@@") {
         Some(at) if !patch.starts_with("@@") => &patch[at + 1..],
@@ -2084,7 +2111,7 @@ fn file_edit(path: &str, patch: &str) -> FileEdit {
 
 /// A change of many files keeps the diffs of the first few; the rest are
 /// counted.
-fn capped(mut files: Vec<FileEdit>) -> Vec<FileEdit> {
+pub(super) fn capped(mut files: Vec<FileEdit>) -> Vec<FileEdit> {
     for file in files.iter_mut().skip(DIFFS_KEPT) {
         file.diff.clear();
     }
@@ -2092,7 +2119,7 @@ fn capped(mut files: Vec<FileEdit>) -> Vec<FileEdit> {
 }
 
 /// A tool's input, short: its words, or its first value that is one.
-fn brief(input: &Value) -> String {
+pub(super) fn brief(input: &Value) -> String {
     let said = match input {
         Value::Object(map) => ["description", "query", "url", "prompt", "code", "name", "command"]
             .iter()
@@ -2109,7 +2136,7 @@ fn brief(input: &Value) -> String {
 }
 
 /// The questions a `question` tool asks, one a line with its choices.
-fn questions_of(questions: &Value) -> String {
+pub(super) fn questions_of(questions: &Value) -> String {
     let mut text = String::new();
     for question in questions.as_array().into_iter().flatten() {
         if !text.is_empty() {
@@ -2139,6 +2166,7 @@ fn shell_item(message: &Value) -> Option<Item> {
         output: tail(message["output"]["output"].as_str().unwrap_or_default(), OUTPUT_KEPT),
         exit,
         looks: Vec::new(),
+        pictures: Vec::new(),
     })
 }
 
@@ -2194,6 +2222,7 @@ fn permission_ask(chat: &Chat, request: &Value) -> Ask {
         // rule for the whole project, of wider patterns than the command
         // shown. That is answered in its terminal, which says so.
         choices: vec![Choice::Accept, Choice::Decline],
+        questions: Vec::new(),
     }
 }
 
@@ -2227,6 +2256,7 @@ fn form_ask(form: &Value) -> Option<Ask> {
         reason: form["title"].as_str().map(str::to_string),
         cwd: None,
         choices: Vec::new(),
+        questions: Vec::new(),
     })
 }
 
@@ -2273,6 +2303,14 @@ fn models_of(listed: &Value) -> (Vec<ModelChoice>, HashMap<String, u64>) {
                 .filter(|variant| variant != "default")
                 .collect(),
             id,
+            // Its own words when it has them, else whose it is.
+            description: model["description"]
+                .as_str()
+                .filter(|words| !words.trim().is_empty())
+                .or(model["providerID"].as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         });
     }
     (models, windows)
@@ -2404,7 +2442,7 @@ fn handle_op(api: &Api, chat: &mut Chat, out: &Out, op: Op) -> Result<()> {
             Ok(_) => {}
             Err(err) => out.refused(format!("{err:#}"))?,
         },
-        Op::Answer { ask, choice } => match chat.asks.get(&ask) {
+        Op::Answer { ask, choice, .. } => match chat.asks.get(&ask) {
             Some(asked) if asked.choices.is_empty() => out.refused("this question is answered in the terminal")?,
             Some(asked) if !asked.choices.contains(&choice) => {
                 out.refused("OpenCode keeps \"always\" for the whole project: answer that in its terminal")?
@@ -2508,6 +2546,8 @@ fn handle_op(api: &Api, chat: &mut Chat, out: &Out, op: Op) -> Result<()> {
         }
         Op::Install => out.refused("OpenCode needs nothing installed")?,
         Op::Reload => out.refused("OpenCode has no extension to load")?,
+        // Answered where ops are read (`read_ops`).
+        Op::Open { .. } => {}
     }
     Ok(())
 }
@@ -2613,6 +2653,7 @@ fn handle_event(api: &Api, chat: &mut Chat, out: &Out, event: &Value) -> Result<
                     name: "skill".into(),
                     detail: data["name"].as_str().unwrap_or_default().to_string(),
                     status: Status::Done,
+                    pictures: Vec::new(),
                 },
             )?;
         }
@@ -2808,6 +2849,7 @@ fn handle_event(api: &Api, chat: &mut Chat, out: &Out, event: &Value) -> Result<
                         output: tail(data["output"]["output"].as_str().unwrap_or_default(), OUTPUT_KEPT),
                         exit,
                         looks: Vec::new(),
+                        pictures: Vec::new(),
                     },
                 )?;
             }
@@ -3104,6 +3146,7 @@ mod tests {
             reason: None,
             cwd: None,
             choices: vec![Choice::Accept, Choice::Decline],
+            questions: Vec::new(),
         };
         chat.asks.insert("per_own".into(), ask("per_own"));
         chat.asks.insert("per_child".into(), ask("per_child"));

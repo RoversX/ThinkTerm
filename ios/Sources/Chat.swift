@@ -125,12 +125,14 @@ struct ChatModelMenu: Decodable, Equatable {
     var efforts_heading: String
 }
 
-/// A model; `efforts` empty for one picked as it is.
+/// A model; `efforts` empty for one picked as it is; `description`, what
+/// it is for, in the agent's words, when it says.
 struct ChatModelChoice: Decodable, Equatable, Identifiable {
     var id: String
     var label: String
     var current: Bool
     var efforts: [ChatModelOption]
+    var description: String?
 }
 
 struct ChatModelOption: Decodable, Equatable, Identifiable {
@@ -201,6 +203,8 @@ struct ChatGroup: Decodable {
     var badge: String?
     var open: Bool
     var rows: [ChatRow]
+    /// Its folds' pictures, under its line while it is closed.
+    var pictures: [ChatSent]?
 }
 
 struct ChatFold: Decodable {
@@ -218,21 +222,24 @@ struct ChatFold: Decodable {
     /// while it is open.
     var can_open: Bool
     var body: FoldBody?
+    /// The pictures it looked at, under its line.
+    var pictures: [ChatSent]?
 }
 
 enum FoldBody: Decodable {
     case blocks([MdBlock])
     case output(String)
-    case list([String])
+    /// `paths`: the file each line opens, empty for one that opens none.
+    case list([String], paths: [String])
     case diff([DiffFile])
 
-    private enum Key: String, CodingKey { case t, blocks, text, lines, files }
+    private enum Key: String, CodingKey { case t, blocks, text, lines, paths, files }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Key.self)
         switch try c.decode(String.self, forKey: .t) {
         case "text": self = .blocks(try c.decode([MdBlock].self, forKey: .blocks))
-        case "list": self = .list(try c.decode([String].self, forKey: .lines))
+        case "list": self = .list(try c.decode([String].self, forKey: .lines), paths: (try? c.decode([String].self, forKey: .paths)) ?? [])
         case "diff": self = .diff(try c.decode([DiffFile].self, forKey: .files))
         default: self = .output((try? c.decode(String.self, forKey: .text)) ?? "")
         }
@@ -242,6 +249,28 @@ enum FoldBody: Decodable {
 struct DiffFile: Decodable, Hashable {
     var path: String
     var lines: [DiffLine]
+}
+
+/// A file the host showed (`TerminalModel.chatOpenFile`): code in lines of
+/// coloured runs, Markdown laid out, a picture, or why it is not shown.
+struct ChatShownFile {
+    var path: String
+    var name: String
+    var size: String
+    /// "code", "markdown", "picture" or "none".
+    var kind: String
+    var lines: [[ChatCodeRun]]
+    var blocks: [MdBlock]
+    var image: UIImage?
+    /// Why it is not shown, or that only its start is.
+    var note: String?
+}
+
+/// A run of code in one colour; `k` what it is ("keyword", "string",
+/// "comment" ...), none for plain.
+struct ChatCodeRun: Decodable, Hashable {
+    var t: String
+    var k: String?
 }
 
 /// `t`: "add", "del", "ctx" or "hunk".
@@ -296,8 +325,6 @@ struct MdSpan: Decodable, Hashable {
     var code: Bool?
     var strike: Bool?
     var link: String?
-    /// How much of its colour it shows, for words just come in.
-    var fade: Double?
 }
 
 struct ChatAsk: Decodable {
@@ -311,6 +338,21 @@ struct ChatAsk: Decodable {
     /// With no choices: the label of the way to the terminal, where the
     /// agent takes its answer.
     var terminal: String?
+    /// What a question asks; picks are sent with `chatAnswerQuestions`.
+    var questions: [ChatQuestion]?
+}
+
+/// `multi`: several of its options may be picked.
+struct ChatQuestion: Decodable, Hashable {
+    var question: String
+    var header: String
+    var multi: Bool
+    var options: [ChatQuestionOption]
+}
+
+struct ChatQuestionOption: Decodable, Hashable {
+    var label: String
+    var description: String
 }
 
 struct ChatChoice: Decodable, Hashable {
@@ -421,7 +463,7 @@ struct ChatPage: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityReduceMotion) private var still
-    /// How much of each reply on its way is on show.
+    /// How many lines of each reply on its way are on show.
     @StateObject private var reveal = ChatReveal()
     /// Swiped left: the rows move aside for when each came about, and back
     /// once let go (or the touch is taken for something else).
@@ -431,8 +473,9 @@ struct ChatPage: View {
     var body: some View {
         let chat = feed.chat
         let scale = chatTextScale(settings.chatText, typeSize)
-        // A reply on its way shows as it is written, its words coming in at
-        // a steady pace; or, set to blocks, only once written whole.
+        // A reply on its way shows as it is written, a whole line at a time,
+        // each fading in as the reply grows to hold it; or, set to blocks,
+        // only once written whole.
         let streaming = settings.chatReveal != "blocks"
         let writing = Set(chat?.writing ?? [])
         let rows = (chat?.rows ?? []).filter { row in
@@ -501,8 +544,7 @@ struct ChatPage: View {
                         .transition(.opacity)
                     }
                     ForEach(rows) { row in
-                        let shown = streaming && !still ? reveal.shownOf(row, writing: writing) : nil
-                        rowView(row, shown: shown)
+                        rowView(row, reveal: streaming && !still ? reveal : nil, writing: writing)
                             // The full width: its time sits at the right edge
                             // however short the row.
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -599,21 +641,25 @@ struct ChatPage: View {
                 reveal.prime(chat?.rows ?? [])
                 reveal.prune(Set(ids))
             }
-            // Replies on their way catch up with what has come of them, a
-            // little each frame, the list following the end as they grow
-            // when the person reads there. It rests once all have caught up,
-            // until more comes.
-            .task(id: streaming && !still ? wanted : -1) {
+            // Replies on their way catch up with the whole lines come of
+            // them, a little each frame, the list following the end as they
+            // grow when the person reads there. It rests a few frames after
+            // all have caught up (what just came is laid out, and where its
+            // lines end known, a little later), until more comes.
+            .task(id: streaming && !still ? RevealWanted(length: wanted, writing: writing, wakes: reveal.wakes) : nil) {
                 guard streaming && !still else { return }
-                var last = Date()
-                while !Task.isCancelled {
+                var spare = revealSpare
+                while spare > 0 {
                     try? await Task.sleep(for: .milliseconds(16))
-                    let now = Date()
-                    let seconds = min(0.1, now.timeIntervalSince(last))
-                    last = now
-                    guard reveal.step(texts, writing: writing, seconds: seconds) else { break }
-                    if atEnd && !follow { proxy.scrollTo("end", anchor: .bottom) }
+                    if Task.isCancelled { return }
+                    if reveal.step(texts, writing: writing, now: Date()) {
+                        spare = revealSpare
+                        if atEnd && !follow { proxy.scrollTo("end", anchor: .bottom) }
+                    } else {
+                        spare -= 1
+                    }
                 }
+                reveal.rest()
             }
             .onChange(of: chat?.rows.last?.id) {
                 guard atEnd || follow else { return }
@@ -637,8 +683,15 @@ struct ChatPage: View {
             PictureView(
                 file: picture,
                 thumb: picture.picture.flatMap { feed.thumbs[$0] },
-                local: picture.path.flatMap { feed.pictures[$0] }
+                local: picture.path.flatMap { feed.pictures[$0] },
+                sharp: picture.path.flatMap { feed.shown[$0]?.image },
+                // Not to be had whole, and no small one either: said so,
+                // not a blank screen.
+                failed: picture.path.map { feed.shownLate.contains($0) || (feed.shown[$0] != nil && feed.shown[$0]?.image == nil) } ?? true
             ) { shownPicture = nil }
+        }
+        .sheet(item: $feed.fileOpen) { open in
+            FileSheet(path: open.path, feed: feed)
         }
         .onChange(of: chat?.notice) { _, new in
             guard let new, new.seq > noticeSeen else { return }
@@ -749,13 +802,20 @@ struct ChatPage: View {
 
     // MARK: what it said and did
 
+    /// A picture a call looked at, shown big: its small one at once, the
+    /// host's whole one asked for meanwhile.
+    private func showLooked(_ picture: ChatSent) {
+        shownPicture = picture
+        if let path = picture.path, feed.pictures[path] == nil { model.chatOpenFile(path, sheet: false) }
+    }
+
     @ViewBuilder
-    private func rowView(_ row: ChatRow, shown: Int? = nil) -> some View {
+    private func rowView(_ row: ChatRow, reveal: ChatReveal? = nil, writing: Set<String> = []) -> some View {
         switch row {
         case let .user(_, text, attachments):
             VStack(alignment: .trailing, spacing: 6) {
                 if !attachments.isEmpty {
-                    SentFiles(files: attachments, pictures: feed.pictures, thumbs: feed.thumbs) { shownPicture = $0 }
+                    SentFiles(files: attachments, pictures: feed.pictures, thumbs: feed.thumbs, open: { model.chatOpenFile($0) }) { shownPicture = $0 }
                 }
                 if !text.isEmpty {
                     HStack {
@@ -774,23 +834,34 @@ struct ChatPage: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
-        case let .text(_, blocks, copy):
-            // Grows as more of what it says comes, at once: an animated
-            // growth a few times a second kept the list moving under the
-            // words.
+        case let .text(id, blocks, copy):
+            // On its way, it grows a whole line at a time, each fading in.
             VStack(alignment: .leading, spacing: 2) {
-                // As far as it has come in: the newest words fading in.
-                MarkdownBlocks(blocks: shown.map { mdHead(blocks, $0) } ?? blocks, whole: shown == nil ? nil : blocks)
-                    .textSelection(.enabled)
+                if let reveal {
+                    LineReveal(marks: reveal.marks(id), lines: reveal.lines(id, writing: writing.contains(id)), onShown: { reveal.wake(id) }) {
+                        MarkdownBlocks(blocks: blocks)
+                            .textSelection(.enabled)
+                    }
+                } else {
+                    MarkdownBlocks(blocks: blocks)
+                        .textSelection(.enabled)
+                }
                 // The answer whole, as written.
                 if let copy {
                     CopyButton(size: 14) { UIPasteboard.general.string = copy }
                 }
             }
         case let .fold(fold):
-            FoldView(fold: fold) { model.chatToggle(fold.id) }
+            FoldView(fold: fold, thumbs: feed.thumbs, show: showLooked, openFile: { model.chatOpenFile($0) }) { model.chatToggle(fold.id) }
         case let .group(group):
-            GroupView(group: group, toggle: { model.chatToggle(group.id) }, toggleFold: { model.chatToggle($0) })
+            GroupView(
+                group: group,
+                thumbs: feed.thumbs,
+                show: showLooked,
+                openFile: { model.chatOpenFile($0) },
+                toggle: { model.chatToggle(group.id) },
+                toggleFold: { model.chatToggle($0) }
+            )
         case let .note(_, text):
             Text(text)
                 .font(.footnote)
@@ -855,8 +926,9 @@ struct ChatPage: View {
     }
 
     private func askCard(_ ask: ChatAsk) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label(ask.label, systemImage: "exclamationmark.triangle")
+        let questions = ask.questions ?? []
+        return VStack(alignment: .leading, spacing: 8) {
+            Label(ask.label, systemImage: questions.isEmpty ? "exclamationmark.triangle" : "questionmark.bubble")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(waiting)
             Text(ask.question)
@@ -880,6 +952,10 @@ struct ChatPage: View {
             if let place = ask.place {
                 Text(place).font(.caption).foregroundStyle(.secondary)
             }
+            if !questions.isEmpty {
+                QuestionPicks(ask: ask, questions: questions, model: model)
+                    .id(ask.id)
+            }
             // Answered only in the agent's terminal, which is under the chat.
             if let terminal = ask.terminal {
                 Button {
@@ -893,7 +969,7 @@ struct ChatPage: View {
                 .buttonStyle(.glassProminent)
                 .padding(.top, 2)
             }
-            if let lead = ask.choices.first(where: { $0.lead }) {
+            if questions.isEmpty, let lead = ask.choices.first(where: { $0.lead }) {
                 Button {
                     model.chatAnswer(ask: ask.id, choice: lead.id)
                 } label: {
@@ -1176,6 +1252,8 @@ private struct ChatComposer: View, Equatable {
 
     @State private var text = ""
     @State private var pickingPhotos = false
+    /// The models' sheet is up.
+    @State private var pickingModel = false
     @State private var pickingFiles = false
     @State private var photos: [PhotosPickerItem] = []
     /// Bumped on each thing said, for the tap felt.
@@ -1227,9 +1305,11 @@ private struct ChatComposer: View, Equatable {
         let card = RoundedRectangle(cornerRadius: 24, style: .continuous)
         return VStack(spacing: 8) {
             if let offer {
-                CommandPalette(commands: offer.commands, menu: menu, pick: { pick($0, from: offer.from) }) { id, effort in
-                    model.chatSetModel(id, effort: effort)
+                // `/model` raises the composer's own sheet: the palette goes
+                // as the field is cleared, the sheet stays for how hard.
+                CommandPalette(commands: offer.commands, menu: menu, pick: { pick($0, from: offer.from) }) {
                     text = ""
+                    pickingModel = true
                 }
                 .transition(
                     .asymmetric(
@@ -1382,12 +1462,11 @@ private struct ChatComposer: View, Equatable {
         }
     }
 
-    /// The model in use, in the field beside send. A tap opens on the
-    /// models; one that can think more or less opens on how hard, a menu
-    /// of its own.
+    /// The model in use, in the field beside send: a tap raises the
+    /// models (`ModelSheet`).
     private func modelChip(_ menu: ChatModelMenu) -> some View {
-        Menu {
-            ModelMenu(menu: menu) { id, effort in model.chatSetModel(id, effort: effort) }
+        Button {
+            pickingModel = true
         } label: {
             HStack(spacing: 4) {
                 Text(menu.label)
@@ -1402,45 +1481,102 @@ private struct ChatComposer: View, Equatable {
             .frame(maxWidth: 210, minHeight: 44)
             .contentShape(Rectangle())
         }
-        .menuStyle(.button)
         .buttonStyle(.plain)
         .sensoryFeedback(.selection, trigger: menu.label)
         .accessibilityLabel("\(tr("chat.model")): \(menu.label)")
+        .sheet(isPresented: $pickingModel) {
+            ModelSheet(menu: menu) { id, effort in model.chatSetModel(id, effort: effort) }
+        }
     }
 }
 
-/// The models, each that thinks more or less opening on how hard: what
-/// the model chip and `/model` open on.
-private struct ModelMenu: View {
+/// The models to talk to, risen from the bottom: each with what it is for,
+/// the one in use ticked; under them, how hard the one picked thinks, side
+/// by side. What the model chip and `/model` raise. Picking a model that
+/// can think more or less keeps the sheet up for that; picking how hard,
+/// or a model that cannot, puts it away.
+private struct ModelSheet: View {
     let menu: ChatModelMenu
     let set: (String, String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+    /// The one picked here, before the host says it is in use.
+    @State private var picked: String?
 
     var body: some View {
-        Section(menu.models_heading) {
-            ForEach(menu.models) { choice in
-                if choice.efforts.isEmpty {
-                    Button {
-                        if !choice.current { set(choice.id, nil) }
-                    } label: {
-                        if choice.current { Label(choice.label, systemImage: "checkmark") } else { Text(choice.label) }
-                    }
-                } else {
-                    Menu {
-                        Section(menu.efforts_heading) {
-                            ForEach(choice.efforts) { effort in
-                                Button {
-                                    if !effort.current { set(choice.id, effort.id) }
-                                } label: {
-                                    if effort.current { Label(effort.label, systemImage: "checkmark") } else { Text(effort.label) }
+        let using = menu.models.first { $0.current }
+        let chosen = menu.models.first { $0.id == (picked ?? using?.id) } ?? using
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(menu.models) { choice in
+                        Button {
+                            picked = choice.id
+                            if !choice.current {
+                                // How hard it thinks stays as it was, where it can.
+                                let effort = using?.efforts.first(where: \.current)?.id
+                                set(choice.id, choice.efforts.contains { $0.id == effort } ? effort : nil)
+                            }
+                            if choice.efforts.isEmpty { dismiss() }
+                        } label: {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(choice.label)
+                                        .foregroundStyle(.primary)
+                                    if let words = choice.description, !words.isEmpty {
+                                        Text(words)
+                                            .font(.footnote)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                }
+                                Spacer(minLength: 0)
+                                if choice.id == chosen?.id {
+                                    Image(systemName: "checkmark")
+                                        .font(.body.weight(.semibold))
+                                        .foregroundStyle(.tint)
                                 }
                             }
+                            .contentShape(Rectangle())
                         }
-                    } label: {
-                        if choice.current { Label(choice.label, systemImage: "checkmark") } else { Text(choice.label) }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(choice.id == chosen?.id ? .isSelected : [])
+                    }
+                }
+                if let chosen, !chosen.efforts.isEmpty {
+                    // Side by side; any tap picks and puts the sheet away,
+                    // the one in use too.
+                    Section(menu.efforts_heading) {
+                        HStack(spacing: 4) {
+                            ForEach(chosen.efforts) { effort in
+                                Button {
+                                    if !(chosen.current && effort.current) { set(chosen.id, effort.id) }
+                                    dismiss()
+                                } label: {
+                                    Text(effort.label)
+                                        .font(.system(size: 14, weight: effort.current ? .semibold : .regular))
+                                        .foregroundStyle(effort.current ? .primary : .secondary)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.8)
+                                        .frame(maxWidth: .infinity, minHeight: 34)
+                                        .background(
+                                            effort.current ? Color.accentColor.opacity(0.2) : .clear,
+                                            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        )
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityAddTraits(effort.current ? .isSelected : [])
+                            }
+                        }
                     }
                 }
             }
+            .navigationTitle(menu.models_heading)
+            .navigationBarTitleDisplayMode(.inline)
         }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .sensoryFeedback(.selection, trigger: picked)
     }
 }
 
@@ -1503,7 +1639,8 @@ private struct CommandPalette: View {
     let commands: [ChatCommand]
     let menu: ChatModelMenu?
     let pick: (ChatCommand) -> Void
-    let setModel: (String, String?) -> Void
+    /// `/model`: the models' sheet.
+    let pickModel: () -> Void
 
     private let rowHeight: CGFloat = 54
     private let headingHeight: CGFloat = 30
@@ -1524,13 +1661,12 @@ private struct CommandPalette: View {
                                 .frame(height: headingHeight, alignment: .bottomLeading)
                                 .accessibilityAddTraits(.isHeader)
                         }
-                        if command.here == "model", let menu {
-                            Menu {
-                                ModelMenu(menu: menu, set: setModel)
+                        if command.here == "model", menu != nil {
+                            Button {
+                                pickModel()
                             } label: {
                                 CommandRow(command: command).frame(height: rowHeight)
                             }
-                            .menuStyle(.button)
                             .buttonStyle(.plain)
                         } else {
                             Button {
@@ -1617,23 +1753,47 @@ private func chatTimeWords(_ at: Int64) -> String {
     return day + "\n" + time
 }
 
-/// How many characters at the growing end of a reply fade in.
-private let fading = 24
-/// The slowest a reply comes in, in characters a second; and, faster, all
-/// it is behind over this many seconds, again each frame: a burst comes in
+/// The slowest a reply comes in, in lines a second; and, faster, all it is
+/// behind over this many seconds, again each frame: a burst comes in
 /// quickly at first and eases as it catches up.
-private let revealPace = 90.0
-private let revealBehind = 0.6
+private let linePace = 5.0
+private let linesBehind = 0.8
+/// How many frames the reveal goes on after nothing moved: what just came
+/// is laid out, and where its lines end known, a little later.
+private let revealSpare = 4
 
-/// How much of each reply on its way is on show. Only one begun while the
-/// chat is open is stepped (from nothing), until it has caught up and is
-/// written whole; the rest show whole and are not counted.
+/// What the reveal follows: more of a reply on its way, another begun or
+/// done being written, or one come on screen.
+private struct RevealWanted: Equatable {
+    let length: Int
+    let writing: Set<String>
+    let wakes: Int
+}
+
+/// How many lines of each reply on its way are on show. Only one begun
+/// while the chat is open is stepped (from nothing), or one being written
+/// when it opened (from as far as it had come), until it has caught up and
+/// is written whole; the rest show whole.
 @MainActor
 final class ChatReveal: ObservableObject {
-    @Published private var shown: [String: Int] = [:]
-    private var carry: [String: Double] = [:]
+    /// The whole lines on show, and how far the next has come in.
+    @Published private var shown: [String: Double] = [:]
+    private var held: [String: LineMarks] = [:]
+    /// Replies come in whole: they stay so.
+    private var done: Set<String> = []
     private var initial: Set<String> = []
     private var primed = false
+    /// When it last stepped, kept while more comes (each time more comes
+    /// the stepping starts over): no time is lost to the new start.
+    private var lastStep: Date?
+    /// Replies come on screen: one still coming in goes on where it was,
+    /// though nothing more has come of it.
+    @Published private(set) var wakes = 0
+
+    /// Reply `id` came on screen.
+    func wake(_ id: String) {
+        if shown[id] != nil { wakes += 1 }
+    }
 
     func prime(_ rows: [ChatRow]) {
         guard !primed, !rows.isEmpty else { return }
@@ -1641,14 +1801,17 @@ final class ChatReveal: ObservableObject {
         initial = Set(rows.map(\.id))
     }
 
+    /// Nothing more to step: the next stepping starts afresh.
+    func rest() {
+        lastStep = nil
+    }
+
     /// What the core let go of is let go here too.
     func prune(_ ids: Set<String>) {
         let gone = shown.keys.filter { !ids.contains($0) }
-        guard !gone.isEmpty else { return }
-        for id in gone {
-            shown[id] = nil
-            carry[id] = nil
-        }
+        for id in gone { shown[id] = nil }
+        held = held.filter { ids.contains($0.key) }
+        done.formIntersection(ids)
     }
 
     /// Whether the reply `id` is being stepped: what it has come to counts.
@@ -1656,41 +1819,64 @@ final class ChatReveal: ObservableObject {
         shown[id] != nil
     }
 
-    private func begins(_ id: String, writing: Set<String>) -> Bool {
-        primed && writing.contains(id) && !initial.contains(id)
+    func marks(_ id: String) -> LineMarks {
+        if let marks = held[id] { return marks }
+        let marks = LineMarks()
+        held[id] = marks
+        return marks
     }
 
-    func shownOf(_ row: ChatRow, writing: Set<String>) -> Int? {
-        guard case let .text(id, blocks, _) = row else { return nil }
-        guard shown[id] != nil || begins(id, writing: writing) else { return nil }
-        let at = shown[id] ?? 0
-        return at < mdLength(blocks) ? at : nil
+    /// How many lines of reply `id` show: none of one begun after the chat
+    /// opened until its first is whole; nil for all of it.
+    func lines(_ id: String, writing: Bool) -> Double? {
+        if let at = shown[id] { return at }
+        return writing && primed && !initial.contains(id) && !done.contains(id) ? 0 : nil
     }
 
-    /// One frame on: each reply behind what came of it catches up a
-    /// little. False when none is behind.
-    func step(_ texts: [(String, [MdBlock])], writing: Set<String>, seconds: Double) -> Bool {
+    /// One frame on, at `now`: each reply behind the whole lines come of it
+    /// catches up a little. False when none moved.
+    func step(_ texts: [(String, [MdBlock])], writing: Set<String>, now: Date) -> Bool {
+        let seconds = lastStep.map { min(0.1, max(0, now.timeIntervalSince($0))) } ?? 1.0 / 60
+        lastStep = now
         var moved = false
         var next = shown
-        for (id, blocks) in texts {
-            guard next[id] != nil || begins(id, writing: writing) else { continue }
-            let full = mdLength(blocks)
-            let at = next[id] ?? 0
-            if at >= full {
-                // Caught up: let go once no more is to come of it.
-                if !writing.contains(id) {
+        for (id, _) in texts {
+            let on = writing.contains(id)
+            let found = held[id]
+            let at: Double
+            if let now = next[id] {
+                at = now
+            } else {
+                guard on, primed, !done.contains(id) else { continue }
+                if initial.contains(id) {
+                    // Being written when the chat opened: as far as it had
+                    // come, the line on its way too.
+                    guard let found, found.visible else { continue }
+                    at = Double(found.ends().count)
+                } else {
+                    at = 0
+                }
+                next[id] = at
+            }
+            // Off the screen (or never on it): whole when back, once
+            // written.
+            guard let marks = found, marks.visible else {
+                if !on {
                     next[id] = nil
-                    carry[id] = nil
-                } else if next[id] != full {
-                    next[id] = full
+                    done.insert(id)
                 }
                 continue
             }
-            let pace = max(revealPace, Double(full - at) / revealBehind)
-            let gone = (carry[id] ?? 0) + pace * seconds
-            let whole = Int(gone)
-            carry[id] = gone - Double(whole)
-            next[id] = min(full, at + whole)
+            let ready = marks.ready(writing: on)
+            if at >= Double(ready) {
+                if !on {
+                    next[id] = nil
+                    done.insert(id)
+                }
+                continue
+            }
+            let pace = max(linePace, (Double(ready) - at) / linesBehind)
+            next[id] = min(Double(ready), at + pace * seconds)
             moved = true
         }
         if next != shown { shown = next }
@@ -1698,7 +1884,176 @@ final class ChatReveal: ObservableObject {
     }
 }
 
-/// How many characters `blocks` show: what a reply's growth is counted in.
+/// Where a reply's lines end, down from its top: what one on its way comes
+/// in by. Its text views say where they are (`LineMarking`), and how tall a
+/// line of theirs is; a table, how tall its rows are.
+final class LineMarks: @unchecked Sendable {
+    static let space = "tt.reply"
+    /// How tall the reply is whole.
+    var full: CGFloat = 0
+    /// On screen now.
+    var visible = false
+    private var parts: [Int: Part] = [:]
+
+    private struct Part {
+        var frame: CGRect
+        /// A line and the space after it; the space alone.
+        var pitch: CGFloat
+        var gap: CGFloat
+        /// A table's rows, how tall each.
+        var rows: [CGFloat]? = nil
+    }
+
+    func put(_ key: Int, frame: CGRect, pitch: CGFloat, gap: CGFloat) {
+        parts[key, default: Part(frame: frame, pitch: pitch, gap: gap)].frame = frame
+        parts[key]?.pitch = pitch
+        parts[key]?.gap = gap
+    }
+
+    func rows(_ key: Int, _ heights: [CGFloat]) {
+        parts[key, default: Part(frame: .zero, pitch: 0, gap: 0)].rows = heights
+    }
+
+    func drop(_ key: Int) {
+        parts[key] = nil
+    }
+
+    /// Each line's end, down from the reply's top, in order. A text view's
+    /// lines are as many as its height holds, its height shared out among
+    /// them: each end falls in the space under its line.
+    func ends() -> [CGFloat] {
+        var out: [CGFloat] = []
+        for part in parts.values {
+            if let rows = part.rows {
+                var foot = part.frame.minY
+                for row in rows {
+                    foot += row
+                    out.append(foot)
+                }
+            } else if part.pitch > 0, part.frame.height > 0 {
+                let n = max(1, Int(((part.frame.height + part.gap) / part.pitch).rounded()))
+                for i in 1...n { out.append(part.frame.minY + part.frame.height * CGFloat(i) / CGFloat(n)) }
+            }
+        }
+        return out.sorted()
+    }
+
+    /// Where the reply may stop as it comes in: each line's end, and its
+    /// own foot when below the last (a code block's margin).
+    func stops() -> [CGFloat] {
+        let ends = ends()
+        guard let last = ends.last, full <= last + 0.5 else { return ends + [full] }
+        return ends
+    }
+
+    /// How many stops may show: all of a reply written whole; of one still
+    /// written, all its lines but the last, which may not be whole yet.
+    func ready(writing: Bool) -> Int {
+        writing ? max(0, ends().count - 1) : stops().count
+    }
+}
+
+private struct LineMarksKey: EnvironmentKey {
+    static let defaultValue: LineMarks? = nil
+}
+
+extension EnvironmentValues {
+    /// The reply whose lines a text view is among, while it comes in.
+    var lineMarks: LineMarks? {
+        get { self[LineMarksKey.self] }
+        set { self[LineMarksKey.self] = newValue }
+    }
+}
+
+/// A text view's say in where its reply's lines end (`LineMarks`): where
+/// it is, and how tall a line of its is with the space after it (none for
+/// a table, which gives its rows).
+private struct LineMarking: ViewModifier {
+    let key: Int
+    var pitch: CGFloat = 0
+    var gap: CGFloat = 0
+    @Environment(\.lineMarks) private var marks
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let marks {
+            content
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(LineMarks.space)) } action: { frame in
+                    marks.put(key, frame: frame, pitch: pitch, gap: gap)
+                }
+                .onDisappear { marks.drop(key) }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// A text view in `font` with `spacing` between its lines, marking
+    /// where they end for the reply it is in.
+    fileprivate func lineMark(_ key: Int, font: UIFont, spacing: CGFloat) -> some View {
+        modifier(LineMarking(key: key, pitch: font.lineHeight + spacing, gap: spacing))
+    }
+}
+
+/// Where `lines` leave a reply: all on show down to `solid`, then the line
+/// coming in, `fade` of the way, down to `next`; the reply as tall as
+/// `height` meanwhile, growing as the line fades in.
+private struct LineCut {
+    var solid: CGFloat
+    var next: CGFloat
+    var fade: Double
+    var height: CGFloat
+}
+
+private func lineCut(_ stops: [CGFloat], _ lines: Double) -> LineCut {
+    let whole = min(max(0, Int(lines.rounded(.down))), stops.count)
+    let solid = whole == 0 ? 0 : stops[whole - 1]
+    guard whole < stops.count else { return LineCut(solid: solid, next: solid, fade: 0, height: solid) }
+    let next = stops[whole]
+    // Quick at first, settling into its place.
+    let left = 1 - (lines - Double(whole))
+    let t = 1 - left * left * left
+    return LineCut(solid: solid, next: next, fade: t, height: solid + (next - solid) * CGFloat(t))
+}
+
+/// A reply as much of it as `lines` says (nil: all), the line coming in
+/// fading in, the reply growing to hold it: never past what it has grown
+/// to, over what comes after it. `onShown` when it comes on screen.
+private struct LineReveal<Content: View>: View {
+    let marks: LineMarks
+    let lines: Double?
+    let onShown: () -> Void
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        let cut = lines.map { lineCut(marks.stops(), $0) }
+        content
+            .environment(\.lineMarks, marks)
+            .coordinateSpace(.named(LineMarks.space))
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { marks.full = $0 }
+            .mask(alignment: .top) {
+                if let cut {
+                    VStack(spacing: 0) {
+                        Rectangle().frame(height: cut.solid)
+                        Rectangle().opacity(cut.fade).frame(height: max(0, cut.height - cut.solid))
+                        Spacer(minLength: 0)
+                    }
+                } else {
+                    Rectangle()
+                }
+            }
+            .frame(height: cut?.height, alignment: .top)
+            .onAppear {
+                marks.visible = true
+                onShown()
+            }
+            .onDisappear { marks.visible = false }
+    }
+}
+
+/// How many characters `blocks` show: how much of a reply has come.
 func mdLength(_ blocks: [MdBlock]) -> Int {
     blocks.reduce(0) { $0 + mdLength($1) }
 }
@@ -1714,78 +2069,6 @@ func mdLength(_ block: MdBlock) -> Int {
     case .rule: return 1
     case let .table(_, head, rows): return ([head] + rows).reduce(0) { $0 + $1.reduce(0) { $0 + spansLength($1) } }
     }
-}
-
-/// The first `n` characters of `blocks`, the newest of them fading in.
-func mdHead(_ blocks: [MdBlock], _ n: Int) -> [MdBlock] {
-    var out: [MdBlock] = []
-    var left = n
-    for block in blocks {
-        guard left > 0 else { break }
-        let size = mdLength(block)
-        let whole = size <= left
-        switch block {
-        case let .para(spans): out.append(.para(spansHead(spans, left)))
-        case let .heading(level, spans): out.append(.heading(level, spansHead(spans, left)))
-        case let .item(depth, mark, spans): out.append(.item(depth: depth, mark: mark, spansHead(spans, left)))
-        case let .quote(spans): out.append(.quote(spansHead(spans, left)))
-        case let .code(lang, text): out.append(whole ? block : .code(lang: lang, text: String(text.prefix(left))))
-        case .rule: out.append(block)
-        // A table comes in row by row.
-        case let .table(align, head, rows):
-            if whole {
-                out.append(block)
-            } else {
-                var room = left - head.reduce(0) { $0 + spansLength($1) }
-                var kept: [[[MdSpan]]] = []
-                for row in rows where room > 0 {
-                    room -= row.reduce(0) { $0 + spansLength($1) }
-                    kept.append(row)
-                }
-                out.append(.table(align: align, head: head, rows: kept))
-            }
-        }
-        left -= size
-    }
-    return out
-}
-
-/// `spans` cut to `n` characters, the last of them fading in: the newest
-/// faintest.
-private func spansHead(_ spans: [MdSpan], _ n: Int) -> [MdSpan] {
-    var cut: [MdSpan] = []
-    var left = n
-    for span in spans {
-        guard left > 0 else { break }
-        var piece = span
-        if span.text.count > left { piece.text = String(span.text.prefix(left)) }
-        cut.append(piece)
-        left -= span.text.count
-    }
-    let total = spansLength(cut)
-    guard total > 0, n < spansLength(spans) else { return cut }
-    // Three bands at the end, each fainter than the one before it.
-    let bands = [total - fading, total - fading * 2 / 3, total - fading / 3, total]
-    let fades = [1.0, 0.75, 0.5, 0.25]
-    var out: [MdSpan] = []
-    var at = 0
-    for span in cut {
-        let characters = Array(span.text)
-        let start = at
-        let end = at + characters.count
-        at = end
-        var from = start
-        while from < end {
-            let band = bands.firstIndex { $0 > from } ?? 0
-            let to = min(end, max(bands[band], from + 1))
-            var piece = span
-            piece.text = String(characters[(from - start)..<(to - start)])
-            piece.fade = min(span.fade ?? 1, fades[band])
-            out.append(piece)
-            from = to
-        }
-    }
-    return out
 }
 
 /// A row added while the chat is on show comes in: up a little, from
@@ -1897,6 +2180,8 @@ private struct SentFiles: View {
     let files: [ChatSent]
     let pictures: [String: URL]
     let thumbs: [String: UIImage]
+    /// A file's path: what it holds, from the host.
+    let open: (String) -> Void
     let show: (ChatSent) -> Void
 
     var body: some View {
@@ -1914,12 +2199,11 @@ private struct SentFiles: View {
                         .buttonStyle(.plain)
                         .accessibilityLabel(file.name)
                     } else if let path = file.path {
-                        // Where it is on the host, to be pasted wherever it is wanted.
-                        Button { UIPasteboard.general.string = path } label: {
+                        // What it holds, from the host, on a tap.
+                        Button { open(path) } label: {
                             FileCard(name: file.name, under: nil, image: file.image)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityHint(tr("copy"))
                     } else {
                         FileCard(name: file.name, under: nil, image: file.image)
                     }
@@ -1983,6 +2267,10 @@ private struct PictureView: View {
     let file: ChatSent
     let thumb: UIImage?
     let local: URL?
+    /// The host's whole picture, once it came.
+    var sharp: UIImage? = nil
+    /// It could not be had: said so where it would be.
+    var failed = false
     let close: () -> Void
     @State private var zoom: CGFloat = 1
     @GestureState private var pinch: CGFloat = 1
@@ -1993,10 +2281,20 @@ private struct PictureView: View {
     @State private var own: UIImage?
 
     var body: some View {
-        let picture = own ?? thumb
+        let picture = own ?? sharp ?? thumb
         let scale = max(1, min(zoom * pinch, 6))
         ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
+            if picture == nil {
+                Group {
+                    if failed {
+                        Text(tr("chat.file.failed")).foregroundStyle(.white.opacity(0.8))
+                    } else {
+                        ProgressView().tint(.white)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             if let picture {
                 Image(uiImage: picture)
                     .resizable()
@@ -2058,6 +2356,208 @@ private struct PictureView: View {
     }
 }
 
+/// The pictures a call looked at, small under its line, each as wide as
+/// its shape: a tap shows one big.
+private struct ToolPictures: View {
+    let pictures: [ChatSent]
+    let thumbs: [String: UIImage]
+    let show: (ChatSent) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(pictures.enumerated()), id: \.offset) { _, picture in
+                    let thumb = picture.picture.flatMap { thumbs[$0] }
+                    let ratio = thumb.map { min(max($0.size.width / max($0.size.height, 1), 0.5), 2.2) } ?? 1.4
+                    Button { show(picture) } label: {
+                        ZStack {
+                            Color.secondary.opacity(0.12)
+                            if let thumb {
+                                Image(uiImage: thumb)
+                                    .resizable()
+                                    .scaledToFill()
+                            } else {
+                                Image(systemName: "photo")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(width: 104 * ratio, height: 104)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(thumb == nil && picture.path == nil)
+                    .accessibilityLabel(picture.name)
+                }
+            }
+        }
+    }
+}
+
+/// A file the chat named, risen from the bottom: its name, size and place
+/// over it, then what it holds -- code coloured, Markdown laid out, a
+/// picture (a tap shows it big) -- or why not. What came of it before
+/// shows while it is asked for again.
+private struct FileSheet: View {
+    let path: String
+    @ObservedObject var feed: TerminalModel.ChatFeed
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var scheme
+    @State private var big = false
+
+    var body: some View {
+        let file = feed.shown[path]
+        NavigationStack {
+            Group {
+                if let file {
+                    shown(file)
+                } else if feed.shownLate.contains(path) {
+                    waiting(tr("chat.file.failed"), busy: false)
+                } else {
+                    waiting(tr("chat.file.loading"), busy: true)
+                }
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                Text([file.flatMap { $0.kind == "none" ? nil : $0.size }, path].compactMap { $0 }.joined(separator: " · "))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity)
+            }
+            .navigationTitle(file?.name ?? (path as NSString).lastPathComponent)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { UIPasteboard.general.string = path } label: { Image(systemName: "doc.on.doc") }
+                        .accessibilityLabel(tr("chat.file.copy_path"))
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(tr("done")) { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        .fullScreenCover(isPresented: $big) {
+            if let file, let image = file.image {
+                PictureView(file: ChatSent(name: file.name, image: true, picture: nil, path: path), thumb: nil, local: nil, sharp: image) { big = false }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func shown(_ file: ChatShownFile) -> some View {
+        switch file.kind {
+        case "picture" where file.image != nil:
+            ScrollView {
+                Image(uiImage: file.image!)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .padding(16)
+                    .onTapGesture { big = true }
+                    .accessibilityAddTraits(.isButton)
+            }
+        case "markdown":
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let note = file.note { noteText(note) }
+                    MarkdownBlocks(blocks: file.blocks)
+                        .textSelection(.enabled)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+            }
+        case "code":
+            CodeLines(file: file, dark: scheme == .dark)
+        default:
+            waiting(file.note ?? tr("chat.file.failed"), busy: false)
+        }
+    }
+
+    private func noteText(_ text: String) -> some View {
+        Text(text).font(.footnote).foregroundStyle(.secondary)
+    }
+
+    private func waiting(_ words: String, busy: Bool) -> some View {
+        VStack(spacing: 12) {
+            if busy { ProgressView() }
+            Text(words)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(.top, 48)
+    }
+}
+
+/// A file's code, a line each, numbered in a gutter, long lines wrapped
+/// under their start, coloured as the host told.
+private struct CodeLines: View {
+    let file: ChatShownFile
+    let dark: Bool
+
+    var body: some View {
+        let gutter = CGFloat(String(file.lines.count).count) * 8 + 6
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if let note = file.note {
+                    Text(note).font(.footnote).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6)
+                }
+                ForEach(Array(file.lines.enumerated()), id: \.offset) { n, runs in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text("\(n + 1)")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary.opacity(0.6))
+                            .frame(width: gutter, alignment: .trailing)
+                        Text(line(runs))
+                            .font(.system(size: 12.5, design: .monospaced))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.trailing, 12)
+                    .padding(.vertical, 1)
+                }
+            }
+            .padding(.vertical, 10)
+            .textSelection(.enabled)
+        }
+    }
+
+    private func line(_ runs: [ChatCodeRun]) -> AttributedString {
+        var out = AttributedString()
+        for run in runs {
+            var piece = AttributedString(run.t)
+            if let colour = codeColour(run.k, dark: dark) { piece.foregroundColor = colour }
+            if run.k == "comment" { piece.font = .system(size: 12.5, design: .monospaced).italic() }
+            out.append(piece)
+        }
+        return out
+    }
+}
+
+/// The colour of a run of code by what it is, as Xcode's default themes
+/// colour it; none for what keeps the text's own.
+private func codeColour(_ kind: String?, dark: Bool) -> Color? {
+    func rgb(_ hex: UInt32) -> Color {
+        Color(red: Double((hex >> 16) & 0xFF) / 255, green: Double((hex >> 8) & 0xFF) / 255, blue: Double(hex & 0xFF) / 255)
+    }
+    switch kind {
+    case "keyword": return rgb(dark ? 0xFF7AB2 : 0xAD3DA4)
+    case "string": return rgb(dark ? 0xFF8170 : 0xC41A16)
+    case "comment": return rgb(dark ? 0x7F8C98 : 0x5D6C79)
+    case "number", "constant": return rgb(dark ? 0xD9C97C : 0x1C00CF)
+    case "function", "constructor": return rgb(dark ? 0x67B7A4 : 0x326D74)
+    case "type", "module": return rgb(dark ? 0x5DD8FF : 0x0B4F79)
+    case "property", "attribute", "label", "tag": return rgb(dark ? 0xA167E6 : 0x6C36A9)
+    default: return nil
+    }
+}
+
 /// While it works: what it is doing, and how long it has been at it.
 private struct BusyLine: View {
     let text: String
@@ -2104,9 +2604,15 @@ private struct BusyLine: View {
     }
 }
 
-/// What the agent did, folded into one line that opens on a tap.
+/// What the agent did, folded into one line that opens on a tap; the
+/// pictures it looked at small under it.
 private struct FoldView: View {
     let fold: ChatFold
+    let thumbs: [String: UIImage]
+    /// A picture it looked at, shown big.
+    let show: (ChatSent) -> Void
+    /// A file it names, shown in the sheet.
+    let openFile: (String) -> Void
     let toggle: () -> Void
     /// Turned at the tap, before the core's view comes back with what
     /// opens; following that view when it says otherwise.
@@ -2154,9 +2660,14 @@ private struct FoldView: View {
             }
             .buttonStyle(.plain)
             .disabled(!fold.can_open)
+            if let pictures = fold.pictures, !pictures.isEmpty {
+                ToolPictures(pictures: pictures, thumbs: thumbs, show: show)
+                    .padding(.leading, 20)
+                    .padding(.vertical, 2)
+            }
             // What opens slides open and fades in, and closes the same way.
             if fold.open, let body = fold.body {
-                FoldBodyView(shown: body)
+                FoldBodyView(shown: body, open: openFile)
                     .padding(.leading, 20)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -2180,9 +2691,13 @@ private func foldSymbol(_ icon: String) -> String {
     }
 }
 
-/// Work done between two things said, as one line; open, its folds.
+/// Work done between two things said, as one line; open, its folds;
+/// closed, their pictures small under it.
 private struct GroupView: View {
     let group: ChatGroup
+    let thumbs: [String: UIImage]
+    let show: (ChatSent) -> Void
+    let openFile: (String) -> Void
     let toggle: () -> Void
     let toggleFold: (String) -> Void
     /// Turned at the tap, before the core's view comes back.
@@ -2226,11 +2741,16 @@ private struct GroupView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            if !group.open, let pictures = group.pictures, !pictures.isEmpty {
+                ToolPictures(pictures: pictures, thumbs: thumbs, show: show)
+                    .padding(.leading, 20)
+                    .padding(.vertical, 2)
+            }
             if group.open {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(group.rows) { row in
                         if case let .fold(fold) = row {
-                            FoldView(fold: fold) { toggleFold(fold.id) }
+                            FoldView(fold: fold, thumbs: thumbs, show: show, openFile: openFile) { toggleFold(fold.id) }
                         }
                     }
                 }
@@ -2252,6 +2772,8 @@ private enum ChatColors {
 
 private struct FoldBodyView: View {
     let shown: FoldBody
+    /// A file a line names, shown in the sheet.
+    var open: (String) -> Void = { _ in }
     @Environment(\.colorScheme) private var scheme
     /// Output, lists and diffs grow with the chat's text; the boxes
     /// around them do not.
@@ -2272,24 +2794,47 @@ private struct FoldBodyView: View {
                     .padding(.vertical, 10)
             }
             .background(codeGround, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        case let .list(lines):
+        case let .list(lines, paths):
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(.system(size: 12.5 * scale, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                ForEach(Array(lines.enumerated()), id: \.offset) { n, line in
+                    // A file read opens on a tap; a search or a folder does not.
+                    let path = n < paths.count ? paths[n] : ""
+                    if path.isEmpty {
+                        Text(line)
+                            .font(.system(size: 12.5 * scale, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else {
+                        Button { open(path) } label: {
+                            Text(line)
+                                .font(.system(size: 12.5 * scale, design: .monospaced))
+                                .foregroundStyle(.tint)
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
         case let .diff(files):
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(files, id: \.self) { file in
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(file.path)
-                            .font(.system(size: 11.5 * scale, design: .monospaced))
+                        // The file as it is now, on a tap.
+                        Button { open(file.path) } label: {
+                            HStack(spacing: 6) {
+                                Text(file.path)
+                                    .font(.system(size: 11.5 * scale, design: .monospaced))
+                                    .lineLimit(1)
+                                Image(systemName: "eye")
+                                    .font(.system(size: 11))
+                                    .opacity(0.7)
+                            }
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
                         ScrollView(.horizontal, showsIndicators: false) {
                             VStack(alignment: .leading, spacing: 0) {
                                 ForEach(Array(file.lines.enumerated()), id: \.offset) { _, line in
@@ -2332,13 +2877,15 @@ private struct TableBlock: View {
     let align: [String]
     let head: [[MdSpan]]
     let rows: [[[MdSpan]]]
+    /// Told how tall its rows are, each time they are laid out.
+    var onRows: (([CGFloat]) -> Void)? = nil
     @Environment(\.chatTextScale) private var scale
 
     var body: some View {
         let columns = max(head.count, rows.map(\.count).max() ?? 0)
         let all = [head] + rows
         ScrollView(.horizontal, showsIndicators: false) {
-            TableLayout(columns: columns, widest: 240) {
+            TableLayout(columns: columns, widest: 240, onRows: onRows) {
                 ForEach(0..<(all.count * columns), id: \.self) { at in
                     let (r, c) = (at / columns, at % columns)
                     cell(c < all[r].count ? all[r][c] : [], column: c, row: r, last: r == all.count - 1)
@@ -2377,6 +2924,7 @@ private struct TableBlock: View {
 private struct TableLayout: Layout {
     let columns: Int
     let widest: CGFloat
+    var onRows: (([CGFloat]) -> Void)? = nil
 
     struct Measure {
         var widths: [CGFloat] = []
@@ -2406,6 +2954,7 @@ private struct TableLayout: Layout {
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Measure) {
+        onRows?(cache.heights)
         var y = bounds.minY
         for r in cache.heights.indices {
             var x = bounds.minX
@@ -2423,23 +2972,16 @@ private struct TableLayout: Layout {
     }
 }
 
-/// Markdown's blocks as text views.
+/// Markdown's blocks as text views. In a reply coming in a line at a time
+/// (`LineMarks`), each says where its lines are.
 struct MarkdownBlocks: View {
     let blocks: [MdBlock]
     /// Code blocks carry a copy button (what the agent said, not a fold's).
     var copies = true
-    /// The blocks in full when `blocks` is only as far as they have come
-    /// in: a code block's copy takes its code from it.
-    var whole: [MdBlock]? = nil
     @Environment(\.colorScheme) private var scheme
     @Environment(\.codeScroll) private var codeScroll
-
-    /// The code of block `at` of `whole`, when there is one.
-    private static func code(_ whole: [MdBlock]?, _ at: Int) -> String? {
-        guard let whole, at < whole.count, case let .code(_, text) = whole[at] else { return nil }
-        return text
-    }
     @Environment(\.chatTextScale) private var scale
+    @Environment(\.lineMarks) private var marks
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -2457,10 +2999,13 @@ struct MarkdownBlocks: View {
             Text(Self.attributed(spans, size: 16 * scale))
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
+                .lineMark(at, font: .systemFont(ofSize: 16 * scale), spacing: 4)
         case let .heading(level, spans):
-            Text(Self.attributed(spans, size: (level == 1 ? 20 : level == 2 ? 18 : 16.5) * scale, weight: .semibold))
+            let size = (level == 1 ? 20 : level == 2 ? 18 : 16.5) * scale
+            Text(Self.attributed(spans, size: size, weight: .semibold))
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
+                .lineMark(at, font: .systemFont(ofSize: size, weight: .semibold), spacing: 3)
                 .padding(.top, !first && level <= 2 ? 6 : 0)
         case let .item(depth, mark, spans):
             HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -2468,6 +3013,7 @@ struct MarkdownBlocks: View {
                 Text(Self.attributed(spans, size: 16 * scale))
                     .lineSpacing(4)
                     .fixedSize(horizontal: false, vertical: true)
+                    .lineMark(at, font: .systemFont(ofSize: 16 * scale), spacing: 4)
             }
             .padding(.leading, CGFloat(depth) * 18)
         case let .quote(spans):
@@ -2477,6 +3023,7 @@ struct MarkdownBlocks: View {
                     .lineSpacing(4)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                    .lineMark(at, font: .systemFont(ofSize: 16 * scale), spacing: 4)
             }
             .fixedSize(horizontal: false, vertical: true)
         case let .code(lang, text):
@@ -2490,7 +3037,7 @@ struct MarkdownBlocks: View {
                             .foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                         if copies {
-                            CopyButton(size: 12) { UIPasteboard.general.string = Self.code(whole, at) ?? text }
+                            CopyButton(size: 12) { UIPasteboard.general.string = text }
                         }
                     }
                     .padding(.leading, 12)
@@ -2502,6 +3049,7 @@ struct MarkdownBlocks: View {
                         .font(.system(size: 13 * scale, design: .monospaced))
                         .lineSpacing(2)
                         .fixedSize()
+                        .lineMark(at, font: .monospacedSystemFont(ofSize: 13 * scale, weight: .regular), spacing: 2)
                         .padding(.horizontal, 12)
                         .padding(.top, named || copies ? 0 : 10)
                         .padding(.bottom, 10)
@@ -2516,7 +3064,9 @@ struct MarkdownBlocks: View {
         case .rule:
             Divider()
         case let .table(align, head, rows):
-            TableBlock(align: align, head: head, rows: rows)
+            // A reply coming in a line at a time takes it a row at a time.
+            TableBlock(align: align, head: head, rows: rows, onRows: marks.map { marks in { marks.rows(at, $0) } })
+                .modifier(LineMarking(key: at))
         }
     }
 
@@ -2529,8 +3079,6 @@ struct MarkdownBlocks: View {
             if span.italic == true { font = font.italic() }
             piece.font = font
             if span.code == true { piece.backgroundColor = Color.primary.opacity(0.08) }
-            // Words just come in, still fading in.
-            if let fade = span.fade, fade < 1 { piece.foregroundColor = Color.primary.opacity(fade) }
             if span.strike == true { piece.strikethroughStyle = .single }
             if let link = span.link, let url = URL(string: link) {
                 piece.link = url
@@ -2539,5 +3087,106 @@ struct MarkdownBlocks: View {
             out.append(piece)
         }
         return out
+    }
+}
+
+/// A question's options: one question that takes one pick is answered by
+/// tapping it; else the picks are sent with the lead choice's button.
+struct QuestionPicks: View {
+    let ask: ChatAsk
+    let questions: [ChatQuestion]
+    let model: TerminalModel
+    @State private var picks: [Int: Set<String>] = [:]
+
+    private var instant: Bool { questions.count == 1 && !questions[0].multi }
+    private var ready: Bool { questions.indices.allSatisfy { !(picks[$0] ?? []).isEmpty } }
+    /// Each question's picks, in the order it offers them.
+    private var answers: [String] {
+        questions.enumerated().map { at, question in
+            question.options.map(\.label).filter { (picks[at] ?? []).contains($0) }.joined(separator: ", ")
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(questions.enumerated()), id: \.offset) { at, question in
+                        if questions.count > 1 {
+                            if !question.header.isEmpty {
+                                Text(question.header)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(question.question)
+                                .font(.subheadline.weight(.medium))
+                        }
+                        ForEach(question.options, id: \.label) { option in
+                            optionRow(at: at, question: question, option: option)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 380)
+            .fixedSize(horizontal: false, vertical: true)
+            if !instant, let lead = ask.choices.first(where: { $0.lead }) {
+                Button {
+                    model.chatAnswerQuestions(ask: ask.id, answers: answers)
+                } label: {
+                    Text(lead.label)
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 36)
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(!ready)
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    private func optionRow(at: Int, question: ChatQuestion, option: ChatQuestionOption) -> some View {
+        let picked = (picks[at] ?? []).contains(option.label)
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        return Button {
+            if instant {
+                model.chatAnswerQuestions(ask: ask.id, answers: [option.label])
+                return
+            }
+            var now = picks[at] ?? []
+            if !question.multi {
+                now = [option.label]
+            } else if picked {
+                now.remove(option.label)
+            } else {
+                now.insert(option.label)
+            }
+            picks[at] = now
+        } label: {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(option.label)
+                        .font(.body.weight(.semibold))
+                    if !option.description.isEmpty {
+                        Text(option.description)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+                if picked {
+                    Image(systemName: "checkmark")
+                        .foregroundStyle(.tint)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(picked ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.07), in: shape)
+            .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        // Answered only in the terminal: read here, not picked.
+        .disabled(ask.choices.isEmpty)
     }
 }

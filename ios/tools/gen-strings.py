@@ -24,6 +24,10 @@ LANGS = ["en-US", "zh-CN", "ja-JP", "fr-FR", "de-DE"]
 
 # Keys the phone app has and the prototype never had. Same order as LANGS.
 EXTRA = {
+    # The chat's file and picture viewer
+    "chat.file.loading": ["Opening…", "正在打开…", "開いています…", "Ouverture…", "Wird geöffnet…"],
+    "chat.file.failed": ["Couldn't open this file", "打不开这个文件", "このファイルを開けません", "Impossible d’ouvrir ce fichier", "Datei kann nicht geöffnet werden"],
+    "chat.file.copy_path": ["Copy path", "复制路径", "パスをコピー", "Copier le chemin", "Pfad kopieren"],
     # common
     "ok": ["OK", "好", "OK", "OK", "OK"],
     "copy": ["Copy", "复制", "コピー", "Copier", "Kopieren"],

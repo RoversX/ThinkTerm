@@ -6,7 +6,8 @@
 //! the client, [`Ev`]s from the bridge. The bridge speaks each agent's own
 //! interface -- Codex's app-server daemon, the extension ThinkTerm puts
 //! into Pi, OpenCode's background service -- and tells what happens in
-//! the shapes below, the same for
+//! the shapes below (Claude Code too, through the mod ThinkTerm puts into
+//! it), the same for
 //! every agent. Nothing here is worded for a person: the client words it,
 //! in the language it shows.
 
@@ -22,26 +23,30 @@ pub mod view;
 
 /// The command that has a running agent take ThinkTerm's extension in
 /// anew: Pi's `/reload`; OMP's reloads only its plugins, and its
-/// `/restart` the extensions too.
+/// `/restart` the extensions too; Claude Code's `/reload-plugins`.
 pub fn reload_command(agent_id: &str) -> &'static str {
-    if agent_id == "omp" {
-        "/restart"
-    } else {
-        "/reload"
+    match agent_id {
+        "omp" => "/restart",
+        "claude" => "/reload-plugins",
+        _ => "/reload",
     }
 }
 
 /// Whether a chat can be had with an agent, by the id its detection gives
 /// it (`thinkterm_proto::AgentStatus::agent_id`).
 pub fn chat_agent(agent_id: &str) -> bool {
-    matches!(agent_id, "codex" | "pi" | "omp" | "opencode")
+    matches!(agent_id, "codex" | "pi" | "omp" | "opencode" | "claude")
 }
 
 /// Bumped when a line changes meaning. Either side ignores the fields it
 /// does not know. 2: what is said may carry attachments, and the model
 /// can be changed ([`Op::SetModel`], [`Ev::Models`]). 3: the agent says
 /// what commands it takes ([`Ev::Commands`]), sent as what is said, and
-/// how full its context is ([`Ev::Context`]).
+/// how full its context is ([`Ev::Context`]). Added since, without a
+/// bump (an older side lets them go): the pictures a call looked at
+/// ([`Item::Command`], [`Item::Tool`]), a file shown on the client's
+/// asking ([`Op::Open`], [`Ev::File`]), what a model is for
+/// ([`ModelChoice::description`]).
 pub const PROTOCOL: u32 = 3;
 /// The longest line either side takes in.
 pub const MAX_LINE: usize = 8 << 20;
@@ -61,8 +66,15 @@ pub enum Op {
     /// Stop the running turn.
     Interrupt,
     /// Answer what the agent asked ([`Ask::id`]) with one of its
-    /// [`Ask::choices`].
-    Answer { ask: String, choice: Choice },
+    /// [`Ask::choices`]. A question ([`AskKind::Question`]) is answered
+    /// with `accept` and `answers`: what was picked for each of its
+    /// [`Ask::questions`], in order (several picks joined by ", ").
+    Answer {
+        ask: String,
+        choice: Choice,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<String>,
+    },
     /// History from before the oldest item sent so far.
     Older,
     /// Put ThinkTerm's extension into the agent, after an
@@ -80,6 +92,10 @@ pub enum Op {
         #[serde(default)]
         effort: Option<String>,
     },
+    /// Show the file at `path`, one the conversation named (sent, read,
+    /// changed, a picture it looked at): absolute, or from where the agent
+    /// was started. Answered by [`Ev::File`], by the bridge itself.
+    Open { path: String },
 }
 
 /// What the bridge says.
@@ -89,7 +105,7 @@ pub enum Ev {
     /// The first line once the pane's conversation is found.
     Hello {
         protocol: u32,
-        /// `codex`, `pi`, `omp`, `opencode`.
+        /// `codex`, `pi`, `omp`, `opencode`, `claude`.
         agent: String,
         /// The conversation's own name, when it has one.
         #[serde(default)]
@@ -174,7 +190,49 @@ pub enum Ev {
     /// said after history, for what it holds. A line of its own, as
     /// [`Ev::Worked`] is.
     Times { times: Vec<(String, u64)> },
+    /// How the agent takes its permission prompts, in its own word for it
+    /// (Claude Code's `default`, `acceptEdits`, `plan`, `auto`): said by a
+    /// bridge whose agent has such a mode, when it is known or changes.
+    Mode { mode: String },
+    /// A file, as [`Op::Open`] asked for it.
+    File { file: FileShown },
 }
+
+/// A file as a client shows it: its text (a code file's colours told),
+/// or a picture of it, or why neither.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileShown {
+    /// As [`Op::Open`] asked for it.
+    pub path: String,
+    /// How large it is, in bytes.
+    #[serde(default)]
+    pub size: u64,
+    /// What it holds, when that is text: the start of it, at most
+    /// [`FILE_TEXT_SHOWN`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// There is more of the text than is shown.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cut: bool,
+    /// The language its text is in, as the highlighter names it (`rust`,
+    /// `markdown`); none when not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// How the text is coloured: byte ranges of it and what each is
+    /// (`keyword`, `string`, `comment`, `function`, ...), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<(u32, u32, String)>,
+    /// A picture of it (JPEG, base64), when it is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// Why it is not shown: `missing`, `folder`, `binary`, `too_big`,
+    /// `unreadable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The most of a file's text [`Ev::File`] carries.
+pub const FILE_TEXT_SHOWN: usize = 256 << 10;
 
 impl Ev {
     /// An item, whole.
@@ -221,6 +279,10 @@ pub enum Item {
         /// search, list a folder): such runs fold together.
         #[serde(default)]
         looks: Vec<Look>,
+        /// The pictures it looked at (a picture file it read), each with
+        /// where it is, so that it can be opened.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pictures: Vec<Attachment>,
     },
     /// Files it changed.
     Edit {
@@ -235,6 +297,10 @@ pub enum Item {
         #[serde(default)]
         detail: String,
         status: Status,
+        /// The pictures that came of it (a picture looked at, a screenshot
+        /// taken), as [`Item::Command::pictures`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pictures: Vec<Attachment>,
     },
     /// Something that happened to the conversation itself.
     Note {
@@ -393,6 +459,9 @@ pub struct ModelChoice {
     /// none when it cannot be told.
     #[serde(default)]
     pub efforts: Vec<String>,
+    /// What it is for, in the agent's own words, when it says.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +479,10 @@ pub struct Look {
     pub kind: LookKind,
     /// The file or folder, or what was searched for.
     pub target: String,
+    /// Where the file read is, when `target` names it only as it is shown
+    /// (its name alone): what opens it ([`Op::Open`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +545,30 @@ pub struct Ask {
     /// only in its terminal (OMP's approvals), and the client points there.
     #[serde(default)]
     pub choices: Vec<Choice>,
+    /// What a [`AskKind::Question`] asks, one or more questions at once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<Question>,
+}
+
+/// A question the agent puts to the person, with the answers it offers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub question: String,
+    /// A word or two for it ("Library").
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    /// Several may be picked.
+    #[serde(default)]
+    pub multi: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +580,8 @@ pub enum AskKind {
     Edit,
     /// May it use another tool (`body` names it)?
     Tool,
+    /// It asks the person something ([`Ask::questions`]).
+    Question,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +642,7 @@ mod tests {
             output: "ok".into(),
             exit: Some(0),
             looks: vec![],
+            pictures: Vec::new(),
         });
         let line = serde_json::to_string(&ev).unwrap();
         assert!(line.contains(r#""ev":"item""#) && line.contains(r#""kind":"command""#));
@@ -553,7 +653,8 @@ mod tests {
             op,
             Op::Answer {
                 ask: "7".into(),
-                choice: Choice::AcceptForSession
+                choice: Choice::AcceptForSession,
+                answers: Vec::new(),
             }
         );
     }
