@@ -26,6 +26,9 @@ struct ThreadsHome: View {
     private static let backdrop = Color.chromeBackdrop
     private static let headerHeight: CGFloat = 64
     private static let footerHeight: CGFloat = 64
+    /// The widest the list runs (an iPad's): wider, it keeps to the middle,
+    /// as the grouped lists do there. Android's `READABLE_WIDTH`.
+    static let readableWidth: CGFloat = 720
 
     /// What the list leads to.
     private enum Route: Hashable {
@@ -133,18 +136,28 @@ struct ThreadsHome: View {
             }
             .padding(.horizontal, 10)
             .padding(.bottom, 12)
+            .frame(maxWidth: Self.readableWidth)
+            .frame(maxWidth: .infinity)
         }
         .scrollDismissesKeyboard(.immediately)
         .foregroundColor(.primary)
         .background(Self.backdrop.ignoresSafeArea())
+        // The bars over the list's column, as wide as it is; their ground
+        // across the whole window.
         .floatingBar(edge: .top, fading: Self.backdrop, scrim: true) {
             VStack(spacing: 0) {
                 header
                 if searching { searchField }
             }
+            .frame(maxWidth: Self.readableWidth)
+            .frame(maxWidth: .infinity)
         }
         .floatingBar(edge: .bottom, fading: Self.backdrop) {
-            if !searching { footer }
+            if !searching {
+                footer
+                    .frame(maxWidth: Self.readableWidth)
+                    .frame(maxWidth: .infinity)
+            }
         }
         .barRoom(.top, height: Self.headerHeight, $headerRoom)
         .barRoom(.bottom, height: Self.footerHeight, $footerRoom)

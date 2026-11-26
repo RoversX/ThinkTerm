@@ -556,9 +556,10 @@ struct TerminalScreen: View {
         .coordinateSpace(name: "screen")
         .background(cardsAlpha > 0 ? OverviewScreen.backdrop : model.background)
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
-            let frame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect) ?? .zero
-            // The sidebar's search has a keyboard too, and no key bar.
-            keyboardUp = frame.height > 0 && model.inputView?.isFirstResponder == true
+            // The sidebar's search has a keyboard too, and no key bar. A
+            // floating keyboard (an iPad's) leaves the bottom as it was.
+            keyboardUp = KeyboardCover.height(note, in: model.inputView?.window) > 0
+                && model.inputView?.isFirstResponder == true
             // The terminal's back before the overview it was put away for.
             if keyboardUp { moves.waiting = false }
         }

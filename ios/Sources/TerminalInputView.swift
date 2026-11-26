@@ -126,8 +126,17 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         isDirectionalLockEnabled = true
         delaysContentTouches = false
         panGestureRecognizer.maximumNumberOfTouches = 1
+        // The offset is the terminal's scroll (`runway`): a hardware key
+        // the text system passes on (Page Down while composing) must not
+        // move it.
+        allowsKeyboardScrolling = false
         delegate = self
         tap.addTarget(self, action: #selector(tapped(_:)))
+        // Control Center, the app switcher, the lock: the end of a key
+        // held then may never come here.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appSteppedBack), name: UIApplication.willResignActiveNotification, object: nil
+        )
         travel.began = { [weak self] in
             guard let self else { return }
             // Landing on the terminal as it coasts stops it.
@@ -478,6 +487,7 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
             }
         }
         let became = super.becomeFirstResponder()
+        if became { leftOptionDown = false }
         updateScreenWanted()
         return became
     }
@@ -494,6 +504,8 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         }
         // The next keyboard starts with nothing typed.
         if resigned { forgetTyped(keeping: 0) }
+        // Keys let go of elsewhere are never heard of here.
+        if resigned { leftOptionDown = false; takenPresses.removeAll(); letGoOfHeld() }
         if resigned { quiet = false }
         updateScreenWanted()
         return resigned
@@ -1030,6 +1042,9 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         case #selector(copy(_:)): return selected != nil
         case #selector(paste(_:)): return UIPasteboard.general.hasStrings
         case #selector(selectAll(_:)): return currentScreen() != nil
+        // An open composition has the keys: its candidates take the
+        // arrows, Escape and the rest.
+        case #selector(hardwareKey(_:)): return marked == nil
         default: return false
         }
     }
@@ -1093,39 +1108,234 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     // MARK: hardware keyboard
 
-    override var keyCommands: [UIKeyCommand]? {
-        var cmds: [UIKeyCommand] = []
-        let specials: [String] = [
+    /// The function row, F1 to F12, as key commands name its keys.
+    private static let functionKeys = [
+        UIKeyCommand.f1, UIKeyCommand.f2, UIKeyCommand.f3, UIKeyCommand.f4,
+        UIKeyCommand.f5, UIKeyCommand.f6, UIKeyCommand.f7, UIKeyCommand.f8,
+        UIKeyCommand.f9, UIKeyCommand.f10, UIKeyCommand.f11, UIKeyCommand.f12,
+    ]
+
+    /// A key command's key by the name the core knows it by.
+    private static let keyNames: [String: String] = {
+        var names = [
+            UIKeyCommand.inputUpArrow: "ArrowUp",
+            UIKeyCommand.inputDownArrow: "ArrowDown",
+            UIKeyCommand.inputLeftArrow: "ArrowLeft",
+            UIKeyCommand.inputRightArrow: "ArrowRight",
+            UIKeyCommand.inputHome: "Home",
+            UIKeyCommand.inputEnd: "End",
+            UIKeyCommand.inputPageUp: "PageUp",
+            UIKeyCommand.inputPageDown: "PageDown",
+            UIKeyCommand.inputEscape: "Escape",
+            "\t": "Tab",
+            "\r": "Enter",
+        ]
+        for (i, input) in functionKeys.enumerated() { names[input] = "F\(i + 1)" }
+        return names
+    }()
+
+    /// What a hardware keyboard (an iPad's, mostly) sends as keys rather
+    /// than text: the arrows, Home to Page Down, Escape, Tab and F1 to F12,
+    /// with any of Shift, Ctrl and Option on them; Enter with one of those
+    /// (bare, it is typing, which the text system has); and Ctrl with a
+    /// letter or `[ ] \ /`, the shell's own, and Ctrl+Shift and Ctrl+Option
+    /// with a letter.
+    /// Not Ctrl+Space: it switches the keyboard's language on an iPad. Key
+    /// commands, not presses, so they repeat as the system's keys do. The
+    /// delete keys are presses (`pressKey`): a key command for "Delete" is
+    /// Backspace's. Command is the system's and the edit menu's (Copy,
+    /// Paste, Select All). Made once.
+    private static let hardwareCommands: [UIKeyCommand] = {
+        let mixes: [UIKeyModifierFlags] = [
+            [], .shift, .control, .alternate,
+            [.control, .shift], [.alternate, .shift], [.control, .alternate], [.control, .alternate, .shift],
+        ]
+        let keys = [
             UIKeyCommand.inputUpArrow, UIKeyCommand.inputDownArrow,
             UIKeyCommand.inputLeftArrow, UIKeyCommand.inputRightArrow,
+            UIKeyCommand.inputHome, UIKeyCommand.inputEnd,
+            UIKeyCommand.inputPageUp, UIKeyCommand.inputPageDown,
             UIKeyCommand.inputEscape, "\t",
-        ]
-        for input in specials {
-            let c = UIKeyCommand(input: input, modifierFlags: [], action: #selector(hardwareKey(_:)))
+        ] + functionKeys
+        var cmds: [UIKeyCommand] = []
+        func add(_ input: String, _ flags: UIKeyModifierFlags) {
+            let c = UIKeyCommand(input: input, modifierFlags: flags, action: #selector(TerminalInputView.hardwareKey(_:)))
             c.wantsPriorityOverSystemBehavior = true
             cmds.append(c)
         }
-        for ch in "abcdefghijklmnopqrstuvwxyz[]\\" {
-            let c = UIKeyCommand(input: String(ch), modifierFlags: .control, action: #selector(hardwareKey(_:)))
-            c.wantsPriorityOverSystemBehavior = true
-            cmds.append(c)
+        for input in keys {
+            for flags in mixes { add(input, flags) }
+        }
+        for flags in mixes where !flags.isEmpty { add("\r", flags) }
+        for ch in "abcdefghijklmnopqrstuvwxyz[]\\/" {
+            add(String(ch), .control)
+            // With Shift, a sign is the layout's (Ctrl+? is not Ctrl+/),
+            // which is not known here; but Ctrl+Shift+\ splits the pane.
+            // Ctrl+Option with a sign is taken for AltGr's character
+            // (`keymap::map_key`). So the letters, mostly.
+            if ch.isLetter || ch == "\\" { add(String(ch), [.control, .shift]) }
+            if ch.isLetter { add(String(ch), [.control, .alternate]) }
         }
         return cmds
-    }
+    }()
+
+    override var keyCommands: [UIKeyCommand]? { Self.hardwareCommands }
 
     @objc private func hardwareKey(_ cmd: UIKeyCommand) {
+        letGoOfHeld()
         guard let input = cmd.input else { return }
-        let name: String
-        switch input {
-        case UIKeyCommand.inputUpArrow: name = "ArrowUp"
-        case UIKeyCommand.inputDownArrow: name = "ArrowDown"
-        case UIKeyCommand.inputLeftArrow: name = "ArrowLeft"
-        case UIKeyCommand.inputRightArrow: name = "ArrowRight"
-        case UIKeyCommand.inputEscape: name = "Escape"
-        case "\t": name = "Tab"
-        default: name = input
+        let flags = cmd.modifierFlags
+        let ctrl = flags.contains(.control), alt = flags.contains(.alternate), shift = flags.contains(.shift)
+        // Ctrl+Shift+C and V copy and paste, as Command's do: the
+        // selection is this view's, and the clipboard the system's.
+        if ctrl && shift && !alt && (input == "c" || input == "v") {
+            if input == "v" { paste(nil) } else if selected != nil { copy(nil) }
+            return
         }
-        model?.key(name, ctrl: cmd.modifierFlags.contains(.control), alt: cmd.modifierFlags.contains(.alternate), shift: cmd.modifierFlags.contains(.shift))
+        // A character carries its Shift, and the core is told of it too:
+        // its shortcuts (Ctrl+Shift+Z) go by it.
+        let name = Self.keyNames[input] ?? (shift ? input.uppercased() : input)
+        model?.key(name, ctrl: ctrl, alt: alt, shift: shift)
+    }
+
+    /// The left Option is down. With it a letter or sign is Alt's, as on
+    /// the desktop (`send_composed_key_when_left_alt_is_pressed`), unless
+    /// Settings says otherwise (`leftOptionAlt`); the right Option types
+    /// the keyboard's own character (å, or @ on some layouts).
+    private var leftOptionDown = false
+    /// Presses sent as keys here: their ends are not the text system's
+    /// either.
+    private var takenPresses = Set<UIPress>()
+
+    /// A key sent from a press, by the core's name for it.
+    private struct PressedKey {
+        let name: String
+        let ctrl: Bool, alt: Bool, shift: Bool
+    }
+
+    /// The last press sent as a key here, while it is held: sent again
+    /// and again, as the system repeats its keys (Delete held down).
+    /// `heldTurn` counts the presses, so a repeat of one let go stops.
+    private var held: (press: UIPress, key: PressedKey)?
+    private var heldTurn = 0
+
+    private func send(_ key: PressedKey) {
+        model?.key(key.name, ctrl: key.ctrl, alt: key.alt, shift: key.shift)
+    }
+
+    private func hold(_ press: UIPress, _ key: PressedKey) {
+        heldTurn += 1
+        held = (press, key)
+        let turn = heldTurn
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.repeatDelay) { [weak self] in self?.repeatHeld(turn) }
+    }
+
+    private func repeatHeld(_ turn: Int) {
+        guard turn == heldTurn, let held else { return }
+        // Only while this view has the keys and its window is the one
+        // typed into.
+        guard isFirstResponder, window?.isKeyWindow == true else { return letGoOfHeld() }
+        send(held.key)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.repeatEvery) { [weak self] in self?.repeatHeld(turn) }
+    }
+
+    private func letGoOfHeld() {
+        held = nil
+        heldTurn += 1
+    }
+
+    /// The system's own key repeat, as it comes: the wait before the
+    /// first repeat, and between them.
+    private static let repeatDelay: TimeInterval = 0.4
+    private static let repeatEvery: TimeInterval = 0.08
+
+    /// The keys of the number row, whatever the layout prints on them.
+    private static let numberRow: Set<UIKeyboardHIDUsage> = [
+        .keyboard1, .keyboard2, .keyboard3, .keyboard4, .keyboard5,
+        .keyboard6, .keyboard7, .keyboard8, .keyboard9, .keyboard0,
+    ]
+
+    @objc private func appSteppedBack() {
+        leftOptionDown = false
+        letGoOfHeld()
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // Option first: a key pressed with it, in the same batch, is Alt's;
+        // and one held since before this view had the keys counts too.
+        let down = presses.union(event?.allPresses ?? [])
+        if down.contains(where: { $0.key?.keyCode == .keyboardLeftAlt && $0.phase != .ended && $0.phase != .cancelled }) {
+            leftOptionDown = true
+        }
+        // Another key, a modifier too, stops the one held repeating.
+        letGoOfHeld()
+        var rest = Set<UIPress>()
+        for press in presses {
+            if let key = press.key, let sent = pressKey(key) {
+                takenPresses.insert(press)
+                send(sent)
+                hold(press, sent)
+            } else {
+                rest.insert(press)
+            }
+        }
+        if !rest.isEmpty { super.pressesBegan(rest, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let rest = letGo(presses)
+        if !rest.isEmpty { super.pressesEnded(rest, with: event) }
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let rest = letGo(presses)
+        if !rest.isEmpty { super.pressesCancelled(rest, with: event) }
+    }
+
+    /// The presses that end, less those sent as keys here.
+    private func letGo(_ presses: Set<UIPress>) -> Set<UIPress> {
+        var rest = Set<UIPress>()
+        for press in presses {
+            if press.key?.keyCode == .keyboardLeftAlt { leftOptionDown = false }
+            // Its own end, or a modifier's (Option let go turns words back
+            // into characters): the repeat stops.
+            letGoOfHeld()
+            if takenPresses.remove(press) == nil { rest.insert(press) }
+        }
+        return rest
+    }
+
+    /// What a press sends as a key, by the key it is rather than what it
+    /// types: Delete forward, with anything on it; Backspace with Ctrl or
+    /// Option (bare, or with Shift, it is the text system's); and a letter
+    /// or sign with the left Option alone, as Alt's. Nil for the text
+    /// system's: anything with Command, or with a composition open, and
+    /// the rest.
+    private func pressKey(_ key: UIKey) -> PressedKey? {
+        let flags = key.modifierFlags
+        guard !flags.contains(.command), marked == nil else { return nil }
+        let ctrl = flags.contains(.control), alt = flags.contains(.alternate), shift = flags.contains(.shift)
+        switch key.keyCode {
+        case .keyboardDeleteForward:
+            return PressedKey(name: "Delete", ctrl: ctrl, alt: alt, shift: shift)
+        case .keyboardDeleteOrBackspace:
+            guard ctrl || alt else { return nil }
+            return PressedKey(name: "Backspace", ctrl: ctrl, alt: alt, shift: shift)
+        default:
+            break
+        }
+        guard leftOptionDown, alt, !ctrl, AppSettings.shared.leftOptionAlt else { return nil }
+        let chars = key.charactersIgnoringModifiers
+        guard chars.count == 1, let ch = chars.first, let scalar = chars.unicodeScalars.first,
+              scalar.value >= 0x20, scalar.value != 0x7F,
+              !(0xF700...0xF8FF).contains(scalar.value) else { return nil }
+        // Without its modifiers a key reads as unshifted. Shift on a
+        // letter is its capital (a, и, ü); on a sign (? over /) or the
+        // number row (2 over é on a French keyboard) it is the layout's,
+        // which is not known here, so that one is the keyboard's to type.
+        let capital = chars.uppercased()
+        if shift && (!ch.isLowercase || capital.count != 1 || Self.numberRow.contains(key.keyCode)) { return nil }
+        return PressedKey(name: shift ? capital : chars, ctrl: false, alt: true, shift: shift)
     }
 
     // MARK: positions

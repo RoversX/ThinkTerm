@@ -91,10 +91,10 @@ struct KeyBar: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
             // The keyboard coming up takes the panel's place: the two
-            // never stack. A hardware keyboard (the simulator's) posts a
-            // zero-height frame and takes nothing.
-            let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
-            guard (frame?.height ?? 0) > 0 else { return }
+            // never stack. With a hardware keyboard there is none, or only
+            // an iPad's strip of shortcuts, and the panel stays; a floating
+            // keyboard leaves the bottom to it too.
+            guard KeyboardCover.height(note, in: model.inputView?.window) > KeyboardCover.softKeyboard else { return }
             withAnimation(.easeOut(duration: 0.16)) { model.panelOpen = false }
         }
     }
@@ -292,5 +292,25 @@ struct KeyBar: View {
         .foregroundColor(model.panelOpen ? .white : model.ink)
         .padding(.leading, 2)
         .padding(.trailing, 5)
+    }
+}
+
+/// How much of a window's bottom the keyboard of a keyboard notification
+/// covers, in the window's points: 0 for none, for a floating keyboard (off
+/// the bottom), or for a keyboard beside a window it does not reach (Split
+/// View, Stage Manager). The frame comes in the screen's space, which a
+/// window on an iPad need not fill.
+enum KeyboardCover {
+    /// Taller than this, it is the on-screen keyboard; lower, it is an
+    /// iPad's strip of shortcuts over a hardware keyboard.
+    static let softKeyboard: CGFloat = 120
+
+    static func height(_ note: Notification, in window: UIWindow?) -> CGFloat {
+        guard let window, let screen = window.windowScene?.screen,
+              let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
+              frame.height > 0 else { return 0 }
+        let covered = window.convert(frame, from: screen.coordinateSpace).intersection(window.bounds)
+        guard !covered.isNull, covered.height > 0, covered.maxY >= window.bounds.maxY - 1 else { return 0 }
+        return covered.height
     }
 }

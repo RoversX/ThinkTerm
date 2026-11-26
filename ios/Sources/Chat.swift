@@ -574,6 +574,10 @@ struct ChatPage: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
+                // An iPad's: the rows keep to a readable width, in the
+                // middle, and so does the field below them.
+                .frame(maxWidth: ThreadsHome.readableWidth)
+                .frame(maxWidth: .infinity)
             }
             // A swipe to the left over the rows moves them aside for their
             // times; not one that scrolls a code block, nor one from the
@@ -923,6 +927,8 @@ struct ChatPage: View {
         .padding(.horizontal, 10)
         .padding(.top, 8)
         .padding(.bottom, 6)
+        .frame(maxWidth: ThreadsHome.readableWidth)
+        .frame(maxWidth: .infinity)
     }
 
     private func askCard(_ ask: ChatAsk) -> some View {

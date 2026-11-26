@@ -117,6 +117,11 @@ final class AppSettings: ObservableObject {
     @Published var hapticKeys: Bool {
         didSet { defaults.set(hapticKeys, forKey: "key.haptics") }
     }
+    /// A hardware keyboard's left Option sends Alt (the right one types
+    /// the layout's characters), as on the desktop; off, both type them.
+    @Published var leftOptionAlt: Bool {
+        didSet { defaults.set(leftOptionAlt, forKey: "key.leftoptionalt") }
+    }
     /// The key panel opens with the software keyboard.
     @Published var autoKeyPanel: Bool {
         didSet { defaults.set(autoKeyPanel, forKey: "key.autopanel") }
@@ -190,6 +195,7 @@ final class AppSettings: ObservableObject {
         agentsOnly = d.object(forKey: "home.agents") as? Bool ?? false
         skyHaptics = d.object(forKey: "sky.haptics") as? Bool ?? true
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
+        leftOptionAlt = d.object(forKey: "key.leftoptionalt") as? Bool ?? true
         autoKeyPanel = d.object(forKey: "key.autopanel") as? Bool ?? false
         pinchZoom = d.object(forKey: "gesture.pinch") as? Bool ?? true
         twoFingerHidesKeyboard = d.object(forKey: "gesture.twofinger") as? Bool ?? true

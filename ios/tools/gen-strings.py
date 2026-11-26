@@ -334,7 +334,7 @@ EXTRA = {
     "tn.added": ["Added", "已添加", "追加済み", "Ajouté", "Hinzugefügt"],
     "tn.signin": ["Sign In to Tailscale", "登录 Tailscale", "Tailscale にログイン", "Se connecter à Tailscale", "Bei Tailscale anmelden"],
     "tn.login.body": ["Sign in to Tailscale in the browser; it connects by itself once you have.", "在浏览器里登录 Tailscale，登录后自动连上。", "ブラウザで Tailscale にログインすると、自動で接続します。", "Connectez-vous à Tailscale dans le navigateur ; la connexion se fait d’elle-même ensuite.", "Melde dich im Browser bei Tailscale an; danach verbindet es sich von selbst."],
-    "tn.connected.body": ["This phone is in your tailnet; its other machines are on the Hosts page.", "这台手机在你的 tailnet 里，主机页能看到其他机器。", "この端末は tailnet に参加しています。ほかのマシンはホストのページにあります。", "Ce téléphone est dans votre tailnet ; ses autres machines sont sur la page Hôtes.", "Dieses Telefon ist in deinem Tailnet; die anderen Geräte findest du unter Hosts."],
+    "tn.connected.body": ["This device is in your tailnet; its other machines are on the Hosts page.", "这台设备在你的 tailnet 里，主机页能看到其他机器。", "この端末は tailnet に参加しています。ほかのマシンはホストのページにあります。", "Cet appareil est dans votre tailnet ; ses autres machines sont sur la page Hôtes.", "Dieses Gerät ist in deinem Tailnet; die anderen Geräte findest du unter Hosts."],
     "tn.qr.title": ["Sign In on Another Device", "用另一台设备登录", "別の端末でログイン", "Se connecter sur un autre appareil", "Auf einem anderen Gerät anmelden"],
     "tn.thisdevice": ["This Device", "这台设备", "この端末", "Cet appareil", "Dieses Gerät"],
     "tn.address": ["Address", "地址", "アドレス", "Adresse", "Adresse"],
@@ -472,11 +472,11 @@ EXTRA = {
     "lock.after.1200": ["20 minutes", "20 分钟", "20 分", "20 minutes", "20 Minuten"],
     "lock.after.3600": ["1 hour", "1 小时", "1 時間", "1 heure", "1 Stunde"],
     "lock.note.ios": [
-        "Opening ThinkTerm asks for Face ID or your passcode. Back within the time set, it does not ask again.",
-        "打开 ThinkTerm 时需要面容 ID 或密码。离开不超过设定的时间，回来不用再验证。",
-        "ThinkTerm を開くと Face ID またはパスコードを求めます。設定した時間内に戻れば、もう一度は求めません。",
-        "À l’ouverture, ThinkTerm demande Face ID ou votre code. De retour dans le délai choisi, il ne redemande pas.",
-        "Beim Öffnen fragt ThinkTerm nach Face ID oder Ihrem Code. Zurück innerhalb der eingestellten Zeit, fragt es nicht erneut.",
+        "Opening ThinkTerm asks for Face ID, Touch ID or your passcode. Back within the time set, it does not ask again.",
+        "打开 ThinkTerm 时需要面容 ID、触控 ID 或密码。离开不超过设定的时间，回来不用再验证。",
+        "ThinkTerm を開くと Face ID、Touch ID、またはパスコードを求めます。設定した時間内に戻れば、もう一度は求めません。",
+        "À l’ouverture, ThinkTerm demande Face ID, Touch ID ou votre code. De retour dans le délai choisi, il ne redemande pas.",
+        "Beim Öffnen fragt ThinkTerm nach Face ID, Touch ID oder Ihrem Code. Zurück innerhalb der eingestellten Zeit, fragt es nicht erneut.",
     ],
     "lock.note.android": [
         "Opening ThinkTerm asks for your fingerprint, face or screen lock. Back within the time set, it does not ask again.",
@@ -486,11 +486,11 @@ EXTRA = {
         "Beim Öffnen fragt ThinkTerm nach Fingerabdruck, Gesicht oder Displaysperre. Zurück innerhalb der eingestellten Zeit, fragt es nicht erneut.",
     ],
     "lock.nopasscode.ios": [
-        "Set a passcode in the iPhone’s Settings first.",
-        "请先在 iPhone 的设置里设置密码。",
-        "先に iPhone の設定でパスコードを設定してください。",
-        "Définissez d’abord un code dans les Réglages de l’iPhone.",
-        "Legen Sie zuerst in den Einstellungen des iPhone einen Code fest.",
+        "Set a passcode in the Settings app first.",
+        "请先在“设置”App 里设置密码。",
+        "先に設定アプリでパスコードを設定してください。",
+        "Définissez d’abord un code dans l’app Réglages.",
+        "Legen Sie zuerst in der Einstellungen-App einen Code fest.",
     ],
     "lock.nopasscode.android": [
         "Set a screen lock in the phone’s Settings first.",
@@ -515,6 +515,15 @@ EXTRA = {
         "本人確認してロックをオフにします",
         "Confirmez votre identité pour désactiver le verrouillage",
         "Bestätigen Sie Ihre Identität, um die Sperre auszuschalten",
+    ],
+    # A hardware keyboard's left Option (Settings > Keyboard)
+    "k.optionalt": ["Left Option as Alt", "左 Option 键作 Alt", "左 Option キーを Alt として使う", "Option gauche comme Alt", "Linke Wahltaste als Alt"],
+    "k.optionalt.note": [
+        "For a hardware keyboard: the left Option key sends Alt, as terminals use it (Alt+B goes back a word); the right one types the keyboard’s own characters. Off, both type them, as some layouts need for @ or [.",
+        "外接键盘用：左 Option 键当 Alt 发送，终端里常用（比如 Alt+B 后退一个词）；右 Option 照常打出键盘上的字符。关掉后两边都打字符，有些键盘布局要靠它打 @ 或 [。",
+        "ハードウェアキーボード用：左の Option キーを Alt として送ります（Alt+B で 1 語戻るなど）。右の Option はキーボードの文字を入力します。オフにすると両方とも文字を入力します（配列によっては @ や [ に必要です）。",
+        "Pour un clavier physique : la touche Option de gauche envoie Alt, comme dans un terminal (Alt+B recule d’un mot) ; celle de droite tape les caractères du clavier. Désactivé, les deux les tapent, comme @ ou [ sur certaines dispositions.",
+        "Für eine Hardwaretastatur: Die linke Wahltaste sendet Alt, wie im Terminal üblich (Alt+B springt ein Wort zurück); die rechte tippt die Zeichen der Tastatur. Aus, tippen beide sie, wie manche Layouts es für @ oder [ brauchen.",
     ],
 }
 

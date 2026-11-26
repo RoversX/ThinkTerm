@@ -294,6 +294,11 @@ struct SettingsPageView: View {
                 }
                 Toggle(tr("k.haptics"), isOn: $settings.hapticKeys)
             }
+            Section {
+                Toggle(tr("k.optionalt"), isOn: $settings.leftOptionAlt)
+            } footer: {
+                Text(tr("k.optionalt.note"))
+            }
         case .gestures:
             Section {
                 Toggle(tr("g.pinch"), isOn: $settings.pinchZoom)
