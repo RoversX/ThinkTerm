@@ -284,7 +284,15 @@ data class ChatSent(val name: String, val image: Boolean, val picture: String?, 
 sealed class ChatRow {
     abstract val id: String
 
-    data class User(override val id: String, val text: String, val attachments: List<ChatSent>) : ChatRow()
+    /// `sending`: "sending" until the agent takes it, shown faded, or
+    /// "failed", with `failed` under it and a tap sending it again.
+    data class User(
+        override val id: String,
+        val text: String,
+        val attachments: List<ChatSent>,
+        val sending: String? = null,
+        val failed: String? = null,
+    ) : ChatRow()
     /// `copy`: the words as written, for the last reply of a turn.
     data class Text(override val id: String, val blocks: List<MdBlock>, val copy: String? = null) : ChatRow()
     data class Fold(
@@ -509,7 +517,13 @@ object ChatViews {
     private fun row(r: JSONObject): ChatRow? {
         val id = r.optString("id")
         return when (r.optString("kind")) {
-            "user" -> ChatRow.User(id, r.optString("text"), sent(r.optJSONArray("attachments")))
+            "user" -> ChatRow.User(
+                id,
+                r.optString("text"),
+                sent(r.optJSONArray("attachments")),
+                r.optStringOrNull("sending"),
+                r.optStringOrNull("failed"),
+            )
             "text" -> ChatRow.Text(id, blocks(r.optJSONArray("blocks")), r.optStringOrNull("copy"))
             "fold" -> ChatRow.Fold(
                 id = id,
@@ -1065,7 +1079,10 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean, revea
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     when (row) {
         is ChatRow.User -> Column(
-            Modifier.fillMaxWidth(),
+            Modifier
+                .fillMaxWidth()
+                // On its way, faint until the agent takes it.
+                .graphicsLayer { alpha = if (row.sending == "sending") 0.55f else 1f },
             horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -1083,6 +1100,22 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean, revea
                             .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFE9E9EB))
                             .padding(horizontal = 14.dp, vertical = 9.dp),
                     )
+                }
+            }
+            // Not sent: said so under it, and a tap sends it again.
+            if (row.sending == "failed") {
+                val again = row.failed.orEmpty()
+                Row(
+                    Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(role = Role.Button) { model.chatResend(row.id) }
+                        .semantics { contentDescription = again }
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    DesktopIcon("triangle-alert", size = 14.dp, tint = Color(0xFFFF453A))
+                    Text(again, fontSize = 12.5.sp, color = Color(0xFFFF453A))
                 }
             }
         }

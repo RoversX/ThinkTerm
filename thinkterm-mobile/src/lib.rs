@@ -922,6 +922,11 @@ impl Core {
         }));
     }
 
+    /// Send again what was said as the user row `id` and did not go.
+    pub fn chat_resend(&self, id: String) {
+        let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Resend(id)));
+    }
+
     pub fn chat_interrupt(&self) {
         let _ = self.tx.send(core::Cmd::Chat(core::ChatCmd::Interrupt));
     }

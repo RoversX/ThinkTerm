@@ -1415,6 +1415,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func chatAnswer(ask: String, choice: String) { core.chatAnswer(ask: ask, choice: choice) }
     func chatAnswerQuestions(ask: String, answers: [String]) { core.chatAnswerQuestions(ask: ask, answers: answers) }
     func chatInterrupt() { core.chatInterrupt() }
+    /// Send again what was said as the user row `id` and did not go.
+    func chatResend(_ id: String) { core.chatResend(id: id) }
     func chatOlder() { core.chatOlder() }
     func chatAction(_ action: String) { core.chatAction(action: action) }
     func chatToggle(_ row: String) { core.chatToggle(row: row) }

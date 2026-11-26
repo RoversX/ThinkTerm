@@ -152,7 +152,9 @@ struct ChatSent: Decodable, Hashable {
 }
 
 enum ChatRow: Decodable, Identifiable {
-    case user(id: String, text: String, attachments: [ChatSent])
+    /// `sending`: "sending" until the agent takes it, shown faded, or
+    /// "failed", with `failed` under it and a tap sending it again.
+    case user(id: String, text: String, attachments: [ChatSent], sending: String?, failed: String?)
     /// `copy`: the words as written, for the last reply of a turn.
     case text(id: String, blocks: [MdBlock], copy: String?)
     case fold(ChatFold)
@@ -163,7 +165,7 @@ enum ChatRow: Decodable, Identifiable {
 
     var id: String {
         switch self {
-        case let .user(id, _, _): return id
+        case let .user(id, _, _, _, _): return id
         case let .text(id, _, _): return id
         case let .note(id, _, _, _): return id
         case let .fold(fold): return fold.id
@@ -171,7 +173,7 @@ enum ChatRow: Decodable, Identifiable {
         }
     }
 
-    private enum Key: String, CodingKey { case kind, id, text, blocks, attachments, copy, aside, done }
+    private enum Key: String, CodingKey { case kind, id, text, blocks, attachments, copy, aside, done, sending, failed }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Key.self)
@@ -181,7 +183,9 @@ enum ChatRow: Decodable, Identifiable {
             self = .user(
                 id: id,
                 text: try c.decode(String.self, forKey: .text),
-                attachments: (try? c.decode([ChatSent].self, forKey: .attachments)) ?? []
+                attachments: (try? c.decode([ChatSent].self, forKey: .attachments)) ?? [],
+                sending: try? c.decode(String.self, forKey: .sending),
+                failed: try? c.decode(String.self, forKey: .failed)
             )
         case "text": self = .text(id: id, blocks: try c.decode([MdBlock].self, forKey: .blocks), copy: try? c.decode(String.self, forKey: .copy))
         case "fold": self = .fold(try ChatFold(from: decoder))
@@ -848,7 +852,7 @@ struct ChatPage: View {
     @ViewBuilder
     private func rowView(_ row: ChatRow, reveal: ChatReveal? = nil, writing: Set<String> = []) -> some View {
         switch row {
-        case let .user(_, text, attachments):
+        case let .user(id, text, attachments, sending, failed):
             VStack(alignment: .trailing, spacing: 6) {
                 if !attachments.isEmpty {
                     SentFiles(files: attachments, pictures: feed.pictures, thumbs: feed.thumbs, open: { model.chatOpenFile($0) }) { shownPicture = $0 }
@@ -868,7 +872,24 @@ struct ChatPage: View {
                             )
                     }
                 }
+                // Not sent: said so under it, and a tap sends it again.
+                if sending == "failed" {
+                    Button { model.chatResend(id) } label: {
+                        HStack(spacing: 6) {
+                            DesktopIcon(name: "triangle-alert", size: 14)
+                            Text(failed ?? "")
+                                .font(.footnote)
+                        }
+                        .foregroundColor(.red)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
+            // On its way, faint until the agent takes it.
+            .opacity(sending == "sending" ? 0.55 : 1)
             .frame(maxWidth: .infinity, alignment: .trailing)
         case let .text(id, blocks, copy):
             // On its way, it grows a whole line at a time, each fading in.

@@ -289,6 +289,8 @@ pub enum ChatCmd {
     Load,
     /// Open its channel again, after it ended.
     Retry,
+    /// Send again what was said as this row's id and did not go.
+    Resend(String),
     /// Open or fold a row.
     Toggle(String),
     /// Show the file at `path`, as the conversation named it: its text or
@@ -788,7 +790,12 @@ impl State {
                 // with.
                 let refused = attachments.is_empty() && self.chat.as_mut().is_some_and(|chat| !chat.model.may_send(&text));
                 if !refused {
-                    self.chat_op_or_end(ChatOp::Send { text, attachments });
+                    self.chat_say(text, attachments);
+                }
+            }
+            ChatCmd::Resend(id) => {
+                if let Some((text, attachments)) = self.chat.as_mut().and_then(|chat| chat.model.resend(&id)) {
+                    self.chat_send_as(Some(id), text, attachments);
                 }
             }
             ChatCmd::SetModel { model, effort } => {
@@ -1009,12 +1016,67 @@ impl State {
 
     /// Whether `op` went out to the chat's bridge.
     fn chat_op(&mut self, op: ChatOp) -> bool {
-        if self.chat.is_none() {
+        let Some(chat) = self.chat.as_mut() else {
             return false;
-        }
-        match (&self.link, serde_json::to_string(&op)) {
+        };
+        let sent = match (&self.link, serde_json::to_string(&op)) {
             (Some(link), Ok(line)) => link.chat_send(line),
             _ => false,
+        };
+        if sent {
+            // A refusal that comes next is of this, not of words said.
+            chat.model.sent_as(None);
+        }
+        sent
+    }
+
+    /// Words for the agent, and the files with them: on show at once as
+    /// sending, and sent now while the chat is connected -- else held, to
+    /// go once it is (`chat_send_held`). A command, which shows no row, is
+    /// put back in the field while it is not.
+    fn chat_say(&mut self, text: String, attachments: Vec<thinkterm_agent_chat::Attachment>) {
+        let Some(chat) = self.chat.as_mut() else {
+            return;
+        };
+        let connected = chat.model.connected();
+        match chat.model.sending(&text, &attachments) {
+            Some(_) if !connected => {}
+            None if !connected => chat.model.command_not_sent(&text),
+            id => self.chat_send_as(id, text, attachments),
+        }
+    }
+
+    /// Send what was said as `id` (none for a command). Words that cannot
+    /// go out now are held, to go once the chat is connected again: the
+    /// connection's going says the chat is cut off. A command is put back
+    /// in the field.
+    fn chat_send_as(&mut self, id: Option<String>, text: String, attachments: Vec<thinkterm_agent_chat::Attachment>) {
+        let sent = self.chat_op(ChatOp::Send { text: text.clone(), attachments });
+        let Some(chat) = self.chat.as_mut() else {
+            return;
+        };
+        match (sent, id) {
+            (true, id) => chat.model.sent_as(id),
+            (false, Some(id)) => chat.model.hold(&id),
+            (false, None) => chat.model.command_not_sent(&text),
+        }
+    }
+
+    /// What was said while the chat was not connected, sent now that it is.
+    fn chat_send_held(&mut self) {
+        let held = match self.chat.as_mut() {
+            Some(chat) => chat.model.take_held(),
+            None => return,
+        };
+        let several = held.len() > 1;
+        for (id, text, attachments) in held {
+            self.chat_send_as(Some(id), text, attachments);
+        }
+        // A refusal that comes now cannot be told to be of which.
+        if several {
+            if let Some(chat) = self.chat.as_mut() {
+                chat.model.sent_as(None);
+            }
         }
     }
 
@@ -1975,6 +2037,8 @@ impl State {
             Net::ChatLine { generation, line } => {
                 if let Some(chat) = self.chat.as_mut().filter(|chat| chat.generation == generation) {
                     if chat.model.line(&line) {
+                        // What was said while it connected goes once it is.
+                        self.chat_send_held();
                         // Lines close together are shown together.
                         self.chat_owed = true;
                         self.publish_chat_owed();

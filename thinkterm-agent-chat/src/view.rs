@@ -84,6 +84,38 @@ pub struct Chat {
     /// Cut off, and being opened again by itself (`lost`): said as
     /// reconnecting, not as a chat that ended, until the bridge greets.
     again: bool,
+    /// What the person said that the agent has not taken yet, oldest
+    /// first: on show at once at the end, faded, until the item it becomes
+    /// comes; marked when it did not go, to be sent again.
+    outgoing: Vec<Outgoing>,
+    sent_count: u64,
+    /// The last op that went to the bridge, when it was something said
+    /// (`sent_as`): a refusal that comes next is of it.
+    last_sent: Option<String>,
+    /// Items of the person's that stand for something said here, by their
+    /// id: shown under the id its outgoing row had, so the row stays.
+    stand_ins: HashMap<String, String>,
+    /// The last thing said that an item took, and that item's id: a bridge
+    /// that shows what was said at once (Claude's) may still be refused it
+    /// just after, and then it is put back as not sent.
+    last_taken: Option<(String, Outgoing)>,
+    /// The bridge greeted on this channel and has sent its history since:
+    /// what is held goes only then, so that what the history shows arrived
+    /// already is not sent twice.
+    history_seen: bool,
+}
+
+/// Something said, on its way to the agent.
+#[derive(Debug, Clone)]
+struct Outgoing {
+    id: String,
+    text: String,
+    attachments: Vec<Attachment>,
+    /// Why it did not go, when it did not.
+    failed: Option<String>,
+    /// Said while the chat was not connected: it goes once it is
+    /// (`take_held`), as nothing of it left the phone.
+    held: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +145,8 @@ pub struct ChatView {
     /// Something to tell once: shown when `seq` is new.
     pub notice: Option<NoticeView>,
     pub placeholder: String,
+    /// Words can be sent: while it connects too, as they are held and go
+    /// once it is (`Chat::take_held`); not while something is wrong.
     pub can_send: bool,
     pub can_stop: bool,
     /// Files and pictures can be sent along (a bridge that takes them).
@@ -261,6 +295,13 @@ pub enum Row {
         text: String,
         /// Pictures and files sent with it.
         attachments: Vec<AttachmentView>,
+        /// Not taken by the agent yet: `sending`, shown faded, or
+        /// `failed`, shown as not sent, to be tapped to send again.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sending: Option<&'static str>,
+        /// Said under one that failed: what a tap does.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failed: Option<String>,
     },
     Text {
         id: String,
@@ -495,6 +536,13 @@ impl Chat {
                 guessed,
                 protocol,
             } => {
+                // What is held was said to this agent, in the conversation
+                // on show: one picked among several, or another agent in the
+                // pane, is not sure to be it -- left for the person to send.
+                if guessed || (self.protocol != 0 && agent != self.agent) {
+                    self.give_up("the conversation changed");
+                }
+                self.history_seen = false;
                 self.agent = agent;
                 self.protocol = protocol;
                 // An extension's greeting is taken as current; the bridge
@@ -520,11 +568,21 @@ impl Chat {
                 }
             }
             Ev::History { mut items, more, reset } => {
+                // Only an item new to the chat can be what was said here
+                // just now: one held already, or from older pages, came
+                // before it, whatever its words.
+                let known: HashSet<String> = self.items.iter().map(|item| item.id().to_string()).collect();
                 for item in &mut items {
                     self.keep_pictures(item);
+                    if reset && !known.contains(item.id()) {
+                        self.taken(item, false);
+                    }
                 }
                 if reset {
+                    self.history_seen = true;
                     self.items = items;
+                    let held: HashSet<&str> = self.items.iter().map(Item::id).collect();
+                    self.stand_ins.retain(|id, _| held.contains(id.as_str()));
                     self.limit = ITEMS_KEPT;
                     self.let_go_of_pictures();
                     self.writing.clear();
@@ -546,6 +604,8 @@ impl Chat {
             Ev::Item { mut item, partial } => {
                 self.keep_pictures(&mut item);
                 let id = item.id().to_string();
+                let fresh = !self.items.iter().any(|held| held.id() == id);
+                self.taken(&item, fresh);
                 // Only a turn under way writes: one sent after it ended (a
                 // last flush after a stop) is all there is of it.
                 if partial && self.state == Some(AgentState::Working) {
@@ -588,15 +648,27 @@ impl Chat {
                 self.problem = Some((Some(Need::PiRestart), String::new()));
             }
             Ev::Refused { message } => {
-                // What was refused may be the older history asked for, or
-                // the reload sent.
+                // What was refused may be the older history asked for, the
+                // reload sent, or what was just said: then marked as not
+                // sent.
+                let theirs = self.loading_older || self.reloading;
                 self.loading_older = false;
                 self.reloading = false;
+                if let Some(id) = self.last_sent.take().filter(|_| !theirs) {
+                    self.refused_send(&id, &message);
+                }
                 let mut args = FluentArgs::new();
                 args.set("why", message);
                 self.notify(tr_args("chat-refused", &args));
             }
             Ev::Error { need, message, can_load } => {
+                // A card the person can act on (Load, Install) may still
+                // lead to the chat: what is held waits for it.
+                if can_load || matches!(need, Some(Need::PiRestart | Need::PiExtension)) {
+                    self.unsure("the chat stopped");
+                } else {
+                    self.give_up("the chat stopped");
+                }
                 self.problem = Some((need, message));
                 self.can_load = can_load;
                 self.loading = None;
@@ -634,6 +706,7 @@ impl Chat {
     /// The channel to the bridge ended: `missing` when the host's ThinkTerm
     /// has no bridge (an older one).
     pub fn ended(&mut self, missing: bool, reason: &str) {
+        self.give_up(reason);
         if missing {
             self.problem = Some((Some(Need::Bridge), reason.to_string()));
         } else if self.problem.is_none() {
@@ -650,6 +723,8 @@ impl Chat {
     /// wait): said as reconnecting, what was held still on show, nothing
     /// asked of the person.
     pub fn lost(&mut self) {
+        self.unsure("the connection dropped");
+        self.history_seen = false;
         self.problem = None;
         self.state = None;
         self.asks.clear();
@@ -682,6 +757,11 @@ impl Chat {
     /// A new channel is on its way: what was held stays on show until
     /// the bridge sends it again.
     pub fn reconnecting(&mut self) {
+        // What went on the channel before is not sure to have reached the
+        // agent; what is held goes on the new one.
+        self.unsure("the chat was opened again");
+        self.last_sent = None;
+        self.history_seen = false;
         self.problem = None;
         self.state = None;
         self.asks.clear();
@@ -870,6 +950,9 @@ impl Chat {
             let extra = self.items.len() - self.limit;
             for item in self.items.drain(..extra) {
                 self.times.remove(item.id());
+                if let Some(row) = self.stand_ins.remove(item.id()) {
+                    self.times.remove(&row);
+                }
             }
             self.let_go_of_pictures();
             self.more = false;
@@ -960,7 +1043,7 @@ impl Chat {
             }),
             placeholder: tr_args("chat-placeholder", &args),
             pane: self.pane,
-            can_send: self.problem.is_none() && self.state.is_some(),
+            can_send: self.problem.is_none(),
             can_stop: self.problem.is_none() && self.state == Some(AgentState::Working),
             can_attach: self.problem.is_none() && self.protocol >= 2,
             commands: self.command_views(),
@@ -1000,8 +1083,185 @@ impl Chat {
             }
             i += 1;
         }
+        // Before what is on its way is put after it: a reply still being
+        // written is no finished answer for a row the agent has not taken.
         self.mark_answers(&mut rows, resting);
+        // What was said here and not taken yet, after all of it.
+        for out in &self.outgoing {
+            rows.push(Row::User {
+                id: out.id.clone(),
+                text: out.text.clone(),
+                attachments: out
+                    .attachments
+                    .iter()
+                    .map(|sent| AttachmentView {
+                        name: sent.name.clone(),
+                        image: sent.image,
+                        picture: None,
+                        path: sent.path.clone(),
+                    })
+                    .collect(),
+                sending: Some(if out.failed.is_some() { "failed" } else { "sending" }),
+                failed: out.failed.as_ref().map(|_| tr("chat-not-sent")),
+            });
+        }
         rows
+    }
+
+    /// The agent can be spoken to now: greeted, and nothing wrong.
+    pub fn connected(&self) -> bool {
+        self.problem.is_none() && self.state.is_some()
+    }
+
+    /// The person said `text`, with `attachments`: on show at once as
+    /// sending, until the agent takes it. Its id, for whether it went
+    /// (`sent_as`, `not_sent`) -- none for a command (`/compact`), which no
+    /// agent shows as said; words that only start with a slash (a path) or
+    /// a dollar sign are words. Said while the chat is not connected, it is
+    /// held, to go once it is (`take_held`).
+    pub fn sending(&mut self, text: &str, attachments: &[Attachment]) -> Option<String> {
+        let words = text.trim();
+        if attachments.is_empty() && (words.is_empty() || command_typed(words).is_some()) {
+            return None;
+        }
+        self.sent_count += 1;
+        let id = format!("outgoing-{}", self.sent_count);
+        self.times.insert(id.clone(), now());
+        self.outgoing.push(Outgoing {
+            id: id.clone(),
+            text: text.to_string(),
+            attachments: attachments.to_vec(),
+            failed: None,
+            held: !self.connected(),
+        });
+        Some(id)
+    }
+
+    /// The op that just went to the bridge: what was said as `id`, or
+    /// something else (`None`). A refusal that comes next is of it.
+    pub fn sent_as(&mut self, id: Option<String>) {
+        self.last_sent = id;
+    }
+
+    /// What was said and held while the chat was not connected, to go now
+    /// that it is, and the bridge has sent its history (which shows what
+    /// arrived already): id, words and files. None until then.
+    pub fn take_held(&mut self) -> Vec<(String, String, Vec<Attachment>)> {
+        if !self.connected() || !self.history_seen {
+            return Vec::new();
+        }
+        self.outgoing
+            .iter_mut()
+            .filter(|out| out.held && out.failed.is_none())
+            .map(|out| {
+                out.held = false;
+                (out.id.clone(), out.text.clone(), out.attachments.clone())
+            })
+            .collect()
+    }
+
+    /// What was said as `id` could not go out now: held, to go once the
+    /// chat is connected again.
+    pub fn hold(&mut self, id: &str) {
+        if let Some(out) = self.outgoing.iter_mut().find(|out| out.id == id) {
+            out.held = true;
+        }
+    }
+
+    /// What was said as `id` did not go (`why`, in English): marked, to be
+    /// sent again.
+    pub fn not_sent(&mut self, id: &str, why: &str) {
+        if let Some(out) = self.outgoing.iter_mut().find(|out| out.id == id) {
+            out.failed = Some(why.to_string());
+            out.held = false;
+        }
+    }
+
+    /// The bridge refused what was said as `id`, just after it went: marked
+    /// as not sent -- put back first when a bridge that shows what was said
+    /// at once (Claude's) had shown it already.
+    fn refused_send(&mut self, id: &str, why: &str) {
+        if !self.outgoing.iter().any(|out| out.id == id) {
+            let Some((item, mut out)) = self.last_taken.take().filter(|(_, out)| out.id == id) else {
+                return;
+            };
+            self.items.retain(|held| held.id() != item);
+            self.stand_ins.remove(&item);
+            out.held = false;
+            self.outgoing.push(out);
+        }
+        self.not_sent(id, why);
+    }
+
+    /// A command typed while the chat is not connected: not sent, and back
+    /// in the field to send once it is. A reload it was is not on its way.
+    pub fn command_not_sent(&mut self, text: &str) {
+        self.reloading = false;
+        self.notify_keeping(tr("chat-not-connected"), Some(text.to_string()));
+    }
+
+    /// What was said as `id`, to be sent again: its words and files to send
+    /// now, or none while the chat is not connected -- it is held then, to
+    /// go once it is.
+    pub fn resend(&mut self, id: &str) -> Option<(String, Vec<Attachment>)> {
+        let ready = self.connected() && self.history_seen;
+        let out = self.outgoing.iter_mut().find(|out| out.id == id && out.failed.is_some())?;
+        out.failed = None;
+        out.held = !ready;
+        ready.then(|| (out.text.clone(), out.attachments.clone()))
+    }
+
+    /// Nothing said here that went out and is still on its way is sure to
+    /// have reached the agent: marked, to be sent again -- what did reach
+    /// it is taken from the history the channel sends anew. What is held
+    /// never left, and still goes once the chat is back.
+    fn unsure(&mut self, why: &str) {
+        for out in self.outgoing.iter_mut().filter(|out| !out.held) {
+            out.failed.get_or_insert_with(|| why.to_string());
+        }
+    }
+
+    /// The chat stopped, and does not come back by itself: all that is on
+    /// its way, held or not, is marked, to be sent again.
+    fn give_up(&mut self, why: &str) {
+        for out in &mut self.outgoing {
+            out.held = false;
+            out.failed.get_or_insert_with(|| why.to_string());
+        }
+        self.last_sent = None;
+    }
+
+    /// An item of the person's came (`fresh`: just now, not in history):
+    /// what was said here and is it goes from the rows on their way -- the
+    /// one with its words; or, for one just come, the oldest on its way with
+    /// files, whose words a bridge puts its own way (their paths after them).
+    /// What is held never left the phone, and is no item's.
+    fn taken(&mut self, item: &Item, fresh: bool) {
+        let Item::User { id, text, .. } = item else {
+            return;
+        };
+        if self.outgoing.is_empty() || self.stand_ins.contains_key(id) {
+            return;
+        }
+        let words = uploads_named(text).0;
+        let at = self
+            .outgoing
+            .iter()
+            .position(|out| !out.held && out.text.trim() == words.trim())
+            .or_else(|| {
+                fresh
+                    .then(|| {
+                        self.outgoing
+                            .iter()
+                            .position(|out| !out.held && out.failed.is_none() && !out.attachments.is_empty())
+                    })
+                    .flatten()
+            });
+        if let Some(at) = at {
+            let out = self.outgoing.remove(at);
+            self.stand_ins.insert(id.clone(), out.id.clone());
+            self.last_taken = Some((id.clone(), out));
+        }
     }
 
     /// The last reply of each turn finished -- one the person spoke after,
@@ -1375,9 +1635,13 @@ impl Chat {
                     .collect();
                 shown.extend(files);
                 Row::User {
-                    id: id.clone(),
+                    // Where it stands for something said here, the row that
+                    // was shown for that.
+                    id: self.stand_ins.get(id).cloned().unwrap_or_else(|| id.clone()),
                     text,
                     attachments: shown,
+                    sending: None,
+                    failed: None,
                 }
             }
             Item::Text { id, text } => Row::Text {
@@ -2766,6 +3030,135 @@ mod tests {
     }
 
     #[test]
+    fn what_is_said_shows_at_once_and_is_held_failed_or_sent_again() {
+        let sending = |view: &ChatView| -> Vec<(String, Option<&'static str>)> {
+            view.rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::User { text, sending, .. } => Some((text.clone(), *sending)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let state_of = |chat: &Chat, text: &str| {
+            // The last row with the words: what is on its way comes last.
+            sending(&chat.view()).into_iter().rev().find(|(said, _)| said == text).map(|(_, state)| state)
+        };
+        let hello = |guessed: bool| Ev::Hello {
+            protocol: 2,
+            agent: "codex".into(),
+            title: None,
+            guessed,
+        };
+        let user = |id: &str, text: &str| Item::User {
+            id: id.into(),
+            text: text.into(),
+            attachments: Vec::new(),
+        };
+        let history = |items: Vec<Item>| Ev::History { items, more: false, reset: true };
+        let mut chat = Chat::new(1, "codex");
+        // Said while it connects: on show at once, held, and sent once it is
+        // greeted and has sent its history.
+        let early = chat.sending("hi", &[]).unwrap();
+        assert!(chat.view().can_send);
+        assert_eq!(state_of(&chat, "hi"), Some(Some("sending")));
+        assert!(chat.take_held().is_empty(), "not connected yet");
+        chat.apply(hello(false));
+        assert!(chat.take_held().is_empty(), "its history first");
+        chat.apply(history(vec![user("u0", "yes")]));
+        let held = chat.take_held();
+        assert_eq!(held.iter().map(|(id, text, _)| (id.as_str(), text.as_str())).collect::<Vec<_>>(), [(early.as_str(), "hi")]);
+        assert!(chat.take_held().is_empty(), "sent once");
+        chat.sent_as(Some(early.clone()));
+        // The agent takes it: one row, under the id it was shown with.
+        chat.apply(Ev::Item { item: user("u1", "hi"), partial: false });
+        let view = chat.view();
+        assert_eq!(state_of(&chat, "hi"), Some(None));
+        assert!(matches!(&view.rows[1], Row::User { id, .. } if *id == early));
+
+        // Refused just after it went: not sent, and a tap sends it again.
+        let refused = chat.sending("again", &[]).unwrap();
+        chat.sent_as(Some(refused.clone()));
+        chat.apply(Ev::Refused { message: "busy".into() });
+        assert_eq!(state_of(&chat, "again"), Some(Some("failed")));
+        assert_eq!(chat.resend(&refused).map(|(text, _)| text), Some("again".to_string()));
+        assert_eq!(state_of(&chat, "again"), Some(Some("sending")));
+        assert!(chat.resend(&refused).is_none(), "only what failed");
+        // A refusal of something else marks nothing: another op, or the
+        // older history asked for just before.
+        chat.sent_as(None);
+        chat.apply(Ev::Refused { message: "nothing is running".into() });
+        chat.sent_as(Some(refused.clone()));
+        chat.loading_older = true;
+        chat.apply(Ev::Refused { message: "no older history".into() });
+        assert_eq!(state_of(&chat, "again"), Some(Some("sending")));
+
+        // A bridge that shows what was said at once, then refuses it: back
+        // as not sent, the item it showed gone.
+        let shown = chat.sending("look here", &[]).unwrap();
+        chat.sent_as(Some(shown.clone()));
+        chat.apply(Ev::Item { item: user("sent-1", "look here"), partial: false });
+        assert_eq!(state_of(&chat, "look here"), Some(None));
+        chat.apply(Ev::Refused { message: "dropped".into() });
+        assert_eq!(state_of(&chat, "look here"), Some(Some("failed")));
+        assert!(!chat.items.iter().any(|item| item.id() == "sent-1"));
+
+        // Cut off: what went is not sure to have arrived; what is said
+        // meanwhile is held, and goes once it is back.
+        chat.lost();
+        let cut = chat.sending("while cut off", &[]).unwrap();
+        assert_eq!(state_of(&chat, "again"), Some(Some("failed")));
+        assert_eq!(state_of(&chat, "while cut off"), Some(Some("sending")));
+        chat.reconnecting();
+        chat.apply(hello(false));
+        // The history it sends again: an old "yes" takes nothing said now,
+        // and a line typed in the terminal takes nothing held.
+        let said_yes = chat.sending("yes", &[]).unwrap();
+        chat.not_sent(&said_yes, "the connection dropped");
+        chat.apply(history(vec![user("u0", "yes"), user("u1", "hi"), user("t1", "from the terminal")]));
+        assert_eq!(state_of(&chat, "yes"), Some(Some("failed")), "the old yes is not it");
+        assert_eq!(chat.take_held().iter().map(|(id, ..)| id.clone()).collect::<Vec<_>>(), [cut.clone()]);
+        chat.sent_as(Some(cut));
+        // What arrived after all is taken from the history, even failed.
+        chat.reconnecting();
+        chat.apply(hello(false));
+        chat.apply(history(vec![user("u0", "yes"), user("u1", "hi"), user("u2", "again")]));
+        assert_eq!(state_of(&chat, "again"), Some(None));
+        // A resend while it is not connected is held again.
+        chat.lost();
+        assert!(chat.resend(&said_yes).is_none());
+        assert_eq!(state_of(&chat, "yes"), Some(Some("sending")));
+        // Greeted in a conversation picked among several: what is held is
+        // not sent there by itself.
+        chat.reconnecting();
+        chat.apply(hello(true));
+        chat.apply(history(Vec::new()));
+        assert!(chat.take_held().is_empty());
+        assert_eq!(state_of(&chat, "yes"), Some(Some("failed")));
+        // It stopped for good: all of it is marked, held or not.
+        let last = chat.sending("last", &[]).unwrap();
+        chat.hold(&last);
+        chat.ended(false, "the channel closed");
+        assert_eq!(state_of(&chat, "last"), Some(Some("failed")));
+        assert!(chat.take_held().is_empty());
+
+        // A card the person can act on keeps what is held for after it.
+        let mut chat = Chat::new(1, "claude");
+        chat.sending("later", &[]).unwrap();
+        chat.line(r#"{"ev":"error","need":"pi_restart","message":"not running","can_load":true}"#);
+        assert_eq!(state_of(&chat, "later"), Some(Some("sending")));
+
+        // A command shows no row; one typed while not connected goes back
+        // to the field. A path or a dollar sign at the start is words.
+        let mut chat = Chat::new(1, "codex");
+        assert!(chat.sending("/compact", &[]).is_none());
+        chat.command_not_sent("/compact");
+        assert_eq!(chat.view().notice.and_then(|notice| notice.kept), Some("/compact".to_string()));
+        assert!(chat.sending("/etc/hosts is wrong", &[]).is_some());
+        assert!(chat.sending("$HOME is unset", &[]).is_some());
+    }
+
+    #[test]
     fn a_chat_cut_off_says_it_reconnects_and_keeps_what_it_held() {
         let mut chat = Chat::new(1, "pi");
         chat.apply(Ev::Hello {
@@ -2787,7 +3180,8 @@ mod tests {
         let view = chat.view();
         assert_eq!(view.state, "connecting");
         assert_eq!(view.state_label, tr("chat-reconnecting"));
-        assert!(view.problem.is_none() && !view.can_send);
+        // What is said meanwhile is held, and goes once it is back.
+        assert!(view.problem.is_none() && view.can_send);
         assert_eq!(view.rows.len(), 1, "what it held stays on show");
         // A channel opened anew still says so, until its bridge greets.
         chat.reconnecting();

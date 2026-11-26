@@ -1159,6 +1159,8 @@ class TerminalModel(
     fun chatAnswer(ask: String, choice: String) = core.chatAnswer(ask, choice)
     fun chatAnswerQuestions(ask: String, answers: List<String>) = core.chatAnswerQuestions(ask, answers)
     fun chatInterrupt() = core.chatInterrupt()
+    /// Send again what was said as the user row `id` and did not go.
+    fun chatResend(id: String) = core.chatResend(id)
     fun chatOlder() = core.chatOlder()
     fun chatAction(action: String) = core.chatAction(action)
     fun chatToggle(row: String) = core.chatToggle(row)
