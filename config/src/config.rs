@@ -2226,11 +2226,11 @@ fn default_tab_max_width() -> usize {
 }
 
 fn default_window_tab_width() -> usize {
-    320
+    360
 }
 
 fn default_pane_tab_width() -> usize {
-    320
+    360
 }
 
 fn default_update_interval() -> u64 {

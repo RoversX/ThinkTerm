@@ -2,7 +2,7 @@
 tags:
   - tab_bar
 ---
-# `pane_tab_width = 320`
+# `pane_tab_width = 360`
 
 How wide each tab in a pane's header is: the row of tabs above a pane, one
 to each pane of a split window. Every tab has this width, whatever its
@@ -16,7 +16,7 @@ leave room for fewer of them.
 
 The width is in design pixels, the unit ThinkTerm's interface is drawn in:
 two to a point on macOS, and two to a pixel at 100% display scaling on
-Windows and Linux. The default, 320, is 160 points. It is kept between 200
+Windows and Linux. The default, 360, is 180 points. It is kept between 200
 and 1200.
 
 ```lua

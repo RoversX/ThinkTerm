@@ -283,7 +283,7 @@ details.
   bar at the bottom of the window instead of the top
 * [window_tab_width](lua/config/window_tab_width.md) sets how wide each tab
   in the window's top tab row is, in design pixels (two to a point; default
-  320, kept between 200 and 1200). When the tabs do not all fit, the row
+  360, kept between 200 and 1200). When the tabs do not all fit, the row
   scrolls. **Settings › Appearance › Tab Width** sets it too and wins while
   it is set; its reset button hands the width back to the option. A tab
   whose title does not fit shows the whole title in a card when the pointer

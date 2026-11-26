@@ -4040,8 +4040,8 @@ mod tests {
     fn a_window_tab_is_as_wide_as_settings_say_else_as_the_configuration_says() {
         let mut settings = ThinkTermNativeSettings::default();
         let configured = ConfigHandle::default_config().window_tab_width;
-        assert_eq!(configured, 320);
-        assert_eq!(window_tab_width_in(&settings, configured), 320);
+        assert_eq!(configured, 360);
+        assert_eq!(window_tab_width_in(&settings, configured), 360);
         assert_eq!(window_tab_width_in(&settings, 520), 520);
         // Out of range in the configuration file is brought into it.
         assert_eq!(window_tab_width_in(&settings, 10), TAB_WIDTH_LEAST);
@@ -4057,8 +4057,8 @@ mod tests {
     fn a_pane_tab_is_as_wide_as_its_own_setting_says_apart_from_the_window_tabs() {
         let mut settings = ThinkTermNativeSettings::default();
         let configured = ConfigHandle::default_config().pane_tab_width;
-        assert_eq!(configured, 320);
-        assert_eq!(pane_tab_width_in(&settings, configured), 320);
+        assert_eq!(configured, 360);
+        assert_eq!(pane_tab_width_in(&settings, configured), 360);
         assert_eq!(pane_tab_width_in(&settings, 240), 240);
         assert_eq!(pane_tab_width_in(&settings, 10), TAB_WIDTH_LEAST);
         assert_eq!(pane_tab_width_in(&settings, 9000), TAB_WIDTH_MOST);
