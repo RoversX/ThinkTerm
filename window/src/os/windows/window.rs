@@ -3108,6 +3108,7 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
         scroll_phase: None,
         momentum_phase: None,
         precise_wheel_lines: None,
+        wheel_notches: None,
     };
     inner
         .borrow_mut()
@@ -3162,6 +3163,7 @@ unsafe fn nc_mouse_button(
         scroll_phase: None,
         momentum_phase: None,
         precise_wheel_lines: None,
+        wheel_notches: None,
     };
     inner
         .borrow_mut()
@@ -3199,6 +3201,7 @@ unsafe fn mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         scroll_phase: None,
         momentum_phase: None,
         precise_wheel_lines: None,
+        wheel_notches: None,
     };
 
     inner.events.dispatch(WindowEvent::MouseEvent(event));
@@ -3239,6 +3242,7 @@ unsafe fn nc_mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
         scroll_phase: None,
         momentum_phase: None,
         precise_wheel_lines: None,
+        wheel_notches: None,
     };
 
     inner.events.dispatch(WindowEvent::MouseEvent(event));
@@ -3352,6 +3356,7 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         // The travel in lines (columns, for the horizontal wheel) before it
         // was rounded to notches, so a sub-line step is not lost.
         precise_wheel_lines: Some(scaled_delta as f32 / WHEEL_DELTA as f32),
+        wheel_notches: None,
     };
     inner
         .borrow_mut()

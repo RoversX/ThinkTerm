@@ -6650,6 +6650,7 @@ mod tests {
             scroll_phase: None,
             momentum_phase: None,
             precise_wheel_lines: None,
+            wheel_notches: None,
         }
     }
 
