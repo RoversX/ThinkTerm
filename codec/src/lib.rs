@@ -1050,6 +1050,8 @@ pdu! {
     SpawnPageResponse: 145,
     ChangePage: 146,
     PageChanged: 147,
+    GetProjectRepos: 148,
+    ProjectRepos: 149,
 }
 
 /// Discovery only. This address conveys no authority to approve or export.
@@ -1801,6 +1803,48 @@ impl Pdu {
 /// Ask a mux server for its authoritative ThinkTerm session view.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
 pub struct GetThinkTermSessionState {}
+
+/// Ask a mux server which git repository each project's folder is in, so
+/// the projects of several machines can be put together by repository.
+///
+/// Asked for, and not part of the session view: a server reads the folders
+/// only while a client that groups by them keeps asking, and sends nothing
+/// to one that does not. It needed no version of its own -- a server before
+/// it answers with an error, and the client groups nothing there.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct GetProjectRepos {}
+
+/// The projects whose repository the server has read, by id. A project
+/// outside a repository, or not read yet, is not listed; one read later
+/// is published as a change of the session view.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ProjectRepos {
+    pub repos: Vec<ProjectRepoEntry>,
+    /// Some projects' folders are still being read, as when the server has
+    /// just begun to: what is not listed is not known yet, rather than in
+    /// no repository, and a client keeps what it had for those.
+    pub reading: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ProjectRepoEntry {
+    pub project_id: String,
+    pub repo: ThinkTermProjectRepo,
+}
+
+/// The git checkout a project's folder is in.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Default)]
+pub struct ThinkTermProjectRepo {
+    /// Where the repository comes from, the same on every machine that
+    /// cloned it: `github.com/owner/repo`, never with a user, password,
+    /// port or query. `None` when it has no remote on the network.
+    pub remote: Option<String>,
+    /// The branch checked out, or the start of the commit when none is.
+    pub branch: Option<String>,
+    /// The folder of the linked worktree it is in, by name only; `None` in
+    /// the repository's own checkout.
+    pub worktree: Option<String>,
+}
 
 /// Unilateral: the mux that owns `pane_id` re-classified its agent status.
 /// `None` means the pane is no longer running a recognized agent.
@@ -4052,6 +4096,34 @@ mod test {
             pdu.encode(&mut encoded, 0x80).unwrap();
             let decoded = Pdu::decode(encoded.as_slice()).unwrap();
             assert_eq!(decoded.serial, 0x80);
+            assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
+    #[test]
+    fn project_repos_round_trip_without_changing_the_version() {
+        // Asked for, so a server before them answers with an error rather
+        // than failing the connection: no bump.
+        assert_eq!(CODEC_VERSION, 89);
+        for pdu in [
+            Pdu::GetProjectRepos(GetProjectRepos {}),
+            Pdu::ProjectRepos(ProjectRepos { repos: Vec::new(), reading: true }),
+            Pdu::ProjectRepos(ProjectRepos {
+                reading: false,
+                repos: vec![ProjectRepoEntry {
+                    project_id: "p1".into(),
+                    repo: ThinkTermProjectRepo {
+                        remote: Some("github.com/owner/repo".into()),
+                        branch: Some("main".into()),
+                        worktree: Some("feature".into()),
+                    },
+                }],
+            }),
+        ] {
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 23).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.serial, 23);
             assert_eq!(decoded.pdu, pdu);
         }
     }

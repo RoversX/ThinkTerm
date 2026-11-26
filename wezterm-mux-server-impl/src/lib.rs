@@ -18,6 +18,7 @@ pub mod pki;
 mod plugin_relay;
 pub mod privacy;
 mod private_file;
+mod project_repos;
 mod sent_images;
 pub mod sessionhandler;
 pub mod share;

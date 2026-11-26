@@ -12321,6 +12321,7 @@ dependencies = [
  "tempfile",
  "termwiz 0.24.0",
  "thinkterm-core",
+ "thinkterm-git-info",
  "thinkterm-import",
  "thinkterm-plugin-channel",
  "thinkterm-proto",

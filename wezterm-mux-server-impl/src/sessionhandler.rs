@@ -2952,6 +2952,13 @@ impl SessionHandler {
                 })));
             }
 
+            // Not on the web or share lists: a browser or another account
+            // is refused it. Answered from what is read already; the
+            // folders themselves are read on threads of their own.
+            Pdu::GetProjectRepos(_) => {
+                send_response(Ok(Pdu::ProjectRepos(crate::project_repos::answer())));
+            }
+
             Pdu::GetThinkTermSessionState(_) => {
                 // The snapshot asks every pane for its progress and title
                 // under the mux's window lock; done on the main thread so a
@@ -4095,6 +4102,7 @@ impl SessionHandler {
             | Pdu::GetImportSessionStatusResponse { .. }
             | Pdu::ThinkTermTreeState { .. }
             | Pdu::ThinkTermSessionState { .. }
+            | Pdu::ProjectRepos { .. }
             | Pdu::EnsureThinkTermThreadResponse { .. }
             | Pdu::ClientViewportState { .. }
             | Pdu::FrontendAccessState { .. }
@@ -4605,6 +4613,16 @@ mod tests {
             .store(7, std::sync::atomic::Ordering::Relaxed);
         crate::share::grant_for_test(share_id, viewer_id);
         handler
+    }
+
+    /// Which git repository the folders are in is for the account's own
+    /// clients: a browser on a web token is refused it, and so is another
+    /// account watching a shared pane.
+    #[test]
+    fn project_repos_are_not_for_a_browser_or_a_share_viewer() {
+        let ask = Pdu::GetProjectRepos(codec::GetProjectRepos {});
+        assert!(!super::web_peer_may_send(&ask));
+        assert!(!super::share_peer_may_send(&ask));
     }
 
     #[test]
