@@ -40,6 +40,8 @@ EXTRA = {
     "chat.terminal": ["Show the terminal", "显示终端", "ターミナルを表示", "Afficher le terminal", "Terminal anzeigen"],
     # The model sheet's title
     "chat.model.pick": ["Select Model", "选择模型", "モデルを選択", "Choisir le modèle", "Modell wählen"],
+    # A way out of a page with no other: a picture shown big
+    "close": ["Close", "关闭", "閉じる", "Fermer", "Schließen"],
     # The desktop's tooltip-sidebar-thread-search, with this app's word for a thread.
     "thread.find": ["Find Thread", "查找会话", "セッションを検索", "Rechercher une session", "Thread finden"],
     "thread.find.none": ["No thread matches", "没有匹配的会话", "一致するセッションはありません", "Aucune session ne correspond", "Kein Thread passt"],

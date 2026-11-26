@@ -154,11 +154,16 @@ import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
 import kotlinx.coroutines.Job
@@ -2424,7 +2429,7 @@ private fun FileSheet(path: String, model: TerminalModel, dark: Boolean, onDismi
     }
     if (big) {
         file?.picture?.let { picture ->
-            PictureView(ChatSent(file.name, true, null, path), null, null, sharp = picture) { big = false }
+            PictureView(1, 0, page = { PicturePage(ChatSent(file.name, true, null, path), null, null, sharp = picture) }) { big = false }
         }
     }
 }
@@ -3129,7 +3134,9 @@ private fun sizeWords(bytes: Long): String = when {
 /// one big; its files as cards.
 @Composable
 private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean) {
-    var shown by remember { mutableStateOf<ChatSent?>(null) }
+    // The pictures among them, kept as they were when one was tapped: big,
+    // a swipe goes from one to the next.
+    var shown by remember { mutableStateOf<Pair<List<ChatSent>, Int>?>(null) }
     Row(
         Modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -3146,7 +3153,12 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
                     modifier = Modifier
                         .size(132.dp)
                         .clip(RoundedCornerShape(14.dp))
-                        .clickable(role = Role.Image) { shown = file },
+                        .clickable(role = Role.Image) {
+                            val pictures = files.filter { f ->
+                                f.image && (f.path?.let { model.chatPictures[it] } != null || f.picture?.let { model.chatThumbs[it] } != null)
+                            }
+                            shown = pictures to pictures.indexOfFirst { it === file }.coerceAtLeast(0)
+                        },
                 )
             } else {
                 // What it holds, from the host, on a tap.
@@ -3161,8 +3173,14 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
             }
         }
     }
-    shown?.let { file ->
-        PictureView(file, file.picture?.let { model.chatThumbs[it] }, file.path?.let { model.chatPictures[it] }) { shown = null }
+    shown?.let { (pictures, start) ->
+        PictureView(pictures.size, start, page = { at ->
+            val file = pictures[at]
+            val thumb = file.picture?.let { model.chatThumbs[it] }
+            // Said so when the phone's copy cannot be read and there is no
+            // small one.
+            PicturePage(file, thumb, file.path?.let { model.chatPictures[it] }, failed = thumb == null)
+        }) { shown = null }
     }
 }
 
@@ -3172,7 +3190,9 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
 @Composable
 private fun ToolPictures(pictures: List<ChatSent>, model: TerminalModel, modifier: Modifier = Modifier) {
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
-    var shown by remember { mutableStateOf<ChatSent?>(null) }
+    // Those to be had, kept as they were when one was tapped: big, a swipe
+    // goes from one to the next.
+    var shown by remember { mutableStateOf<Pair<List<ChatSent>, Int>?>(null) }
     Row(
         modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -3186,7 +3206,10 @@ private fun ToolPictures(pictures: List<ChatSent>, model: TerminalModel, modifie
                     .aspectRatio(ratio)
                     .clip(RoundedCornerShape(10.dp))
                     .background(secondary.copy(alpha = 0.12f))
-                    .clickable(enabled = picture.path != null || thumb != null, role = Role.Image) { shown = picture },
+                    .clickable(enabled = picture.path != null || thumb != null, role = Role.Image) {
+                        val open = pictures.filter { p -> p.path != null || p.picture?.let { model.chatThumbs[it] } != null }
+                        shown = open to open.indexOfFirst { it === picture }.coerceAtLeast(0)
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 if (thumb != null) {
@@ -3197,74 +3220,79 @@ private fun ToolPictures(pictures: List<ChatSent>, model: TerminalModel, modifie
             }
         }
     }
-    shown?.let { picture ->
-        val path = picture.path
-        LaunchedEffect(path) { if (path != null) model.chatOpenFile(path, sheet = false) }
-        // Not to be had whole, and no small one either: said so, not a
-        // blank screen.
-        val failed = path == null || model.chatShownLate[path] == true || model.chatShown[path]?.let { it.picture == null } == true
-        PictureView(picture, picture.picture?.let { model.chatThumbs[it] }, null, sharp = path?.let { model.chatShown[it]?.picture }, failed = failed) { shown = null }
+    shown?.let { (open, start) ->
+        PictureView(
+            open.size,
+            start,
+            page = { at ->
+                val picture = open[at]
+                val path = picture.path
+                // Not to be had whole, and no small one either: said so, not
+                // a blank screen.
+                val failed = path == null || model.chatShownLate[path] == true || model.chatShown[path]?.let { it.picture == null } == true
+                PicturePage(picture, picture.picture?.let { model.chatThumbs[it] }, null, sharp = path?.let { model.chatShown[it]?.picture }, failed = failed)
+            },
+            // The host's whole picture asked for, once on show.
+            onShown = { at -> open[at].path?.let { model.chatOpenFile(it, sheet = false) } },
+        ) { shown = null }
     }
 }
 
-/// A picture over everything, as large as it fits: the phone's own copy
-/// when it sent it, else the host's whole one when it came (`sharp`), else
-/// its small one. Two fingers zoom it, a double tap zooms in or back; a
-/// tap puts it away. Share hands it to another app (to save it, or send it
-/// on).
+/// One of the pictures shown big together, and what is had of it: the
+/// phone's own copy when it sent it, else the host's whole one when it
+/// came (`sharp`), else its small one.
+private class PicturePage(
+    val file: ChatSent,
+    val thumb: ImageBitmap?,
+    val local: File?,
+    val sharp: ImageBitmap? = null,
+    /// It could not be had: said so where it would be.
+    val failed: Boolean = false,
+)
+
+/// Pictures over everything, each as large as it fits, a swipe going to
+/// the one beside it (`count` of them, `start` first). Two fingers zoom
+/// one, a double tap zooms in or back; a tap puts them away. Share hands
+/// the one on show to another app (to save it, or send it on). `onShown`
+/// hears of each the first time it is on show.
 @Composable
-private fun PictureView(file: ChatSent, thumb: ImageBitmap?, local: File?, sharp: ImageBitmap? = null, failed: Boolean = false, onClose: () -> Unit) {
-    val picture = rememberPicture(sharp ?: thumb, local, 2048)
+private fun PictureView(count: Int, start: Int, page: (Int) -> PicturePage, onShown: (Int) -> Unit = {}, onClose: () -> Unit) {
     val context = LocalContext.current
-    var scale by remember { mutableStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
+    val pager = rememberPagerState(initialPage = start.coerceIn(0, (count - 1).coerceAtLeast(0))) { count }
+    // A zoomed picture's drag moves it about, not to the next one.
+    var zoomed by remember { mutableStateOf(false) }
+    val told = remember { HashSet<Int>() }
+    LaunchedEffect(pager.currentPage) { if (told.add(pager.currentPage)) onShown(pager.currentPage) }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onTap = { onClose() },
-                        onDoubleTap = { at ->
-                            if (scale > 1f) {
-                                scale = 1f
-                                offset = Offset.Zero
-                            } else {
-                                scale = 2.5f
-                                // The point tapped stays under the finger.
-                                offset = (Offset(size.width / 2f, size.height / 2f) - at) * 1.5f
-                            }
-                        },
-                    )
-                }
-                .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(1f, 6f)
-                        offset = if (scale == 1f) Offset.Zero else offset + pan
-                    }
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            if (picture == null) {
-                if (failed) {
-                    Text(tr("chat.file.failed"), fontSize = 15.sp, color = Color.White.copy(alpha = 0.8f))
-                } else {
-                    CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.5.dp, color = Color.White.copy(alpha = 0.8f))
-                }
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            HorizontalPager(pager, Modifier.fillMaxSize(), userScrollEnabled = !zoomed, pageSpacing = 12.dp) { at ->
+                PicturePane(page(at), onZoomed = { if (at == pager.currentPage) zoomed = it }, onClose = onClose)
             }
-            if (picture != null) {
-                Image(
-                    picture,
-                    contentDescription = file.name,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize().graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                        translationX = offset.x
-                        translationY = offset.y
-                    },
-                )
+            val shown = if (count > 0) page(pager.currentPage.coerceIn(0, count - 1)) else null
+            // The way out, where a page's is: a tap anywhere puts it away
+            // too, but a button says so.
+            val closeLabel = tr("close")
+            Box(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(12.dp)
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.16f))
+                    .clickable(role = Role.Button) { onClose() }
+                    .semantics { contentDescription = closeLabel },
+                contentAlignment = Alignment.Center,
+            ) {
+                DesktopIcon("x", size = 19.dp, tint = Color.White)
+            }
+            if (count > 1) {
+                Box(
+                    Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(12.dp).height(44.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("${pager.currentPage + 1} / $count", fontSize = 15.sp, color = Color.White.copy(alpha = 0.85f))
+                }
             }
             val share = tr("chat.share")
             Box(
@@ -3275,12 +3303,76 @@ private fun PictureView(file: ChatSent, thumb: ImageBitmap?, local: File?, sharp
                     .size(44.dp)
                     .clip(CircleShape)
                     .background(Color.White.copy(alpha = 0.16f))
-                    .clickable(role = Role.Button) { sharePicture(context, file.name, local, picture) }
+                    .clickable(role = Role.Button) { shown?.let { sharePicture(context, it.file.name, it.local, it.sharp ?: it.thumb) } }
                     .semantics { contentDescription = share },
                 contentAlignment = Alignment.Center,
             ) {
                 DesktopIcon("share-2", size = 19.dp, tint = Color.White)
             }
+        }
+    }
+}
+
+/// One picture of `PictureView`, as large as it fits, zoomed by itself.
+/// One finger on it at its size is left to the pages, to swipe on.
+@Composable
+private fun PicturePane(shown: PicturePage, onZoomed: (Boolean) -> Unit, onClose: () -> Unit) {
+    val picture = rememberPicture(shown.sharp ?: shown.thumb, shown.local, 2048)
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(scale > 1f) { onZoomed(scale > 1f) }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .clipToBounds()
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { onClose() },
+                    onDoubleTap = { at ->
+                        if (scale > 1f) {
+                            scale = 1f
+                            offset = Offset.Zero
+                        } else {
+                            scale = 2.5f
+                            // The point tapped stays under the finger.
+                            offset = (Offset(size.width / 2f, size.height / 2f) - at) * 1.5f
+                        }
+                    },
+                )
+            }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    do {
+                        val event = awaitPointerEvent()
+                        if (scale > 1f || event.changes.count { it.pressed } > 1) {
+                            scale = (scale * event.calculateZoom()).coerceIn(1f, 6f)
+                            offset = if (scale == 1f) Offset.Zero else offset + event.calculatePan()
+                            event.changes.forEach { if (it.positionChanged()) it.consume() }
+                        }
+                    } while (event.changes.any { it.pressed })
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (picture == null) {
+            if (shown.failed) {
+                Text(tr("chat.file.failed"), fontSize = 15.sp, color = Color.White.copy(alpha = 0.8f))
+            } else {
+                CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.5.dp, color = Color.White.copy(alpha = 0.8f))
+            }
+        } else {
+            Image(
+                picture,
+                contentDescription = shown.file.name,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize().graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    translationX = offset.x
+                    translationY = offset.y
+                },
+            )
         }
     }
 }

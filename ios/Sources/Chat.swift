@@ -468,11 +468,11 @@ struct ChatPage: View {
     /// Just said something: what comes of it is shown, wherever the
     /// person was.
     @State private var follow = false
-    /// A picture sent, shown big.
-    @State private var shownPicture: ChatSent?
     /// Gliding to the end for the button: once there, the end is read,
     /// even if more came in on the way.
     @State private var jumping = false
+    /// Pictures sent or looked at, shown big together.
+    @State private var shownPictures: ShownPictures?
     /// The rows on show already: one not among them comes in as it is
     /// added, the first ones as they are.
     @State private var known: Set<String> = []
@@ -741,16 +741,26 @@ struct ChatPage: View {
             known.formUnion(chat?.rows.map(\.id) ?? [])
             reveal.prime(chat?.rows ?? [])
         }
-        .fullScreenCover(item: $shownPicture) { picture in
+        .fullScreenCover(item: $shownPictures) { shown in
             PictureView(
-                file: picture,
-                thumb: picture.picture.flatMap { feed.thumbs[$0] },
-                local: picture.path.flatMap { feed.pictures[$0] },
-                sharp: picture.path.flatMap { feed.shown[$0]?.image },
-                // Not to be had whole, and no small one either: said so,
-                // not a blank screen.
-                failed: picture.path.map { feed.shownLate.contains($0) || (feed.shown[$0] != nil && feed.shown[$0]?.image == nil) } ?? true
-            ) { shownPicture = nil }
+                pages: shown.pictures.map { picture in
+                    PicturePage(
+                        file: picture,
+                        thumb: picture.picture.flatMap { feed.thumbs[$0] },
+                        local: picture.path.flatMap { feed.pictures[$0] },
+                        sharp: picture.path.flatMap { feed.shown[$0]?.image },
+                        // Not to be had whole, and no small one either:
+                        // said so, not a blank screen.
+                        failed: picture.path.map { feed.shownLate.contains($0) || (feed.shown[$0] != nil && feed.shown[$0]?.image == nil) } ?? true
+                    )
+                },
+                start: shown.start,
+                onShown: { at in
+                    // One a call looked at: the host's whole one asked for.
+                    guard shown.looked, let path = shown.pictures[at].path, feed.pictures[path] == nil else { return }
+                    model.chatOpenFile(path, sheet: false)
+                }
+            ) { shownPictures = nil }
         }
         .sheet(item: $feed.fileOpen) { open in
             FileSheet(path: open.path, feed: feed)
@@ -880,11 +890,10 @@ struct ChatPage: View {
 
     // MARK: what it said and did
 
-    /// A picture a call looked at, shown big: its small one at once, the
-    /// host's whole one asked for meanwhile.
-    private func showLooked(_ picture: ChatSent) {
-        shownPicture = picture
-        if let path = picture.path, feed.pictures[path] == nil { model.chatOpenFile(path, sheet: false) }
+    /// Pictures a call looked at, shown big from the one tapped: each its
+    /// small one at once, the host's whole one asked for meanwhile.
+    private func showLooked(_ pictures: [ChatSent], _ at: Int) {
+        shownPictures = ShownPictures(pictures: pictures, start: at, looked: true)
     }
 
     @ViewBuilder
@@ -893,7 +902,7 @@ struct ChatPage: View {
         case let .user(id, text, attachments, sending, failed):
             VStack(alignment: .trailing, spacing: 6) {
                 if !attachments.isEmpty {
-                    SentFiles(files: attachments, pictures: feed.pictures, thumbs: feed.thumbs, open: { model.chatOpenFile($0) }) { shownPicture = $0 }
+                    SentFiles(files: attachments, pictures: feed.pictures, thumbs: feed.thumbs, open: { model.chatOpenFile($0) }) { shownPictures = ShownPictures(pictures: $0, start: $1, looked: false) }
                 }
                 if !text.isEmpty {
                     HStack {
@@ -2272,34 +2281,28 @@ private struct PickedFiles: View {
             HStack(spacing: 10) {
                 ForEach(files) { file in
                     ZStack(alignment: .topTrailing) {
-                        ZStack {
-                            if let preview = file.preview {
-                                Image(uiImage: preview)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 64, height: 64)
-                                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                            } else {
-                                FileCard(name: file.name, under: ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file), image: file.image)
-                                    .frame(height: 64)
-                            }
-                            if let error = file.error {
-                                Button { retry(file) } label: {
+                        card(file)
+                            // Over the card only, as large as it is: laid
+                            // beside it, the shade and the progress took all
+                            // the width the row would give them.
+                            .overlay {
+                                if let error = file.error {
+                                    Button { retry(file) } label: {
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.red.opacity(0.45))
+                                            Image(systemName: "arrow.clockwise").font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("\(file.name): \(error)")
+                                    .accessibilityHint(tr("chat.attach.retry"))
+                                } else if file.path == nil {
                                     ZStack {
-                                        RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.red.opacity(0.45))
-                                        Image(systemName: "arrow.clockwise").font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                                        RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.black.opacity(0.35))
+                                        UploadRing(fraction: file.total > 0 ? Double(file.sent) / Double(file.total) : nil)
                                     }
                                 }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("\(file.name): \(error)")
-                                .accessibilityHint(tr("chat.attach.retry"))
-                            } else if file.path == nil {
-                                RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.black.opacity(0.35))
-                                ProgressView(value: file.total > 0 ? Double(file.sent) / Double(file.total) : 0)
-                                    .progressViewStyle(.circular)
-                                    .tint(.white)
                             }
-                        }
                         Button { remove(file) } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 10, weight: .bold))
@@ -2314,6 +2317,44 @@ private struct PickedFiles: View {
                     .padding(.trailing, 8)
                 }
             }
+        }
+    }
+
+    /// A picture, small; another file, as a card.
+    @ViewBuilder
+    private func card(_ file: TerminalModel.ChatFile) -> some View {
+        if let preview = file.preview {
+            Image(uiImage: preview)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 64, height: 64)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        } else {
+            FileCard(name: file.name, under: ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file), image: file.image)
+                .frame(height: 64)
+        }
+    }
+}
+
+/// How much of an upload has gone, as a small ring; a spinner while that
+/// is not known yet.
+private struct UploadRing: View {
+    let fraction: Double?
+
+    var body: some View {
+        if let fraction {
+            ZStack {
+                Circle().stroke(Color.white.opacity(0.3), lineWidth: 2.5)
+                Circle()
+                    .trim(from: 0, to: max(0.02, min(fraction, 1)))
+                    .stroke(Color.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.linear(duration: 0.2), value: fraction)
+            }
+            .frame(width: 22, height: 22)
+        } else {
+            ProgressView()
+                .tint(.white)
         }
     }
 }
@@ -2348,14 +2389,18 @@ private struct SentFiles: View {
     let thumbs: [String: UIImage]
     /// A file's path: what it holds, from the host.
     let open: (String) -> Void
-    let show: (ChatSent) -> Void
+    /// The pictures among them, shown big from the one tapped.
+    let show: ([ChatSent], Int) -> Void
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(Array(files.enumerated()), id: \.offset) { _, file in
                     if file.image, let picture = picture(file, side: 480) {
-                        Button { show(file) } label: {
+                        Button {
+                            let shown = files.filter { $0.image && ($0.picture.flatMap { thumbs[$0] } != nil || $0.path.flatMap { pictures[$0] } != nil) }
+                            show(shown, shown.firstIndex { $0 == file } ?? 0)
+                        } label: {
                             Image(uiImage: picture)
                                 .resizable()
                                 .scaledToFill()
@@ -2426,41 +2471,140 @@ struct CopyButton: View {
     }
 }
 
-/// A picture over everything, as large as it fits. Two fingers zoom it, a
-/// double tap zooms in or back; a tap puts it away. Share hands it to
-/// another app (to save it, or send it on).
-private struct PictureView: View {
+/// Pictures shown big together, as they were when one was tapped:
+/// `looked` those a call looked at, whose whole ones the host is asked for.
+private struct ShownPictures: Identifiable {
+    let id = UUID()
+    let pictures: [ChatSent]
+    let start: Int
+    let looked: Bool
+}
+
+/// One of the pictures shown big together, and what is had of it.
+private struct PicturePage {
     let file: ChatSent
     let thumb: UIImage?
+    /// The phone's own copy, when it sent it.
     let local: URL?
     /// The host's whole picture, once it came.
     var sharp: UIImage? = nil
     /// It could not be had: said so where it would be.
     var failed = false
+}
+
+/// Pictures over everything, each as large as it fits, a swipe going to
+/// the one beside it. Two fingers zoom one, a double tap zooms in or back;
+/// a tap puts them away. Share hands the one on show to another app (to
+/// save it, or send it on). `onShown` hears of each the first time it is on
+/// show.
+private struct PictureView: View {
+    let pages: [PicturePage]
+    let onShown: (Int) -> Void
+    let close: () -> Void
+    /// The one on show.
+    @State private var at: Int?
+    /// A zoomed picture's drag moves it about, not to the next one.
+    @State private var zoomed = false
+    @State private var told: Set<Int> = []
+    /// The phone's own copies, made ready once each: not again with each
+    /// step of a pinch.
+    @State private var owns: [Int: UIImage] = [:]
+
+    init(pages: [PicturePage], start: Int = 0, onShown: @escaping (Int) -> Void = { _ in }, close: @escaping () -> Void) {
+        self.pages = pages
+        self.onShown = onShown
+        self.close = close
+        _at = State(initialValue: min(max(start, 0), max(pages.count - 1, 0)))
+    }
+
+    var body: some View {
+        let current = min(max(at ?? 0, 0), max(pages.count - 1, 0))
+        ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 0) {
+                    ForEach(pages.indices, id: \.self) { i in
+                        PicturePane(page: pages[i], own: owns[i], zoomed: { if i == current { zoomed = $0 } }, close: close)
+                            .containerRelativeFrame([.horizontal, .vertical])
+                            .id(i)
+                            .onAppear {
+                                if owns[i] == nil, let local = pages[i].local { owns[i] = chatPicture(thumb: nil, local: local, side: 2048) }
+                            }
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollTargetBehavior(.paging)
+            .scrollPosition(id: $at)
+            .scrollIndicators(.hidden)
+            .scrollDisabled(zoomed)
+            .ignoresSafeArea()
+            HStack {
+                // The way out, where a page's is: a tap anywhere puts it
+                // away too, but a button says so.
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 44, height: 44)
+                        .glassEffect(.regular.interactive(), in: .circle)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(tr("close"))
+                Spacer()
+                if pages.count > 1 {
+                    Text("\(current + 1) / \(pages.count)")
+                        .font(.system(size: 15, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                Spacer()
+                if let page = pages.indices.contains(current) ? pages[current] : nil, let picture = owns[current] ?? page.sharp ?? page.thumb {
+                    // The phone's own file as it is, else the one shown.
+                    Group {
+                        if let local = page.local {
+                            ShareLink(item: local, preview: SharePreview(page.file.name, image: Image(uiImage: picture))) { shareLabel }
+                        } else {
+                            ShareLink(item: Image(uiImage: picture), preview: SharePreview(page.file.name, image: Image(uiImage: picture))) { shareLabel }
+                        }
+                    }
+                    .accessibilityLabel(tr("chat.share"))
+                } else {
+                    Color.clear.frame(width: 44, height: 44)
+                }
+            }
+            .padding(12)
+        }
+        .onChange(of: current, initial: true) { _, now in
+            if told.insert(now).inserted { onShown(now) }
+        }
+    }
+
+    private var shareLabel: some View {
+        Image(systemName: "square.and.arrow.up")
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 44, height: 44)
+            .glassEffect(.regular.interactive(), in: .circle)
+    }
+}
+
+/// One picture of `PictureView`, as large as it fits, zoomed by itself.
+/// One finger on it at its size is left to the pages, to swipe on.
+private struct PicturePane: View {
+    let page: PicturePage
+    let own: UIImage?
+    let zoomed: (Bool) -> Void
     let close: () -> Void
     @State private var zoom: CGFloat = 1
     @GestureState private var pinch: CGFloat = 1
     @State private var offset: CGSize = .zero
     @GestureState private var drag: CGSize = .zero
-    /// The phone's own copy, made ready once: not again with each step of
-    /// a pinch.
-    @State private var own: UIImage?
 
     var body: some View {
-        let picture = own ?? sharp ?? thumb
+        let picture = own ?? page.sharp ?? page.thumb
         let scale = max(1, min(zoom * pinch, 6))
-        ZStack(alignment: .topTrailing) {
-            Color.black.ignoresSafeArea()
-            if picture == nil {
-                Group {
-                    if failed {
-                        Text(tr("chat.file.failed")).foregroundStyle(.white.opacity(0.8))
-                    } else {
-                        ProgressView().tint(.white)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+        ZStack {
             if let picture {
                 Image(uiImage: picture)
                     .resizable()
@@ -2468,32 +2612,19 @@ private struct PictureView: View {
                     .scaleEffect(scale)
                     .offset(x: offset.width + drag.width, y: offset.height + drag.height)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .ignoresSafeArea()
-                    .gesture(
-                        MagnifyGesture()
-                            .updating($pinch) { value, state, _ in state = value.magnification }
-                            .onEnded { value in
-                                zoom = max(1, min(zoom * value.magnification, 6))
-                                if zoom == 1 { offset = .zero }
-                            }
-                            .simultaneously(with: DragGesture()
-                                .updating($drag) { value, state, _ in if zoom > 1 { state = value.translation } }
-                                .onEnded { value in
-                                    if zoom > 1 { offset = CGSize(width: offset.width + value.translation.width, height: offset.height + value.translation.height) }
-                                })
-                    )
-                // The phone's own file as it is, else the small one shown.
+                    .gesture(gestures)
+            } else {
                 Group {
-                    if let local {
-                        ShareLink(item: local, preview: SharePreview(file.name, image: Image(uiImage: picture))) { shareLabel }
+                    if page.failed {
+                        Text(tr("chat.file.failed")).foregroundStyle(.white.opacity(0.8))
                     } else {
-                        ShareLink(item: Image(uiImage: picture), preview: SharePreview(file.name, image: Image(uiImage: picture))) { shareLabel }
+                        ProgressView().tint(.white)
                     }
                 }
-                .padding(12)
-                .accessibilityLabel(tr("chat.share"))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .clipped()
         .contentShape(Rectangle())
         .onTapGesture(count: 2) {
             withAnimation(.snappy(duration: 0.25)) {
@@ -2506,19 +2637,27 @@ private struct PictureView: View {
             }
         }
         .onTapGesture(perform: close)
+        .onChange(of: zoom > 1) { _, now in zoomed(now) }
         .accessibilityAddTraits(.isButton)
-        .onAppear {
-            if own == nil, let local { own = chatPicture(thumb: nil, local: local, side: 2048) }
-        }
-        .accessibilityLabel(file.name)
+        .accessibilityLabel(page.file.name)
     }
 
-    private var shareLabel: some View {
-        Image(systemName: "square.and.arrow.up")
-            .font(.system(size: 16, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 44, height: 44)
-            .glassEffect(.regular.interactive(), in: .circle)
+    /// Two fingers zoom it; once zoomed, one moves it about. At its size
+    /// there is no drag of its own, which would hold the pages still.
+    private var gestures: AnyGesture<Void> {
+        let magnify = MagnifyGesture()
+            .updating($pinch) { value, state, _ in state = value.magnification }
+            .onEnded { value in
+                zoom = max(1, min(zoom * value.magnification, 6))
+                if zoom == 1 { offset = .zero }
+            }
+        guard zoom > 1 else { return AnyGesture(magnify.map { _ in }) }
+        let move = DragGesture()
+            .updating($drag) { value, state, _ in state = value.translation }
+            .onEnded { value in
+                offset = CGSize(width: offset.width + value.translation.width, height: offset.height + value.translation.height)
+            }
+        return AnyGesture(magnify.simultaneously(with: move).map { _ in })
     }
 }
 
@@ -2527,7 +2666,8 @@ private struct PictureView: View {
 private struct ToolPictures: View {
     let pictures: [ChatSent]
     let thumbs: [String: UIImage]
-    let show: (ChatSent) -> Void
+    /// Those to be had, shown big from the one tapped.
+    let show: ([ChatSent], Int) -> Void
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -2535,7 +2675,10 @@ private struct ToolPictures: View {
                 ForEach(Array(pictures.enumerated()), id: \.offset) { _, picture in
                     let thumb = picture.picture.flatMap { thumbs[$0] }
                     let ratio = thumb.map { min(max($0.size.width / max($0.size.height, 1), 0.5), 2.2) } ?? 1.4
-                    Button { show(picture) } label: {
+                    Button {
+                        let open = pictures.filter { $0.path != nil || $0.picture.flatMap { thumbs[$0] } != nil }
+                        show(open, open.firstIndex { $0 == picture } ?? 0)
+                    } label: {
                         ZStack {
                             Color.secondary.opacity(0.12)
                             if let thumb {
@@ -2608,7 +2751,7 @@ private struct FileSheet: View {
         .presentationDragIndicator(.visible)
         .fullScreenCover(isPresented: $big) {
             if let file, let image = file.image {
-                PictureView(file: ChatSent(name: file.name, image: true, picture: nil, path: path), thumb: nil, local: nil, sharp: image) { big = false }
+                PictureView(pages: [PicturePage(file: ChatSent(name: file.name, image: true, picture: nil, path: path), thumb: nil, local: nil, sharp: image)]) { big = false }
             }
         }
     }
@@ -2775,8 +2918,8 @@ private struct BusyLine: View {
 private struct FoldView: View {
     let fold: ChatFold
     let thumbs: [String: UIImage]
-    /// A picture it looked at, shown big.
-    let show: (ChatSent) -> Void
+    /// Pictures it looked at, shown big from the one tapped.
+    let show: ([ChatSent], Int) -> Void
     /// A file it names, shown in the sheet.
     let openFile: (String) -> Void
     let toggle: () -> Void
@@ -2862,7 +3005,7 @@ private func foldSymbol(_ icon: String) -> String {
 private struct GroupView: View {
     let group: ChatGroup
     let thumbs: [String: UIImage]
-    let show: (ChatSent) -> Void
+    let show: ([ChatSent], Int) -> Void
     let openFile: (String) -> Void
     let toggle: () -> Void
     let toggleFold: (String) -> Void
