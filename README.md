@@ -17,7 +17,11 @@ brew install --cask roversx/tap/thinkterm
 
 ⭐ Consider starring [ThinkTerm](https://github.com/RoversX/ThinkTerm)!
 
-**Platforms:** macOS · Linux · Windows · Web · TUI — iOS and Android in development.
+**Your machines fuse into one.**
+
+A superfast terminal with a built-in multiplexer.
+
+**Platforms:** macOS · Linux · Windows · Web · TUI · iOS · Android
 
 ![Lazygit in a ThinkTerm workspace with agent status in the right sidebar](assets/screenshots/lazygit.png)
 
@@ -220,7 +224,7 @@ The CLI also exposes panes to automation: `thinkterm cli send-text` sends input,
 | **Desktop** | Native application for macOS, Linux, and Windows. |
 | **TUI** | Workspace navigation and terminal control inside an existing terminal, through `thinkterm tui`. |
 | **Browser** | A client served by your own mux server; requires WebGPU and a secure browser context. Browser access must be enabled explicitly. |
-| **iOS and Android** | Native clients in development, with a shared Rust core, GPU rendering, and SSH transport. Mobile release readiness and device coverage are still being established. |
+| **iOS and Android** | Native clients with a shared Rust core, GPU rendering, and SSH transport. |
 
 The clients connect to server-held sessions; their interfaces and feature coverage differ.
 
@@ -239,9 +243,9 @@ Enable a listener in **Settings → Web**, then create an access token for the b
 
 See [Browser access](docs/thinkterm/web-access.md) for listener setup, tokens, SSH forwarding, and certificate handling.
 
-### Mobile development
+### Mobile apps
 
-The [iOS](ios) and [Android](android) apps use native interfaces and the shared [mobile core](thinkterm-mobile). They connect over SSH to sessions on another machine. They are under active development and are not presented here as released mobile products.
+The [iOS](ios) and [Android](android) apps use native interfaces and the shared [mobile core](thinkterm-mobile). They connect over SSH to sessions on another machine.
 
 ![ThinkTerm on iOS, iPadOS and Android](assets/screenshots/mobile.jpeg)
 
