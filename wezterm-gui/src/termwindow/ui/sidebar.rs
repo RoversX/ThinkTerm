@@ -1533,14 +1533,14 @@ impl crate::TermWindow {
                 });
         let hovered =
             !reconnect_in_flight && self.is_pointer_over_ui_rect(row_x, y, row_width, row_height);
-        // New Thread's pill, the warning colour only in its icon and words.
-        self.paint_sidebar_action_button(
+        // A glass pill like New Thread's, the warning colour only in its
+        // icon and words.
+        self.paint_sidebar_glass_button(
             layers,
             layer,
             euclid::rect(row_x as f32, y as f32, row_width as f32, row_height as f32),
             self.chrome(),
             hovered,
-            false,
         )
         .context("sidebar reconnect row")?;
         let reconnect_label = if reconnect_in_flight {
@@ -4346,8 +4346,8 @@ impl crate::TermWindow {
     /// A sidebar action button: circle or pill, with a shadow and hairline
     /// border.
     ///
-    /// The per-section add buttons, the reconnect row and the right
-    /// sidebar's paint these; New Thread and the bell are glass
+    /// The per-section add buttons and the right sidebar's paint these;
+    /// New Thread, the bell and the reconnect row are glass
     /// (`paint_sidebar_glass_button`). They
     /// used to carry the radius and the fill separately. Keeping the
     /// treatment in one place is what stops one of them from staying a
