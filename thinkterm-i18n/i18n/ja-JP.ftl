@@ -898,7 +898,6 @@ settings-status-stop-session-server-error = セッションサーバーを停止
 settings-status-window-restore-off = 新しい macOS ウィンドウで位置とサイズの復元を無効にしました。
 settings-status-window-restore-error = ウィンドウ復元設定を保存できません：{ $error }
 settings-status-renderer = レンダラーを { $renderer } に設定しました。ThinkTerm の再起動後に適用されます。
-settings-status-window-acrylic-after-restart = { $setting }を{ $value }に変更しました。すりガラスは ThinkTerm の再起動後に表示されます（OpenGL レンダラーが必要）。
 settings-status-renderer-error = レンダラー設定を保存できません：{ $error }
 settings-status-restarting = ThinkTerm を再起動しています…
 settings-status-restart-error = ThinkTerm を再起動できません：{ $error }

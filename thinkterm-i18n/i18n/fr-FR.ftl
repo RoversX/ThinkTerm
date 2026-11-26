@@ -913,7 +913,6 @@ settings-status-stop-session-server-error = Impossible d’arrêter le serveur d
 settings-status-window-restore-off = Restauration de la taille et position désactivée pour les nouvelles fenêtres macOS.
 settings-status-window-restore-error = Impossible d’enregistrer la restauration de fenêtre : { $error }
 settings-status-renderer = Moteur de rendu défini sur { $renderer } ; redémarrez ThinkTerm pour l’appliquer.
-settings-status-window-acrylic-after-restart = { $setting } est maintenant { $value } ; le verre dépoli apparaît après le redémarrage de ThinkTerm (avec le rendu OpenGL).
 settings-status-renderer-error = Impossible d’enregistrer le moteur de rendu : { $error }
 settings-status-restarting = Redémarrage de ThinkTerm…
 settings-status-restart-error = Impossible de redémarrer ThinkTerm : { $error }

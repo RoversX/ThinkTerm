@@ -50,35 +50,11 @@ impl std::fmt::Debug for EglWrapper {
     }
 }
 
-/// `EGL_ANGLE_direct_composition`: a window surface drawn onto a
-/// DirectComposition visual, alpha and all, rather than into the window.
-#[cfg(windows)]
-const DIRECT_COMPOSITION_ANGLE: i32 = 0x33A5;
-
-/// The size of `window`'s client area, in pixels.
-#[cfg(windows)]
-fn client_size(window: ffi::EGLNativeWindowType) -> (u32, u32) {
-    let mut rect: winapi::shared::windef::RECT = unsafe { std::mem::zeroed() };
-    unsafe { winapi::um::winuser::GetClientRect(window, &mut rect) };
-    (
-        (rect.right - rect.left).max(0) as u32,
-        (rect.bottom - rect.top).max(0) as u32,
-    )
-}
-
 #[derive(Debug)]
 pub struct GlConnection {
     egl: EglWrapper,
     display: ffi::types::EGLDisplay,
     is_opengl: bool,
-    extensions: String,
-}
-
-impl GlConnection {
-    #[allow(dead_code)]
-    pub fn has_extension(&self, wanted: &str) -> bool {
-        self.extensions.split(' ').any(|ext| ext == wanted)
-    }
 }
 
 impl std::ops::Deref for GlConnection {
@@ -102,10 +78,6 @@ pub struct GlState {
     connection: Rc<GlConnection>,
     surface: ffi::types::EGLSurface,
     context: ffi::types::EGLContext,
-    /// The window a DirectComposition surface is drawn for, checked at
-    /// each swap: see `swap_buffers`.
-    #[cfg(windows)]
-    composition_window: Option<ffi::EGLNativeWindowType>,
 }
 
 impl Drop for GlState {
@@ -534,36 +506,6 @@ impl GlState {
         })
     }
 
-    /// An EGL connection that can draw onto DirectComposition, from the
-    /// first EGL found that can -- the ANGLE shipped beside the executable.
-    #[cfg(windows)]
-    pub fn connect_for_composition() -> anyhow::Result<Rc<GlConnection>> {
-        Self::with_egl_lib(|egl| {
-            let connection = Self::connect_with(egl, None)?;
-            ensure!(
-                connection.has_extension("EGL_ANGLE_direct_composition"),
-                "no EGL_ANGLE_direct_composition"
-            );
-            Ok(connection)
-        })
-    }
-
-    /// A window surface on `connection` drawn onto DirectComposition: the
-    /// window was made without a redirection bitmap, so nothing else shows.
-    #[cfg(windows)]
-    pub fn create_for_composition(
-        connection: &Rc<GlConnection>,
-        window: ffi::EGLNativeWindowType,
-    ) -> anyhow::Result<GlState> {
-        let mut state = Self::create_with_surface_attributes(
-            connection,
-            window,
-            &[DIRECT_COMPOSITION_ANGLE, ffi::TRUE as i32],
-        )?;
-        state.composition_window = Some(window);
-        Ok(state)
-    }
-
     fn connect_with(
         egl: EglWrapper,
         display: Option<ffi::EGLNativeDisplayType>,
@@ -586,19 +528,18 @@ impl GlState {
         };
 
         let extensions = unsafe { egl.egl.QueryString(egl_display, ffi::EXTENSIONS as _) };
-        let extensions = if extensions.is_null() {
-            String::new()
-        } else {
+        if !extensions.is_null() {
             let cstr = unsafe { std::ffi::CStr::from_ptr(extensions) };
-            String::from_utf8_lossy(cstr.to_bytes()).to_string()
-        };
-        log::trace!("EGL extensions: {}", extensions);
+            log::trace!(
+                "EGL extensions: {}",
+                String::from_utf8_lossy(cstr.to_bytes())
+            );
+        }
 
         Ok(Rc::new(GlConnection {
             display: egl_display,
             egl,
             is_opengl,
-            extensions,
         }))
     }
 
@@ -729,8 +670,6 @@ impl GlState {
                 connection: Rc::clone(connection),
                 context,
                 surface,
-                #[cfg(windows)]
-                composition_window: None,
             });
         }
 
@@ -744,27 +683,10 @@ unsafe impl glium::backend::Backend for GlState {
     }
 
     fn swap_buffers(&self) -> Result<(), glium::SwapBuffersError> {
-        // ANGLE resizes the swap chain behind a DirectComposition window only
-        // as it presents: a frame drawn just after a resize went into the
-        // old size's buffer, so the window is asked to draw once more. Done
-        // here, with no window state touched: this runs inside its paint.
-        // A minimized window's client area is empty, and the swap chain keeps
-        // its size then: that is not a frame to redraw.
-        #[cfg(windows)]
-        let stale = self.composition_window.filter(|&window| {
-            let client = client_size(window);
-            client.0 > 0 && client.1 > 0 && self.surface_size() != client
-        });
         let res = unsafe {
             self.connection
                 .SwapBuffers(self.connection.display, self.surface)
         };
-        #[cfg(windows)]
-        if let Some(window) = stale {
-            unsafe {
-                winapi::um::winuser::InvalidateRect(window, std::ptr::null(), 0);
-            }
-        }
         if res != 1 {
             Err(match unsafe { self.connection.GetError() } as u32 {
                 ffi::CONTEXT_LOST => glium::SwapBuffersError::ContextLost,

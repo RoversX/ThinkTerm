@@ -22,6 +22,11 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* Windows: a see-through window now asks for Desktop Acrylic on Windows 11
+  22H2 and later with `win32_system_backdrop = "Auto"` (the default), and
+  applies it live when the opacity changes. The DirectComposition trial and
+  its restart requirement are gone. `"Mica"` remains available for an opaque,
+  wallpaper-derived material.
 * DECRQCRA is now disabled by default to prevent silent screen scraping.
   Set `enable_checksum_rectangular_area = true` to re-enable it.
   Thanks to @jquast! #7701

@@ -834,20 +834,17 @@ pub(crate) fn window_opacity_supported() -> bool {
 const WINDOW_BLUR_RADIUS: i64 = 20;
 
 /// The configuration keys the window-opacity setting overrides, and with
-/// what -- with them, on Windows, the way of asking for the frosted
-/// backdrop being tried. `None` removes a key, so that the configuration
-/// decides again.
+/// what. `None` removes a key, so that the configuration decides again.
 pub(crate) fn window_opacity_overrides(
     settings: &ThinkTermNativeSettings,
-) -> [(&'static str, Option<wezterm_dynamic::Value>); 4] {
+) -> [(&'static str, Option<wezterm_dynamic::Value>); 3] {
     use wezterm_dynamic::ToDynamic;
     let changes = window_opacity_changes(settings.appearance.window_opacity);
-    let [opacity, blur, backdrop, glass] = WINDOW_OPACITY_KEYS;
+    let [opacity, blur, glass] = WINDOW_OPACITY_KEYS;
     let mac_glass = settings.appearance.mac_glass;
     [
         (opacity, changes.opacity.map(|opacity| opacity.to_dynamic())),
         (blur, changes.blur.map(|blur| blur.to_dynamic())),
-        (backdrop, changes.acrylic.map(|acrylic| acrylic.to_dynamic())),
         // Always, on macOS: choosing the blur in Settings undoes a glass the
         // configuration file asks for.
         (
@@ -858,25 +855,19 @@ pub(crate) fn window_opacity_overrides(
 }
 
 /// The configuration keys Settings' window opacity overrides in a window.
-pub(crate) const WINDOW_OPACITY_KEYS: [&str; 4] = [
+pub(crate) const WINDOW_OPACITY_KEYS: [&str; 3] = [
     "window_background_opacity",
     "macos_window_background_blur",
-    "win32_backdrop_trial",
     "macos_window_glass",
 ];
 
 /// What a window opacity of `percent` changes in a window's configuration:
-/// the opacity, and while it is see-through the frosted glass that goes
-/// with it -- on macOS the blur the configuration file does not ask for
-/// itself, on Windows the acrylic drawn through DirectComposition, which a
-/// window takes as it is made. `None` changes nothing.
-///
-/// `win32_system_backdrop` stays the configuration's to choose: with this
-/// window frame it turns a see-through window opaque (wezterm#6265).
+/// the opacity, and while it is see-through the blur the configuration file
+/// does not ask for itself on macOS. Windows asks for Acrylic from the opacity
+/// the configuration ends up with, so it needs no key of its own here.
 struct WindowOpacityChanges {
     opacity: Option<f64>,
     blur: Option<i64>,
-    acrylic: Option<config::Win32BackdropTrial>,
 }
 
 fn window_opacity_changes(percent: Option<u8>) -> WindowOpacityChanges {
@@ -891,8 +882,6 @@ fn window_opacity_changes(percent: Option<u8>) -> WindowOpacityChanges {
             && cfg!(target_os = "macos")
             && config.macos_window_background_blur == 0)
             .then_some(WINDOW_BLUR_RADIUS),
-        acrylic: (see_through && cfg!(windows))
-            .then_some(config::Win32BackdropTrial::Composition),
     }
 }
 
@@ -4089,10 +4078,9 @@ mod tests {
     fn window_opacity_overrides_the_opacity_and_asks_for_a_blur() {
         use wezterm_dynamic::ToDynamic;
         let mut settings = ThinkTermNativeSettings::default();
-        let [opacity, blur, backdrop, glass] = window_opacity_overrides(&settings);
+        let [opacity, blur, glass] = window_opacity_overrides(&settings);
         assert_eq!(opacity, ("window_background_opacity", None));
         assert_eq!(blur, ("macos_window_background_blur", None));
-        assert_eq!(backdrop, ("win32_backdrop_trial", None));
         assert_eq!(
             glass,
             (
@@ -4101,7 +4089,7 @@ mod tests {
             )
         );
         settings.appearance.window_opacity = Some(80);
-        let [opacity, blur, ..] = window_opacity_overrides(&settings);
+        let [opacity, blur, _] = window_opacity_overrides(&settings);
         if window_opacity_supported() {
             assert_eq!(opacity.1, Some(0.8f64.to_dynamic()));
         } else {
@@ -4115,21 +4103,8 @@ mod tests {
             assert_eq!(opacity.1, Some(0.3f64.to_dynamic()));
         }
         settings.appearance.window_opacity = Some(100);
-        let [_, blur, ..] = window_opacity_overrides(&settings);
+        let [_, blur, _] = window_opacity_overrides(&settings);
         assert_eq!(blur.1, None);
-        // Opaque, Windows is asked for no acrylic either. The Windows
-        // backdrop itself is never Settings' to set.
-        let [_, _, backdrop, _] = window_opacity_overrides(&settings);
-        assert_eq!(backdrop.1, None);
-        assert!(!WINDOW_OPACITY_KEYS.contains(&"win32_system_backdrop"));
-        // See-through, it is, on Windows.
-        settings.appearance.window_opacity = Some(80);
-        let [_, _, backdrop, _] = window_opacity_overrides(&settings);
-        assert_eq!(
-            backdrop.1,
-            (cfg!(windows) && window_opacity_supported())
-                .then(|| config::Win32BackdropTrial::Composition.to_dynamic())
-        );
     }
 
     #[test]
@@ -4194,13 +4169,6 @@ mod tests {
         assert_eq!(settings.appearance.sidebar_shade, NativeSidebarShade::Dark);
         assert_eq!(settings.appearance.tab_bar_shade, NativeShade::Light);
         assert_eq!(settings.appearance.terminal_shade, NativeShade::Dark);
-    }
-
-    #[test]
-    fn a_frosted_glass_choice_left_by_a_trial_build_is_ignored() {
-        let text = r#"{"appearance":{"window_opacity":80,"windows_backdrop":"composition"}}"#;
-        let settings: ThinkTermNativeSettings = serde_json::from_str(text).unwrap();
-        assert_eq!(settings.appearance.window_opacity, Some(80));
     }
 
     use config::UiColors;

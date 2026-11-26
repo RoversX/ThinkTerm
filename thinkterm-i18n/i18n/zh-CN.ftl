@@ -898,7 +898,6 @@ settings-status-stop-session-server-error = 无法停止会话服务器:{ $error
 settings-status-window-restore-off = 已为新的 macOS 窗口关闭主窗口位置与大小恢复。
 settings-status-window-restore-error = 无法保存窗口恢复设置：{ $error }
 settings-status-renderer = 渲染器已设为 { $renderer }；重启 ThinkTerm 后生效。
-settings-status-window-acrylic-after-restart = { $setting }现为{ $value }；毛玻璃要重启 ThinkTerm 后出现（需要 OpenGL 渲染器）。
 settings-status-renderer-error = 无法保存渲染器设置：{ $error }
 settings-status-restarting = 正在重启 ThinkTerm…
 settings-status-restart-error = 无法重启 ThinkTerm：{ $error }

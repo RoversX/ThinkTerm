@@ -895,7 +895,6 @@ settings-status-stop-session-server-error = Не удалось останови
 settings-status-window-restore-off = Восстановление положения выключено для новых окон macOS.
 settings-status-window-restore-error = Не удалось сохранить восстановление окна: { $error }
 settings-status-renderer = Отрисовка: { $renderer }; перезапустите ThinkTerm для применения.
-settings-status-window-acrylic-after-restart = { $setting }: { $value }; матовое стекло появится после перезапуска ThinkTerm с OpenGL.
 settings-status-renderer-error = Не удалось сохранить отрисовку: { $error }
 settings-status-restarting = Перезапуск ThinkTerm…
 settings-status-restart-error = Не удалось перезапустить ThinkTerm: { $error }
