@@ -77,6 +77,9 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     /// Threads home lists the projects of every host by the git repository
     /// they are in, rather than host by host.
     var byRepo by pref("home.repos", false)
+    /// The host whose Space the lists show (Threads home, a terminal's
+    /// sidebar): the one looked at last, kept from one launch to the next.
+    var spaceHost by pref("spaces.host", "")
     /// A repository's group says the host its remote is on, not only the
     /// owner: `github.com/owner/repo`.
     var repoHost by pref("home.repos.host", false)

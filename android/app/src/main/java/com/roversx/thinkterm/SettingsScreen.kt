@@ -400,11 +400,6 @@ private fun SettingsSection(
             "interface" -> {
                 Group {
                     SwitchRow(tr("i.panebars"), settings.paneBars) { settings.paneBars = it }
-                    SegmentRow(
-                        tr("i.spaces"),
-                        listOf(tr("i.spaces.list"), tr("i.spaces.menu")),
-                        if (settings.spaces == "menu") 1 else 0,
-                    ) { settings.spaces = if (it == 1) "menu" else "list" }
                     SwitchRow(tr("sky.haptics"), settings.skyHaptics) { settings.skyHaptics = it }
                 }
                 // The Threads home's projects by repository, every host's

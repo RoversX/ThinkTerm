@@ -13,6 +13,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
@@ -194,6 +195,8 @@ private fun Root(store: HostStore, debuggable: Boolean) {
     }
     var page by remember { mutableStateOf(Page.THREADS) }
     var open by remember { mutableStateOf<Host?>(null) }
+    // A terminal the sidebar brought from another host's comes with it out.
+    var openPanel by remember { mutableStateOf(false) }
     // A notification's agent is on a host: its terminal opens, wherever the
     // app was. A host since removed leaves the link with nowhere to go.
     val link = AgentLinks.pending
@@ -204,29 +207,50 @@ private fun Root(store: HostStore, debuggable: Boolean) {
             AgentLinks.pending = null
         } else if (open?.id != host.id) {
             open = host
+            openPanel = false
         }
     }
     // The host whose own page is up on the hosts' screen: kept here, so the
     // way back from its terminal comes back to it, as iOS's stack does.
     var hostPage by remember { mutableStateOf<String?>(null) }
-    val route = open?.let { Route.OnTerminal(it) } ?: Route.OnPage(page)
+    val route = open?.let { Route.OnTerminal(it, openPanel) } ?: Route.OnPage(page)
 
     // A page pushed slides in over the one it leaves, as iOS's stack does.
     AnimatedContent(
         targetState = route,
-        transitionSpec = { pushTransition(targetState.depth > initialState.depth) },
+        transitionSpec = {
+            // One host's terminal for another's (the sidebar went there):
+            // a cross-fade, not a page pushed.
+            if (targetState is Route.OnTerminal && initialState is Route.OnTerminal) {
+                androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(240)) togetherWith
+                    androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(200))
+            } else {
+                pushTransition(targetState.depth > initialState.depth)
+            }
+        },
         contentKey = { it.key },
         label = "pages",
     ) { shown ->
         when (shown) {
-            is Route.OnTerminal -> TerminalScreen(shown.host, store) { open = null }
+            // Another host's, from the sidebar: the terminal is swapped
+            // for it in place; back from it is back to Threads.
+            is Route.OnTerminal -> TerminalScreen(
+                shown.host,
+                store,
+                panelOut = shown.panel,
+                onHost = { to, panel ->
+                    open = to
+                    openPanel = panel
+                    page = Page.THREADS
+                    hostPage = null
+                },
+            ) { open = null; openPanel = false }
             is Route.OnPage -> {
                 SystemBars(dark = isSystemInDarkTheme())
                 when (shown.page) {
                     Page.THREADS -> ThreadsHome(
                         store = store,
-                        debuggable = debuggable,
-                        onOpen = { open = it },
+                        onOpen = { open = it; openPanel = false },
                         onHosts = { page = Page.HOSTS },
                         onSettings = { page = Page.SETTINGS },
                     )
@@ -238,7 +262,7 @@ private fun Root(store: HostStore, debuggable: Boolean) {
                             onBack = { page = Page.THREADS; hostPage = null },
                             hostPage = hostPage,
                             onHostPage = { hostPage = it },
-                        ) { open = it }
+                        ) { open = it; openPanel = false }
                     }
                     Page.SETTINGS -> {
                         BackHandler { page = Page.THREADS }
@@ -264,7 +288,7 @@ private sealed class Route {
         override val key get() = page.name
     }
 
-    data class OnTerminal(val host: Host) : Route() {
+    data class OnTerminal(val host: Host, val panel: Boolean = false) : Route() {
         override val depth get() = 2
         override val key get() = "terminal:" + host.id
     }

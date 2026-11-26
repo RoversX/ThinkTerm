@@ -124,7 +124,16 @@ import kotlinx.coroutines.delay
 /// piece of chrome takes the terminal's own background, as on iOS.
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
+fun TerminalScreen(
+    host: Host,
+    store: HostStore,
+    /// Come with the sidebar out: it brought the terminal here, a Space of
+    /// this host picked in another's.
+    panelOut: Boolean = false,
+    /// Another host's terminal in this one's place (`panel`: its sidebar out).
+    onHost: (Host, Boolean) -> Unit,
+    onBack: () -> Unit,
+) {
     val context = LocalContext.current
     // The connection is the host's, not the screen's: it lives in
     // `Sessions` and is picked up again on the way back.
@@ -144,7 +153,9 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val lang = AppLanguage.tag
 
-    var showTree by remember { mutableStateOf(false) }
+    var showTree by remember { mutableStateOf(panelOut) }
+    // The lists show this host's Space from now on.
+    LaunchedEffect(host.id) { AppSettings.get(context).spaceHost = host.id }
     /// The right sidebar is out from under the screen (`RightPanel`).
     var showRight by remember { mutableStateOf(false) }
     // How far the screen has slid off each sidebar, 0 to 1: they lie under
@@ -324,6 +335,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                 Box(Modifier.width(drawerWidth).fillMaxHeight().align(Alignment.TopStart)) {
                     SidebarPanel(
                         model = model,
+                        store = store,
                         done = { showTree = false },
                         // Over the sidebar, which waits under them, as iOS's
                         // stack pushes a page over the drawer it came from.
@@ -332,6 +344,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                         onOverview = { showTree = false; if (overviewShown) closeOverview() else openOverview() },
                         // The whole page goes, the sidebar with it: one move.
                         onLeave = { onBack() },
+                        onHost = onHost,
                         overviewOn = overviewShown,
                     )
                 }
@@ -364,11 +377,13 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                         Box(Modifier.width(SIDEBAR_COLUMN).fillMaxHeight()) {
                             SidebarPanel(
                                 model = model,
+                                store = store,
                                 done = {},
                                 onEditHost = { editingHost = model.host },
                                 onSettings = { showSettings = true },
                                 onOverview = { if (overviewShown) closeOverview() else openOverview() },
                                 onLeave = { onBack() },
+                                onHost = onHost,
                                 overviewOn = overviewShown,
                             )
                         }
