@@ -2,20 +2,11 @@
 
 **English** · [简体中文](readme-i18n/README.zh-CN.md) · [日本語](readme-i18n/README.ja-JP.md) · [Français](readme-i18n/README.fr-FR.md) · [Deutsch](readme-i18n/README.de-DE.md) · [Русский](readme-i18n/README.ru-RU.md)
 
-## 📥 Download
-
-**[Download here](https://github.com/RoversX/ThinkTerm/releases)** - Get the latest release
-
-🍺 **Homebrew** (macOS): 
-```
-brew install --cask roversx/tap/thinkterm
-```
+📥 **[Download here](https://github.com/RoversX/ThinkTerm/releases)**
 
 🌐 **Website**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **Documentation**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
-
-⭐ Consider starring [ThinkTerm](https://github.com/RoversX/ThinkTerm)!
 
 **Your machines fuse into one.**
 
@@ -91,14 +82,9 @@ ThinkTerm 0.6.0 and Ghostty 1.4.0 ran on the same machine under Ubuntu 26.04. Th
 | Long escape codes | 416.6 | 56.1 | 7.43× |
 | Images | 299.1 | 53.2 | 5.62× |
 
-<details>
-<summary>Ubuntu 26.04 benchmark screenshots</summary>
-
 | ThinkTerm 0.6.0 | Ghostty 1.4.0 |
 | :---: | :---: |
 | ![ThinkTerm benchmark results](assets/screenshots/ubuntu-thinkterm-0.6.0.png) | ![Ghostty benchmark results](assets/screenshots/ubuntu-ghostty-1.4.0.png) |
-
-</details>
 
 Progress across versions on the same Mac. Ratio compares 0.4.3 with the early build.
 
@@ -252,6 +238,12 @@ The [iOS](ios) and [Android](android) apps use native interfaces and the shared 
 Android updates: [F-Droid repository](https://github.com/RoversX/fdroid/tree/dist).
 
 ## Getting started
+
+On macOS, install ThinkTerm with Homebrew:
+
+```sh
+brew install --cask roversx/tap/thinkterm
+```
 
 For a desktop build on macOS or Linux, install Rust and your platform's build tools, then:
 
