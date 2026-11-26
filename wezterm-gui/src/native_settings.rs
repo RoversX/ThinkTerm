@@ -440,6 +440,30 @@ where
     })
 }
 
+/// The lines per wheel notch Settings offers, and the one it starts at: as
+/// far as a notch has always gone on X11.
+pub(crate) const WHEEL_LINES_RANGE: std::ops::RangeInclusive<u8> = 1..=20;
+pub(crate) const DEFAULT_WHEEL_LINES: u8 = 5;
+
+/// Lines per wheel notch from the file: a number is rounded and brought
+/// into the range, anything else reads as the default.
+fn wheel_lines_or_default<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw.as_f64().filter(|lines| lines.is_finite()) {
+        Some(lines) => lines.round().clamp(
+            f64::from(*WHEEL_LINES_RANGE.start()),
+            f64::from(*WHEEL_LINES_RANGE.end()),
+        ) as u8,
+        None => {
+            log::warn!("unknown wheel_lines {raw} in the settings; using the default");
+            DEFAULT_WHEEL_LINES
+        }
+    })
+}
+
 /// The same for any of the plain choices: one this build cannot read (a
 /// newer build's, or a typo) reads as its default, and the file is kept.
 fn choice_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -1158,6 +1182,11 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) fontconfig_prefer_system_fallback: Option<bool>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
     pub(crate) scroll_mode: NativeScrollMode,
+    /// Lines one notch of a mouse wheel moves the terminal's scrollback on
+    /// Linux, where the system keeps no such setting. Windows and macOS
+    /// follow their own.
+    #[serde(deserialize_with = "wheel_lines_or_default")]
+    pub(crate) wheel_lines: u8,
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) selection_style: NativeSelectionStyle,
     /// A selection let go of is copied to the clipboard, as WezTerm and
@@ -1207,6 +1236,7 @@ impl Default for NativeTerminalSettings {
             fontconfig_prefer_system_fallback: None,
             remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
             scroll_mode: NativeScrollMode::default(),
+            wheel_lines: DEFAULT_WHEEL_LINES,
             selection_style: NativeSelectionStyle::default(),
             copy_on_select: true,
             right_click: NativeRightClick::default(),
@@ -1233,6 +1263,14 @@ pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
 /// `load`, which deep-clones the whole settings tree.
 pub(crate) fn scroll_mode() -> NativeScrollMode {
     load_shared().terminal.scroll_mode
+}
+
+/// Read on every wheel notch over a terminal, through the shared handle.
+pub(crate) fn wheel_lines() -> u8 {
+    load_shared()
+        .terminal
+        .wheel_lines
+        .clamp(*WHEEL_LINES_RANGE.start(), *WHEEL_LINES_RANGE.end())
 }
 
 /// Read every frame, through the shared handle.
@@ -4213,6 +4251,23 @@ mod tests {
         let text = r#"{"appearance":{"window_opacity":80,"windows_backdrop":"composition"}}"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(text).unwrap();
         assert_eq!(settings.appearance.window_opacity, Some(80));
+    }
+
+    #[test]
+    fn wheel_lines_read_from_the_file_stay_in_range() {
+        let read = |terminal: &str| -> u8 {
+            let text = format!(r#"{{"terminal":{terminal}}}"#);
+            let settings: ThinkTermNativeSettings = serde_json::from_str(&text).unwrap();
+            settings.terminal.wheel_lines
+        };
+        assert_eq!(read("{}"), DEFAULT_WHEEL_LINES);
+        assert_eq!(read(r#"{"wheel_lines":3}"#), 3);
+        assert_eq!(read(r#"{"wheel_lines":3.0}"#), 3);
+        assert_eq!(read(r#"{"wheel_lines":2.6}"#), 3);
+        assert_eq!(read(r#"{"wheel_lines":0}"#), 1);
+        assert_eq!(read(r#"{"wheel_lines":-4}"#), 1);
+        assert_eq!(read(r#"{"wheel_lines":500}"#), 20);
+        assert_eq!(read(r#"{"wheel_lines":"fast"}"#), DEFAULT_WHEEL_LINES);
     }
 
     use config::UiColors;

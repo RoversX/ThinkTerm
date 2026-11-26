@@ -2231,6 +2231,34 @@ pub fn tooltip_left_aligns(item_type: &UIItemType) -> bool {
     )
 }
 
+/// The lines a vertical wheel event moves the scrollback, same sign as
+/// `amount`. Notches from X11 or Wayland move the lines Settings asks for,
+/// read only then; anything else keeps the amount the system gave.
+fn scrollback_wheel_lines(amount: i16, notches: Option<i16>, lines_per_notch: fn() -> u8) -> i16 {
+    match notches {
+        // Not i16::MIN: the caller negates it.
+        Some(notches) => notches
+            .saturating_mul(i16::from(lines_per_notch()))
+            .max(-i16::MAX),
+        None => amount,
+    }
+}
+
+#[cfg(test)]
+mod scrollback_wheel_lines_tests {
+    use super::scrollback_wheel_lines;
+
+    #[test]
+    fn notches_move_the_lines_asked_for_and_other_wheels_keep_theirs() {
+        assert_eq!(scrollback_wheel_lines(5, Some(1), || 3), 3);
+        assert_eq!(scrollback_wheel_lines(-5, Some(-2), || 7), -14);
+        // Windows and macOS: the system's lines, with no notches beside them.
+        assert_eq!(scrollback_wheel_lines(3, None, || unreachable!()), 3);
+        assert_eq!(scrollback_wheel_lines(1, Some(i16::MAX), || 20), i16::MAX);
+        assert_eq!(scrollback_wheel_lines(-1, Some(i16::MIN), || 20), -i16::MAX);
+    }
+}
+
 /// The window holding the keyboard focus, if a ThinkTerm window does.
 /// Held by the window's `space_owner_id`: its mux window id changes with
 /// every thread or Space it switches to, and the holder must still match
@@ -12057,7 +12085,11 @@ impl TermWindow {
             return Ok(());
         };
         let amount = match event.kind {
-            MouseEventKind::VertWheel(amount) => -amount,
+            MouseEventKind::VertWheel(amount) => -scrollback_wheel_lines(
+                amount,
+                event.wheel_notches,
+                crate::native_settings::wheel_lines,
+            ),
             _ => return Ok(()),
         };
         if crate::native_settings::scroll_mode() == crate::native_settings::NativeScrollMode::Smooth

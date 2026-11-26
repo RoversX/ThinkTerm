@@ -2431,6 +2431,9 @@ enum SettingsAction {
     ToggleBottomQuote,
     SetRemotePaneResizeMode(NativeRemotePaneResizeMode),
     SetScrollMode(crate::native_settings::NativeScrollMode),
+    DecreaseWheelLines,
+    IncreaseWheelLines,
+    ResetWheelLines,
     ToggleSystemFontFallback,
     SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
     ToggleCopyOnSelect,
@@ -6198,6 +6201,40 @@ impl SettingsWindow {
         }
     }
 
+    /// Step the lines per wheel notch by `step`, or with `None` put back the
+    /// default, kept to the range offered. The step counts from the value in
+    /// the file, through `update`, so an edit made elsewhere is neither lost
+    /// nor stepped from a stale copy. Read on every notch, so the next one
+    /// goes the new distance.
+    fn apply_wheel_lines(&mut self, step: Option<i8>) {
+        self.ui.open_dropdown = None;
+        let range = crate::native_settings::WHEEL_LINES_RANGE;
+        let mut lines = crate::native_settings::DEFAULT_WHEEL_LINES;
+        let saved = crate::native_settings::update(|settings| {
+            if let Some(step) = step {
+                lines = settings.terminal.wheel_lines.saturating_add_signed(step);
+            }
+            lines = lines.clamp(*range.start(), *range.end());
+            settings.terminal.wheel_lines = lines;
+        });
+        let setting = crate::i18n::tr("settings-wheel-lines");
+        match saved {
+            Ok(saved) => {
+                self.set_native_settings((*saved).clone());
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[("setting", setting), ("value", lines.to_string())],
+                );
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     /// Save one of the mouse and clipboard choices. Merged into the freshest
     /// settings for the reason `apply_text_contrast` gives; each is read
     /// where it is used, so nothing needs telling.
@@ -7530,6 +7567,9 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SetScrollMode(mode) => self.apply_scroll_mode(mode),
+            SettingsAction::DecreaseWheelLines => self.apply_wheel_lines(Some(-1)),
+            SettingsAction::IncreaseWheelLines => self.apply_wheel_lines(Some(1)),
+            SettingsAction::ResetWheelLines => self.apply_wheel_lines(None),
             SettingsAction::ToggleSystemFontFallback => {
                 let on = !self
                     .native_settings
@@ -14890,6 +14930,33 @@ impl SettingsWindow {
                 selected,
                 rows.rule(),
             )?);
+
+            // Windows and macOS have the system's own setting for this.
+            if cfg!(all(unix, not(target_os = "macos"))) {
+                let lines = this.native_settings.terminal.wheel_lines;
+                let (tx, tw) = this.paint_row_tile(
+                    layers,
+                    row_x,
+                    rows.y,
+                    row_width,
+                    SvgIcon::Mouse,
+                    TileColor::Teal,
+                )?;
+                rows.add(this.paint_font_size_stepper_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr("settings-wheel-lines"),
+                    &crate::i18n::tr("settings-wheel-lines-description"),
+                    f64::from(lines),
+                    Some(&lines.to_string()),
+                    SettingsAction::ResetWheelLines,
+                    SettingsAction::DecreaseWheelLines,
+                    SettingsAction::IncreaseWheelLines,
+                    rows.rule(),
+                )?);
+            }
 
             let (tx, tw) = this.paint_row_tile(
                 layers,
