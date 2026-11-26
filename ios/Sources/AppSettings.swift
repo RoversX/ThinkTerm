@@ -94,9 +94,17 @@ final class AppSettings: ObservableObject {
 
     /// How the sidebar shows the Spaces: "list", every Space a row that
     /// folds, or "menu", the Space on show with the others in its menu,
-    /// as the desktop's sidebar has them.
+    /// as the desktop's sidebar has them. No longer offered: the lists show
+    /// one Space at a time, its menu at their head (`SpaceList`).
     @Published var spaces: String {
         didSet { defaults.set(spaces, forKey: "ui.spaces") }
+    }
+
+    /// The host whose Space the lists show (Threads home, a terminal's
+    /// sidebar), by its id: the one looked at last, kept from one launch to
+    /// the next.
+    @Published var spaceHost: String {
+        didSet { defaults.set(spaceHost, forKey: "spaces.host") }
     }
 
     /// Threads lists only the threads the Status panel has something in
@@ -204,6 +212,7 @@ final class AppSettings: ObservableObject {
         chatText = d.string(forKey: "chat.text") ?? "m"
         chatReveal = d.string(forKey: "chat.reveal") ?? "stream"
         spaces = d.string(forKey: "ui.spaces") ?? "list"
+        spaceHost = d.string(forKey: "spaces.host") ?? ""
         agentsOnly = d.object(forKey: "home.agents") as? Bool ?? false
         byRepo = d.object(forKey: "home.repos") as? Bool ?? false
         repoHost = d.object(forKey: "home.repos.host") as? Bool ?? false

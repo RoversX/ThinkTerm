@@ -259,10 +259,6 @@ struct SettingsPageView: View {
         case .interface:
             Section {
                 Toggle(tr("i.panebars"), isOn: $settings.paneBars)
-                push(tr("i.spaces"), selection: $settings.spaces, options: [
-                    PickerOption("list", tr("i.spaces.list")),
-                    PickerOption("menu", tr("i.spaces.menu")),
-                ])
                 Toggle(tr("sky.haptics"), isOn: $settings.skyHaptics)
             }
             // The Threads home's projects by repository, every host's

@@ -85,6 +85,19 @@ struct TerminalScreen: View {
     @State private var moves = OverviewMoves()
     /// Whether tabs lie past the start of the strip and past its end.
     @State private var stripEnds = StripEnds()
+    /// Another host's terminal in this one's place, from the sidebar: a
+    /// thread or a Space of that host picked there; for a Space, it comes
+    /// with its sidebar out.
+    var onHost: ((UUID, Bool) -> Void)?
+
+    /// `panelOut`: the screen comes with its sidebar out, as the sidebar
+    /// brought it here from another host's (a Space of this one picked).
+    init(model: TerminalModel, panelOut: Bool = false, onHost: ((UUID, Bool) -> Void)? = nil) {
+        _model = ObservedObject(wrappedValue: model)
+        self.onHost = onHost
+        _showTree = State(initialValue: panelOut)
+        _drawerShown = State(initialValue: panelOut)
+    }
 
     /// On a phone held upright the sidebar is a drawer the whole screen
     /// slides off, rounding its corner -- by the button or a swipe from the
@@ -209,10 +222,11 @@ struct TerminalScreen: View {
             .simultaneousGesture(
                 DragGesture(minimumDistance: 24).onEnded { drag in
                     // A swipe back toward the side it came from, not a
-                    // scroll of the list that drifts.
+                    // scroll of the list that drifts. One across the drawer
+                    // is its list's, which goes to another Space with it.
                     let move = drag.translation
                     guard abs(move.width) > abs(move.height) else { return }
-                    if drawerOpen && move.width < -60 { showTree = false }
+                    if drawerOpen && move.width < -60 && drag.startLocation.x > drawerWidth { showTree = false }
                     if showRight && move.width > 60 { showRight = false }
                 },
                 including: drawerOpen || showRight ? .all : .subviews
@@ -222,6 +236,8 @@ struct TerminalScreen: View {
             .animation(Self.slide, value: sidebarPinned)
             .onAppear {
                 self.wide = wide
+                // Wide, the sidebar is a column: the drawer has no place.
+                if wide { showTree = false }
                 model.edgePullsDrawer = !wide && !showTree
                 // No room for a split's panes side by side: one at a time.
                 model.setOnePane(!wide)
@@ -349,13 +365,12 @@ struct TerminalScreen: View {
     private func sidebar(live: Bool) -> some View {
         SidebarPanel(
             model: model,
-            hostName: hostName,
-            connected: connected,
             done: { if !wide { showTree = false } },
             onEditHost: { showTree = false; editingHost = model.host },
             onSettings: { showSettings = true },
             onOverview: { openOverview() },
             onLeave: { leave() },
+            onHost: onHost,
             overviewOn: overviewOpen,
             live: live
         )
@@ -702,6 +717,9 @@ struct TerminalScreen: View {
         .onAppear {
             moves.onScreen = true
             model.enterScreen()
+            // The lists show this host's Space from now on.
+            let shown = (model.host?.id ?? Sessions.probeId).uuidString
+            if settings.spaceHost != shown { settings.spaceHost = shown }
             // The automated flows connect on their own schedule; a session
             // found open is simply shown. One lost and not redialing by
             // itself (auto-reconnect off) is dialled again: coming to it --

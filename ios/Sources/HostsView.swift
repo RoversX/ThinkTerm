@@ -6,6 +6,9 @@ import SwiftUI
 struct HostsView: View {
     @EnvironmentObject var store: HostStore
     @EnvironmentObject var sessions: Sessions
+    /// Another host's terminal in place of one opened here (its sidebar's
+    /// Space menu), from Threads.
+    @Environment(\.openTerminal) private var openTerminal
     @ObservedObject private var lang = AppLanguage.shared
     @State private var adding = false
     @State private var search = ""
@@ -81,7 +84,7 @@ struct HostsView: View {
             // The development row's stand-in host, told by its id: a real
             // host may well be called "probe". It has no page; it connects.
             if host.id == probe.id {
-                TerminalScreen(model: sessions.model(for: nil, store: store))
+                TerminalScreen(model: sessions.model(for: nil, store: store), onHost: openTerminal)
             } else {
                 page(host)
             }
@@ -91,12 +94,12 @@ struct HostsView: View {
         }
         // A host's page opens its terminal by value, in this same stack.
         .navigationDestination(for: HostTerminal.self) { target in
-            TerminalScreen(model: sessions.model(for: target.host, store: store))
+            TerminalScreen(model: sessions.model(for: target.host, store: store), onHost: openTerminal)
         }
         // A separate destination type so the menu's Connect can push
         // without fighting the value-based destinations above.
         .navigationDestination(item: $connecting) { target in
-            TerminalScreen(model: sessions.model(for: target.host, store: store))
+            TerminalScreen(model: sessions.model(for: target.host, store: store), onHost: openTerminal)
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
