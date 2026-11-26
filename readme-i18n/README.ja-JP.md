@@ -2,55 +2,26 @@
 
 [English](../README.md) · [简体中文](README.zh-CN.md) · **日本語** · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md) · [Русский](README.ru-RU.md)
 
-## 📥 ダウンロード
-
-**[こちらからダウンロード](https://github.com/RoversX/ThinkTerm/releases)** - 最新リリースを入手
-
-🍺 **Homebrew**（macOS）： 
-```
-brew install --cask roversx/tap/thinkterm
-```
+📥 **[こちらからダウンロード](https://github.com/RoversX/ThinkTerm/releases)**
 
 🌐 **公式サイト**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **ドキュメント**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
 
-⭐ よろしければ [ThinkTerm](https://github.com/RoversX/ThinkTerm) にスターをお願いします！
-
 **複数のマシンを、ひとつの作業環境に。**
 
-ThinkTerm は [WezTerm](https://github.com/wezterm/wezterm) を基盤とした、**Rust で書かれた、マルチプレクサー内蔵のオープンソースターミナル**です。mux サーバーがシェル、ツール、コーディングエージェントを実行し、デスクトップ、TUI、ブラウザーの各クライアントがそのセッションに接続します。ローカルとリモートの作業を同じワークスペースにまとめ、別のデバイスからも接続できます。
+マルチプレクサーを内蔵した超高速ターミナル。
 
-**対応プラットフォーム：** macOS · Linux · Windows · Web · TUI — iOS と Android は開発中。
+**対応プラットフォーム：** macOS · Linux · Windows · Web · TUI · iOS · Android
 
-<table>
-  <tr>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/workspace.jpeg" alt="分割ターミナル、ソースのプレビュー、プロジェクトのファイルツリー" width="100%">
-      <br><strong>プロジェクトのワークスペース</strong>
-    </td>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/agents.jpeg" alt="リモートターミナル横のエージェント状態とワークスペースのサイドバー" width="100%">
-      <br><strong>複数マシンのエージェント</strong>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/overview.jpeg" alt="Space ごとにまとめたターミナルのライブプレビュー" width="100%">
-      <br><strong>セッションの全体表示</strong>
-    </td>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/spaces.jpeg" alt="プロジェクトの Thread と Space の選択メニュー" width="100%">
-      <br><strong>スペースの切り替え</strong>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="../assets/screenshots/mobile.jpeg" alt="iOS / iPadOS 版（Swift）と Android 版（Kotlin）の ThinkTerm" width="100%">
-      <br><strong>iOS・iPadOS・Android</strong>
-    </td>
-  </tr>
-</table>
+![ThinkTerm のワークスペースで動く lazygit と右サイドバーのエージェント状態](../assets/screenshots/lazygit.png)
+
+<details>
+<summary>デモを見る</summary>
+
+https://github.com/user-attachments/assets/7317e369-db86-463f-9379-a8a2ed4b602b
+
+</details>
 
 ## パフォーマンス
 
@@ -100,6 +71,20 @@ Linux では kitty と比較しました。Ubuntu 20.04（i9-12900K）、180×50
 | 画像 | **663.3** | 196.3 | 3.4× |
 
 </details>
+
+同じ Ubuntu 26.04 マシンで ThinkTerm 0.6.0 と Ghostty 1.4.0 を比較しました。表は端末入力を解析する際のスループット（MB/s）を示します。
+
+| 項目 | ThinkTerm 0.6.0 | Ghostty 1.4.0 | 倍率 |
+| --- | ---: | ---: | ---: |
+| ASCII 文字のみ | 352.7 | 148.1 | 2.38× |
+| Unicode 文字 | 202.5 | 96.6 | 2.10× |
+| 文字の少ない CSI シーケンス | 61.1 | 58.6 | 1.04× |
+| 長いエスケープシーケンス | 416.6 | 56.1 | 7.43× |
+| 画像 | 299.1 | 53.2 | 5.62× |
+
+| ThinkTerm 0.6.0 | Ghostty 1.4.0 |
+| :---: | :---: |
+| ![ThinkTerm — ベンチマーク結果](../assets/screenshots/ubuntu-thinkterm-0.6.0.png) | ![Ghostty — ベンチマーク結果](../assets/screenshots/ubuntu-ghostty-1.4.0.png) |
 
 同じ Mac でのバージョンごとの推移です。倍率は 0.4.3 と初期ビルドの比較です。
 
@@ -180,6 +165,29 @@ ThinkTerm のターミナルコア、mux サーバー、デスクトップクラ
 
 ローカルとリモートのワークスペースを同じサイドバーに表示します。Thread の状態で、処理中、対応が必要、完了、待機中を区別できます。全体表示では Space ごとにターミナルのライブプレビューが並ぶため、タブをひとつずつ開かずにセッションを探せます。
 
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/workspace.jpeg" alt="分割ターミナル、ソースのプレビュー、プロジェクトのファイルツリー" width="100%">
+      <br><strong>プロジェクトのワークスペース</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/agents.jpeg" alt="リモートターミナル横のエージェント状態とワークスペースのサイドバー" width="100%">
+      <br><strong>複数マシンのエージェント</strong>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/overview.jpeg" alt="Space ごとにまとめたターミナルのライブプレビュー" width="100%">
+      <br><strong>セッションの全体表示</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/spaces.jpeg" alt="プロジェクトの Thread と Space の選択メニュー" width="100%">
+      <br><strong>スペースの切り替え</strong>
+    </td>
+  </tr>
+</table>
+
 ## 日々のターミナル作業に
 
 - **Rust、性能、メモリ効率。** ThinkTerm は負荷の高いターミナル作業を想定しています。多数のセッションやエージェントを並行して動かしても快適に操作できることを目指し、ターミナルの処理性能、描画効率、メモリ使用量を継続的に最適化しています。
@@ -202,7 +210,7 @@ CLI からペインを自動操作することもできます。`thinkterm cli s
 | **デスクトップ** | macOS、Linux、Windows 向けのネイティブアプリ。 |
 | **TUI** | `thinkterm tui` を使い、既存のターミナル内でワークスペースを移動し、セッションを操作。 |
 | **ブラウザー** | 自分の mux サーバーが配信するクライアント。WebGPU とブラウザーのセキュアコンテキストが必要。アクセスを明示的に有効化する必要あり。 |
-| **iOS と Android** | 開発中のネイティブクライアント。Rust コアを共有し、GPU 描画と SSH 通信を使用。リリースに向けた整備と実機検証は継続中。 |
+| **iOS と Android** | Rust コアを共有するネイティブクライアント。描画には GPU、通信には SSH を使用します。 |
 
 各クライアントはサーバー上のセッションに接続しますが、インターフェースや対応機能は異なります。
 
@@ -221,13 +229,21 @@ TUI はワークスペースの移動、タブ、ペイン分割、サイズ変�
 
 リスナー、トークン、SSH 転送、証明書については[ブラウザーからのアクセス](../docs/thinkterm/web-access.md)をご覧ください。
 
-### モバイル版の開発
+### モバイルアプリ
 
-[iOS](../ios) と [Android](../android) のアプリは、ネイティブ UI と共有の[モバイルコア](../thinkterm-mobile)を使用します。SSH で別のマシン上のセッションに接続します。現在も開発中であり、リリース済みのモバイル製品としては案内していません。
+[iOS](../ios) と [Android](../android) のアプリは、ネイティブ UI と共有の[モバイルコア](../thinkterm-mobile)を使用します。SSH で別のマシン上のセッションに接続します。
+
+![iOS / iPadOS 版（Swift）と Android 版（Kotlin）の ThinkTerm](../assets/screenshots/mobile.jpeg)
 
 Android の更新：[F-Droid リポジトリ](https://github.com/RoversX/fdroid/tree/dist).
 
 ## 使い始める
+
+macOS では Homebrew で ThinkTerm をインストールできます。
+
+```sh
+brew install --cask roversx/tap/thinkterm
+```
 
 macOS または Linux でデスクトップ版をビルドするには、Rust とプラットフォームのビルドツールをインストールし、次を実行します。
 

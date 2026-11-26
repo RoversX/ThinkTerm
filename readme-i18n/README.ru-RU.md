@@ -2,57 +2,26 @@
 
 [English](../README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md) · **Русский**
 
-## 📥 Загрузка
-
-**[Скачать здесь](https://github.com/RoversX/ThinkTerm/releases)** - последняя версия
-
-🍺 **Homebrew** (macOS): 
-```
-brew install --cask roversx/tap/thinkterm
-```
+📥 **[Скачать здесь](https://github.com/RoversX/ThinkTerm/releases)**
 
 🌐 **Сайт**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **Документация**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
 
-⭐ Поставьте звезду [ThinkTerm](https://github.com/RoversX/ThinkTerm)!
-
 **Ваши машины сливаются в одну.**
 
-ThinkTerm — это **терминал со встроенным мультиплексором, написанный на Rust**, с открытым исходным кодом и построенный на [WezTerm](https://github.com/wezterm/wezterm). Его mux-сервер запускает ваши оболочки, инструменты и агентов для программирования, а настольный клиент, TUI и браузер подключаются к этим сеансам. Соберите локальную и удалённую работу в одном рабочем пространстве и возвращайтесь к ней с другого устройства.
+Сверхбыстрый терминал со встроенным мультиплексором.
 
-**Платформы:** macOS · Linux · Windows · Web · TUI — iOS и Android в разработке.
+**Платформы:** macOS · Linux · Windows · Web · TUI · iOS · Android
+
+![Lazygit в рабочем пространстве ThinkTerm со статусами агентов на правой боковой панели](../assets/screenshots/lazygit.png)
+
+<details>
+<summary>Посмотреть демо</summary>
 
 https://github.com/user-attachments/assets/7317e369-db86-463f-9379-a8a2ed4b602b
 
-<table>
-  <tr>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/workspace.jpeg" alt="Разделённые терминалы, предпросмотр исходного кода и дерево файлов проекта" width="100%">
-      <br><strong>Рабочее пространство проекта</strong>
-    </td>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/agents.jpeg" alt="Статус агентов рядом с удалённым терминалом и боковой панелью рабочего пространства" width="100%">
-      <br><strong>Агенты на разных машинах</strong>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/overview.jpeg" alt="Живые превью терминалов, сгруппированные по Space" width="100%">
-      <br><strong>Обзор сеансов</strong>
-    </td>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/spaces.jpeg" alt="Выбор Space рядом с Threads проекта" width="100%">
-      <br><strong>Spaces</strong>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="../assets/screenshots/mobile.jpeg" alt="ThinkTerm на iOS / iPadOS (Swift) и Android (Kotlin)" width="100%">
-      <br><strong>iOS, iPadOS и Android</strong>
-    </td>
-  </tr>
-</table>
+</details>
 
 ## Производительность
 
@@ -102,6 +71,20 @@ ThinkTerm измерялся с локальным mux: оболочка раб�
 | Изображения | **663,3** | 196,3 | 3,4× |
 
 </details>
+
+ThinkTerm 0.6.0 и Ghostty 1.4.0 тестировались на одном компьютере под управлением Ubuntu 26.04. В таблице указана скорость разбора входных данных терминала в МБ/с.
+
+| Тест | ThinkTerm 0.6.0 | Ghostty 1.4.0 | Разница |
+| --- | ---: | ---: | ---: |
+| Только символы ASCII | 352.7 | 148.1 | 2.38× |
+| Символы Unicode | 202.5 | 96.6 | 2.10× |
+| CSI-последовательности с малым числом символов | 61.1 | 58.6 | 1.04× |
+| Длинные escape-последовательности | 416.6 | 56.1 | 7.43× |
+| Изображения | 299.1 | 53.2 | 5.62× |
+
+| ThinkTerm 0.6.0 | Ghostty 1.4.0 |
+| :---: | :---: |
+| ![ThinkTerm — Результаты теста](../assets/screenshots/ubuntu-thinkterm-0.6.0.png) | ![Ghostty — Результаты теста](../assets/screenshots/ubuntu-ghostty-1.4.0.png) |
 
 Прогресс от версии к версии на том же Mac. Разница — 0.4.3 в сравнении с ранней сборкой.
 
@@ -182,6 +165,29 @@ ThinkTerm измерялся с локальным mux: оболочка раб�
 
 Локальные и удалённые рабочие пространства находятся в одной боковой панели. Статус Thread помогает отличить идущую работу, работу, требующую внимания, завершённую работу и простаивающие сеансы. Обзор показывает живые превью терминалов, сгруппированные по Space, так что нужный сеанс можно найти, не открывая каждую вкладку.
 
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/workspace.jpeg" alt="Разделённые терминалы, предпросмотр исходного кода и дерево файлов проекта" width="100%">
+      <br><strong>Рабочее пространство проекта</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/agents.jpeg" alt="Статус агентов рядом с удалённым терминалом и боковой панелью рабочего пространства" width="100%">
+      <br><strong>Агенты на разных машинах</strong>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/overview.jpeg" alt="Живые превью терминалов, сгруппированные по Space" width="100%">
+      <br><strong>Обзор сеансов</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/spaces.jpeg" alt="Выбор Space рядом с Threads проекта" width="100%">
+      <br><strong>Spaces</strong>
+    </td>
+  </tr>
+</table>
+
 ## Для ежедневной работы в терминале
 
 - **Rust, производительность и экономия памяти.** ThinkTerm создан для требовательной работы в терминале. Пропускная способность терминала, эффективность отрисовки и расход памяти — постоянные приоритеты оптимизации, чтобы множество сеансов и агентов оставались отзывчивыми, работая параллельно.
@@ -204,7 +210,7 @@ CLI также открывает панели для автоматизации
 | **Настольное приложение** | Нативное приложение для macOS, Linux и Windows. |
 | **TUI** | Навигация по рабочим пространствам и управление терминалом внутри уже открытого терминала через `thinkterm tui`. |
 | **Браузер** | Клиент, который отдаёт ваш собственный mux-сервер; нужны WebGPU и защищённый контекст браузера. Доступ из браузера нужно включить явно. |
-| **iOS и Android** | Нативные клиенты в разработке, с общим ядром на Rust, отрисовкой через GPU и транспортом SSH. Готовность к выпуску и поддержка устройств ещё определяются. |
+| **iOS и Android** | Нативные клиенты с общим ядром на Rust, отрисовкой на GPU и подключением по SSH. |
 
 Клиенты подключаются к сеансам на сервере; их интерфейсы и набор возможностей различаются.
 
@@ -223,13 +229,21 @@ TUI поддерживает навигацию по рабочим простр
 
 Настройка слушателя, токены, проброс через SSH и работа с сертификатами описаны в разделе [Доступ из браузера](../docs/thinkterm/web-access.md).
 
-### Мобильная разработка
+### Мобильные приложения
 
-Приложения для [iOS](../ios) и [Android](../android) используют нативные интерфейсы и общее [мобильное ядро](../thinkterm-mobile). Они подключаются по SSH к сеансам на другой машине. Они в активной разработке и здесь не представлены как выпущенные мобильные продукты.
+Приложения для [iOS](../ios) и [Android](../android) используют нативные интерфейсы и общее [мобильное ядро](../thinkterm-mobile). Они подключаются по SSH к сеансам на другой машине.
+
+![ThinkTerm на iOS / iPadOS (Swift) и Android (Kotlin)](../assets/screenshots/mobile.jpeg)
 
 Обновления Android: [репозиторий F-Droid](https://github.com/RoversX/fdroid/tree/dist).
 
 ## Начало работы
+
+В macOS ThinkTerm можно установить через Homebrew:
+
+```sh
+brew install --cask roversx/tap/thinkterm
+```
 
 Для сборки настольного приложения в macOS или Linux установите Rust и инструменты сборки для своей платформы, затем:
 

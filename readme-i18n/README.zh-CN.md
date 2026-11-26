@@ -2,55 +2,26 @@
 
 [English](../README.md) · **简体中文** · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md) · [Русский](README.ru-RU.md)
 
-## 📥 下载
-
-**[点击下载](https://github.com/RoversX/ThinkTerm/releases)** - 获取最新版本
-
-🍺 **Homebrew**（macOS）： 
-```
-brew install --cask roversx/tap/thinkterm
-```
+📥 **[点击下载](https://github.com/RoversX/ThinkTerm/releases)**
 
 🌐 **官网**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **文档**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
 
-⭐ 觉得有用的话，给 [ThinkTerm](https://github.com/RoversX/ThinkTerm) 点个 Star 吧！
-
 **让你的多台机器融为一体。**
 
-ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**，基于 [WezTerm](https://github.com/wezterm/wezterm) 构建。mux 服务端运行你的 Shell、工具和编程 Agent，桌面端、TUI 和浏览器端连接这些会话。你可以把本地与远程工作整理在同一个工作空间里，再从其他设备接入。
+一款内置终端复用器的超高速终端。
 
-**平台支持：** macOS · Linux · Windows · Web · TUI — iOS 和 Android 开发中。
+**平台支持：** macOS · Linux · Windows · Web · TUI · iOS · Android
 
-<table>
-  <tr>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/workspace.jpeg" alt="终端分屏、源码预览和项目文件树" width="100%">
-      <br><strong>项目工作空间</strong>
-    </td>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/agents.jpeg" alt="远程终端旁的 Agent 状态与工作空间侧边栏" width="100%">
-      <br><strong>跨机器的 Agent</strong>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/overview.jpeg" alt="按 Space 分组的终端实时预览" width="100%">
-      <br><strong>会话总览</strong>
-    </td>
-    <td width="50%" align="center">
-      <img src="../assets/screenshots/spaces.jpeg" alt="项目 Thread 旁的 Space 选择器" width="100%">
-      <br><strong>空间切换</strong>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="../assets/screenshots/mobile.jpeg" alt="iOS / iPadOS 版（Swift）和 Android 版（Kotlin）的 ThinkTerm" width="100%">
-      <br><strong>iOS、iPadOS 和 Android</strong>
-    </td>
-  </tr>
-</table>
+![ThinkTerm 工作区中的 lazygit，右侧显示 Agent 状态](../assets/screenshots/lazygit.png)
+
+<details>
+<summary>观看演示</summary>
+
+https://github.com/user-attachments/assets/7317e369-db86-463f-9379-a8a2ed4b602b
+
+</details>
 
 ## 性能
 
@@ -100,6 +71,20 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 | 图片 | **663.3** | 196.3 | 3.4× |
 
 </details>
+
+ThinkTerm 0.6.0 和 Ghostty 1.4.0 在同一台运行 Ubuntu 26.04 的机器上测试。下表列出两者解析终端输入的吞吐量（MB/s）。
+
+| 测试项 | ThinkTerm 0.6.0 | Ghostty 1.4.0 | 倍数 |
+| --- | ---: | ---: | ---: |
+| 纯 ASCII 字符 | 352.7 | 148.1 | 2.38× |
+| Unicode 字符 | 202.5 | 96.6 | 2.10× |
+| CSI 序列夹少量字符 | 61.1 | 58.6 | 1.04× |
+| 长转义序列 | 416.6 | 56.1 | 7.43× |
+| 图片 | 299.1 | 53.2 | 5.62× |
+
+| ThinkTerm 0.6.0 | Ghostty 1.4.0 |
+| :---: | :---: |
+| ![ThinkTerm — 跑分结果](../assets/screenshots/ubuntu-thinkterm-0.6.0.png) | ![Ghostty — 跑分结果](../assets/screenshots/ubuntu-ghostty-1.4.0.png) |
 
 同一台 Mac 上的版本进步。倍数是 0.4.3 相对早期版本。
 
@@ -180,6 +165,29 @@ Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TU
 
 本地与远程工作空间共用一个侧边栏。Thread 状态区分运行中、需要关注、已完成和空闲。总览按 Space 展示终端的实时预览，无需逐个打开标签就能找到会话。
 
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/workspace.jpeg" alt="终端分屏、源码预览和项目文件树" width="100%">
+      <br><strong>项目工作空间</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/agents.jpeg" alt="远程终端旁的 Agent 状态与工作空间侧边栏" width="100%">
+      <br><strong>跨机器的 Agent</strong>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/overview.jpeg" alt="按 Space 分组的终端实时预览" width="100%">
+      <br><strong>会话总览</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="../assets/screenshots/spaces.jpeg" alt="项目 Thread 旁的 Space 选择器" width="100%">
+      <br><strong>空间切换</strong>
+    </td>
+  </tr>
+</table>
+
 ## 面向日常终端工作
 
 - **Rust、性能与内存效率。** ThinkTerm 面向高负载终端工作流，持续优化终端吞吐、渲染效率和内存占用，以多个会话与 Agent 并行工作时的流畅响应为目标。
@@ -202,7 +210,7 @@ CLI 也支持自动化操作窗格：`thinkterm cli send-text` 发送输入，`s
 | **桌面端** | 面向 macOS、Linux 和 Windows 的原生应用。 |
 | **TUI** | 通过 `thinkterm tui`，在已有终端中浏览工作空间并操作终端会话。 |
 | **浏览器端** | 由你自己的 mux 服务端提供；需要 WebGPU 和浏览器安全上下文。必须主动启用浏览器访问。 |
-| **iOS 和 Android** | 开发中的原生客户端，共享 Rust 核心，使用 GPU 渲染和 SSH 传输。移动端的发布准备与设备覆盖仍在完善。 |
+| **iOS 和 Android** | 原生客户端共享 Rust 核心，使用 GPU 渲染，通过 SSH 连接。 |
 
 这些客户端连接服务端持有的会话，但界面和功能覆盖范围有所不同。
 
@@ -221,13 +229,21 @@ TUI 支持工作空间导航、标签页、分屏、调整大小、复制模式�
 
 监听配置、令牌、SSH 转发和证书处理方式见[浏览器访问](../docs/thinkterm/web-access.md)。
 
-### 移动端开发
+### 移动端应用
 
-[iOS](../ios) 和 [Android](../android) 应用采用原生界面，共享[移动端核心](../thinkterm-mobile)，通过 SSH 连接另一台机器上的会话。它们仍在积极开发中，目前不作为已发布的移动产品介绍。
+[iOS](../ios) 和 [Android](../android) 应用采用原生界面，共享[移动端核心](../thinkterm-mobile)，通过 SSH 连接另一台机器上的会话。
+
+![iOS / iPadOS 版（Swift）和 Android 版（Kotlin）的 ThinkTerm](../assets/screenshots/mobile.jpeg)
 
 Android 更新：[F-Droid 软件源](https://github.com/RoversX/fdroid/tree/dist).
 
 ## 开始使用
+
+在 macOS 上使用 Homebrew 安装 ThinkTerm：
+
+```sh
+brew install --cask roversx/tap/thinkterm
+```
 
 在 macOS 或 Linux 上构建桌面端，请先安装 Rust 和平台构建工具，然后执行：
 
