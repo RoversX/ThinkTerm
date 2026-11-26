@@ -68,6 +68,7 @@ targets:
         # The launch screen, black (Info.plist); the other keys are below.
         INFOPLIST_FILE: Info.plist
         INFOPLIST_KEY_CFBundleDisplayName: ThinkTerm
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         # Asked when a machine on the same network is first reached: an ssh
         # host there, or a tailnet's machine reached directly rather than
         # through a relay.

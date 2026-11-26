@@ -48,6 +48,11 @@ PackageUrl: https://github.com/RoversX/thinkterm
 License: GPL-3.0-only
 LicenseUrl: https://github.com/RoversX/thinkterm/blob/main/LICENSE.md
 ShortDescription: A workspace-first terminal emulator and multiplexer implemented in Rust
+Tags:
+- developer-tools
+- terminal
+- multiplexer
+- ssh
 ReleaseNotesUrl: https://github.com/RoversX/thinkterm/releases/tag/$TAG_NAME
 ManifestType: defaultLocale
 ManifestVersion: 1.1.0

@@ -33,17 +33,4 @@
   <url type="bugtracker">https://github.com/RoversX/thinkterm/issues</url>
 
   <developer_name>RoversX</developer_name>
-
-  <releases>
-    <release version="20220807-113146-c2fee766" date="2022-08-07">
-      <description>
-        <p>
-          Featuring more powerful key and mouse bindings, new lua functions for
-          working with color, json, time, processes and windows, reduced
-          scrollback memory consumption, increased search performance, IME on
-          Wayland and more!
-        </p>
-      </description>
-    </release>
-  </releases>
 </component>

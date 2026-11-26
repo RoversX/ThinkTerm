@@ -387,6 +387,7 @@ case $OSTYPE in
       "-DMyAppArch=$iss_arch" "-F${instname}" ci/windows-installer.iss
     ;;
   linux-gnu|linux)
+    release_date=${RELEASE_DATE:-$(date -u +%F)}
     distro=$(lsb_release -is 2>/dev/null || sh -c "source /etc/os-release && echo \$NAME")
     distver=$(lsb_release -rs 2>/dev/null || sh -c "source /etc/os-release && echo \$VERSION_ID")
     case "$distro" in
@@ -420,7 +421,7 @@ cargo build --profile ${PROFILE} \
 BUILDEOFEOF
 )
           BUILD_REQUIRES=$(cat <<BREQEOF
-BuildRequires: gcc, gcc-c++, make, curl, fontconfig-devel, openssl-devel, pam-devel, libxcb-devel, libxkbcommon-devel, libxkbcommon-x11-devel, wayland-devel, xcb-util-devel, xcb-util-keysyms-devel, xcb-util-image-devel, xcb-util-wm-devel, git
+BuildRequires: gcc, gcc-c++, make, curl, fontconfig-devel, openssl-devel, pam-devel, libxcb-devel, libxkbcommon-devel, libxkbcommon-x11-devel, wayland-devel, xcb-util-devel, xcb-util-keysyms-devel, xcb-util-image-devel, xcb-util-wm-devel, git, python3
 %if 0%{?suse_version}
 BuildRequires: Mesa-libEGL-devel
 %else
@@ -529,7 +530,7 @@ ln -s thinkterm.fish %{buildroot}/usr/share/fish/vendor_completions.d/wezterm.fi
 install -Dm644 assets/icon/terminal.png %{buildroot}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 install -Dm644 assets/wezterm.desktop %{buildroot}/usr/share/applications/com.roversx.thinkterm.desktop
 $PIN_DESKTOP_EXEC %{buildroot}/usr/share/applications/com.roversx.thinkterm.desktop
-install -Dm644 assets/wezterm.appdata.xml %{buildroot}/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
+python3 ci/write-appdata.py "$TAG_NAME" "$release_date" "%{buildroot}/usr/share/metainfo/com.roversx.thinkterm.appdata.xml"
 install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm/NOTICE
 install -Dm644 LICENSE.md %{buildroot}/usr/share/licenses/thinkterm/LICENSE.md
@@ -702,7 +703,7 @@ EOF
             install -Dm644 assets/icon/terminal.png $root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
             install -Dm644 assets/wezterm.desktop $root/usr/share/applications/com.roversx.thinkterm.desktop
             eval "$PIN_DESKTOP_EXEC $root/usr/share/applications/com.roversx.thinkterm.desktop"
-            install -Dm644 assets/wezterm.appdata.xml $root/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
+            python3 ci/write-appdata.py "$TAG_NAME" "$release_date" "$root/usr/share/metainfo/com.roversx.thinkterm.appdata.xml"
             install -Dm644 assets/wezterm-nautilus.py $root/usr/share/nautilus-python/extensions/wezterm-nautilus.py
           fi
 

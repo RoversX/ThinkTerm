@@ -7,6 +7,7 @@ mkdir AppDir
 
 # The cargo profile the binaries were built with, as ci/deploy.sh reads it.
 PROFILE=${CARGO_PROFILE:-release}
+TAG_NAME=${TAG_NAME:-$(git -c "core.abbrev=8" show -s "--format=%cd-%h" "--date=format:%Y%m%d-%H%M%S")}
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-mux-server
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/wezterm
@@ -19,7 +20,7 @@ install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-tailnet
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/strip-ansi-escapes
 install -Dm644 assets/icon/terminal.png AppDir/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.thinkterm.desktop
-install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
+python3 ci/write-appdata.py "$TAG_NAME" "${RELEASE_DATE:-$(date -u +%F)}" AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py AppDir/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 install -Dm644 NOTICE AppDir/usr/share/doc/thinkterm/NOTICE
 # The browser client, where the server looks for it: <exe>/../share/thinkterm/web.
@@ -60,7 +61,6 @@ esac
 # AppImage it produces have to self-extract instead of FUSE-mounting.
 export APPIMAGE_EXTRACT_AND_RUN=1
 
-TAG_NAME=${TAG_NAME:-$(git -c "core.abbrev=8" show -s "--format=%cd-%h" "--date=format:%Y%m%d-%H%M%S")}
 distro=$(lsb_release -is 2>/dev/null || sh -c "source /etc/os-release && echo \$NAME")
 distver=$(lsb_release -rs 2>/dev/null || sh -c "source /etc/os-release && echo \$VERSION_ID")
 

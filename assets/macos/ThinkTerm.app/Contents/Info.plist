@@ -25,7 +25,7 @@
 	<key>CFBundleIconFile</key>
 	<string>ThinkTerm_simple.icns</string>
 	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.utilities</string>
+	<string>public.app-category.developer-tools</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>

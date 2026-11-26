@@ -1,11 +1,16 @@
 [Desktop Entry]
 Name=ThinkTerm
 Comment=Workspace-first terminal emulator
-Keywords=shell;prompt;command;commandline;cmd;
+Keywords=shell;prompt;command;commandline;cmd;ssh;multiplexer;
+Keywords[de]=shell;prompt;command;commandline;cmd;ssh;multiplexer;Terminal;Befehlszeile;Fernverbindung;Terminal-Multiplexer;
+Keywords[fr]=shell;prompt;command;commandline;cmd;ssh;multiplexer;terminal;ligne de commande;connexion distante;multiplexeur de terminal;
+Keywords[ja]=shell;prompt;command;commandline;cmd;ssh;multiplexer;ターミナル;端末;コマンドライン;リモート接続;ターミナルマルチプレクサ;
+Keywords[ru]=shell;prompt;command;commandline;cmd;ssh;multiplexer;терминал;командная строка;удалённое подключение;терминальный мультиплексор;
+Keywords[zh_CN]=shell;prompt;command;commandline;cmd;ssh;multiplexer;终端;远程连接;终端复用;
 Icon=com.roversx.thinkterm
 StartupWMClass=com.roversx.thinkterm
 TryExec=thinkterm
 Exec=thinkterm start --class com.roversx.thinkterm --cwd .
 Type=Application
-Categories=System;TerminalEmulator;Utility;
+Categories=Development;System;TerminalEmulator;Utility;
 Terminal=false

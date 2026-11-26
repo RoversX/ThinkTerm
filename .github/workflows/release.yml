@@ -92,6 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.plan.outputs.version }}
+      release_date: ${{ steps.plan.outputs.release_date }}
       release_tag: ${{ steps.plan.outputs.release_tag }}
       publish: ${{ steps.plan.outputs.publish }}
       windows_matrix: ${{ steps.plan.outputs.windows_matrix }}
@@ -170,6 +171,7 @@ jobs:
 
           {
             echo "version=$version"
+            echo "release_date=$(date -u +%F)"
             echo "release_tag=$release_tag"
             echo "publish=$publish"
             echo "windows_matrix=$windows_matrix"
@@ -547,6 +549,7 @@ jobs:
 
     env:
       TAG_NAME: ${{ needs.prepare.outputs.version }}
+      RELEASE_DATE: ${{ needs.prepare.outputs.release_date }}
       # Packaging and AppImage must read the same profile directory as the
       # build and cache steps.
       CARGO_PROFILE: ${{ inputs.profile || 'release' }}
