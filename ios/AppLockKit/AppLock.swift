@@ -80,11 +80,23 @@ public final class AppLock: ObservableObject {
         return ok
     }
 
-    public func turnOff() {
+    /// Turns the lock off once the check passes, as it went on: else
+    /// anyone holding the app while it is open (back within the time set)
+    /// could take the lock off for good. A phone with no passcode left has
+    /// nothing to check with, and the lock lets anyone in already: off at
+    /// once. Says whether it is off.
+    @MainActor @discardableResult
+    public func turnOff(reason: String) async -> Bool {
+        if !enabled { return true }
+        if !passcodeOff {
+            let (ok, noPasscode) = await ask(reason: reason)
+            guard ok || noPasscode || passcodeOff else { return false }
+        }
         enabled = false
         locked = false
         awayAt = nil
         UserDefaults.standard.set(false, forKey: Self.onKey)
+        return true
     }
 
     public func setLockAfter(_ seconds: Int) {

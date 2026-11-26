@@ -363,8 +363,11 @@ private fun SettingsSection(
                 // not held shut: the footer says what puts it back.
                 val canLock = AppLock.available(context)
                 Group(footer = tr(if (canLock) "lock.note.android" else "lock.nopasscode.android")) {
+                    // Either way only once the check passes: off too, or
+                    // whoever holds the open app could take it off.
                     SwitchRow(tr("lock.app"), AppLock.enabled) { on ->
-                        if (!on) AppLock.turnOff() else if (activity != null) AppLock.turnOn(activity, tr("lock.reason.on"))
+                        if (activity == null) return@SwitchRow
+                        if (on) AppLock.turnOn(activity, tr("lock.reason.on")) else AppLock.turnOff(activity, tr("lock.reason.off"))
                     }
                     if (AppLock.enabled) {
                         PushRow(tr("lock.after"), label(lockAfters(), AppLock.lockAfterSeconds.toString())) { onPush("lock.after") }

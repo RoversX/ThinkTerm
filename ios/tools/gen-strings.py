@@ -505,6 +505,13 @@ EXTRA = {
         "Confirmez votre identité pour activer le verrouillage",
         "Bestätigen Sie Ihre Identität, um die Sperre einzuschalten",
     ],
+    "lock.reason.off": [
+        "Confirm it’s you to turn off the lock",
+        "验证身份以关闭锁定",
+        "本人確認してロックをオフにします",
+        "Confirmez votre identité pour désactiver le verrouillage",
+        "Bestätigen Sie Ihre Identität, um die Sperre auszuschalten",
+    ],
 }
 
 

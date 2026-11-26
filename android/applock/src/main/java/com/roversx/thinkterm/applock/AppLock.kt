@@ -135,7 +135,24 @@ object AppLock {
         }
     }
 
-    fun turnOff() {
+    /// Turns the lock off once the check passes, as it went on: else
+    /// anyone holding the app while it is open (back within the time set)
+    /// could take the lock off for good. A phone with no screen lock left
+    /// has nothing to check with, and the lock lets anyone in already: off
+    /// at once. `done` hears whether it is off.
+    fun turnOff(activity: Activity, title: String, done: (Boolean) -> Unit = {}) {
+        if (!enabled) return done(true)
+        if (noScreenLock(activity)) {
+            off()
+            return done(true)
+        }
+        ask(activity, title) { ok ->
+            if (ok || noScreenLock(activity)) off()
+            done(!enabled)
+        }
+    }
+
+    private fun off() {
         enabled = false
         awayAt = null
         prefs?.edit()?.putBoolean(KEY_ON, false)?.apply()

@@ -196,13 +196,15 @@ struct SettingsPageView: View {
             // The app lock (ios/AppLockKit): turned on only once the
             // phone's check passes, so it can always be lifted.
             Section {
+                // Either way only once the check passes: off too, or
+                // whoever holds the open app could take it off.
                 Toggle(tr("lock.app"), isOn: Binding(
                     get: { lock.enabled },
                     set: { on in
                         if on {
                             Task { await lock.turnOn(reason: tr("lock.reason.on")) }
                         } else {
-                            lock.turnOff()
+                            Task { await lock.turnOff(reason: tr("lock.reason.off")) }
                         }
                     }
                 ))

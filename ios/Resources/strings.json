@@ -346,7 +346,8 @@
     "lock.reason": "ThinkTerm entsperren",
     "lock.reason.on": "Bestätigen Sie Ihre Identität, um die Sperre einzuschalten",
     "lock.unlock": "Entsperren",
-    "sec.security": "Sicherheit"
+    "sec.security": "Sicherheit",
+    "lock.reason.off": "Bestätigen Sie Ihre Identität, um die Sperre auszuschalten"
   },
   "en-US": {
     "about.build": "Build",
@@ -695,7 +696,8 @@
     "lock.reason": "Unlock ThinkTerm",
     "lock.reason.on": "Confirm it’s you to turn on the lock",
     "lock.unlock": "Unlock",
-    "sec.security": "Security"
+    "sec.security": "Security",
+    "lock.reason.off": "Confirm it’s you to turn off the lock"
   },
   "fr-FR": {
     "about.build": "Compilation",
@@ -1044,7 +1046,8 @@
     "lock.reason": "Déverrouiller ThinkTerm",
     "lock.reason.on": "Confirmez votre identité pour activer le verrouillage",
     "lock.unlock": "Déverrouiller",
-    "sec.security": "Sécurité"
+    "sec.security": "Sécurité",
+    "lock.reason.off": "Confirmez votre identité pour désactiver le verrouillage"
   },
   "ja-JP": {
     "about.build": "ビルド",
@@ -1393,7 +1396,8 @@
     "lock.reason": "ThinkTerm のロックを解除",
     "lock.reason.on": "本人確認してロックをオンにします",
     "lock.unlock": "ロック解除",
-    "sec.security": "セキュリティ"
+    "sec.security": "セキュリティ",
+    "lock.reason.off": "本人確認してロックをオフにします"
   },
   "zh-CN": {
     "about.build": "构建",
@@ -1742,6 +1746,7 @@
     "lock.reason": "解锁 ThinkTerm",
     "lock.reason.on": "验证身份以开启锁定",
     "lock.unlock": "解锁",
-    "sec.security": "安全"
+    "sec.security": "安全",
+    "lock.reason.off": "验证身份以关闭锁定"
   }
 }

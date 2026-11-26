@@ -24,6 +24,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.core.os.BundleCompat
 import com.roversx.thinkterm.applock.AppLock
 import com.roversx.thinkterm.applock.AppLockGate
 import com.roversx.thinkterm.applock.AppLockTexts
@@ -115,14 +116,15 @@ class MainActivity : ComponentActivity() {
         super.onActivityResult(
             result.getInt(HELD_REQUEST),
             result.getInt(HELD_RESULT),
-            result.getParcelable(HELD_DATA, Intent::class.java),
+            BundleCompat.getParcelable(result, HELD_DATA, Intent::class.java),
         )
     }
 
     /// Held results of the screen this one replaces: kept again while
     /// locked, handed on at once otherwise.
     private fun restoreHeld(saved: Bundle?) {
-        val results = saved?.getParcelableArrayList(HELD_KEY, Bundle::class.java) ?: return
+        // BundleCompat: the typed getters of Android 13 itself are broken.
+        val results = saved?.let { BundleCompat.getParcelableArrayList(it, HELD_KEY, Bundle::class.java) } ?: return
         for (result in results) {
             if (hold(result)) continue
             held += result
