@@ -20867,7 +20867,7 @@ impl SettingsWindow {
         }
         let mut merged = crate::native_settings::load();
         merged.appearance.window_tabs = mode;
-        merged.appearance.window_tabs_pinned = false;
+        merged.appearance.window_tabs_pinned = crate::native_settings::OnByDefault(false);
         self.set_native_settings(merged);
         let setting = crate::i18n::tr("settings-window-tabs");
         match crate::native_settings::save(&self.native_settings) {

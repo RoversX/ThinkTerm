@@ -467,12 +467,13 @@ impl NativeBottomQuoteMode {
 
 /// The window tab row: the first of the two tab bars.
 ///
-/// `Show` is the default and the row it has always been. `AutoHide` gives
-/// its height back to the terminal and brings it down over the top of the
-/// window while the pointer rests at the top edge, pushing the terminal
-/// area down rather than resizing it; its pin keeps it out
-/// (`window_tabs_pinned`). A file that chose to hide it outright, a choice
-/// since withdrawn, has it auto-hide.
+/// `Show` is the row it has always been. `AutoHide` gives its height back
+/// to the terminal and brings it down over the top of the window while the
+/// pointer rests at the top edge, pushing the terminal area down rather
+/// than resizing it; its pin keeps it out (`window_tabs_pinned`).
+/// `AutoHide` with the pin in is the default: the row stays where it was,
+/// and its pin is there to let it go. A file that chose to hide it
+/// outright, a choice since withdrawn, has it auto-hide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeWindowTabs {
@@ -483,7 +484,18 @@ pub(crate) enum NativeWindowTabs {
 
 impl Default for NativeWindowTabs {
     fn default() -> Self {
-        Self::Show
+        Self::AutoHide
+    }
+}
+
+/// A switch that is on unless the file says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct OnByDefault(pub(crate) bool);
+
+impl Default for OnByDefault {
+    fn default() -> Self {
+        Self(true)
     }
 }
 
@@ -556,8 +568,8 @@ pub(crate) struct NativeAppearanceSettings {
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) window_tabs: NativeWindowTabs,
     /// Under `AutoHide`, the row's pin is in: it stays out and takes its
-    /// height in the layout, as under `Show`.
-    pub(crate) window_tabs_pinned: bool,
+    /// height in the layout, as under `Show`. In unless the file says not.
+    pub(crate) window_tabs_pinned: OnByDefault,
     /// See [`NativeServerPlacement`].
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) server_placement: NativeServerPlacement,
@@ -1311,7 +1323,7 @@ pub(crate) fn window_tabs_choice() -> (NativeWindowTabs, bool) {
     let settings = load_shared();
     (
         settings.appearance.window_tabs,
-        settings.appearance.window_tabs_pinned,
+        settings.appearance.window_tabs_pinned.0,
     )
 }
 
@@ -1319,7 +1331,7 @@ pub(crate) fn window_tabs_choice() -> (NativeWindowTabs, bool) {
 /// window is told directly, so no reload is owed.
 pub(crate) fn save_window_tabs_pinned(pinned: bool) -> anyhow::Result<()> {
     update_ui_state_and_settings_window(|settings| {
-        settings.appearance.window_tabs_pinned = pinned
+        settings.appearance.window_tabs_pinned = OnByDefault(pinned)
     })
 }
 
@@ -4478,14 +4490,36 @@ mod tests {
         assert_eq!(settings.terminal.cursor_shape, NativeCursorShape::Block);
     }
 
-    /// A file from before the window tab row could hide keeps it shown.
+    /// A file without a choice, or no file, has the row auto-hide with its
+    /// pin in, so it stays out as it always has.
     #[test]
-    fn a_settings_file_without_a_window_tabs_choice_shows_the_row() {
+    fn a_settings_file_without_a_window_tabs_choice_keeps_the_row_out_pinned() {
         let json = r#"{ "version": 1, "appearance": { "theme_mode": "system" } }"#;
         let settings: ThinkTermNativeSettings =
             serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::AutoHide);
+        assert!(settings.appearance.window_tabs_pinned.0);
+        let fresh = ThinkTermNativeSettings::default();
+        assert_eq!(fresh.appearance.window_tabs, NativeWindowTabs::AutoHide);
+        assert!(fresh.appearance.window_tabs_pinned.0);
+    }
+
+    /// A file that chose a mode and a pin keeps them: a saved `Show`, or an
+    /// auto-hiding row with its pin out, is not changed by the new default.
+    #[test]
+    fn a_saved_window_tabs_choice_and_pin_survive_the_new_default() {
+        let json = r#"{"appearance": {"window_tabs": "show", "window_tabs_pinned": false}}"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
         assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::Show);
-        assert!(!settings.appearance.window_tabs_pinned);
+        assert!(!settings.appearance.window_tabs_pinned.0);
+        let json = r#"{"appearance": {"window_tabs": "auto_hide", "window_tabs_pinned": false}}"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::AutoHide);
+        assert!(!settings.appearance.window_tabs_pinned.0);
+        let out = serde_json::to_string(&settings).expect("serialises");
+        assert!(out.contains("\"window_tabs_pinned\":false"), "{out}");
     }
 
     #[test]
