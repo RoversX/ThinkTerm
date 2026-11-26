@@ -14,6 +14,7 @@ members = [
   "thinkterm-tailnet-engine",
   "thinkterm-tailnet-node",
   "thinkterm-file-index",
+  "thinkterm-git-info",
   "thinkterm-font-core",
   "thinkterm-font-web",
   "thinkterm-i18n",
@@ -196,6 +197,7 @@ thinkterm-core = { path = "thinkterm-core" }
 thinkterm-tailnet = { path = "thinkterm-tailnet" }
 thinkterm-tailnet-engine = { path = "thinkterm-tailnet-engine" }
 thinkterm-file-index = { path = "thinkterm-file-index" }
+thinkterm-git-info = { path = "thinkterm-git-info" }
 thinkterm-font-core = { path = "thinkterm-font-core" }
 thinkterm-font-web = { path = "thinkterm-font-web" }
 thinkterm-i18n = { path = "thinkterm-i18n" }

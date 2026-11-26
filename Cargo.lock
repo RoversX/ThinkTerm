@@ -9404,6 +9404,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-git-info"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "thinkterm-i18n"
 version = "0.1.0"
 dependencies = [
@@ -12161,6 +12168,7 @@ dependencies = [
  "textwrap",
  "thinkterm-core",
  "thinkterm-file-index",
+ "thinkterm-git-info",
  "thinkterm-i18n",
  "thinkterm-import",
  "thinkterm-import-herdr",

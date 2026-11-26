@@ -7,7 +7,6 @@
 //! panel only ever looks it up.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -260,85 +259,23 @@ fn local_dir(url: &url::Url, names: &[String]) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
-/// The linked worktree `dir` is in, when the nearest folder at or above it
-/// with a `.git` is one. A repository's own checkout keeps a directory
-/// there; a linked worktree, a submodule or a separated git directory keep
-/// a file naming the git directory, and only a linked worktree's points
-/// back at the repository through a `commondir`.
+/// The linked worktree `dir` is in, when the checkout it is in is one: a
+/// repository's own checkout, a submodule or a separated git directory is
+/// not.
 fn read_worktree(dir: &Path) -> Option<Worktree> {
-    for folder in dir.ancestors() {
-        let dot_git = folder.join(".git");
-        if dot_git.is_dir() {
-            return None;
-        }
-        if !dot_git.is_file() {
-            continue;
-        }
-        let text = read_small_file(&dot_git)?;
-        let git_dir = folder.join(text.lines().next()?.strip_prefix("gitdir:")?.trim());
-        if !git_dir.join("commondir").is_file() {
-            return None;
-        }
-        let branch = read_small_file(&git_dir.join("HEAD")).and_then(|head| branch_of_head(&head));
-        return Some(Worktree {
-            folder: folder.file_name()?.to_string_lossy().into_owned(),
-            branch,
-        });
-    }
-    None
-}
-
-/// The text of a file git keeps: only a plain one -- a FIFO would block the
-/// read, a device would not end it -- and no longer than git writes there.
-fn read_small_file(path: &Path) -> Option<String> {
-    if !std::fs::metadata(path).ok()?.is_file() {
+    let checkout = thinkterm_git_info::checkout_of(dir)?;
+    if !checkout.linked {
         return None;
     }
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(4096)
-        .read_to_string(&mut text)
-        .ok()?;
-    Some(text)
-}
-
-/// The branch a `HEAD` file names, or the start of the commit it holds when
-/// detached. A reftable repository keeps its real HEAD elsewhere and leaves
-/// `refs/heads/.invalid` in the file, which is no branch.
-fn branch_of_head(head: &str) -> Option<String> {
-    let head = head.trim();
-    match head.strip_prefix("ref: ") {
-        Some(reference) => {
-            let branch = reference.strip_prefix("refs/heads/").unwrap_or(reference);
-            (branch != ".invalid").then(|| branch.to_string())
-        }
-        None => (head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()))
-            .then(|| head[..7].to_string()),
-    }
+    Some(Worktree {
+        folder: checkout.folder.file_name()?.to_string_lossy().into_owned(),
+        branch: checkout.branch,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_head_names_its_branch_or_its_commit() {
-        assert_eq!(
-            branch_of_head("ref: refs/heads/main\n").as_deref(),
-            Some("main")
-        );
-        assert_eq!(
-            branch_of_head("ref: refs/heads/feature/login\r\n").as_deref(),
-            Some("feature/login")
-        );
-        assert_eq!(
-            branch_of_head("a1b2c3d4e5f60718\n").as_deref(),
-            Some("a1b2c3d")
-        );
-        assert_eq!(branch_of_head("ref: refs/heads/.invalid\n"), None);
-        assert_eq!(branch_of_head("not a head"), None);
-    }
 
     #[test]
     fn only_this_machine_s_directories_are_read() {

@@ -76,6 +76,7 @@ futures.workspace = true
 hdrhistogram.workspace = true
 hostname.workspace = true
 thinkterm-file-index.workspace = true
+thinkterm-git-info.workspace = true
 image.workspace = true
 lazy_static.workspace = true
 lfucache.workspace = true
