@@ -557,7 +557,11 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
 
 pub fn run_cli(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
     let executor = promise::spawn::ScopedExecutor::new();
-    match promise::spawn::block_on(executor.run(async move { run_cli_async(opts, cli).await })) {
+    // On the heap: the command's future is some 50 KiB, and every executor
+    // layer it is handed through keeps a copy of what it was given. Held on
+    // the stack, that came to over 900 KiB of the main thread's before the
+    // command did anything, and Windows gives the main thread 1 MiB.
+    match promise::spawn::block_on(executor.run(Box::pin(run_cli_async(opts, cli)))) {
         Ok(_) => Ok(()),
         Err(err) => crate::terminate_with_error(err),
     }
