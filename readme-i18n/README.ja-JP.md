@@ -16,6 +16,8 @@ WezTerm をベースにした超高速ターミナルマルチプレクサー。
 
 ![ThinkTerm のワークスペースで動く lazygit と右サイドバーのエージェント状態](../assets/screenshots/lazygit.png)
 
+![iOS / iPadOS 版（Swift）と Android 版（Kotlin）の ThinkTerm](../assets/screenshots/mobile.jpeg)
+
 <details>
 <summary>デモを見る</summary>
 
@@ -232,8 +234,6 @@ TUI はワークスペースの移動、タブ、ペイン分割、サイズ変�
 ### モバイルアプリ
 
 [iOS](../ios) と [Android](../android) のアプリは、ネイティブ UI と共有の[モバイルコア](../thinkterm-mobile)を使用します。SSH で別のマシン上のセッションに接続します。
-
-![iOS / iPadOS 版（Swift）と Android 版（Kotlin）の ThinkTerm](../assets/screenshots/mobile.jpeg)
 
 Android の更新：[F-Droid リポジトリ](https://github.com/RoversX/fdroid/tree/dist).
 

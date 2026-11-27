@@ -16,6 +16,8 @@ A superfast terminal multiplexer built on top of WezTerm.
 
 ![Lazygit in a ThinkTerm workspace with agent status in the right sidebar](assets/screenshots/lazygit.png)
 
+![ThinkTerm on iOS, iPadOS and Android](assets/screenshots/mobile.jpeg)
+
 <details>
 <summary>Watch the demo</summary>
 
@@ -232,8 +234,6 @@ See [Browser access](docs/thinkterm/web-access.md) for listener setup, tokens, S
 ### Mobile apps
 
 The [iOS](ios) and [Android](android) apps use native interfaces and the shared [mobile core](thinkterm-mobile). They connect over SSH to sessions on another machine.
-
-![ThinkTerm on iOS, iPadOS and Android](assets/screenshots/mobile.jpeg)
 
 Android updates: [F-Droid repository](https://github.com/RoversX/fdroid/tree/dist).
 

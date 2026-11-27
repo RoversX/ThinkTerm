@@ -16,6 +16,8 @@
 
 ![ThinkTerm 工作区中的 lazygit，右侧显示 Agent 状态](../assets/screenshots/lazygit.png)
 
+![iOS / iPadOS 版（Swift）和 Android 版（Kotlin）的 ThinkTerm](../assets/screenshots/mobile.jpeg)
+
 <details>
 <summary>观看演示</summary>
 
@@ -232,8 +234,6 @@ TUI 支持工作空间导航、标签页、分屏、调整大小、复制模式�
 ### 移动端应用
 
 [iOS](../ios) 和 [Android](../android) 应用采用原生界面，共享[移动端核心](../thinkterm-mobile)，通过 SSH 连接另一台机器上的会话。
-
-![iOS / iPadOS 版（Swift）和 Android 版（Kotlin）的 ThinkTerm](../assets/screenshots/mobile.jpeg)
 
 Android 更新：[F-Droid 软件源](https://github.com/RoversX/fdroid/tree/dist).
 

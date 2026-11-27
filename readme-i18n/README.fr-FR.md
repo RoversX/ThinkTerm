@@ -16,6 +16,8 @@ Un multiplexeur de terminal ultrarapide basé sur WezTerm.
 
 ![Lazygit dans un espace de travail ThinkTerm, avec l’état des agents dans la barre latérale droite](../assets/screenshots/lazygit.png)
 
+![ThinkTerm sur iOS / iPadOS (Swift) et sur Android (Kotlin)](../assets/screenshots/mobile.jpeg)
+
 <details>
 <summary>Voir la démo</summary>
 
@@ -232,8 +234,6 @@ Le guide [Accès par navigateur](../docs/thinkterm/web-access.md) détaille les 
 ### Applications mobiles
 
 Les applications [iOS](../ios) et [Android](../android) utilisent des interfaces natives et un [cœur mobile partagé](../thinkterm-mobile). Elles se connectent par SSH aux sessions d'une autre machine.
-
-![ThinkTerm sur iOS / iPadOS (Swift) et sur Android (Kotlin)](../assets/screenshots/mobile.jpeg)
 
 Mises à jour Android : [dépôt F-Droid](https://github.com/RoversX/fdroid/tree/dist).
 

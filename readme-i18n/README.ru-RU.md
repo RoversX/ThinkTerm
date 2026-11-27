@@ -16,6 +16,8 @@
 
 ![Lazygit в рабочем пространстве ThinkTerm со статусами агентов на правой боковой панели](../assets/screenshots/lazygit.png)
 
+![ThinkTerm на iOS / iPadOS (Swift) и Android (Kotlin)](../assets/screenshots/mobile.jpeg)
+
 <details>
 <summary>Посмотреть демо</summary>
 
@@ -232,8 +234,6 @@ TUI поддерживает навигацию по рабочим простр
 ### Мобильные приложения
 
 Приложения для [iOS](../ios) и [Android](../android) используют нативные интерфейсы и общее [мобильное ядро](../thinkterm-mobile). Они подключаются по SSH к сеансам на другой машине.
-
-![ThinkTerm на iOS / iPadOS (Swift) и Android (Kotlin)](../assets/screenshots/mobile.jpeg)
 
 Обновления Android: [репозиторий F-Droid](https://github.com/RoversX/fdroid/tree/dist).
 
