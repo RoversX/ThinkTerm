@@ -1533,14 +1533,14 @@ impl crate::TermWindow {
                 });
         let hovered =
             !reconnect_in_flight && self.is_pointer_over_ui_rect(row_x, y, row_width, row_height);
-        // New Thread's pill, the warning colour only in its icon and words.
-        self.paint_sidebar_action_button(
+        // A glass pill like New Thread's, the warning colour only in its
+        // icon and words.
+        self.paint_sidebar_glass_button(
             layers,
             layer,
             euclid::rect(row_x as f32, y as f32, row_width as f32, row_height as f32),
             self.chrome(),
             hovered,
-            false,
         )
         .context("sidebar reconnect row")?;
         let reconnect_label = if reconnect_in_flight {
@@ -4346,8 +4346,8 @@ impl crate::TermWindow {
     /// A sidebar action button: circle or pill, with a shadow and hairline
     /// border.
     ///
-    /// The per-section add buttons, the reconnect row and the right
-    /// sidebar's paint these; New Thread and the bell are glass
+    /// The per-section add buttons paint these; New Thread, the bell, the
+    /// reconnect row and the right sidebar's Files buttons are glass
     /// (`paint_sidebar_glass_button`). They
     /// used to carry the radius and the fill separately. Keeping the
     /// treatment in one place is what stops one of them from staying a
@@ -4519,12 +4519,13 @@ impl crate::TermWindow {
         )
     }
 
-    /// New Thread and the bell: glass on the sidebar as a selected row is
+    /// New Thread and the bell, and the buttons and search fields made like
+    /// them: glass on the sidebar as a selected row is
     /// (`paint_sidebar_glass`), on the button's own fill and one step
     /// fainter (`GLASS_BUTTON_STRENGTH`), so that the row stays the one
     /// that stands out; under the pointer, on the hover fill and as strong
     /// as the row.
-    fn paint_sidebar_glass_button(
+    pub(crate) fn paint_sidebar_glass_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         layer_num: usize,
@@ -4547,6 +4548,38 @@ impl crate::TermWindow {
             None,
             strength,
             hovered,
+        )
+    }
+
+    /// A search field on a sidebar: glass as New Thread is
+    /// (`paint_sidebar_glass_button`), and while it has the keyboard, ringed
+    /// in `chrome.selected_bg`, the hairline a field has always had then.
+    pub(crate) fn paint_sidebar_glass_field(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        chrome: UiPalette,
+        hovered: bool,
+        focused: bool,
+    ) -> anyhow::Result<()> {
+        self.paint_sidebar_glass_button(layers, layer_num, rect, chrome, hovered)?;
+        if !focused {
+            return Ok(());
+        }
+        let Some(gl_state) = self.render_state.as_ref() else {
+            return Ok(());
+        };
+        DrawContext::new(gl_state, self.dimensions, &self.render_metrics).draw_rounded_frame(
+            layers,
+            layer_num,
+            rect.min_x(),
+            rect.min_y(),
+            rect.width(),
+            rect.height(),
+            LinearRgba::TRANSPARENT,
+            chrome.selected_bg,
+            rect.height().min(rect.width()) / 2.0,
         )
     }
 

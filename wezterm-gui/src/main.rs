@@ -77,6 +77,7 @@ mod shell_catalog;
 mod snippets;
 mod spawn;
 mod ssh_hosts;
+mod start_request;
 mod state_backup;
 mod stats;
 mod tab_icons;
@@ -212,7 +213,7 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     mux.set_default_domain(&domain);
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    async_run_terminal_gui(cmd, start_command, should_publish, false).await
 }
 
 fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -267,7 +268,7 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
     mux.add_domain(&domain);
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    async_run_terminal_gui(cmd, start_command, should_publish, false).await
 }
 
 fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Result<()> {
@@ -1097,6 +1098,18 @@ async fn trigger_gui_startup(
     Ok(())
 }
 
+/// Whether the configuration has a handler for the gui-startup event.
+async fn gui_startup_is_handled() -> bool {
+    config::with_lua_config_on_main_thread(|lua| async move {
+        Ok(match lua {
+            Some(lua) => config::lua::has_event_handler(&lua, "gui-startup")?,
+            None => false,
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
 async fn trigger_and_log_gui_startup(spawn_command: Option<SpawnCommand>) {
     if let Err(err) =
         config::with_lua_config_on_main_thread(move |lua| trigger_gui_startup(lua, spawn_command))
@@ -1139,7 +1152,19 @@ async fn async_run_terminal_gui(
     cmd: Option<CommandBuilder>,
     opts: StartCommand,
     should_publish: bool,
+    opens_by_name: bool,
 ) -> anyhow::Result<()> {
+    // The workspace this launch starts in, before the first window can
+    // move to the thread it opens for what was named.
+    let startup_workspace = Mux::get().active_workspace();
+    // A configuration that handles gui-startup is handed the command, as
+    // before, and decides where it goes.
+    let opens_by_name = if opens_by_name && gui_startup_is_handled().await {
+        crate::start_request::take_for_window();
+        false
+    } else {
+        opens_by_name
+    };
     config::create_user_owned_dirs(&*config::RUNTIME_DIR)?;
     config::create_user_owned_dirs(&*config::CACHE_DIR)?;
 
@@ -1248,8 +1273,19 @@ async fn async_run_terminal_gui(
             }
         }
     }
+    // A folder or program named is the first window's to open
+    // (`start_request`): the startup tab is a plain one, which a restore
+    // finding the Space's terminals running never opens.
+    // Judged by the workspace it started in: the window may have moved to
+    // the new thread already, whose terminal is still on its way.
+    let (startup_cmd, startup_workspace) = if opens_by_name {
+        (None, opts.workspace.or(Some(startup_workspace)))
+    } else {
+        (cmd, opts.workspace)
+    };
     let started =
-        spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await;
+        spawn_tab_in_domain_if_mux_is_empty(startup_cmd, is_connecting, domain, startup_workspace)
+            .await;
     crate::frontend::front_end().startup_settled_soon();
     started
 }
@@ -1308,6 +1344,7 @@ impl Publish {
     pub fn try_spawn(
         &mut self,
         cmd: Option<CommandBuilder>,
+        request: Option<&crate::start_request::StartRequest>,
         config: &ConfigHandle,
         workspace: Option<&str>,
         domain: SpawnTabDomain,
@@ -1341,6 +1378,20 @@ impl Publish {
                             anyhow::bail!(
                                 "Running GUI has different config from us, will start a new one"
                             );
+                        }
+
+                        // A folder or program named opens in the running
+                        // window's Space. A window of another version may not
+                        // know how, and is asked to spawn it, as before. One of
+                        // this version is not asked again when it fails: it
+                        // may have opened it, and only the answer was lost.
+                        if let Some(request) = request {
+                            if vers.version_string == config::wezterm_version() {
+                                if let Err(err) = client.open_from_start(request.to_pdu()).await {
+                                    log::error!("the running ThinkTerm did not open it: {err:#}");
+                                }
+                                return Ok(None);
+                            }
                         }
 
                         let window_id = if new_tab || config.prefer_to_spawn_tabs {
@@ -1392,6 +1443,7 @@ impl Publish {
                                 ).to_string(),
                             })
                             .await
+                            .map(Some)
                     }));
 
                     match res {
@@ -1494,6 +1546,8 @@ fn keep_servers_terminals() {
 
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
     keep_servers_terminals();
+    // A later `thinkterm start` naming a folder or program hands it here.
+    wezterm_mux_server_impl::open_from_start::install(crate::start_request::open_handed);
     let mut listener =
         wezterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
@@ -1667,6 +1721,23 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
     // requirements are different.
+    // A folder or program named opens as a thread in the window's Space,
+    // whichever window that is.
+    // Only where terminals run on this computer: a default domain that is
+    // another machine's gets the command, as before.
+    let default_domain = mux.default_domain();
+    let runs_here = default_domain
+        .downcast_ref::<mux::domain::LocalDomain>()
+        .is_some()
+        || crate::local_sessions::is_host_domain_name(default_domain.domain_name());
+    let start_request = if runs_here {
+        crate::start_request::StartRequest::from_start(&opts).unwrap_or_else(|err| {
+            log::warn!("opening what was named as a terminal, not a thread: {err:#}");
+            None
+        })
+    } else {
+        None
+    };
     let mut publish = Publish::resolve(
         &mux,
         &config,
@@ -1675,6 +1746,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     log::trace!("{:?}", publish);
     if publish.try_spawn(
         cmd.clone(),
+        start_request.as_ref(),
         &config,
         opts.workspace.as_deref(),
         match &opts.domain {
@@ -1692,8 +1764,15 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     crate::tailnet::start();
     let activity = Activity::new();
 
+    // The first window opens it, rather than the startup tab.
+    let opens_by_name = start_request.is_some();
+    if let Some(request) = start_request {
+        crate::start_request::keep_for_first_window(request);
+    }
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
+        if let Err(err) =
+            async_run_terminal_gui(cmd, opts, publish.should_publish(), opens_by_name).await
+        {
             terminate_with_error(err);
         }
         drop(activity);

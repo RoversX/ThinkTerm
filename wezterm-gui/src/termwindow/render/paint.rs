@@ -2622,13 +2622,16 @@ impl crate::TermWindow {
         // terminal's (its colour's own alpha it has already). Over a
         // background image drawn this frame it stays solid: it would coat
         // the image a second time, and its fade clears what is under it.
-        let page_ground_opacity = if !self.window_background.is_empty()
-            && matches!(self.allow_images, AllowImage::Yes | AllowImage::Scale(_))
-        {
+        let over_background_image = !self.window_background.is_empty()
+            && matches!(self.allow_images, AllowImage::Yes | AllowImage::Scale(_));
+        let page_ground_opacity = if over_background_image {
             1.0
         } else {
             self.terminal_ground_opacity(self.config.window_background_opacity)
         };
+        // Set only in a see-through window, where Settings shades the
+        // terminal.
+        let terminal_ground = self.terminal_shade.filter(|_| !over_background_image);
         let (next_frame, previews) = {
             let gl_state = self.render_state.as_ref().unwrap();
             let ctx = DrawContext::new(gl_state, dimensions, &render_metrics);
@@ -2637,6 +2640,7 @@ impl crate::TermWindow {
                 view.set_defer_preview_captures(defer_preview_captures);
                 view.set_host_preview_aspect(host_preview_aspect);
                 view.set_ground_opacity(page_ground_opacity);
+                view.set_terminal_ground(terminal_ground);
                 view.paint_surface_background(&ctx, layers, surface, palette)?;
                 if view.presentation() == ContentViewPresentation::ContentArea
                     && view.host_paints_ground()

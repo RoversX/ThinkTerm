@@ -1,6 +1,18 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // The CLI runs on the main thread, and Windows sizes that thread's stack
+    // from the executable: 1 MiB unless the link says otherwise, where Linux
+    // and macOS give 8 MiB. Ask for the same 8 MiB. The target, not the
+    // host, decides: this is a linker flag for the binaries being built.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => println!("cargo:rustc-link-arg-bins=/STACK:8388608"),
+            Ok("gnu") => println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608"),
+            _ => {}
+        }
+    }
+
     #[cfg(windows)]
     {
         use std::io::Write;

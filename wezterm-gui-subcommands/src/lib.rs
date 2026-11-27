@@ -32,10 +32,11 @@ pub struct StartCommand {
     #[arg(long = "no-auto-connect")]
     pub no_auto_connect: bool,
 
-    /// If enabled, don't try to ask an existing ThinkTerm GUI instance
-    /// to start the command.  Instead, always start the GUI in this
-    /// invocation of ThinkTerm so that you can wait for the command
-    /// to complete by waiting for this ThinkTerm process to finish.
+    /// If enabled, don't ask an existing ThinkTerm GUI instance to open
+    /// the folder or start the program. Instead, always start the GUI in
+    /// this invocation of ThinkTerm. Either way they open in the current
+    /// Space (see --cwd and PROG), so this process lasts as long as its
+    /// window, not as long as the program.
     #[arg(long = "always-new-process")]
     pub always_new_process: bool,
 
@@ -44,8 +45,10 @@ pub struct StartCommand {
     #[arg(long, conflicts_with = "always_new_process")]
     pub new_tab: bool,
 
-    /// Specify the current working directory for the initially
-    /// spawned program
+    /// A folder to open. It opens as a project of the current Space:
+    /// the one there for it already, else a new one. With PROG, the
+    /// program runs in that project. With --domain or --workspace, it is
+    /// the working directory of the program started there instead.
     #[arg(long = "cwd", value_parser, value_hint=ValueHint::DirPath)]
     pub cwd: Option<PathBuf>,
 
@@ -101,7 +104,9 @@ pub struct StartCommand {
     #[arg(long, requires = "domain")]
     pub attach: bool,
 
-    /// Instead of executing your shell, run PROG.
+    /// Instead of executing your shell, run PROG. It runs in a new thread
+    /// of the current project (or of the --cwd folder's project), or,
+    /// with --domain or --workspace, in a window there.
     /// For example: `thinkterm start -- bash -l` will spawn bash
     /// as if it were a login shell. [aliases: -e]
     #[arg(value_parser, value_hint=ValueHint::CommandWithArguments, num_args=1..)]

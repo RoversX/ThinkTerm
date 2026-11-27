@@ -1314,6 +1314,11 @@ pub struct MouseEvent {
     /// wheel amount it comes with. The terminal grid and the sidebars read
     /// it; the rest of the chrome keeps using the integer kind.
     pub precise_wheel_lines: Option<f32>,
+    /// Whole notches of a vertical wheel, same sign as `VertWheel`, where
+    /// the system leaves the lines per notch to the application (X11 and
+    /// Wayland). The terminal's scrollback moves the lines Settings asks for
+    /// per notch; the chrome keeps using the amount.
+    pub wheel_notches: Option<i16>,
 }
 
 #[derive(Debug, Clone)]

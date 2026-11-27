@@ -47,6 +47,16 @@ pub(crate) fn test_link() -> SshLink {
     )
 }
 
+/// [`test_link`], open, with what it would send handed to the test.
+#[cfg(test)]
+pub(crate) fn test_link_open() -> (SshLink, tokio::sync::mpsc::UnboundedReceiver<Out>) {
+    let link = test_link();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    *link.0.out.borrow_mut() = Some(tx);
+    link.0.open.set(true);
+    (link, rx)
+}
+
 struct Inner {
     /// What each dial is made with; the host key it holds the host to can
     /// be forgotten between them (`forget_host_key`).
@@ -196,8 +206,10 @@ impl SshLink {
     }
 
     /// Open the chat with the agent in `pane` on a channel beside the
-    /// protocol's; its lines come back as `Net::ChatLine`, its end as
-    /// `Net::ChatEnded`. False when there is no connection to open it on.
+    /// protocol's, as opening `generation`; its lines come back as
+    /// `Net::ChatLine`, its end as `Net::ChatEnded`, under it. Channels
+    /// opened before stay open until closed. False when there is no
+    /// connection to open it on.
     pub fn chat_open(&self, pane: u32, generation: u64) -> bool {
         let out = self.0.out.borrow();
         match out.as_ref().filter(|_| self.0.open.get()) {
@@ -206,19 +218,20 @@ impl SshLink {
         }
     }
 
-    /// A line for the open chat's bridge; false when there is no
-    /// connection to send it on.
-    pub fn chat_send(&self, line: String) -> bool {
+    /// A line for the bridge of opening `generation`; false when there is
+    /// no connection to send it on.
+    pub fn chat_send(&self, generation: u64, line: String) -> bool {
         let out = self.0.out.borrow();
         match out.as_ref().filter(|_| self.0.open.get()) {
-            Some(out) => out.send(Out::ChatLine(line)).is_ok(),
+            Some(out) => out.send(Out::ChatLine { generation, line }).is_ok(),
             None => false,
         }
     }
 
-    pub fn chat_close(&self) {
+    /// Close the channel of opening `generation`, if it is still open.
+    pub fn chat_close(&self, generation: u64) {
         if let Some(out) = self.0.out.borrow().as_ref() {
-            let _ = out.send(Out::ChatClose);
+            let _ = out.send(Out::ChatClose(generation));
         }
     }
 

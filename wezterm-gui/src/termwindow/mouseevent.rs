@@ -10587,6 +10587,7 @@ mod blocked_pointer_tests {
             scroll_phase: None,
             momentum_phase: None,
             precise_wheel_lines: None,
+            wheel_notches: None,
         };
         let item = UIItem {
             x: 0,

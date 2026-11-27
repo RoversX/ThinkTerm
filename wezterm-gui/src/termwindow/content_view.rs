@@ -753,6 +753,15 @@ pub(crate) trait ContentView {
     /// the view is up.
     fn set_ground_opacity(&mut self, _opacity: f32) {}
 
+    /// In a see-through window, the colour Settings has the terminal's
+    /// ground take in place of its own (the tab bars take it too), opaque;
+    /// how solid it is painted is `set_ground_opacity`'s. `None` where the
+    /// terminal keeps its own ground: an opaque window, a shade left light,
+    /// a scheme on the other side of the interface, a background image.
+    /// Pushed every frame with `set_ground_opacity`; a view that ignores it
+    /// stays as it was.
+    fn set_terminal_ground(&mut self, _ground: Option<::window::color::LinearRgba>) {}
+
     /// Terminal tabs to paint as read-only live thumbnails after the view's
     /// regular UI layers have been prepared.
     fn terminal_previews(&self) -> Vec<TerminalPreviewRequest> {

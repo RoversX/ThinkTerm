@@ -19675,9 +19675,9 @@ impl crate::TermWindow {
         )
     }
 
-    /// A button beside the Files filter, Upload or Refresh: round, and made
-    /// like the left sidebar's New Thread and notifications buttons, so the
-    /// two sidebars' actions look alike.
+    /// A button beside the Files filter, Upload or Refresh: round, and glass
+    /// as the left sidebar's New Thread and notifications buttons are, so
+    /// the two sidebars' actions look alike.
     #[allow(clippy::too_many_arguments)]
     fn paint_files_header_action_button(
         &mut self,
@@ -19692,13 +19692,12 @@ impl crate::TermWindow {
         item_type: UIItemType,
     ) -> anyhow::Result<()> {
         let hovered = self.is_pointer_over_ui_rect(x, y, size, size);
-        self.paint_sidebar_action_button(
+        self.paint_sidebar_glass_button(
             layers,
             1,
             euclid::rect(x as f32, y as f32, size as f32, size as f32),
             chrome,
             hovered,
-            false,
         )
         .context("right sidebar files header button")?;
         self.ui_items.push(UIItem {
@@ -21189,26 +21188,30 @@ impl crate::TermWindow {
             &item_type,
             UIItemType::RightSidebarSnippetSearch | UIItemType::RightSidebarFileFilter
         );
-        self.fill_rounded_rectangle_with_border(
-            layers,
-            layer_num,
-            euclid::rect(x as f32, y as f32, width as f32, height as f32),
-            chrome.control_bg,
-            if focused {
-                chrome.selected_bg
-            } else if hovered {
-                chrome.separator
-            } else {
-                chrome.control_border
-            },
-            if is_search_field {
-                WINDOW_TAB_ADD_BUTTON_RADIUS
-            } else {
-                self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0
-            },
-            CAPSULE_BORDER_WIDTH,
-        )
-        .context("right sidebar snippet text box")?;
+        let rect = euclid::rect(x as f32, y as f32, width as f32, height as f32);
+        if is_search_field {
+            // A search field is glass, as the buttons beside it and the left
+            // sidebar's New Thread are.
+            self.paint_sidebar_glass_field(layers, layer_num, rect, chrome, hovered, focused)
+                .context("right sidebar search field")?;
+        } else {
+            self.fill_rounded_rectangle_with_border(
+                layers,
+                layer_num,
+                rect,
+                chrome.control_bg,
+                if focused {
+                    chrome.selected_bg
+                } else if hovered {
+                    chrome.separator
+                } else {
+                    chrome.control_border
+                },
+                self.ui_f32(SIDEBAR_ROW_RADIUS) + 4.0,
+                CAPSULE_BORDER_WIDTH,
+            )
+            .context("right sidebar snippet text box")?;
+        }
         self.ui_items.push(UIItem {
             x,
             y,

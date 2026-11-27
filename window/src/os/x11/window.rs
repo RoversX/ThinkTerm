@@ -727,9 +727,8 @@ impl XWindowInner {
                     return Ok(());
                 }
 
-                // Ideally this would be configurable, but it's currently a bit
-                // awkward to configure this layer, so let's just improve the
-                // default for now!
+                // The chrome's distance per notch. The terminal's scrollback
+                // goes by `wheel_notches` and the lines Settings asks for.
                 const LINES_PER_TICK: i16 = 5;
 
                 MouseEventKind::VertWheel(if b == 4 {
@@ -744,6 +743,10 @@ impl XWindowInner {
             }
         };
 
+        let wheel_notches = match &kind {
+            MouseEventKind::VertWheel(amount) => Some(amount.signum()),
+            _ => None,
+        };
         let event = MouseEvent {
             kind,
             coords: Point::new(event_x.try_into().unwrap(), event_y.try_into().unwrap()),
@@ -754,6 +757,7 @@ impl XWindowInner {
             scroll_phase: None,
             momentum_phase: None,
             precise_wheel_lines: None,
+            wheel_notches,
         };
         self.do_mouse_event(event)
     }
@@ -1062,6 +1066,7 @@ impl XWindowInner {
                     scroll_phase: None,
                     momentum_phase: None,
                     precise_wheel_lines: None,
+                    wheel_notches: None,
                 };
                 self.do_mouse_event(event)?;
             }

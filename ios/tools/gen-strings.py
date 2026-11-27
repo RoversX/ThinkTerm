@@ -36,6 +36,18 @@ EXTRA = {
     "p.layout": ["Layout", "布局", "レイアウト", "Disposition", "Layout"],
     "project.new": ["New project", "新建项目", "新規プロジェクト", "Nouveau projet", "Neues Projekt"],
     "sidebar": ["Sidebar", "侧栏", "サイドバー", "Barre latérale", "Seitenleiste"],
+    # The chat's way to the terminal under it
+    "chat.terminal": ["Show the terminal", "显示终端", "ターミナルを表示", "Afficher le terminal", "Terminal anzeigen"],
+    # The model sheet's title
+    "chat.model.pick": ["Select Model", "选择模型", "モデルを選択", "Choisir le modèle", "Modell wählen"],
+    # A way out of a page with no other: a picture shown big
+    "close": ["Close", "关闭", "閉じる", "Fermer", "Schließen"],
+    # Threads home's view, picked at its head
+    "home.view.pick": ["Choose a View", "切换视图", "表示を選択", "Choisir une vue", "Ansicht wählen"],
+    "home.view.repos": ["By Project", "按项目", "プロジェクト別", "Par projet", "Nach Projekt"],
+    "home.view.repos.all": ["All computers", "所有电脑", "すべてのコンピューター", "Tous les ordinateurs", "Alle Computer"],
+    "space.new": ["New Space", "新建 Space", "新しい Space", "Nouveau Space", "Neuer Space"],
+    "space.delete.body": ["The tabs of its threads close and the programs in them end.", "它里面会话的标签会关闭，其中的程序会结束。", "そのスレッドのタブが閉じ、中のプログラムは終了します。", "Les onglets de ses fils se ferment et les programmes qu’ils contiennent s’arrêtent.", "Die Tabs seiner Threads werden geschlossen und die Programme darin beendet."],
     # The desktop's tooltip-sidebar-thread-search, with this app's word for a thread.
     "thread.find": ["Find Thread", "查找会话", "セッションを検索", "Rechercher une session", "Thread finden"],
     "thread.find.none": ["No thread matches", "没有匹配的会话", "一致するセッションはありません", "Aucune session ne correspond", "Kein Thread passt"],

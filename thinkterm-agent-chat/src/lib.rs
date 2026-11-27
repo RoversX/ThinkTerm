@@ -181,6 +181,12 @@ pub enum Ev {
     /// its folder: the chat goes on, without what is newer, until the
     /// agent takes it in ([`Op::Reload`]).
     Outdated,
+    /// The agent runs no ThinkTerm extension yet, and the bridge is having
+    /// it take one in by itself: what that waits for, said while the chat
+    /// connects -- no problem to put right. A line of its own, as
+    /// [`Ev::Worked`] is: a client that does not know it shows the chat
+    /// connecting.
+    Loading { wait: LoadWait },
     /// How long a turn worked, said after the last thing that came of it
     /// (the item `after`), where the client shows it. A line of its own,
     /// not an item: a client that does not know it lets it go, where an
@@ -599,6 +605,25 @@ pub enum Done {
     /// The extension is in place; the agent takes it in when it next
     /// starts or reloads.
     Installed,
+}
+
+/// What a load the bridge makes by itself ([`Ev::Loading`]) waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadWait {
+    /// Typed into the agent: it is taking the extension in.
+    Typed,
+    /// The agent is in a turn: it is typed once that ends.
+    Turn,
+    /// Something is typed in the agent's field, which is left as it is:
+    /// it is typed once the field is empty.
+    Field,
+    /// The agent's field is not on its screen (a dialog, a menu): it is
+    /// typed once the field is back.
+    Screen,
+    /// A reason this client does not know.
+    #[serde(other)]
+    Other,
 }
 
 /// What would let the chat work.

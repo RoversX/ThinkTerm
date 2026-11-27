@@ -1173,24 +1173,20 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     let chatFeed = ChatFeed()
 
-    /// The chat on show was opened from Threads: going back from it goes
-    /// back there, past the terminal under it.
-    private(set) var chatFromThreads = false
-    /// Bumped to send the terminal's screen back to Threads, a chat opened
-    /// there still over it: `TerminalScreen` goes, and closes the chat once
-    /// it is gone.
-    @Published private(set) var backToThreads = 0
 
     /// Show `row`'s agent as a chat. The terminal under it goes to the
-    /// agent's pane first, as a tap on the row always did: going back from
-    /// the chat is going to that terminal.
+    /// agent's pane first, as a tap on the row always did: the chat's
+    /// terminal button shows that terminal.
     func openChat(_ row: AgentRow) {
         openChat(pane: row.pane, agent: row.agent_id, place: row.place.isEmpty ? row.name : row.place)
     }
 
-    /// Show the agent in `pane` as a chat; `fromThreads`, going back from
-    /// it goes back to Threads rather than to the terminal under it.
-    func openChat(pane: Int, agent: String, place: String, fromThreads: Bool = false) {
+    /// Show the agent in `pane` as a chat, in place of one on show.
+    func openChat(pane: Int, agent: String, place: String) {
+        // Files picked for another chat are not for this one.
+        if let shown = chatWith, shown.pane != pane || shown.agent != agent {
+            for file in chatFiles { chatDetach(file) }
+        }
         chromeClick("pane", pane: pane)
         chat = nil
         chatThumbs = [:]
@@ -1200,21 +1196,13 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         chatFeed.fileOpen = nil
         chatFileAsked = [:]
         chatShownKept = []
-        chatFromThreads = fromThreads
         chatWith = ChatTarget(pane: pane, agent: agent, place: place)
         core.chatOpen(pane: UInt32(pane), agent: agent)
     }
 
-    /// Back from the chat: to the terminal under it -- or, for one opened
-    /// from Threads, to Threads, unless `toTerminal` (an ask answered only
-    /// in the terminal).
-    func closeChat(toTerminal: Bool = false) {
+    /// The chat ends, and the terminal under it shows.
+    func closeChat() {
         guard chatWith != nil else { return }
-        if chatFromThreads && !toTerminal {
-            backToThreads += 1
-            return
-        }
-        chatFromThreads = false
         chatWith = nil
         chat = nil
         core.chatClose()
@@ -1415,6 +1403,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func chatAnswer(ask: String, choice: String) { core.chatAnswer(ask: ask, choice: choice) }
     func chatAnswerQuestions(ask: String, answers: [String]) { core.chatAnswerQuestions(ask: ask, answers: answers) }
     func chatInterrupt() { core.chatInterrupt() }
+    /// Send again what was said as the user row `id` and did not go.
+    func chatResend(_ id: String) { core.chatResend(id: id) }
     func chatOlder() { core.chatOlder() }
     func chatAction(_ action: String) { core.chatAction(action: action) }
     func chatToggle(_ row: String) { core.chatToggle(row: row) }

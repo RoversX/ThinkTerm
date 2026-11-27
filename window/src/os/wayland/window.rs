@@ -1057,6 +1057,7 @@ impl WaylandWindowInner {
                     scroll_phase: None,
                     momentum_phase: None,
                     precise_wheel_lines: None,
+                    wheel_notches: None,
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }
@@ -1116,6 +1117,7 @@ impl WaylandWindowInner {
                 scroll_phase: None,
                 momentum_phase: None,
                 precise_wheel_lines: None,
+                wheel_notches: None,
             };
             self.events.dispatch(WindowEvent::MouseEvent(event));
         }
@@ -1148,6 +1150,9 @@ impl WaylandWindowInner {
                         scroll_phase: None,
                         momentum_phase: None,
                         precise_wheel_lines: None,
+                        // A wheel step, not pixels of touchpad travel.
+                        wheel_notches: (!is_horizontal && delta.pixels.is_none())
+                            .then_some(delta.amount),
                     };
                     self.events.dispatch(WindowEvent::MouseEvent(event));
                 }

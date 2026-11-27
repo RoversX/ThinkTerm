@@ -172,6 +172,78 @@ pub fn install(target: &Target) -> Result<PathBuf> {
     install_in(&claude_dir(target))
 }
 
+/// [`install`], into the Claude Code whose folder is `claude`, ahead of any
+/// chat: a Claude started from then on runs the mod from its start, and a
+/// phone's chat with it needs no `/reload-plugins`. Whether ours is in
+/// place as written now and was not before.
+pub(super) fn install_into(claude: &Path) -> Result<bool> {
+    let dir = claude.join("skills").join(MOD_NAME);
+    let current = || {
+        MOD_FILES
+            .iter()
+            .all(|(name, text)| std::fs::read_to_string(dir.join(name)).is_ok_and(|now| now == *text))
+    };
+    if current() {
+        return Ok(false);
+    }
+    install_in(claude)?;
+    Ok(current())
+}
+
+/// [`install_into`], only where ours is in place already: one of an older
+/// ThinkTerm is brought up to date (Claude takes an edited mod in by
+/// itself), and none is put where there was none -- or where the person
+/// took it out. A phone's first chat with Claude puts it in.
+pub(super) fn refresh_in(claude: &Path) -> Result<bool> {
+    let ours = module_in(&claude.join("skills").join(MOD_NAME)).is_some_and(|text| text.starts_with(MARK));
+    if !ours {
+        return Ok(false);
+    }
+    install_into(claude)
+}
+
+/// How the mod in the Claude Code whose folder is `claude` is, in the
+/// words `thinkterm skill status` uses.
+pub(super) fn state_in(claude: &Path) -> &'static str {
+    let dir = claude.join("skills").join(MOD_NAME);
+    match module_in(&dir) {
+        None => "missing",
+        Some(text) if !text.starts_with(MARK) => "someone else's",
+        Some(_) if MOD_FILES.iter().all(|(name, text)| std::fs::read_to_string(dir.join(name)).is_ok_and(|now| now == *text)) => "current",
+        Some(_) => "outdated",
+    }
+}
+
+/// Takes ours out of the Claude Code whose folder is `claude`; another
+/// plugin by the name is left alone. Whether there was one of ours.
+pub(super) fn remove_from(claude: &Path) -> Result<bool> {
+    let dir = claude.join("skills").join(MOD_NAME);
+    match module_in(&dir) {
+        Some(text) if text.starts_with(MARK) => {
+            // Our files, and the folders they leave empty: anything put
+            // beside them stays, and its folders with it.
+            for (name, _) in MOD_FILES {
+                let file = dir.join(name);
+                match std::fs::remove_file(&file) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err).with_context(|| format!("removing {}", file.display())),
+                }
+                let mut folder = file.parent();
+                while let Some(at) = folder.filter(|at| at.starts_with(&dir)) {
+                    if std::fs::remove_dir(at).is_err() {
+                        break;
+                    }
+                    folder = at.parent();
+                }
+            }
+            Ok(true)
+        }
+        Some(_) => bail!("{} is someone else's", dir.display()),
+        None => Ok(false),
+    }
+}
+
 fn install_in(claude: &Path) -> Result<PathBuf> {
     if !claude.is_dir() {
         bail!("{} is not there: is Claude Code installed?", claude.display());
@@ -379,41 +451,170 @@ fn field_empty(rows: &[String]) -> Option<bool> {
 
 /// How often a pane whose Claude runs no mod is looked at again.
 const LOOK_AGAIN: Duration = Duration::from_millis(500);
+/// How many loads are typed by themselves, in all: a Claude that takes
+/// none of them has something else in the way, and the person is asked.
+const LOAD_TRIES: u32 = 2;
 
-/// No mod answers in this pane: say what would help, put it in when the
-/// client asks, and go on to the chat once Claude runs it (on its
-/// `/reload-plugins`, or started again).
+/// What a load made by itself comes to, as things are now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadStep {
+    /// The mod is not in Claude Code's folder: it is put in first.
+    Install,
+    /// Claude rests with its field empty: the load is typed now.
+    Type,
+    /// The load waits, for this.
+    Wait(crate::LoadWait),
+    /// Nothing more is done by itself: the person is asked.
+    Ask,
+}
+
+/// A load the bridge makes by itself, while the phone has the chat open --
+/// the bridge goes when the chat closes. Typed only while Claude rests and
+/// its field is empty, so that nothing typed there is touched; once, and
+/// again only once that came to nothing in [`LOADING`]; [`LOAD_TRIES`]
+/// times at most.
+#[derive(Debug, Default)]
+struct AutoLoad {
+    tries: u32,
+    typed: Option<Instant>,
+    given_up: bool,
+    /// Looks in a row that found Claude resting with its field empty: the
+    /// load is typed on the second, so that someone typing at the desk is
+    /// seen before it is typed over them.
+    quiet: u32,
+}
+
+impl AutoLoad {
+    /// What to do now, the mod in place or not (`installed`), the pane
+    /// typed into or not (`can_type`), with Claude doing `agent` and its
+    /// field empty, not, or not to be seen (`field`).
+    fn step(&mut self, installed: bool, can_type: bool, agent: AgentHere, field: Option<bool>, now: Instant) -> LoadStep {
+        if !installed {
+            return LoadStep::Install;
+        }
+        if !can_type || self.given_up || agent == AgentHere::Gone {
+            return LoadStep::Ask;
+        }
+        if self.typed.is_some_and(|at| now.duration_since(at) < LOADING) {
+            return LoadStep::Wait(crate::LoadWait::Typed);
+        }
+        if self.tries >= LOAD_TRIES {
+            self.given_up = true;
+            return LoadStep::Ask;
+        }
+        let step = match (agent, field) {
+            (AgentHere::Working, _) => LoadStep::Wait(crate::LoadWait::Turn),
+            (_, Some(true)) if self.quiet >= 1 => LoadStep::Type,
+            (_, Some(true)) => LoadStep::Wait(crate::LoadWait::Typed),
+            (_, Some(false)) => LoadStep::Wait(crate::LoadWait::Field),
+            (_, None) => LoadStep::Wait(crate::LoadWait::Screen),
+        };
+        self.quiet = if field == Some(true) && agent != AgentHere::Working { self.quiet + 1 } else { 0 };
+        step
+    }
+
+    fn typed(&mut self, now: Instant) {
+        self.tries += 1;
+        self.typed = Some(now);
+        self.quiet = 0;
+    }
+
+    /// The person asked for it (the card's Load): all over again.
+    fn again(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// No mod answers in this pane: have Claude take it in, by itself -- put
+/// into Claude Code's folder first where it is not -- and go on to the chat
+/// once Claude runs it. While that waits, the chat is told what for; only
+/// once nothing more can be done by itself is the person asked.
 fn offer(target: &Target, pane: Option<&dyn PaneControl>, rx: &mpsc::Receiver<Input<Piece>>, out: &Out) -> Result<Option<Note>> {
     let message = "no ThinkTerm plugin is running in this Claude Code (it needs Claude Code 2.1.300 or newer, with plugins allowed)";
-    let say = |out: &Out| -> std::io::Result<()> {
-        let need = if installed(target) { Need::PiRestart } else { Need::PiExtension };
-        out.send(&Ev::Error {
+    // The card, for what the person can do, as things are now: Claude gone
+    // from the pane, the mod in place or not, why it could not be put in.
+    let card = |agent: AgentHere, why: Option<String>| -> Ev {
+        let need = match (installed(target), agent == AgentHere::Gone) {
+            (_, true) => Need::Unsupported,
+            (true, false) => Need::PiRestart,
+            (false, false) => Need::PiExtension,
+        };
+        Ev::Error {
             need: Some(need),
-            message: message.into(),
+            message: why.unwrap_or_else(|| message.into()),
             can_load: need == Need::PiRestart && pane.is_some(),
-        })
+        }
     };
-    say(out)?;
-    let mut loading: Option<Instant> = None;
+    let mut load = AutoLoad::default();
+    // What the chat was last told, so that nothing is said twice -- and a
+    // card that changed (Claude left the pane, another reason) is said again.
+    let mut said: Option<String> = None;
+    let mut install_failed: Option<String> = None;
+    let mut looked: Option<Instant> = None;
     loop {
-        match rx.recv_timeout(LOOK_AGAIN) {
-            Ok(Input::Op(Op::Install)) => match install(target) {
-                Ok(_) if pane.is_some() => say(out)?,
-                Ok(_) => {
-                    out.send(&Ev::Done { what: Done::Installed })?;
-                    say(out)?;
-                }
-                Err(err) => out.refused(format!("{err:#}"))?,
-            },
-            Ok(Input::Op(Op::Reload)) if loading.is_some_and(|at| at.elapsed() < LOADING) => {}
-            Ok(Input::Op(Op::Reload)) => {
-                let loaded = match pane {
-                    Some(pane) => load(pane),
-                    None => Err(format!("type {} in Claude", crate::reload_command("claude"))),
+        // The pane is looked at once a second: a mux round trip or two.
+        if looked.map_or(true, |at| at.elapsed() >= Duration::from_secs(1)) {
+            looked = Some(Instant::now());
+            let agent = pane.map_or(AgentHere::Unknown, |pane| pane.agent());
+            let field = match agent {
+                AgentHere::Resting | AgentHere::Unknown => pane.and_then(|pane| pane.screen()).as_deref().and_then(field_empty),
+                _ => None,
+            };
+            // A mod that could not be put in waits for the person's Install.
+            let mut step = match install_failed {
+                Some(_) => LoadStep::Ask,
+                None => load.step(installed(target), pane.is_some(), agent, field, Instant::now()),
+            };
+            if step == LoadStep::Install {
+                step = match install(target) {
+                    Ok(_) => load.step(true, pane.is_some(), agent, field, Instant::now()),
+                    Err(err) => {
+                        install_failed = Some(format!("{err:#}"));
+                        LoadStep::Ask
+                    }
                 };
-                match loaded {
-                    Ok(()) => loading = Some(Instant::now()),
-                    Err(why) => out.refused(why)?,
+            }
+            if step == LoadStep::Type {
+                let command = crate::reload_command("claude");
+                step = match pane.map(|pane| pane.type_line(command)) {
+                    Some(Ok(())) => {
+                        load.typed(Instant::now());
+                        LoadStep::Wait(crate::LoadWait::Typed)
+                    }
+                    _ => {
+                        load.given_up = true;
+                        LoadStep::Ask
+                    }
+                };
+            }
+            let ev = match step {
+                LoadStep::Wait(wait) => Ev::Loading { wait },
+                _ => card(agent, install_failed.clone()),
+            };
+            let line = serde_json::to_string(&ev).unwrap_or_default();
+            if said.as_deref() != Some(line.as_str()) {
+                said = Some(line);
+                out.send(&ev)?;
+            }
+        }
+        match rx.recv_timeout(LOOK_AGAIN) {
+            Ok(Input::Op(Op::Install)) => {
+                install_failed = None;
+                match install(target) {
+                    Ok(_) => {
+                        load.again();
+                        said = None;
+                        looked = None;
+                    }
+                    Err(err) => out.refused(format!("{err:#}"))?,
+                }
+            }
+            // The card's Load: tried again, as at first.
+            Ok(Input::Op(Op::Reload)) => {
+                if !load.typed.is_some_and(|at| at.elapsed() < LOADING) {
+                    load.again();
+                    said = None;
+                    looked = None;
                 }
             }
             Ok(Input::Op(_)) => out.refused("Claude's chat is not running")?,
@@ -2182,6 +2383,48 @@ mod tests {
     }
 
     #[test]
+    fn a_load_by_itself_waits_its_turn_and_is_typed_twice_at_most() {
+        use crate::LoadWait;
+        let now = Instant::now();
+        let mut load = AutoLoad::default();
+        // Not in Claude Code's folder: put in first.
+        assert_eq!(load.step(false, true, AgentHere::Resting, Some(true), now), LoadStep::Install);
+        // In a turn, something typed, no field on show: it waits.
+        assert_eq!(load.step(true, true, AgentHere::Working, Some(true), now), LoadStep::Wait(LoadWait::Turn));
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(false), now), LoadStep::Wait(LoadWait::Field));
+        assert_eq!(load.step(true, true, AgentHere::Unknown, None, now), LoadStep::Wait(LoadWait::Screen));
+        // At rest, the field empty: typed on the second look in a row, and
+        // not again while it loads.
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), now), LoadStep::Wait(LoadWait::Typed));
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(false), now), LoadStep::Wait(LoadWait::Field), "someone typing");
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), now), LoadStep::Wait(LoadWait::Typed));
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), now), LoadStep::Type);
+        load.typed(now);
+        assert_eq!(
+            load.step(true, true, AgentHere::Resting, Some(true), now + LOADING / 2),
+            LoadStep::Wait(LoadWait::Typed)
+        );
+        // Nothing came of it: once more, as things allow.
+        let later = now + LOADING;
+        assert_eq!(load.step(true, true, AgentHere::Working, Some(true), later), LoadStep::Wait(LoadWait::Turn));
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), later), LoadStep::Wait(LoadWait::Typed));
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), later), LoadStep::Type);
+        load.typed(later);
+        // Twice is all: the person is asked, and stays asked.
+        let last = later + LOADING;
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), last), LoadStep::Ask);
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), last + LOADING), LoadStep::Ask);
+        // Their Load starts it all over again.
+        load.again();
+        load.step(true, true, AgentHere::Resting, Some(true), last);
+        assert_eq!(load.step(true, true, AgentHere::Resting, Some(true), last), LoadStep::Type);
+        // A pane nothing can be typed into, or one Claude has left: asked
+        // at once.
+        assert_eq!(AutoLoad::default().step(true, false, AgentHere::Resting, Some(true), now), LoadStep::Ask);
+        assert_eq!(AutoLoad::default().step(true, true, AgentHere::Gone, Some(true), now), LoadStep::Ask);
+    }
+
+    #[test]
     fn install_puts_the_mod_in_and_leaves_others_alone() {
         let claude = tempfile::tempdir().unwrap();
         let dir = install_in(claude.path()).unwrap();
@@ -2210,6 +2453,37 @@ mod tests {
         let none = claude.path().join("not-there");
         assert!(install_in(&none).is_err());
         assert!(!none.exists());
+    }
+
+    #[test]
+    fn a_server_start_only_freshens_a_mod_put_in_before_and_remove_takes_ours_out() {
+        let claude = tempfile::tempdir().unwrap();
+        let dir = claude.path().join("skills").join(MOD_NAME);
+        // None there, or taken out by the person: none is put in.
+        assert!(!refresh_in(claude.path()).unwrap());
+        assert!(!dir.exists());
+        // An older one of ours: brought up to date.
+        install_in(claude.path()).unwrap();
+        let module = dir.join("hooks/register.ts");
+        std::fs::write(&module, format!("{MARK}\nconst MOD_VERSION = 0\n")).unwrap();
+        assert!(refresh_in(claude.path()).unwrap());
+        assert_eq!(std::fs::read_to_string(&module).unwrap(), MODULE);
+        assert!(!refresh_in(claude.path()).unwrap(), "already up to date");
+        // Taken out, and not again; something put beside it stays.
+        std::fs::write(dir.join("hooks/mine.ts"), "// mine").unwrap();
+        assert!(remove_from(claude.path()).unwrap());
+        assert!(MOD_FILES.iter().all(|(name, _)| !dir.join(name).exists()));
+        assert_eq!(std::fs::read_to_string(dir.join("hooks/mine.ts")).unwrap(), "// mine");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!remove_from(claude.path()).unwrap());
+        assert!(!refresh_in(claude.path()).unwrap());
+        assert!(!dir.exists());
+        // Someone else's of the name is neither freshened nor taken out.
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "// someone else's\n").unwrap();
+        assert!(!refresh_in(claude.path()).unwrap());
+        assert!(remove_from(claude.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&module).unwrap(), "// someone else's\n");
     }
 
     #[test]

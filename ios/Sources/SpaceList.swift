@@ -159,6 +159,11 @@ struct SpaceList: View {
     /// The Space gone to lies after the one left: it comes in from the
     /// right.
     @State private var forward = true
+    /// Threads home's view is being picked (`HomeViewSheet`).
+    @State private var picking = false
+    /// What the sheet left to do once it is gone: a rename asks for the
+    /// name, which a sheet on its way out would not let show.
+    @State private var afterSheet: (() -> Void)?
 
     private static let backdrop = Color.chromeBackdrop
     /// The header's row and the footer's, their padding included.
@@ -198,7 +203,10 @@ struct SpaceList: View {
         let shown = shownEntry(entries)
         let model = shown.flatMap { sessions.existing($0.id) }
         let spaceId = model?.shownSpace?.id
-        let key = (shown?.id.uuidString ?? "") + "/" + (spaceId ?? "")
+        // Threads home's view of every computer's projects by repository,
+        // in place of a Space; a sidebar shows its Space, as ever.
+        let reposView = place == .home && settings.byRepo && !searching && settings.homeView == "repos"
+        let key = reposView ? "repos" : (shown?.id.uuidString ?? "") + "/" + (spaceId ?? "")
         let order = spaceOrder(entries, sessions: sessions)
         let at = order.firstIndex { $0.host == shown?.id && $0.space == spaceId }
         return ScrollView {
@@ -206,7 +214,7 @@ struct SpaceList: View {
             // the scroll's height of before, the list stuck short of its
             // end. A Space's rows have no need of laziness.
             ZStack(alignment: .top) {
-                content(entries, shown: shown, model: model, spaceId: spaceId, order: order, at: at)
+                content(entries, shown: shown, model: model, spaceId: spaceId, order: order, at: at, reposView: reposView)
                     .id(key)
                     .transition(slide)
             }
@@ -214,9 +222,11 @@ struct SpaceList: View {
             .animation(.easeOut(duration: 0.3), value: key)
         }
         .scrollDismissesKeyboard(.immediately)
-        // Swiped sideways, the list goes to the Space before or after the
-        // one on show, as the desktop's sidebar does. A search stays put.
-        .simultaneousGesture(swipeGesture(entries, shown: shown, order: order, at: at), including: searching ? .subviews : .all)
+        // Swiped sideways, a sidebar's list goes to the Space before or
+        // after the one on show, as the desktop's sidebar does. A search
+        // stays put, and so does Threads home: its Spaces are picked from
+        // the menu at its head.
+        .simultaneousGesture(swipeGesture(entries, shown: shown, order: order, at: at), including: searching || place == .home ? .subviews : .all)
         .floatingBar(edge: .top, fading: Self.backdrop, scrim: true) {
             VStack(spacing: 0) {
                 header
@@ -226,13 +236,41 @@ struct SpaceList: View {
         }
         .floatingBar(edge: .bottom, fading: Self.backdrop) {
             if !searching {
-                footer(shown, model)
+                footer(shown, model, reposView: reposView)
                     .readable(place == .home)
             }
         }
         .barRoom(.top, height: Self.headerHeight, $headerRoom)
         .barRoom(.bottom, height: Self.footerHeight, $footerRoom)
         .background { chores(entries, shown: shown) }
+        .sheet(isPresented: $picking, onDismiss: {
+            afterSheet?()
+            afterSheet = nil
+        }) {
+            HomeViewSheet(
+                hosts: menuHosts(entries),
+                shown: shown?.id,
+                reposShown: reposView,
+                byRepo: settings.byRepo,
+                pickRepos: { settings.homeView = "repos" },
+                pickSpace: { id, space in
+                    settings.homeView = ""
+                    pick(entries.first { $0.id == id }, space, shown: shown, order: order, at: at)
+                },
+                toggleConnection: { id in
+                    guard let session = sessions.existing(id) else { return }
+                    if session.connectionUp { session.disconnect() } else { session.connect() }
+                },
+                rename: { id, space in afterSheet = { sessions.existing(id)?.menuAction("rename-space:" + space) } },
+                open: { toTerminal($0) },
+                delete: { id, space in sessions.existing(id)?.menuAction("delete-space:" + space) },
+                newSpace: { id in
+                    sessions.existing(id)?.menuAction("new-space")
+                    settings.homeView = ""
+                    pick(entries.first { $0.id == id }, nil, shown: shown, order: order, at: at)
+                }
+            )
+        }
     }
 
     /// The Space after the one left comes in from the right, the one left
@@ -247,23 +285,41 @@ struct SpaceList: View {
     /// The head and the rows of the Space on show; a search's finds in
     /// their place.
     private func content(
-        _ entries: [ListedHost], shown: ListedHost?, model: TerminalModel?, spaceId: String?, order: [SpaceAt], at: Int?
+        _ entries: [ListedHost], shown: ListedHost?, model: TerminalModel?, spaceId: String?, order: [SpaceAt], at: Int?, reposView: Bool
     ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            if let shown {
-                SpaceTitle(
-                    look: look(entries, shown: shown, model: model, spaceId: spaceId),
-                    model: model,
-                    pick: { id, space in pick(entries.first { $0.id == id }, space, shown: shown, order: order, at: at) },
-                    editHost: onEditHost
+            if reposView && !entries.isEmpty {
+                // Every computer's projects by repository, then the rest,
+                // computer by computer.
+                HomeTitle(title: tr("home.view.repos"), under: tr("home.view.repos.all"), dot: nil, busy: false) { picking = true }
+                RepoGroups(hosts: sessionsOf(entries), open: { started(on: $0) }, openRow: openRow)
+                OtherProjects(
+                    entries: entries,
+                    folded: $folded,
+                    open: { toTerminal($0) },
+                    openRow: openRow,
+                    connect: { id in pick(entries.first { $0.id == id }, nil, shown: shown, order: order, at: at) }
                 )
-                .equatable()
+            } else if let shown {
+                if place == .home {
+                    let space = model?.tree?.spaces.first { $0.id == spaceId }
+                    HomeTitle(title: space?.name ?? shown.name, under: shown.name, dot: HostDot(model), busy: model?.onItsWay ?? false) { picking = true }
+                } else {
+                    SpaceTitle(
+                        look: look(entries, shown: shown, model: model, spaceId: spaceId),
+                        model: model,
+                        pick: { id, space in pick(entries.first { $0.id == id }, space, shown: shown, order: order, at: at) },
+                        editHost: onEditHost
+                    )
+                    .equatable()
+                }
                 if searching {
                     Found(search: search, hosts: sessionsOf(entries), open: openRow)
                 } else {
-                    // Every host's projects by the repository they are in,
-                    // above the Space's own.
-                    if settings.byRepo {
+                    // A sidebar's repositories are above its Space; Threads
+                    // home has a view of them of its own.
+                    let grouped = settings.byRepo && place == .panel
+                    if grouped {
                         RepoGroups(hosts: sessionsOf(entries), open: { started(on: $0) }, openRow: openRow)
                     }
                     if let model {
@@ -272,11 +328,11 @@ struct SpaceList: View {
                             model: model,
                             spaceId: spaceId,
                             folded: $folded,
-                            skipGrouped: settings.byRepo,
+                            skipGrouped: grouped,
                             overview: overview,
                             openHost: {
                                 done()
-                                onOpen(shown.id, false)
+                                toTerminal(shown.id)
                             },
                             openRow: openRow
                         )
@@ -311,20 +367,29 @@ struct SpaceList: View {
             up: model?.connectionUp ?? false,
             editable: onEditHost != nil && shown.host != nil,
             session: model.map { ObjectIdentifier($0) },
-            hosts: entries.map { entry -> MenuHost in
-                let session = sessions.existing(entry.id)
-                return MenuHost(
-                    id: entry.id,
-                    name: entry.name,
-                    dot: HostDot(session),
-                    busy: session?.onItsWay ?? false,
-                    spaces: session.flatMap { listed -> [MenuSpace]? in
-                        guard listed.listReady else { return nil }
-                        return listed.tree?.spaces.map { MenuSpace(id: $0.id, name: $0.name, current: $0.current) }
-                    }
-                )
-            }
+            hosts: menuHosts(entries)
         )
+    }
+
+    /// Every host and its Spaces, as the Space menu and Threads home's
+    /// sheet list them.
+    private func menuHosts(_ entries: [ListedHost]) -> [MenuHost] {
+        entries.map { entry -> MenuHost in
+            let session = sessions.existing(entry.id)
+            return MenuHost(
+                id: entry.id,
+                name: entry.name,
+                dot: HostDot(session),
+                busy: session?.onItsWay ?? false,
+                spaces: session.flatMap { listed -> [MenuSpace]? in
+                    guard listed.listReady else { return nil }
+                    return listed.tree?.spaces.map { MenuSpace(id: $0.id, name: $0.name, current: $0.current) }
+                },
+                session: session != nil,
+                up: session?.connectionUp ?? false,
+                keyPending: session?.pendingHostKey != nil
+            )
+        }
     }
 
     private func sessionsOf(_ entries: [ListedHost]) -> [HostSession] {
@@ -358,13 +423,15 @@ struct SpaceList: View {
     /// chats come first, else the thread; then its host's terminal.
     private func openRow(_ on: UUID, _ model: TerminalModel, _ space: TreeSpace, _ project: TreeProject, _ thread: ThreadRow) {
         if settings.chatFirst, let chat = thread.chat {
-            // Its agent's chat, over the terminal of the agent's pane. From
-            // Threads home, back from it is back there. The thread is read
-            // and recent all the same, as an opened one is.
+            // Its agent's chat, over the terminal of the agent's pane; the
+            // sidebar comes out over it as over the terminal. The thread is
+            // read and recent all the same, as an opened one is.
             if !space.current { model.setSpace(space.id) }
             model.sideClick("touch-thread", id: thread.id)
-            model.openChat(pane: chat.pane, agent: chat.agent, place: project.name + " · " + thread.name, fromThreads: place == .home)
+            model.openChat(pane: chat.pane, agent: chat.agent, place: project.name + " · " + thread.name)
         } else {
+            // Its terminal, in front: a chat over it goes.
+            model.closeChat()
             model.openThread(thread.id, space: space.id)
         }
         settings.spaceHost = on.uuidString
@@ -381,6 +448,13 @@ struct SpaceList: View {
     private func started(on id: UUID) {
         settings.spaceHost = id.uuidString
         done()
+        toTerminal(id)
+    }
+
+    /// A terminal comes to the front (a new thread, a window, one in a
+    /// repository's group): a chat over it goes.
+    private func toTerminal(_ id: UUID) {
+        sessions.existing(id)?.closeChat()
         onOpen(id, false)
     }
 
@@ -498,14 +572,16 @@ struct SpaceList: View {
 
     /// A new thread in the Space on show, where the thumb is, then the
     /// hosts (Threads home's) and the settings. Searching puts them away.
-    private func footer(_ shown: ListedHost?, _ model: TerminalModel?) -> some View {
+    private func footer(_ shown: ListedHost?, _ model: TerminalModel?, reposView: Bool) -> some View {
         HStack(spacing: 12) {
-            if let shown, let model, model.listReady {
+            // None in the view of every computer's repositories: each group
+            // has its +.
+            if let shown, let model, model.listReady, !reposView {
                 Button {
                     model.sideClick("new-thread")
                     settings.spaceHost = shown.id.uuidString
                     done()
-                    onOpen(shown.id, false)
+                    toTerminal(shown.id)
                 } label: {
                     HStack(spacing: 8) {
                         DesktopIcon(name: "square-pen")
@@ -652,6 +728,12 @@ private struct MenuHost: Equatable, Identifiable {
     let dot: HostDot
     let busy: Bool
     let spaces: [MenuSpace]?
+    /// It has a session, and that session's connection is up (as
+    /// `connectionUp`): what its connection's own action does.
+    var session = false
+    var up = false
+    /// Its key waits to be trusted, on its terminal's screen.
+    var keyPending = false
 }
 
 private struct MenuSpace: Equatable, Identifiable {
@@ -900,44 +982,8 @@ private struct SpaceRows: View {
         return above ? "home.repos.above" : agentsOnly ? "home.agents.none" : "overview.none"
     }
 
-    @ViewBuilder
     private func projectRows(_ space: TreeSpace, _ project: TreeProject) -> some View {
-        let key = "project:" + project.id
-        let isFolded = folded.contains(key)
-        SidebarRow(
-            icon: isFolded ? "folder" : "folder-open",
-            title: project.name,
-            dim: true,
-            trailing: AnyView(
-                Button {
-                    model.setSpace(space.id)
-                    model.sideClick("new-thread", id: project.id)
-                    openHost()
-                } label: {
-                    DesktopIcon(name: "circle-plus", size: 18)
-                        .foregroundColor(.secondary)
-                        .frame(width: 32, height: 32)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(tr("thread.new"))
-            )
-        ) {
-            withAnimation(.easeOut(duration: 0.18)) {
-                if isFolded { folded.remove(key) } else { folded.insert(key) }
-            }
-        }
-        .contextMenu { AppMenuItems(model: model, kind: "project", id: project.id) }
-        if !isFolded {
-            // Under the project's name, not stepped in: the desktop's rows
-            // all start at one edge. Pinned threads are above, in their own
-            // list.
-            ForEach(project.threads.filter { !$0.pinned && shownThread($0, agentsOnly: agentsOnly) }) { thread in
-                ThreadItem(model: model, thread: thread) {
-                    openRow(host, model, space, project, thread)
-                }
-            }
-        }
+        ProjectRows(model: model, host: host, space: space, project: project, folded: $folded, agentsOnly: agentsOnly, openHost: openHost, openRow: openRow)
     }
 
     /// Windows no thread claims that the list shows: with the eye on, the
@@ -1474,5 +1520,331 @@ private struct RepoTitle: View {
         copy.host.model.setSpace(copy.space.id)
         copy.host.model.sideClick("new-thread", id: copy.project.id)
         open(copy.host.id)
+    }
+}
+
+/// A project's row -- its folder, folding the threads under it, and the +
+/// that starts one in it -- then its threads.
+private struct ProjectRows: View {
+    @ObservedObject var model: TerminalModel
+    var host: UUID
+    var space: TreeSpace
+    var project: TreeProject
+    @Binding var folded: Set<String>
+    var agentsOnly: Bool
+    var openHost: () -> Void
+    var openRow: (UUID, TerminalModel, TreeSpace, TreeProject, ThreadRow) -> Void
+
+    var body: some View {
+        let key = "project:" + project.id
+        let isFolded = folded.contains(key)
+        SidebarRow(
+            icon: isFolded ? "folder" : "folder-open",
+            title: project.name,
+            dim: true,
+            trailing: AnyView(
+                Button {
+                    model.setSpace(space.id)
+                    model.sideClick("new-thread", id: project.id)
+                    openHost()
+                } label: {
+                    DesktopIcon(name: "circle-plus", size: 18)
+                        .foregroundColor(.secondary)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(tr("thread.new"))
+            )
+        ) {
+            withAnimation(.easeOut(duration: 0.18)) {
+                if isFolded { folded.remove(key) } else { folded.insert(key) }
+            }
+        }
+        .contextMenu { AppMenuItems(model: model, kind: "project", id: project.id) }
+        if !isFolded {
+            // Under the project's name, not stepped in: the desktop's rows
+            // all start at one edge. Pinned threads are above, in their own
+            // list.
+            ForEach(project.threads.filter { !$0.pinned && shownThread($0, agentsOnly: agentsOnly) }) { thread in
+                ThreadItem(model: model, thread: thread) {
+                    openRow(host, model, space, project, thread)
+                }
+            }
+        }
+    }
+}
+
+/// Threads home's head: what it shows, large -- a Space, or every
+/// computer's projects by repository -- and under it where (the computer,
+/// its dot saying how its connection is). A tap picks another
+/// (`HomeViewSheet`).
+private struct HomeTitle: View {
+    let title: String
+    let under: String
+    let dot: HostDot?
+    let busy: Bool
+    let open: () -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: open) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(Font.title.weight(.bold))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                        DesktopIcon(name: "chevrons-up-down", size: 16)
+                            .foregroundColor(.secondary)
+                    }
+                    HStack(spacing: 6) {
+                        if busy {
+                            Spinner(color: .orange).frame(width: 10, height: 10)
+                        } else if let dot {
+                            Circle().fill(dot.color).frame(width: 8, height: 8)
+                        }
+                        Text(under)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+}
+
+/// What Threads home shows, picked from the bottom: every computer's
+/// projects by repository (while those are asked for), then each computer
+/// with its Spaces -- the one on show ticked, a long press to rename or
+/// delete one, and a new one at the end. A computer not connected says how
+/// its connection stands, and a tap connects it; its connection's own
+/// action is behind the dots at its name.
+private struct HomeViewSheet: View {
+    let hosts: [MenuHost]
+    let shown: UUID?
+    let reposShown: Bool
+    let byRepo: Bool
+    let pickRepos: () -> Void
+    let pickSpace: (UUID, String?) -> Void
+    let toggleConnection: (UUID) -> Void
+    let rename: (UUID, String) -> Void
+    /// A host's terminal, for its key to be trusted there.
+    let open: (UUID) -> Void
+    let delete: (UUID, String) -> Void
+    let newSpace: (UUID) -> Void
+    @Environment(\.dismiss) private var dismiss
+    /// A Space to be deleted, asked about first: its threads' tabs close.
+    @State private var deleting: Deleting?
+
+    private struct Deleting: Identifiable {
+        let host: UUID
+        let space: MenuSpace
+        var id: String { host.uuidString + "/" + space.id }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if byRepo {
+                    Section {
+                        Button {
+                            pickRepos()
+                            dismiss()
+                        } label: {
+                            row("arrow.triangle.branch", tr("home.view.repos"), under: tr("home.view.repos.all"), on: reposShown)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                ForEach(hosts) { host in
+                    Section {
+                        if let spaces = host.spaces {
+                            ForEach(spaces) { space in
+                                Button {
+                                    pickSpace(host.id, space.id)
+                                    dismiss()
+                                } label: {
+                                    row("square.stack.3d.up", space.name, on: !reposShown && host.id == shown && space.current)
+                                }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button {
+                                        rename(host.id, space.id)
+                                        dismiss()
+                                    } label: {
+                                        Label(tr("rename"), systemImage: "pencil")
+                                    }
+                                    if spaces.count > 1 {
+                                        Button(role: .destructive) {
+                                            deleting = Deleting(host: host.id, space: space)
+                                        } label: {
+                                            Label(tr("delete"), systemImage: "trash")
+                                        }
+                                    }
+                                }
+                            }
+                            Button {
+                                newSpace(host.id)
+                                dismiss()
+                            } label: {
+                                row("plus", tr("space.new"), on: false)
+                            }
+                            .buttonStyle(.plain)
+                        } else if host.keyPending {
+                            // Its key waits to be trusted, on its terminal's screen.
+                            Button {
+                                dismiss()
+                                open(host.id)
+                            } label: {
+                                row("key", tr("hostkey.approve.title"), on: false)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            Button {
+                                pickSpace(host.id, nil)
+                                dismiss()
+                            } label: {
+                                row("link", tr(host.busy ? "connecting" : "connect"), on: false)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    } header: {
+                        HStack(spacing: 8) {
+                            Circle().fill(host.dot.color).frame(width: 8, height: 8)
+                            Text(host.name)
+                            Spacer(minLength: 0)
+                            // What its connection's own action does is what
+                            // it says: the one flag for both.
+                            if host.session {
+                                Menu {
+                                    Button(tr(host.up ? "disconnect" : "reconnect")) { toggleConnection(host.id) }
+                                } label: {
+                                    Image(systemName: "ellipsis")
+                                        .frame(width: 32, height: 24)
+                                        .contentShape(Rectangle())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(tr("home.view.pick"))
+            .navigationBarTitleDisplayMode(.inline)
+            .alert(item: $deleting) { asked in
+                Alert(
+                    title: Text(tr("thread.delete.title", asked.space.name)),
+                    message: Text(tr("space.delete.body")),
+                    primaryButton: .destructive(Text(tr("delete"))) { delete(asked.host, asked.space.id) },
+                    secondaryButton: .cancel(Text(tr("cancel")))
+                )
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    /// A row: its symbol, its name and what it holds, a tick on the one on
+    /// show.
+    private func row(_ symbol: String, _ title: String, under: String? = nil, on: Bool) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .fontWeight(on ? .semibold : .regular)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if let under {
+                    Text(under)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+            if on {
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.tint)
+            }
+        }
+        .contentShape(Rectangle())
+        .accessibilityAddTraits(on ? .isSelected : [])
+    }
+}
+
+/// Under every computer's repositories on Threads home: each connected
+/// computer's projects in none (or in one with no remote), wherever its
+/// Space, as their projects list them; a computer not connected, a tap
+/// away from connecting.
+private struct OtherProjects: View {
+    let entries: [ListedHost]
+    @Binding var folded: Set<String>
+    let open: (UUID) -> Void
+    let openRow: (UUID, TerminalModel, TreeSpace, TreeProject, ThreadRow) -> Void
+    let connect: (UUID) -> Void
+    @EnvironmentObject private var sessions: Sessions
+    @ObservedObject private var settings = AppSettings.shared
+
+    private struct Placed: Identifiable {
+        let space: TreeSpace
+        let project: TreeProject
+        var id: String { project.id }
+    }
+
+    var body: some View {
+        ForEach(entries) { entry in
+            if sessions.existing(entry.id)?.pendingHostKey != nil {
+                // Its key waits to be trusted, on its terminal's screen.
+                SidebarRow(icon: "key-round", title: entry.name + " · " + tr("hostkey.approve.title"), bold: true) {
+                    open(entry.id)
+                }
+            } else if let model = sessions.existing(entry.id), model.listReady {
+                let rest = (model.tree?.spaces ?? []).flatMap { space in
+                    space.projects
+                        .filter { $0.repo?.remote == nil && listedProject($0, agentsOnly: settings.agentsOnly) }
+                        .map { Placed(space: space, project: $0) }
+                }
+                if !rest.isEmpty {
+                    HStack(spacing: 7) {
+                        Circle().fill(HostDot(model).color).frame(width: 7, height: 7)
+                        Text(entry.name)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 18)
+                    .padding(.bottom, 2)
+                    ForEach(rest) { placed in
+                        ProjectRows(
+                            model: model,
+                            host: entry.id,
+                            space: placed.space,
+                            project: placed.project,
+                            folded: $folded,
+                            agentsOnly: settings.agentsOnly,
+                            openHost: { open(entry.id) },
+                            openRow: openRow
+                        )
+                    }
+                }
+            } else {
+                let busy = sessions.existing(entry.id)?.onItsWay ?? false
+                SidebarRow(icon: "link-2", title: entry.name + " · " + tr(busy ? "connecting" : "host.notconnected"), dim: true) {
+                    connect(entry.id)
+                }
+            }
+        }
     }
 }

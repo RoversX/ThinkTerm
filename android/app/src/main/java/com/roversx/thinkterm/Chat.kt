@@ -9,7 +9,11 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
@@ -118,6 +122,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -149,11 +154,16 @@ import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
 import kotlinx.coroutines.Job
@@ -284,7 +294,15 @@ data class ChatSent(val name: String, val image: Boolean, val picture: String?, 
 sealed class ChatRow {
     abstract val id: String
 
-    data class User(override val id: String, val text: String, val attachments: List<ChatSent>) : ChatRow()
+    /// `sending`: "sending" until the agent takes it, shown faded, or
+    /// "failed", with `failed` under it and a tap sending it again.
+    data class User(
+        override val id: String,
+        val text: String,
+        val attachments: List<ChatSent>,
+        val sending: String? = null,
+        val failed: String? = null,
+    ) : ChatRow()
     /// `copy`: the words as written, for the last reply of a turn.
     data class Text(override val id: String, val blocks: List<MdBlock>, val copy: String? = null) : ChatRow()
     data class Fold(
@@ -509,7 +527,13 @@ object ChatViews {
     private fun row(r: JSONObject): ChatRow? {
         val id = r.optString("id")
         return when (r.optString("kind")) {
-            "user" -> ChatRow.User(id, r.optString("text"), sent(r.optJSONArray("attachments")))
+            "user" -> ChatRow.User(
+                id,
+                r.optString("text"),
+                sent(r.optJSONArray("attachments")),
+                r.optStringOrNull("sending"),
+                r.optStringOrNull("failed"),
+            )
             "text" -> ChatRow.Text(id, blocks(r.optJSONArray("blocks")), r.optStringOrNull("copy"))
             "fold" -> ChatRow.Fold(
                 id = id,
@@ -669,11 +693,13 @@ private val Added = Color(0xFF30D158)
 private val Removed = Color(0xFFFF6961)
 
 /// The chat with the agent of a pane, over that pane's terminal: what it
-/// said and did, what it asks, and a field to say something. Going back
-/// is going to its terminal.
+/// said and did, what it asks, and a field to say something. It is the
+/// thread's view as its terminal is: the button at its top left brings out
+/// the sidebar over it (`onSidebar`), as the terminal's does, and the one
+/// at its right shows the terminal (`onTerminal`).
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
+fun ChatPage(model: TerminalModel, onSidebar: () -> Unit, onTerminal: () -> Unit) {
     val target = model.chatWith ?: return
     val chat = model.chat
     val chrome = LocalChrome.current
@@ -691,7 +717,6 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     // The context's sheet, risen from the bottom.
     var showContext by remember(target.pane) { mutableStateOf(false) }
-    BackHandler { onBack() }
 
     // A reply on its way shows as it is written, a whole line at a time,
     // each fading in as the reply grows to hold it; or, set to blocks, only
@@ -714,9 +739,12 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
     // one made here) left the list. What comes in below does not change
     // it: rows that came in a burst once read as a scroll away from it.
     var reading by remember(target.pane) { mutableStateOf(true) }
+    // Gliding to the end for the button: once there, the end is read, even
+    // if more came in on the way and it stopped short of it.
+    var jumping by remember(target.pane) { mutableStateOf(false) }
     LaunchedEffect(list, target.pane) {
         snapshotFlow { list.isScrollInProgress }.collect { scrolling ->
-            if (!scrolling) reading = !list.canScrollForward
+            if (!scrolling && !jumping) reading = !list.canScrollForward
         }
     }
     // Also when what is under the list grows (a question, the keyboard):
@@ -889,8 +917,17 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             }
             if (chat == null || (rows.isEmpty() && chat.state == "connecting")) {
                 item(key = "tt:connecting") {
-                    Box(Modifier.fillMaxWidth().padding(top = 80.dp), contentAlignment = Alignment.Center) {
+                    // And what it waits for, when the agent is being had to
+                    // take ThinkTerm in.
+                    Column(
+                        Modifier.fillMaxWidth().padding(top = 80.dp, start = 32.dp, end = 32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
                         CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = secondary)
+                        chat?.stateLabel?.takeIf { it.isNotEmpty() }?.let { label ->
+                            Text(label, fontSize = 13.sp, color = secondary, textAlign = TextAlign.Center)
+                        }
                     }
                 }
             }
@@ -951,16 +988,16 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                val back = tr("back")
+                val sidebar = tr("sidebar")
                 Box(
                     Modifier
                         .size(40.dp)
                         .glass(backdrop, dark, CircleShape)
-                        .clickable(role = Role.Button, onClick = onBack)
-                        .semantics { contentDescription = back },
+                        .clickable(role = Role.Button, onClick = onSidebar)
+                        .semantics { contentDescription = sidebar },
                     contentAlignment = Alignment.Center,
                 ) {
-                    DesktopIcon("chevron-left", size = 20.dp, tint = chrome.ink)
+                    DesktopIcon("panel-left", size = 20.dp, tint = chrome.ink)
                 }
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
                     Text(target.place, fontSize = 16.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold, color = chrome.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -977,6 +1014,17 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                     }
                 }
                 chat?.context?.let { context -> ContextRing(context, backdrop, dark) { showContext = true } }
+                val terminal = tr("chat.terminal")
+                Box(
+                    Modifier
+                        .size(40.dp)
+                        .glass(backdrop, dark, CircleShape)
+                        .clickable(role = Role.Button, onClick = onTerminal)
+                        .semantics { contentDescription = terminal },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    DesktopIcon("square-terminal", size = 19.dp, tint = chrome.ink)
+                }
             }
         }
 
@@ -990,7 +1038,9 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
         ) {
             val down = tr("chat.latest")
             AnimatedVisibility(
-                visible = rows.isNotEmpty() && list.canScrollForward,
+                // Not while the end is read: a reply growing there would
+                // have it come and go as the list catches up.
+                visible = rows.isNotEmpty() && !reading && list.canScrollForward,
                 enter = fadeIn(tween(160)) + scaleIn(tween(160), initialScale = 0.8f),
                 exit = fadeOut(tween(120)) + scaleOut(tween(120), targetScale = 0.8f),
             ) {
@@ -999,7 +1049,17 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
                         .size(40.dp)
                         .glass(backdrop, dark, CircleShape)
                         .clickable(role = Role.Button) {
-                            scope.launch { list.animateScrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END) }
+                            scope.launch {
+                                jumping = true
+                                try {
+                                    list.animateScrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END)
+                                    // What came in on the way: there too, at once.
+                                    list.scrollToItem((list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), TO_THE_END)
+                                    reading = true
+                                } finally {
+                                    jumping = false
+                                }
+                            }
                         }
                         .semantics { contentDescription = down },
                     contentAlignment = Alignment.Center,
@@ -1044,7 +1104,7 @@ fun ChatPage(model: TerminalModel, onBack: () -> Unit) {
             // said while they go.
             Appearing(target.pane, chat?.problem) { ProblemCard(it, model, backdrop, dark) }
             Appearing(target.pane, chat?.outdated) { OutdatedCard(it, model, backdrop, dark) }
-            Appearing(target.pane, chat?.ask) { AskCard(it, model, backdrop, dark, onTerminal = { model.closeChat(toTerminal = true) }) }
+            Appearing(target.pane, chat?.ask) { AskCard(it, model, backdrop, dark, onTerminal = { model.closeChat() }) }
             ChatField(chat, target, model, backdrop, dark, onSend = { follow = true })
         }
     }
@@ -1056,7 +1116,10 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean, revea
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     when (row) {
         is ChatRow.User -> Column(
-            Modifier.fillMaxWidth(),
+            Modifier
+                .fillMaxWidth()
+                // On its way, faint until the agent takes it.
+                .graphicsLayer { alpha = if (row.sending == "sending") 0.55f else 1f },
             horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -1074,6 +1137,22 @@ private fun ChatRowView(row: ChatRow, model: TerminalModel, dark: Boolean, revea
                             .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFE9E9EB))
                             .padding(horizontal = 14.dp, vertical = 9.dp),
                     )
+                }
+            }
+            // Not sent: said so under it, and a tap sends it again.
+            if (row.sending == "failed") {
+                val again = row.failed.orEmpty()
+                Row(
+                    Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(role = Role.Button) { model.chatResend(row.id) }
+                        .semantics { contentDescription = again }
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    DesktopIcon("triangle-alert", size = 14.dp, tint = Color(0xFFFF453A))
+                    Text(again, fontSize = 12.5.sp, color = Color(0xFFFF453A))
                 }
             }
         }
@@ -2158,7 +2237,7 @@ private fun ProblemCard(problem: ChatProblem, model: TerminalModel, backdrop: Ba
                     .background(LeadBlue)
                     .clickable(role = Role.Button) {
                         // The terminal is the app's to show; the rest the core's.
-                        if (action.id == "terminal") model.closeChat(toTerminal = true) else model.chatAction(action.id)
+                        if (action.id == "terminal") model.closeChat() else model.chatAction(action.id)
                     },
                 contentAlignment = Alignment.Center,
             ) {
@@ -2350,7 +2429,7 @@ private fun FileSheet(path: String, model: TerminalModel, dark: Boolean, onDismi
     }
     if (big) {
         file?.picture?.let { picture ->
-            PictureView(ChatSent(file.name, true, null, path), null, null, sharp = picture) { big = false }
+            PictureView(1, 0, page = { PicturePage(ChatSent(file.name, true, null, path), null, null, sharp = picture) }) { big = false }
         }
     }
 }
@@ -3055,7 +3134,9 @@ private fun sizeWords(bytes: Long): String = when {
 /// one big; its files as cards.
 @Composable
 private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean) {
-    var shown by remember { mutableStateOf<ChatSent?>(null) }
+    // The pictures among them, kept as they were when one was tapped: big,
+    // a swipe goes from one to the next.
+    var shown by remember { mutableStateOf<Pair<List<ChatSent>, Int>?>(null) }
     Row(
         Modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -3072,7 +3153,12 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
                     modifier = Modifier
                         .size(132.dp)
                         .clip(RoundedCornerShape(14.dp))
-                        .clickable(role = Role.Image) { shown = file },
+                        .clickable(role = Role.Image) {
+                            val pictures = files.filter { f ->
+                                f.image && (f.path?.let { model.chatPictures[it] } != null || f.picture?.let { model.chatThumbs[it] } != null)
+                            }
+                            shown = pictures to pictures.indexOfFirst { it === file }.coerceAtLeast(0)
+                        },
                 )
             } else {
                 // What it holds, from the host, on a tap.
@@ -3087,8 +3173,14 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
             }
         }
     }
-    shown?.let { file ->
-        PictureView(file, file.picture?.let { model.chatThumbs[it] }, file.path?.let { model.chatPictures[it] }) { shown = null }
+    shown?.let { (pictures, start) ->
+        PictureView(pictures.size, start, page = { at ->
+            val file = pictures[at]
+            val thumb = file.picture?.let { model.chatThumbs[it] }
+            // Said so when the phone's copy cannot be read and there is no
+            // small one.
+            PicturePage(file, thumb, file.path?.let { model.chatPictures[it] }, failed = thumb == null)
+        }) { shown = null }
     }
 }
 
@@ -3098,7 +3190,9 @@ private fun SentFiles(files: List<ChatSent>, model: TerminalModel, dark: Boolean
 @Composable
 private fun ToolPictures(pictures: List<ChatSent>, model: TerminalModel, modifier: Modifier = Modifier) {
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
-    var shown by remember { mutableStateOf<ChatSent?>(null) }
+    // Those to be had, kept as they were when one was tapped: big, a swipe
+    // goes from one to the next.
+    var shown by remember { mutableStateOf<Pair<List<ChatSent>, Int>?>(null) }
     Row(
         modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -3112,7 +3206,10 @@ private fun ToolPictures(pictures: List<ChatSent>, model: TerminalModel, modifie
                     .aspectRatio(ratio)
                     .clip(RoundedCornerShape(10.dp))
                     .background(secondary.copy(alpha = 0.12f))
-                    .clickable(enabled = picture.path != null || thumb != null, role = Role.Image) { shown = picture },
+                    .clickable(enabled = picture.path != null || thumb != null, role = Role.Image) {
+                        val open = pictures.filter { p -> p.path != null || p.picture?.let { model.chatThumbs[it] } != null }
+                        shown = open to open.indexOfFirst { it === picture }.coerceAtLeast(0)
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 if (thumb != null) {
@@ -3123,74 +3220,79 @@ private fun ToolPictures(pictures: List<ChatSent>, model: TerminalModel, modifie
             }
         }
     }
-    shown?.let { picture ->
-        val path = picture.path
-        LaunchedEffect(path) { if (path != null) model.chatOpenFile(path, sheet = false) }
-        // Not to be had whole, and no small one either: said so, not a
-        // blank screen.
-        val failed = path == null || model.chatShownLate[path] == true || model.chatShown[path]?.let { it.picture == null } == true
-        PictureView(picture, picture.picture?.let { model.chatThumbs[it] }, null, sharp = path?.let { model.chatShown[it]?.picture }, failed = failed) { shown = null }
+    shown?.let { (open, start) ->
+        PictureView(
+            open.size,
+            start,
+            page = { at ->
+                val picture = open[at]
+                val path = picture.path
+                // Not to be had whole, and no small one either: said so, not
+                // a blank screen.
+                val failed = path == null || model.chatShownLate[path] == true || model.chatShown[path]?.let { it.picture == null } == true
+                PicturePage(picture, picture.picture?.let { model.chatThumbs[it] }, null, sharp = path?.let { model.chatShown[it]?.picture }, failed = failed)
+            },
+            // The host's whole picture asked for, once on show.
+            onShown = { at -> open[at].path?.let { model.chatOpenFile(it, sheet = false) } },
+        ) { shown = null }
     }
 }
 
-/// A picture over everything, as large as it fits: the phone's own copy
-/// when it sent it, else the host's whole one when it came (`sharp`), else
-/// its small one. Two fingers zoom it, a double tap zooms in or back; a
-/// tap puts it away. Share hands it to another app (to save it, or send it
-/// on).
+/// One of the pictures shown big together, and what is had of it: the
+/// phone's own copy when it sent it, else the host's whole one when it
+/// came (`sharp`), else its small one.
+private class PicturePage(
+    val file: ChatSent,
+    val thumb: ImageBitmap?,
+    val local: File?,
+    val sharp: ImageBitmap? = null,
+    /// It could not be had: said so where it would be.
+    val failed: Boolean = false,
+)
+
+/// Pictures over everything, each as large as it fits, a swipe going to
+/// the one beside it (`count` of them, `start` first). Two fingers zoom
+/// one, a double tap zooms in or back; a tap puts them away. Share hands
+/// the one on show to another app (to save it, or send it on). `onShown`
+/// hears of each the first time it is on show.
 @Composable
-private fun PictureView(file: ChatSent, thumb: ImageBitmap?, local: File?, sharp: ImageBitmap? = null, failed: Boolean = false, onClose: () -> Unit) {
-    val picture = rememberPicture(sharp ?: thumb, local, 2048)
+private fun PictureView(count: Int, start: Int, page: (Int) -> PicturePage, onShown: (Int) -> Unit = {}, onClose: () -> Unit) {
     val context = LocalContext.current
-    var scale by remember { mutableStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
+    val pager = rememberPagerState(initialPage = start.coerceIn(0, (count - 1).coerceAtLeast(0))) { count }
+    // A zoomed picture's drag moves it about, not to the next one.
+    var zoomed by remember { mutableStateOf(false) }
+    val told = remember { HashSet<Int>() }
+    LaunchedEffect(pager.currentPage) { if (told.add(pager.currentPage)) onShown(pager.currentPage) }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onTap = { onClose() },
-                        onDoubleTap = { at ->
-                            if (scale > 1f) {
-                                scale = 1f
-                                offset = Offset.Zero
-                            } else {
-                                scale = 2.5f
-                                // The point tapped stays under the finger.
-                                offset = (Offset(size.width / 2f, size.height / 2f) - at) * 1.5f
-                            }
-                        },
-                    )
-                }
-                .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(1f, 6f)
-                        offset = if (scale == 1f) Offset.Zero else offset + pan
-                    }
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            if (picture == null) {
-                if (failed) {
-                    Text(tr("chat.file.failed"), fontSize = 15.sp, color = Color.White.copy(alpha = 0.8f))
-                } else {
-                    CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.5.dp, color = Color.White.copy(alpha = 0.8f))
-                }
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            HorizontalPager(pager, Modifier.fillMaxSize(), userScrollEnabled = !zoomed, pageSpacing = 12.dp) { at ->
+                PicturePane(page(at), onZoomed = { if (at == pager.currentPage) zoomed = it }, onClose = onClose)
             }
-            if (picture != null) {
-                Image(
-                    picture,
-                    contentDescription = file.name,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize().graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                        translationX = offset.x
-                        translationY = offset.y
-                    },
-                )
+            val shown = if (count > 0) page(pager.currentPage.coerceIn(0, count - 1)) else null
+            // The way out, where a page's is: a tap anywhere puts it away
+            // too, but a button says so.
+            val closeLabel = tr("close")
+            Box(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(12.dp)
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.16f))
+                    .clickable(role = Role.Button) { onClose() }
+                    .semantics { contentDescription = closeLabel },
+                contentAlignment = Alignment.Center,
+            ) {
+                DesktopIcon("x", size = 19.dp, tint = Color.White)
+            }
+            if (count > 1) {
+                Box(
+                    Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(12.dp).height(44.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("${pager.currentPage + 1} / $count", fontSize = 15.sp, color = Color.White.copy(alpha = 0.85f))
+                }
             }
             val share = tr("chat.share")
             Box(
@@ -3201,12 +3303,76 @@ private fun PictureView(file: ChatSent, thumb: ImageBitmap?, local: File?, sharp
                     .size(44.dp)
                     .clip(CircleShape)
                     .background(Color.White.copy(alpha = 0.16f))
-                    .clickable(role = Role.Button) { sharePicture(context, file.name, local, picture) }
+                    .clickable(role = Role.Button) { shown?.let { sharePicture(context, it.file.name, it.local, it.sharp ?: it.thumb) } }
                     .semantics { contentDescription = share },
                 contentAlignment = Alignment.Center,
             ) {
                 DesktopIcon("share-2", size = 19.dp, tint = Color.White)
             }
+        }
+    }
+}
+
+/// One picture of `PictureView`, as large as it fits, zoomed by itself.
+/// One finger on it at its size is left to the pages, to swipe on.
+@Composable
+private fun PicturePane(shown: PicturePage, onZoomed: (Boolean) -> Unit, onClose: () -> Unit) {
+    val picture = rememberPicture(shown.sharp ?: shown.thumb, shown.local, 2048)
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(scale > 1f) { onZoomed(scale > 1f) }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .clipToBounds()
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { onClose() },
+                    onDoubleTap = { at ->
+                        if (scale > 1f) {
+                            scale = 1f
+                            offset = Offset.Zero
+                        } else {
+                            scale = 2.5f
+                            // The point tapped stays under the finger.
+                            offset = (Offset(size.width / 2f, size.height / 2f) - at) * 1.5f
+                        }
+                    },
+                )
+            }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    do {
+                        val event = awaitPointerEvent()
+                        if (scale > 1f || event.changes.count { it.pressed } > 1) {
+                            scale = (scale * event.calculateZoom()).coerceIn(1f, 6f)
+                            offset = if (scale == 1f) Offset.Zero else offset + event.calculatePan()
+                            event.changes.forEach { if (it.positionChanged()) it.consume() }
+                        }
+                    } while (event.changes.any { it.pressed })
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (picture == null) {
+            if (shown.failed) {
+                Text(tr("chat.file.failed"), fontSize = 15.sp, color = Color.White.copy(alpha = 0.8f))
+            } else {
+                CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.5.dp, color = Color.White.copy(alpha = 0.8f))
+            }
+        } else {
+            Image(
+                picture,
+                contentDescription = shown.file.name,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize().graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    translationX = offset.x
+                    translationY = offset.y
+                },
+            )
         }
     }
 }
@@ -3301,23 +3467,30 @@ private fun ModelChip(menu: ChatModelMenu, model: TerminalModel, dark: Boolean, 
     if (open) ModelSheet(menu, model, dark) { open = false }
 }
 
-/// The models to talk to, risen from the bottom: each with what it is for,
-/// the one in use ticked; under them, how hard the one picked thinks, side
-/// by side. Picking a model that can think more or less keeps the sheet up
-/// for that; picking how hard, or a model that cannot, puts it away.
+/// The pages of the model sheet: its first, with a row for each setting,
+/// and one for each setting's choices.
+private enum class ModelPage { ROOT, MODELS, EFFORTS }
+
+/// The model and how hard it thinks, risen from the bottom: two rows, the
+/// model in use and how hard it thinks, each a tap away from its own page
+/// -- the models with what each is for, the efforts one under another --
+/// whose pick comes back here. What the model chip and `/model` raise.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ModelSheet(menu: ChatModelMenu, model: TerminalModel, dark: Boolean, onPicked: () -> Unit = {}, onDismiss: () -> Unit) {
     val ink = LocalChrome.current.ink
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     val view = LocalView.current
-    val scope = rememberCoroutineScope()
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val card = if (dark) Color(0xFF2C2C2E) else Color.White
     val using = menu.models.firstOrNull { it.current }
-    // The one picked here, before the host says it is in use.
+    // What was picked here, before the host says it is in use.
     var picked by remember { mutableStateOf(using?.id) }
+    var pickedEffort by remember { mutableStateOf<String?>(null) }
     val chosen = menu.models.firstOrNull { it.id == picked } ?: using
+    val efforts = chosen?.efforts.orEmpty()
+    val effort = efforts.firstOrNull { it.id == pickedEffort } ?: efforts.firstOrNull { it.current }
+    var page by remember { mutableStateOf(ModelPage.ROOT) }
     // Something was picked: told as the sheet goes (`/model`'s field is
     // cleared then; cleared at the pick, the sheet would go with it).
     var pickedAny by remember { mutableStateOf(false) }
@@ -3325,102 +3498,154 @@ private fun ModelSheet(menu: ChatModelMenu, model: TerminalModel, dark: Boolean,
         if (pickedAny) onPicked()
         onDismiss()
     }
-    val close = { scope.launch { state.hide() }.invokeOnCompletion { done() } }
+    val tick = { view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK) }
     ModalBottomSheet(
         onDismissRequest = done,
         sheetState = state,
         containerColor = if (dark) Color(0xFF1C1C1E) else Color(0xFFF2F2F7),
         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
     ) {
-        Column(
-            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 28.dp),
-        ) {
-            Text(
-                menu.modelsHeading,
-                fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = ink,
-                modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 12.dp).semantics { heading() },
-            )
-            Column(Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(card)) {
-                for ((n, choice) in menu.models.withIndex()) {
-                    if (n > 0) HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
-                    val on = choice.id == chosen?.id
-                    Row(
+        // Back from a page of choices is the first page, not away.
+        BackHandler(enabled = page != ModelPage.ROOT) { page = ModelPage.ROOT }
+        Column(Modifier.fillMaxWidth().padding(bottom = 28.dp)) {
+            // The page's name in the middle; on a page of choices, the way
+            // back to the first. The sheet itself goes as sheets do (down,
+            // a tap beside it, back).
+            Box(Modifier.fillMaxWidth().height(52.dp).padding(horizontal = 12.dp)) {
+                if (page != ModelPage.ROOT) {
+                    val label = tr("back")
+                    Box(
                         Modifier
-                            .fillMaxWidth()
-                            .clickable(role = Role.RadioButton) {
-                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                picked = choice.id
-                                pickedAny = true
-                                if (!choice.current) {
-                                    // How hard it thinks stays as it was, where it can.
-                                    val effort = using?.efforts?.firstOrNull { it.current }?.id?.takeIf { e -> choice.efforts.any { it.id == e } }
-                                    model.chatSetModel(choice.id, effort)
-                                }
-                                if (choice.efforts.isEmpty()) close()
-                            }
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            .align(Alignment.CenterStart)
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(card)
+                            .clickable(role = Role.Button) { page = ModelPage.ROOT }
+                            .semantics { contentDescription = label },
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text(choice.label, fontSize = 16.sp, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (choice.description.isNotEmpty()) {
-                                Text(choice.description, fontSize = 13.sp, lineHeight = 17.sp, color = secondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            }
-                        }
-                        Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) {
-                            if (on) DesktopIcon("check", size = 18.dp, tint = LeadBlue)
-                        }
+                        DesktopIcon("chevron-left", size = 18.dp, tint = ink)
                     }
                 }
-            }
-            val efforts = chosen?.efforts.orEmpty()
-            if (chosen != null && efforts.isNotEmpty()) {
                 Text(
-                    menu.effortsHeading,
-                    fontSize = 13.sp,
-                    color = secondary,
-                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 8.dp).semantics { heading() },
+                    when (page) {
+                        ModelPage.ROOT -> tr("chat.model.pick")
+                        ModelPage.MODELS -> menu.modelsHeading
+                        ModelPage.EFFORTS -> menu.effortsHeading
+                    },
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = ink,
+                    maxLines = 1,
+                    modifier = Modifier.align(Alignment.Center).semantics { heading() },
                 )
-                Row(
+            }
+            Spacer(Modifier.height(8.dp))
+            AnimatedContent(
+                targetState = page,
+                transitionSpec = {
+                    // A page of choices comes in from the right, and goes back.
+                    val into = targetState != ModelPage.ROOT
+                    (slideInHorizontally(tween(260)) { if (into) it else -it } + fadeIn(tween(200))) togetherWith
+                        (slideOutHorizontally(tween(260)) { if (into) -it else it } + fadeOut(tween(160)))
+                },
+                label = "model page",
+            ) { shown ->
+                // A long list of models scrolls under the bar.
+                Column(
                     Modifier
+                        .verticalScroll(rememberScrollState())
                         .padding(horizontal = 16.dp)
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(card)
-                        .padding(4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(card),
                 ) {
-                    for (effort in efforts) {
-                        val on = effort.current
-                        Box(
-                            Modifier
-                                .weight(1f)
-                                .height(38.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (on) LeadBlue.copy(alpha = if (dark) 0.32f else 0.16f) else Color.Transparent)
-                                .clickable(role = Role.RadioButton) {
-                                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                    if (!(chosen.current && on)) model.chatSetModel(chosen.id, effort.id)
-                                    pickedAny = true
-                                    close()
-                                },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                effort.label,
-                                fontSize = 13.5.sp,
-                                fontWeight = if (on) FontWeight.SemiBold else null,
-                                color = if (on) ink else secondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                    when (shown) {
+                        ModelPage.ROOT -> {
+                            SheetRow(menu.modelsHeading, chosen?.label.orEmpty(), ink, secondary) { page = ModelPage.MODELS }
+                            if (chosen != null && efforts.isNotEmpty()) {
+                                HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
+                                SheetRow(menu.effortsHeading, effort?.label.orEmpty(), ink, secondary) { page = ModelPage.EFFORTS }
+                            }
+                        }
+                        ModelPage.MODELS -> for ((n, choice) in menu.models.withIndex()) {
+                            if (n > 0) HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
+                            ChoiceRow(choice.label, choice.description, choice.id == chosen?.id, ink, secondary) {
+                                tick()
+                                pickedAny = true
+                                // Another than the one picked last (the one in
+                                // use, or one picked here not yet confirmed):
+                                // how hard it thinks stays as it was, where it
+                                // can.
+                                if (choice.id != chosen?.id) {
+                                    val kept = effort?.id?.takeIf { e -> choice.efforts.any { it.id == e } }
+                                    picked = choice.id
+                                    pickedEffort = kept
+                                    model.chatSetModel(choice.id, kept)
+                                }
+                                page = ModelPage.ROOT
+                            }
+                        }
+                        ModelPage.EFFORTS -> for ((n, option) in efforts.withIndex()) {
+                            if (n > 0) HorizontalDivider(Modifier.padding(start = 16.dp), color = secondary.copy(alpha = 0.14f))
+                            ChoiceRow(option.label, "", option.id == effort?.id, ink, secondary) {
+                                tick()
+                                if (chosen != null && option.id != effort?.id) {
+                                    pickedEffort = option.id
+                                    model.chatSetModel(chosen.id, option.id)
+                                }
+                                pickedAny = true
+                                page = ModelPage.ROOT
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// A row of the model sheet's first page: what it sets, what it is set to,
+/// and that a tap opens its choices.
+@Composable
+private fun SheetRow(title: String, value: String, ink: Color, secondary: Color, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(title, fontSize = 16.sp, color = ink, maxLines = 1, modifier = Modifier.weight(1f))
+        Text(value, fontSize = 15.sp, color = secondary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 200.dp))
+        DesktopIcon("chevron-right", size = 15.dp, tint = secondary)
+    }
+}
+
+/// A choice on one of the model sheet's pages: its name, what it is for,
+/// and a tick on the one picked.
+@Composable
+private fun ChoiceRow(label: String, description: String, on: Boolean, ink: Color, secondary: Color, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 52.dp)
+            .clickable(role = Role.RadioButton, onClick = onClick)
+            .semantics { selected = on }
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(label, fontSize = 16.sp, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (description.isNotEmpty()) {
+                Text(description, fontSize = 13.sp, lineHeight = 17.sp, color = secondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+            if (on) DesktopIcon("check", size = 18.dp, tint = LeadBlue)
         }
     }
 }

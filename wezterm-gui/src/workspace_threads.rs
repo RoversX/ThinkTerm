@@ -3038,6 +3038,88 @@ pub fn create_project_from_path(space_id: &str, path: &str) -> Result<WorkspaceT
     Ok(thread_id)
 }
 
+/// The thread `thinkterm start` opens what it names in, in the Space
+/// `space_id` of this computer. A folder alone opens its project: the one
+/// the Space has for it, at its active thread, else a new one. A program
+/// gets a thread of its own: the first thread of the folder's project when
+/// that is made for it, else a new thread in the folder's project, or in
+/// the Space's active project when no folder is named and that one runs on
+/// this computer (an SSH project does not), else in another that does, else
+/// in a project made for the home folder.
+pub fn thread_for_start(
+    space_id: &str,
+    folder: Option<&str>,
+    for_program: bool,
+) -> Result<WorkspaceThreadId> {
+    // A Space never opened has no project yet: it gets its Home project now.
+    let _ = ensure_active_thread_for_space(space_id);
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    ensure!(store.has_space(space_id), "there is no Space {space_id}");
+    let local = |store: &WorkspaceThreadStore, project: &Project| {
+        project.space_id == space_id
+            && !project.is_archived()
+            && !is_remote_project(project, &store.spaces)
+    };
+    let project_id = match folder {
+        Some(folder) => {
+            // As named, not trimmed: a folder's name may end in a space.
+            let path =
+                fs::canonicalize(folder).with_context(|| format!("open {folder}"))?;
+            ensure!(path.is_dir(), "{} is not a folder", path.display());
+            let had = store
+                .projects
+                .iter()
+                .find(|project| project.space_id == space_id && project.path == path)
+                .map(|project| project.id.clone());
+            let thread_id = store.create_project_from_path(space_id, path);
+            persist_locked(&store);
+            match had {
+                Some(project_id) if for_program => project_id,
+                _ => return Ok(thread_id),
+            }
+        }
+        None => {
+            let active = store
+                .active_project_id_for_space(space_id)
+                .filter(|id| store.projects.iter().any(|p| &p.id == id && local(&store, p)));
+            let any = || {
+                store
+                    .projects
+                    .iter()
+                    .find(|p| local(&store, p))
+                    .map(|p| p.id.clone())
+            };
+            match active.or_else(any) {
+                Some(project_id) => project_id,
+                None => {
+                    let home = normalize_project_path("~")?;
+                    let thread_id = store.create_project_from_path(space_id, home);
+                    persist_locked(&store);
+                    return Ok(thread_id);
+                }
+            }
+        }
+    };
+    drop(store);
+    create_thread(&project_id, None)
+}
+
+/// Programs a thread runs in place of the shell when it is first opened, by
+/// thread id: what `thinkterm start` named, for the thread made for it.
+static FIRST_PROGRAMS: std::sync::LazyLock<Mutex<HashMap<WorkspaceThreadId, CommandBuilder>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Have the thread `thread_id` start `program` when it is first opened.
+pub fn run_first_in_thread(thread_id: &str, program: CommandBuilder) {
+    FIRST_PROGRAMS.lock().insert(thread_id.to_string(), program);
+}
+
+fn take_first_program(workspace_name: &str) -> Option<CommandBuilder> {
+    let (_, thread_id) = parse_thread_workspace_name(workspace_name)?;
+    FIRST_PROGRAMS.lock().remove(&thread_id)
+}
+
 /// The Spaces whose terminals run on this computer, by id and name, in the
 /// sidebar's order.
 pub fn local_spaces() -> Vec<(SpaceId, String)> {
@@ -4435,15 +4517,28 @@ pub(crate) async fn materialize_thread(
             command.set_require_cwd(true);
             command
         });
+        // What `thinkterm start` named for this thread, in place of the
+        // shell and in the same directory.
+        let first_program = take_first_program(&workspace_name).map(|mut program| {
+            program.set_require_cwd(initial_cwd.is_some() && strict_cwd);
+            program
+        });
         // A Thread back without a recorded layout only ever had one pane:
         // it starts with what that pane showed when it stopped, if kept.
-        let command = if spawns_locally(&mux, &default_domain, None) {
+        let first_program_named = first_program.is_some();
+        let command = if first_program.is_some() {
+            first_program
+        } else if spawns_locally(&mux, &default_domain, None) {
             mux::kept_output::with_lone_seed(&workspace_name, command)
         } else {
             command
         };
         let kept_key = workspace_name.clone();
 
+        // Kept until the program has started: a thread whose first spawn
+        // failed runs it when it is opened again.
+        let named = first_program_named.then(|| command.clone()).flatten();
+        let named_workspace = workspace_name.clone();
         let spawned = mux
             .spawn_tab_or_window(
                 window_id,
@@ -4457,6 +4552,11 @@ pub(crate) async fn materialize_thread(
             )
             .await;
         drop(tagged_window);
+        if let (Err(_), Some(program)) = (&spawned, named) {
+            if let Some((_, thread_id)) = parse_thread_workspace_name(&named_workspace) {
+                run_first_in_thread(&thread_id, program);
+            }
+        }
 
         let (_tab, pane, _window_id) = spawned.context("spawn default thread window")?;
         pane.set_config(term_config);

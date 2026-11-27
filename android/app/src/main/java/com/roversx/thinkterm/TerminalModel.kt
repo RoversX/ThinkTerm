@@ -17,7 +17,6 @@ import android.os.VibratorManager
 import android.util.Log
 import android.view.Choreographer
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -906,24 +905,18 @@ class TerminalModel(
     var chat by mutableStateOf<ChatView?>(null)
         private set
 
-    /// The chat on show was opened from Threads: going back from it goes
-    /// back there, past the terminal under it.
-    var chatFromThreads = false
-        private set
-    /// Bumped to send the terminal's screen back to Threads, a chat opened
-    /// there still over it: `TerminalScreen` goes, and closes the chat once
-    /// it is gone.
-    var backToThreads by mutableIntStateOf(0)
-        private set
 
     /// Show `row`'s agent as a chat. The terminal under it goes to the
-    /// agent's pane first, as a tap on the row always did: going back from
-    /// the chat is going to that terminal.
+    /// agent's pane first, as a tap on the row always did: the chat's
+    /// terminal button shows that terminal.
     fun openChat(row: AgentRow) = openChat(row.pane, row.agentId, row.place.ifEmpty { row.name })
 
-    /// `fromThreads`: going back from the chat goes back to Threads rather
-    /// than to the terminal under it.
-    fun openChat(pane: Int, agent: String, place: String, fromThreads: Boolean = false) {
+    /// Show the agent in `pane` as a chat, in place of one on show.
+    fun openChat(pane: Int, agent: String, place: String) {
+        // Files picked for another chat are not for this one.
+        if (chatWith?.let { it.pane != pane || it.agent != agent } == true) {
+            for (file in chatFiles.toList()) chatDetach(file)
+        }
         chromeClick("pane", pane = pane)
         chat = null
         chatThumbs.clear()
@@ -933,7 +926,6 @@ class TerminalModel(
         chatShownLate.clear()
         chatFileAsked.clear()
         chatFileOpen = null
-        chatFromThreads = fromThreads
         chatWith = ChatTarget(pane, agent, place.ifEmpty { agent })
         core.chatOpen(pane.toUInt(), agent)
     }
@@ -944,21 +936,14 @@ class TerminalModel(
         if (link.chat) {
             openChat(link.pane, link.agent, link.place)
         } else {
-            closeChat(toTerminal = true)
+            closeChat()
             chromeClick("pane", pane = link.pane)
         }
     }
 
-    /// Back from the chat: to the terminal under it -- or, for one opened
-    /// from Threads, to Threads, unless `toTerminal` (an ask answered only
-    /// in the terminal).
-    fun closeChat(toTerminal: Boolean = false) {
+    /// The chat ends, and the terminal under it shows.
+    fun closeChat() {
         if (chatWith == null) return
-        if (chatFromThreads && !toTerminal) {
-            backToThreads++
-            return
-        }
-        chatFromThreads = false
         chatWith = null
         chat = null
         core.chatClose()
@@ -1159,6 +1144,8 @@ class TerminalModel(
     fun chatAnswer(ask: String, choice: String) = core.chatAnswer(ask, choice)
     fun chatAnswerQuestions(ask: String, answers: List<String>) = core.chatAnswerQuestions(ask, answers)
     fun chatInterrupt() = core.chatInterrupt()
+    /// Send again what was said as the user row `id` and did not go.
+    fun chatResend(id: String) = core.chatResend(id)
     fun chatOlder() = core.chatOlder()
     fun chatAction(action: String) = core.chatAction(action)
     fun chatToggle(row: String) = core.chatToggle(row)

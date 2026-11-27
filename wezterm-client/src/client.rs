@@ -3442,6 +3442,7 @@ impl Client {
     rpc!(split_pane, SplitPane, SpawnResponse);
     rpc!(spawn_pane_in_stack, SpawnPaneInStack, SpawnResponse);
     rpc!(spawn_page, SpawnPage, SpawnPageResponse);
+    rpc!(open_from_start, OpenFromStart, UnitResponse);
     rpc!(change_page, ChangePage, UnitResponse);
     rpc!(activate_pane_in_stack, ActivatePaneInStack, UnitResponse);
     rpc!(move_pane_to_stack, MovePaneToStack, UnitResponse);

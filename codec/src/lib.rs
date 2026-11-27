@@ -1052,6 +1052,19 @@ pdu! {
     PageChanged: 147,
     GetProjectRepos: 148,
     ProjectRepos: 149,
+    OpenFromStart: 150,
+}
+
+/// A folder to open and a program to run, as `thinkterm start` names them,
+/// handed to the window already running so that it opens them in its
+/// current Space (the folder as a project, the program in a thread of its
+/// own) and comes to the front. Sent only to a window of the same
+/// executable, so it needed no version of its own; a server with no window
+/// answers with an error.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone, Default)]
+pub struct OpenFromStart {
+    pub folder: Option<String>,
+    pub command: Option<CommandSpec>,
 }
 
 /// Discovery only. This address conveys no authority to approve or export.

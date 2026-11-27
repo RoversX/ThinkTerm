@@ -440,6 +440,30 @@ where
     })
 }
 
+/// The lines per wheel notch Settings offers, and the one it starts at: as
+/// far as a notch has always gone on X11.
+pub(crate) const WHEEL_LINES_RANGE: std::ops::RangeInclusive<u8> = 1..=20;
+pub(crate) const DEFAULT_WHEEL_LINES: u8 = 5;
+
+/// Lines per wheel notch from the file: a number is rounded and brought
+/// into the range, anything else reads as the default.
+fn wheel_lines_or_default<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw.as_f64().filter(|lines| lines.is_finite()) {
+        Some(lines) => lines.round().clamp(
+            f64::from(*WHEEL_LINES_RANGE.start()),
+            f64::from(*WHEEL_LINES_RANGE.end()),
+        ) as u8,
+        None => {
+            log::warn!("unknown wheel_lines {raw} in the settings; using the default");
+            DEFAULT_WHEEL_LINES
+        }
+    })
+}
+
 /// The same for any of the plain choices: one this build cannot read (a
 /// newer build's, or a typo) reads as its default, and the file is kept.
 fn choice_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -507,16 +531,16 @@ impl NativeWindowTabs {
 /// Where a connected server's threads show, and how the Space menu lists
 /// servers.
 ///
-/// `OwnSpace` is the default and what servers have always done: each one
-/// has Spaces of its own, every one of them spelled out in the Space menu
-/// under its server. `OneRowEach` keeps those Spaces and folds each server
-/// into one row of the menu. `Folders` keeps the Space menu to this device's
+/// `OwnSpace` is what servers have always done: each one has Spaces of its
+/// own, every one of them spelled out in the Space menu under its server.
+/// `OneRowEach`, the default, keeps those Spaces and folds each server into
+/// one row of the menu. `Folders` keeps the Space menu to this device's
 /// Spaces and shows every server as folders in one of them instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeServerPlacement {
-    #[default]
     OwnSpace,
+    #[default]
     OneRowEach,
     Folders,
 }
@@ -548,10 +572,8 @@ pub(crate) struct NativeAppearanceSettings {
     /// The sidebars' shade.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) sidebar_shade: NativeSidebarShade,
-    /// The tab bars' shade.
-    #[serde(deserialize_with = "choice_or_default")]
-    pub(crate) tab_bar_shade: NativeShade,
-    /// The terminal's shade.
+    /// The terminal's shade, which the tab bars take too. A
+    /// `tab_bar_shade` an older build saved is ignored.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) terminal_shade: NativeShade,
     /// How a sidebar thread row draws the programs its panes run.
@@ -655,13 +677,14 @@ impl NativeMacGlass {
 
 /// The shade of one of the window's areas in a see-through window: dark is
 /// the sidebars' colour as designed, light the terminal's ground, mid
-/// halfway -- and as solid as `shade_opacity` says.
+/// halfway -- and as solid as `shade_opacity` says. The terminal, and the
+/// tab bars with it, are dark unless asked otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeShade {
+    #[default]
     Dark,
     Mid,
-    #[default]
     Light,
 }
 
@@ -669,13 +692,15 @@ impl NativeShade {
     pub(crate) const ALL: [Self; 3] = [Self::Dark, Self::Mid, Self::Light];
 }
 
-/// `NativeShade`, for the sidebars, which are dark unless asked otherwise.
+/// `NativeShade`, for the sidebars, which are light unless asked otherwise:
+/// in a see-through window they stand lighter than the tab bars and the
+/// terminal beside them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeSidebarShade {
-    #[default]
     Dark,
     Mid,
+    #[default]
     Light,
 }
 
@@ -702,8 +727,8 @@ impl NativeSidebarShade {
 /// an area look dark or light: a dark ground let through less shows darker
 /// over whatever is behind, a light one lighter. So a darker shade is more
 /// solid in a dark interface, and less in a light one. Light is the
-/// window's own opacity either way: the terminal, left light, is as solid
-/// as the slider says.
+/// window's own opacity either way: a terminal set light is as solid as
+/// the slider says.
 pub(crate) fn shade_opacity(shade: NativeShade, dark_interface: bool, window: f32) -> f32 {
     let window = window.clamp(0.0, 1.0);
     let step = match shade {
@@ -718,18 +743,22 @@ pub(crate) fn shade_opacity(shade: NativeShade, dark_interface: bool, window: f3
     }
 }
 
-/// The shades Settings asks of a see-through window's areas.
+/// The shades Settings asks of a see-through window's areas. The tab bars
+/// have none of their own: they take the terminal's, so that the two read
+/// as one surface -- its colour where the terminal takes one, and its
+/// solidity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AreaShades {
     pub(crate) sidebar: NativeShade,
-    pub(crate) tab_bar: NativeShade,
     pub(crate) terminal: NativeShade,
 }
 
-/// `palette` with the sidebars and the tab bars shaded as Settings asks,
-/// and the terminal's ground when it is not the light one it has anyway --
-/// unless the terminal's scheme is on the other side of the interface:
-/// the interface's greys under that scheme's text would not be read.
+/// `palette` with the sidebars shaded as Settings asks, and the terminal's
+/// ground when it is not the light one it has anyway -- unless the
+/// terminal's scheme is on the other side of the interface: the interface's
+/// greys under that scheme's text would not be read. The tab bars take the
+/// terminal's ground where it takes one, and stay as designed where it
+/// keeps its own.
 pub(crate) fn apply_area_shades(
     settings: &ThinkTermNativeSettings,
     mut palette: crate::ui::UiPalette,
@@ -752,9 +781,11 @@ pub(crate) fn apply_area_shades(
     };
     let appearance = &settings.appearance;
     palette.workspace_sidebar_bg = pick(appearance.sidebar_shade.shade());
-    palette.header_bg = pick(appearance.tab_bar_shade);
     let terminal = (appearance.terminal_shade != NativeShade::Light && scheme_on_interface_side)
         .then(|| pick(appearance.terminal_shade));
+    // Light is the tab bars' own colour, so this is pick(terminal_shade)
+    // wherever the terminal is shaded.
+    palette.header_bg = terminal.unwrap_or(palette.header_bg);
     (palette, terminal)
 }
 
@@ -788,7 +819,6 @@ pub(crate) fn window_chrome_palette(
     let (palette, terminal) = apply_area_shades(&settings, palette, scheme_on_interface_side);
     let shades = AreaShades {
         sidebar: settings.appearance.sidebar_shade.shade(),
-        tab_bar: settings.appearance.tab_bar_shade,
         terminal: settings.appearance.terminal_shade,
     };
     (palette, terminal, Some(shades))
@@ -1158,6 +1188,11 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) fontconfig_prefer_system_fallback: Option<bool>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
     pub(crate) scroll_mode: NativeScrollMode,
+    /// Lines one notch of a mouse wheel moves the terminal's scrollback on
+    /// Linux, where the system keeps no such setting. Windows and macOS
+    /// follow their own.
+    #[serde(deserialize_with = "wheel_lines_or_default")]
+    pub(crate) wheel_lines: u8,
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) selection_style: NativeSelectionStyle,
     /// A selection let go of is copied to the clipboard, as WezTerm and
@@ -1207,6 +1242,7 @@ impl Default for NativeTerminalSettings {
             fontconfig_prefer_system_fallback: None,
             remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
             scroll_mode: NativeScrollMode::default(),
+            wheel_lines: DEFAULT_WHEEL_LINES,
             selection_style: NativeSelectionStyle::default(),
             copy_on_select: true,
             right_click: NativeRightClick::default(),
@@ -1233,6 +1269,14 @@ pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
 /// `load`, which deep-clones the whole settings tree.
 pub(crate) fn scroll_mode() -> NativeScrollMode {
     load_shared().terminal.scroll_mode
+}
+
+/// Read on every wheel notch over a terminal, through the shared handle.
+pub(crate) fn wheel_lines() -> u8 {
+    load_shared()
+        .terminal
+        .wheel_lines
+        .clamp(*WHEEL_LINES_RANGE.start(), *WHEEL_LINES_RANGE.end())
 }
 
 /// Read every frame, through the shared handle.
@@ -2764,7 +2808,6 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.window_opacity != after.appearance.window_opacity
         || before.appearance.mac_glass != after.appearance.mac_glass
         || before.appearance.sidebar_shade != after.appearance.sidebar_shade
-        || before.appearance.tab_bar_shade != after.appearance.tab_bar_shade
         || before.appearance.terminal_shade != after.appearance.terminal_shade
         || before.appearance.sidebar_thread_icons != after.appearance.sidebar_thread_icons
         || before.appearance.sidebar_thread_status != after.appearance.sidebar_thread_status
@@ -4175,20 +4218,32 @@ mod tests {
         let palette = crate::ui::UiPalette::for_appearance(Appearance::Dark);
         let (dark, light) = (palette.workspace_sidebar_bg, palette.header_bg);
         let mut settings = ThinkTermNativeSettings::default();
-        // As designed unless asked otherwise.
-        assert_eq!(apply_area_shades(&settings, palette, true), (palette, None));
-        settings.appearance.sidebar_shade = NativeSidebarShade::Light;
-        settings.appearance.tab_bar_shade = NativeShade::Dark;
-        settings.appearance.terminal_shade = NativeShade::Mid;
+        // Unless asked otherwise, the sidebars are light, and the tab bars
+        // and the terminal dark.
         let (shaded, terminal) = apply_area_shades(&settings, palette, true);
         assert_eq!(shaded.workspace_sidebar_bg, light);
         assert_eq!(shaded.header_bg, dark);
+        assert_eq!(terminal, Some(dark));
+        // As designed when asked for.
+        settings.appearance.sidebar_shade = NativeSidebarShade::Dark;
+        settings.appearance.terminal_shade = NativeShade::Light;
+        assert_eq!(apply_area_shades(&settings, palette, true), (palette, None));
+        // The tab bars take the terminal's shade, whichever it is.
+        settings.appearance.sidebar_shade = NativeSidebarShade::Light;
+        settings.appearance.terminal_shade = NativeShade::Mid;
+        let (shaded, terminal) = apply_area_shades(&settings, palette, true);
+        assert_eq!(shaded.workspace_sidebar_bg, light);
         let mid = terminal.expect("a mid terminal is asked for");
         assert!(mid != dark && mid != light);
+        assert_eq!(shaded.header_bg, mid);
         // The terminal's own ground is left to its override, not the
-        // palette's sidebar colour, and none on the scheme's other side.
+        // palette's sidebar colour, and none on the scheme's other side,
+        // where the terminal keeps its own ground and the tab bars stay as
+        // designed with it.
         assert_eq!(shaded.sidebar_bg, palette.sidebar_bg);
-        assert_eq!(apply_area_shades(&settings, palette, false).1, None);
+        let (other_side, terminal) = apply_area_shades(&settings, palette, false);
+        assert_eq!(terminal, None);
+        assert_eq!(other_side.header_bg, light);
         // Light is the window's own opacity in either interface.
         assert_eq!(shade_opacity(NativeShade::Light, false, 0.3), 0.3);
         assert_eq!(shade_opacity(NativeShade::Light, false, 0.0), 0.0);
@@ -4201,11 +4256,14 @@ mod tests {
         for shade in NativeShade::ALL {
             assert_eq!(shade_opacity(shade, true, 1.0), 1.0);
         }
-        let text = r#"{"appearance":{"sidebar_shade":"something_new","terminal_shade":"dark"}}"#;
+        // An unknown choice falls back to the default, and the tab bars'
+        // own shade an older build saved is ignored.
+        let text = r#"{"appearance":{"sidebar_shade":"something_new","tab_bar_shade":"dark","terminal_shade":"light"}}"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(text).unwrap();
-        assert_eq!(settings.appearance.sidebar_shade, NativeSidebarShade::Dark);
-        assert_eq!(settings.appearance.tab_bar_shade, NativeShade::Light);
-        assert_eq!(settings.appearance.terminal_shade, NativeShade::Dark);
+        assert_eq!(settings.appearance.sidebar_shade, NativeSidebarShade::Light);
+        assert_eq!(settings.appearance.terminal_shade, NativeShade::Light);
+        let (shaded, _) = apply_area_shades(&settings, palette, true);
+        assert_eq!(shaded.header_bg, light);
     }
 
     #[test]
@@ -4213,6 +4271,23 @@ mod tests {
         let text = r#"{"appearance":{"window_opacity":80,"windows_backdrop":"composition"}}"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(text).unwrap();
         assert_eq!(settings.appearance.window_opacity, Some(80));
+    }
+
+    #[test]
+    fn wheel_lines_read_from_the_file_stay_in_range() {
+        let read = |terminal: &str| -> u8 {
+            let text = format!(r#"{{"terminal":{terminal}}}"#);
+            let settings: ThinkTermNativeSettings = serde_json::from_str(&text).unwrap();
+            settings.terminal.wheel_lines
+        };
+        assert_eq!(read("{}"), DEFAULT_WHEEL_LINES);
+        assert_eq!(read(r#"{"wheel_lines":3}"#), 3);
+        assert_eq!(read(r#"{"wheel_lines":3.0}"#), 3);
+        assert_eq!(read(r#"{"wheel_lines":2.6}"#), 3);
+        assert_eq!(read(r#"{"wheel_lines":0}"#), 1);
+        assert_eq!(read(r#"{"wheel_lines":-4}"#), 1);
+        assert_eq!(read(r#"{"wheel_lines":500}"#), 20);
+        assert_eq!(read(r#"{"wheel_lines":"fast"}"#), DEFAULT_WHEEL_LINES);
     }
 
     use config::UiColors;
@@ -4555,23 +4630,24 @@ mod tests {
         assert!(out.contains("\"window_tabs\":\"auto_hide\""), "{out}");
     }
 
-    /// Servers keep their own Spaces unless a file says otherwise, and a
-    /// choice this build does not know falls back to that too.
+    /// The Space menu folds each server into one row unless a file says
+    /// otherwise, and a choice this build does not know falls back to that
+    /// too.
     #[test]
-    fn a_server_placement_choice_round_trips_and_defaults_to_own_spaces() {
+    fn a_server_placement_choice_round_trips_and_defaults_to_one_row_each() {
         let json = r#"{ "version": 1, "appearance": { "theme_mode": "system" } }"#;
         let settings: ThinkTermNativeSettings =
             serde_json::from_str(json).expect("the file has to survive");
         assert_eq!(
             settings.appearance.server_placement,
-            NativeServerPlacement::OwnSpace
+            NativeServerPlacement::OneRowEach
         );
 
         for (written, expected) in [
             ("own_space", NativeServerPlacement::OwnSpace),
             ("one_row_each", NativeServerPlacement::OneRowEach),
             ("folders", NativeServerPlacement::Folders),
-            ("someday", NativeServerPlacement::OwnSpace),
+            ("someday", NativeServerPlacement::OneRowEach),
         ] {
             let json = format!(r#"{{"appearance": {{"server_placement": "{written}"}}}}"#);
             let settings: ThinkTermNativeSettings =

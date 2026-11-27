@@ -4080,7 +4080,6 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.repos_fetching = true;
         }
         loop {
-            use thinkterm_session::host::PduLink as _;
             let (link, generation) = {
                 let mut inner = self.inner.borrow_mut();
                 inner.repos_again = false;
@@ -7448,6 +7447,9 @@ impl<P: Platform, L: Link> App<P, L> {
                 Self::notify(inner);
             }
             MenuAction::DeleteSpace(id) => {
+                // Another Space comes on show only when the one on show goes:
+                // a phone can delete any of them from its list.
+                let was_shown = self.inner.borrow().tree.spaces().iter().any(|s| s.current && s.id == id);
                 let panes: Vec<PaneId> = {
                     let inner = self.inner.borrow();
                     inner
@@ -7464,9 +7466,13 @@ impl<P: Platform, L: Link> App<P, L> {
                         .unwrap_or_default()
                 };
                 self.kill_panes(panes);
-                self.mutate(crate::tree::delete_space(&id), |app| {
-                    let first = app.inner.borrow().tree.spaces().first().map(|s| s.id.clone());
-                    if let Some(first) = first {
+                self.mutate(crate::tree::delete_space(&id), move |app| {
+                    let (first, none_shown) = {
+                        let inner = app.inner.borrow();
+                        let spaces = inner.tree.spaces();
+                        (spaces.first().map(|s| s.id.clone()), !spaces.iter().any(|s| s.current))
+                    };
+                    if let Some(first) = first.filter(|_| was_shown || none_shown) {
                         app.set_space(&first);
                     }
                 });
