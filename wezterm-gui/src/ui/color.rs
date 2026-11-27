@@ -29,14 +29,6 @@ pub(crate) fn lightness_step(ground: LinearRgba, step: f32) -> LinearRgba {
     from_oklab_clamped(l + step, a, b, alpha)
 }
 
-/// `ground` a `step` lighter, a card lifted off it -- or, where it is too
-/// light for that to show (a near-white ground has no room above it), the
-/// same step darker.
-pub(crate) fn lifted(ground: LinearRgba, step: f32) -> LinearRgba {
-    let l = ground.to_oklaba()[0];
-    lightness_step(ground, if l + step <= 1.0 { step } else { -step })
-}
-
 /// The colour of perceived lightness `l` (OkLab L, kept within 0..=1) with
 /// the tint `a`, `b`, clamped into what a screen shows.
 pub(crate) fn from_oklab_clamped(l: f32, a: f32, b: f32, alpha: f32) -> LinearRgba {
@@ -108,15 +100,5 @@ mod tests {
         // A blue-grey ground steps to a blue-grey.
         assert!(darker.2 > darker.0);
         assert_eq!(darker.3, 1.0);
-    }
-
-    #[test]
-    fn a_lift_shows_even_on_a_near_white_ground() {
-        let l = |c: LinearRgba| c.to_oklaba()[0];
-        let dark = LinearRgba::with_srgba(18, 18, 20, 255);
-        assert!((l(lifted(dark, 0.075)) - l(dark) - 0.075).abs() < 1e-3);
-        // No room above white: a step down instead of none at all.
-        let white = LinearRgba::with_srgba(252, 252, 253, 255);
-        assert!((l(white) - l(lifted(white, 0.075)) - 0.075).abs() < 1e-3);
     }
 }

@@ -44,10 +44,6 @@ const AGENT_ROW_GAP: usize = 10;
 const AGENT_ROW_EXTRA_INSET: usize = 6;
 /// Sub-task lines a row shows before it says how many more there are.
 const AGENT_SUBTASKS_SHOWN: usize = 5;
-/// How much lighter than the panel the row of the agent in the active pane
-/// is, in perceived lightness (OkLab L): a card lifted a little, on any
-/// theme.
-const AGENT_ACTIVE_ROW_STEP: f32 = 0.075;
 
 impl TermWindow {
     /// The strip above the list: one row holding the status line and the
@@ -351,20 +347,13 @@ impl TermWindow {
         // Between rows of a group: plain enough to stay out of the way, but
         // a shade firmer than the separator token, which vanished here.
         let divider = muted_fg.mul_alpha(0.22);
-        // The agent in the pane this window is on lies on the panel's ground
-        // a step lighter, a card lifted off it, so the list shows where you
-        // are. A step of perceived lightness looks the same in every theme
-        // and keeps a scheme's tint: a grey at a fixed alpha was plain on
-        // dark and all but gone on light, darker read as pressed there, and
-        // the accent, a different colour in every theme, looked muddy. Only
-        // a ground too light to lift (near white) takes the step darker.
+        // The agent in the pane this window is on is glass, as the left
+        // sidebar's selected thread is, in its colours, so the list shows
+        // where you are as that one does.
         let active_pane_id = self.get_active_pane_no_overlay().map(|pane| pane.pane_id());
-        let active_fill = self.chrome_surface(crate::ui::color::lifted(
-            chrome.workspace_sidebar_bg,
-            AGENT_ACTIVE_ROW_STEP,
-        ));
-        // A hover is drawn over it: on a light theme a thin grey rather than
-        // the palette's near-white, which is what the current row is there.
+        let row_chrome = self.sidebar_chrome();
+        // The other rows take a hover: on a light theme a thin grey rather
+        // than the palette's near-white.
         let hover_fill = chrome.hover_fill(chrome.sidebar_button_hover_bg);
         // Both fills a little rounder than the snippet cards they started as.
         let row_radius = self.ui_f32(SIDEBAR_ROW_RADIUS + 3.0) + 10.0;
@@ -586,7 +575,8 @@ impl TermWindow {
                 band.visible_height,
             );
             if Some(agent.pane_id) == active_pane_id {
-                self.fill_rounded_rectangle(
+                // Like the selected thread, it takes no hover over it.
+                self.paint_sidebar_glass(
                     layers,
                     1,
                     euclid::rect(
@@ -595,12 +585,15 @@ impl TermWindow {
                         content_width as f32,
                         band.visible_height as f32,
                     ),
-                    active_fill,
                     row_radius,
+                    row_chrome.sidebar_row_active_bg,
+                    row_chrome.sidebar_row_active_border,
+                    None,
+                    1.0,
+                    false,
                 )
                 .context("active agent row")?;
-            }
-            if hovered {
+            } else if hovered {
                 self.fill_rounded_rectangle(
                     layers,
                     1,
