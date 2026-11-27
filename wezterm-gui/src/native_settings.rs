@@ -531,16 +531,16 @@ impl NativeWindowTabs {
 /// Where a connected server's threads show, and how the Space menu lists
 /// servers.
 ///
-/// `OwnSpace` is the default and what servers have always done: each one
-/// has Spaces of its own, every one of them spelled out in the Space menu
-/// under its server. `OneRowEach` keeps those Spaces and folds each server
-/// into one row of the menu. `Folders` keeps the Space menu to this device's
+/// `OwnSpace` is what servers have always done: each one has Spaces of its
+/// own, every one of them spelled out in the Space menu under its server.
+/// `OneRowEach`, the default, keeps those Spaces and folds each server into
+/// one row of the menu. `Folders` keeps the Space menu to this device's
 /// Spaces and shows every server as folders in one of them instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeServerPlacement {
-    #[default]
     OwnSpace,
+    #[default]
     OneRowEach,
     Folders,
 }
@@ -4630,23 +4630,24 @@ mod tests {
         assert!(out.contains("\"window_tabs\":\"auto_hide\""), "{out}");
     }
 
-    /// Servers keep their own Spaces unless a file says otherwise, and a
-    /// choice this build does not know falls back to that too.
+    /// The Space menu folds each server into one row unless a file says
+    /// otherwise, and a choice this build does not know falls back to that
+    /// too.
     #[test]
-    fn a_server_placement_choice_round_trips_and_defaults_to_own_spaces() {
+    fn a_server_placement_choice_round_trips_and_defaults_to_one_row_each() {
         let json = r#"{ "version": 1, "appearance": { "theme_mode": "system" } }"#;
         let settings: ThinkTermNativeSettings =
             serde_json::from_str(json).expect("the file has to survive");
         assert_eq!(
             settings.appearance.server_placement,
-            NativeServerPlacement::OwnSpace
+            NativeServerPlacement::OneRowEach
         );
 
         for (written, expected) in [
             ("own_space", NativeServerPlacement::OwnSpace),
             ("one_row_each", NativeServerPlacement::OneRowEach),
             ("folders", NativeServerPlacement::Folders),
-            ("someday", NativeServerPlacement::OwnSpace),
+            ("someday", NativeServerPlacement::OneRowEach),
         ] {
             let json = format!(r#"{{"appearance": {{"server_placement": "{written}"}}}}"#);
             let settings: ThinkTermNativeSettings =
